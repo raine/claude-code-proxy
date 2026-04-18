@@ -1,6 +1,6 @@
-# claude-openai-proxy
+# claude-codex-proxy
 
-`claude-openai-proxy` is a local HTTP proxy that lets
+`claude-codex-proxy` is a local HTTP proxy that lets
 [Claude Code](https://www.anthropic.com/claude-code) call OpenAI's Codex
 Responses API using a **ChatGPT Pro/Plus subscription** — no Anthropic API key,
 no OpenAI API key.
@@ -24,46 +24,62 @@ subscription.
 
 ### 1. Install
 
+**Homebrew** (macOS and Linux):
+
 ```sh
-git clone https://github.com/raine/claude-openai-proxy
-cd claude-openai-proxy
-bun install
+brew install raine/claude-codex-proxy/claude-codex-proxy
 ```
 
-Requires [Bun](https://bun.sh) 1.3+.
+**Install script** (macOS and Linux):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/raine/claude-codex-proxy/main/scripts/install.sh | bash
+```
+
+**Manual:** download a prebuilt binary for your platform from the
+[releases page](https://github.com/raine/claude-codex-proxy/releases).
+
+**From source** (requires [Bun](https://bun.sh) 1.3+):
+
+```sh
+git clone https://github.com/raine/claude-codex-proxy
+cd claude-codex-proxy
+bun install
+bun src/cli.ts --version
+```
 
 ### 2. Authenticate with ChatGPT
 
 Open a browser (PKCE flow):
 
 ```sh
-bun src/cli.ts auth login
+claude-codex-proxy auth login
 ```
 
 Or, on a headless machine (device code flow):
 
 ```sh
-bun src/cli.ts auth device
+claude-codex-proxy auth device
 ```
 
 Either command prints a URL. Sign in with your **ChatGPT Plus/Pro account**. The
 access and refresh tokens are stored at
-`~/.config/claude-openai-proxy/auth.json` with 0600 permissions.
+`~/.config/claude-codex-proxy/auth.json` with 0600 permissions.
 
 Verify it stuck:
 
 ```sh
-bun src/cli.ts auth status
+claude-codex-proxy auth status
 ```
 
 ### 3. Start the proxy
 
 ```sh
-bun src/cli.ts serve
+claude-codex-proxy serve
 ```
 
 Defaults to `http://127.0.0.1:11434` (loopback only). Override with
-`PORT=18765 bun src/cli.ts serve`.
+`PORT=18765 claude-codex-proxy serve`.
 
 ### 4. Point Claude Code at it
 
@@ -102,11 +118,11 @@ If you pass a model your account isn't entitled to, upstream returns a 400 like
 sequenceDiagram
     autonumber
     participant CC as Claude Code
-    participant P as claude-openai-proxy
+    participant P as claude-codex-proxy
     participant AUTH as auth.openai.com
     participant CGX as chatgpt.com/<br/>backend-api/codex
 
-    Note over P,AUTH: One-time: PKCE or device OAuth<br/>tokens cached at<br/>~/.config/claude-openai-proxy/auth.json
+    Note over P,AUTH: One-time: PKCE or device OAuth<br/>tokens cached at<br/>~/.config/claude-codex-proxy/auth.json
 
     CC->>P: POST /v1/messages (Anthropic shape, stream: true)
 
@@ -157,13 +173,13 @@ Key decisions:
 ### `serve`
 
 Starts the HTTP proxy and blocks. Binds to `127.0.0.1` only. Logs to
-`$XDG_STATE_HOME/claude-openai-proxy/proxy.log` (rotated at 20 MiB). Set
-`CCXP_LOG_STDERR=1` to mirror log lines to stderr while running.
+`$XDG_STATE_HOME/claude-codex-proxy/proxy.log` (rotated at 20 MiB). Set
+`CCP_LOG_STDERR=1` to mirror log lines to stderr while running.
 
 ```sh
-claude-openai-proxy serve
-PORT=18765 claude-openai-proxy serve
-CCXP_LOG_STDERR=1 claude-openai-proxy serve
+claude-codex-proxy serve
+PORT=18765 claude-codex-proxy serve
+CCP_LOG_STDERR=1 claude-codex-proxy serve
 ```
 
 Prints the exact `ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` env vars to export on
@@ -177,11 +193,11 @@ stored a token.
 Runs the PKCE browser flow against `auth.openai.com` using the Codex CLI's
 client ID. Prints a URL, opens a local callback listener on port 1455, waits for
 the browser to redirect back, and stores the resulting access / refresh tokens
-at `~/.config/claude-openai-proxy/auth.json` (mode 0600). The process exits
+at `~/.config/claude-codex-proxy/auth.json` (mode 0600). The process exits
 automatically once the tokens are saved.
 
 ```sh
-claude-openai-proxy auth login
+claude-codex-proxy auth login
 ```
 
 Sign in with your **ChatGPT Plus/Pro account** — not an OpenAI API account. The
@@ -197,7 +213,7 @@ you enter the code from any browser on any other device, and the CLI polls
 `auth.openai.com` until you authorize, then stores the token.
 
 ```sh
-claude-openai-proxy auth device
+claude-codex-proxy auth device
 ```
 
 Useful over SSH, inside a container, or on any host that can't open a browser.
@@ -210,7 +226,7 @@ Shows whether credentials are stored, the account ID, and how long until the
 access token expires. Non-zero exit if no auth is present.
 
 ```sh
-claude-openai-proxy auth status
+claude-codex-proxy auth status
 ```
 
 Example output:
@@ -218,7 +234,7 @@ Example output:
 ```
 Account: 79342a5e-57b7-44ea-bfdc-a83ba070dad6
 Expires: 2026-04-28T16:46:04.827Z (in 863946s)
-File:    /Users/you/.config/claude-openai-proxy/auth.json
+File:    /Users/you/.config/claude-codex-proxy/auth.json
 ```
 
 The proxy refreshes the access token 5 minutes before expiry with a
@@ -229,11 +245,11 @@ calls.
 
 ### `auth logout`
 
-Removes `~/.config/claude-openai-proxy/auth.json`. No server call is needed; the
+Removes `~/.config/claude-codex-proxy/auth.json`. No server call is needed; the
 refresh token just becomes dead.
 
 ```sh
-claude-openai-proxy auth logout
+claude-codex-proxy auth logout
 ```
 
 Run `auth login` again to re-authenticate.
@@ -258,12 +274,12 @@ Settings are environment variables on the proxy process, not a config file.
 | ----------------- | ---------------- | ------------------------------- |
 | `PORT`            | `11434`          | Proxy listen port               |
 | `XDG_STATE_HOME`  | `~/.local/state` | Base dir for `proxy.log`        |
-| `CCXP_LOG_STDERR` | unset            | Also mirror log lines to stderr |
+| `CCP_LOG_STDERR` | unset            | Also mirror log lines to stderr |
 
 ### Files
 
-- `~/.config/claude-openai-proxy/auth.json` — OAuth tokens, 0600
-- `$XDG_STATE_HOME/claude-openai-proxy/proxy.log` — JSON-lines log, rotated at
+- `~/.config/claude-codex-proxy/auth.json` — OAuth tokens, 0600
+- `$XDG_STATE_HOME/claude-codex-proxy/proxy.log` — JSON-lines log, rotated at
   20 MiB. Secrets (`authorization`, `access`, `refresh`, `id_token`,
   `ChatGPT-Account-Id`, …) are redacted before write.
 
@@ -299,7 +315,7 @@ others.
 ```sh
 bunx tsc --noEmit     # typecheck
 bun src/cli.ts serve  # run locally
-tail -f ~/.local/state/claude-openai-proxy/proxy.log | jq .
+tail -f ~/.local/state/claude-codex-proxy/proxy.log | jq .
 ```
 
 The core logic lives in:

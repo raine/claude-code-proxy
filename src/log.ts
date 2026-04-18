@@ -21,7 +21,7 @@ const REDACT_KEYS = new Set([
 
 function stateDir(): string {
   const base = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")
-  return join(base, "claude-openai-proxy")
+  return join(base, "claude-codex-proxy")
 }
 
 export function logDir(): string {
@@ -100,7 +100,7 @@ async function write(level: Level, service: string, msg: string, fields?: Record
   } catch {
     // swallow; also print to stderr for visibility
   }
-  if (level === "error" || level === "warn" || process.env.CCXP_LOG_STDERR) {
+  if (level === "error" || level === "warn" || process.env.CCP_LOG_STDERR) {
     process.stderr.write(line + "\n")
   }
 }

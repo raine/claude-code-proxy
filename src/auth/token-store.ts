@@ -9,7 +9,7 @@ export interface StoredAuth {
   accountId?: string
 }
 
-const DIR = join(homedir(), ".config", "claude-openai-proxy")
+const DIR = join(homedir(), ".config", "claude-codex-proxy")
 const FILE = join(DIR, "auth.json")
 
 export async function loadAuth(): Promise<StoredAuth | undefined> {

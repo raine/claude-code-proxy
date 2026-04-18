@@ -8,7 +8,7 @@ let inflight: Promise<StoredAuth> | undefined
 export async function getAuth(): Promise<StoredAuth> {
   if (!cached) {
     const stored = await loadAuth()
-    if (!stored) throw new Error("Not authenticated. Run: claude-openai-proxy auth login")
+    if (!stored) throw new Error("Not authenticated. Run: claude-codex-proxy auth login")
     cached = stored
   }
   if (cached.expires - REFRESH_MARGIN_MS > Date.now()) {

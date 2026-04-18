@@ -6,10 +6,17 @@ import { loadAuth, authPath, clearAuth } from "./auth/token-store.ts"
 import { startServer } from "./server.ts"
 import { createLogger, logDir } from "./log.ts"
 
+declare const BUILD_VERSION: string | undefined
+const VERSION = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev"
+
 const log = createLogger("cli")
 
 async function main() {
   const [, , cmd, sub] = process.argv
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    console.log(`claude-codex-proxy ${VERSION}`)
+    return
+  }
   switch (cmd) {
     case "serve":
     case undefined: {
@@ -67,11 +74,12 @@ async function main() {
 
 function usageAndExit(): never {
   console.log(`Usage:
-  claude-openai-proxy serve              Run proxy (PORT env, default 11434)
-  claude-openai-proxy auth login         Browser OAuth (PKCE)
-  claude-openai-proxy auth device        Device-code OAuth
-  claude-openai-proxy auth status        Show current auth
-  claude-openai-proxy auth logout        Clear stored auth
+  claude-codex-proxy serve              Run proxy (PORT env, default 11434)
+  claude-codex-proxy auth login         Browser OAuth (PKCE)
+  claude-codex-proxy auth device        Device-code OAuth
+  claude-codex-proxy auth status        Show current auth
+  claude-codex-proxy auth logout        Clear stored auth
+  claude-codex-proxy --version          Show version
 `)
   process.exit(2)
 }
