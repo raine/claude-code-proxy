@@ -1,5 +1,6 @@
 import type {
   AnthropicContentBlock,
+  AnthropicImageBlock,
   AnthropicMessage,
   AnthropicRequest,
   AnthropicTextBlock,
@@ -139,10 +140,11 @@ function buildInput(messages: AnthropicMessage[]): ResponsesInputItem[] {
           if (parts.length) {
             out.push({ type: "message", role: "user", content: parts.splice(0) })
           }
+          const body = toolResultToString(block.content)
           out.push({
             type: "function_call_output",
             call_id: block.tool_use_id,
-            output: toolResultToString(block.content),
+            output: block.is_error ? `[tool execution error]\n${body}` : body,
           })
         }
       }
@@ -184,10 +186,17 @@ function imageToUrl(block: Extract<AnthropicContentBlock, { type: "image" }>): s
   return `data:${block.source.media_type};base64,${block.source.data}`
 }
 
-function toolResultToString(content: string | Array<AnthropicTextBlock | { type: "image" }>): string {
+function toolResultToString(
+  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>,
+): string {
   if (typeof content === "string") return content
   return content
-    .map((b) => (b.type === "text" ? b.text : "[image]"))
+    .map((b) => {
+      if (b.type === "text") return b.text
+      const mt =
+        b.source.type === "base64" ? b.source.media_type : "url"
+      return `[image omitted: ${mt}]`
+    })
     .join("\n")
 }
 
