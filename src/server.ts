@@ -1,6 +1,6 @@
 import { createLogger, logDir } from "./log.ts"
 import type { AnthropicRequest } from "./anthropic/schema.ts"
-import { assertAllowedModel, ModelNotAllowedError } from "./translate/model-allowlist.ts"
+import { assertAllowedModel, ModelNotAllowedError, resolveModel } from "./translate/model-allowlist.ts"
 import { translateRequest } from "./translate/request.ts"
 import { translateStream } from "./translate/stream.ts"
 import { accumulateResponse, UpstreamStreamError } from "./translate/accumulate.ts"
@@ -87,22 +87,26 @@ async function handleMessages(req: Request, reqId: string): Promise<Response> {
   })
   if (VERBOSE) log.debug("anthropic request body", { reqId, body })
 
+  const resolvedModel = resolveModel(body.model)
+
   try {
-    assertAllowedModel(body.model)
+    assertAllowedModel(resolvedModel)
   } catch (err) {
     if (err instanceof ModelNotAllowedError) {
       return jsonError(
         400,
         "invalid_request_error",
-        `Model "${err.model}" is not in the Codex OAuth allowlist`,
+        `Model "${body.model}" resolves to unsupported model "${err.model}"`,
       )
     }
     throw err
   }
 
-  const translated = translateRequest(body, { sessionId })
+  const translated = translateRequest({ ...body, model: resolvedModel }, { sessionId })
   log.debug("translated request", {
     reqId,
+    requestedModel: body.model,
+    resolvedModel,
     inputItems: translated.input.length,
     tools: translated.tools?.length ?? 0,
     hasInstructions: !!translated.instructions,

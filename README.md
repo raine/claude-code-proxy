@@ -122,9 +122,27 @@ Also verified working on this project:
 - `gpt-5.2`
 - `gpt-5.4-mini`
 
-If you pass a model your account isn't entitled to, upstream returns a 400 like
-`"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."`.
-The proxy surfaces that verbatim.
+The proxy also accepts a small set of convenience aliases and resolves them
+before calling the upstream Codex backend:
+
+- `haiku`, `claude-haiku-4-5`, `claude-haiku-4-5-20251001` → `gpt-5.4-mini`
+- `sonnet`, `claude-sonnet-4-6` → `gpt-5.4`
+- `opus`, `claude-opus-4-7` → `gpt-5.4`
+
+These aliases are only shorthand for portability and cheaper subagent configs;
+they are not semantic equivalents of the Claude models they resemble.
+
+If the resolved model isn't supported by your account, upstream returns a 400
+like `"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT
+account."`. The proxy surfaces that verbatim.
+
+For example, you can now point Claude Code or a subagent at the proxy with:
+
+```sh
+ANTHROPIC_MODEL=haiku claude
+```
+
+and the proxy will send `gpt-5.4-mini` upstream.
 
 ## How it works
 
