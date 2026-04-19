@@ -1,24 +1,27 @@
 # claude-codex-proxy
 
-`claude-codex-proxy` is a local HTTP proxy that lets
-[Claude Code](https://www.anthropic.com/claude-code) call OpenAI's Codex
-Responses API using a **ChatGPT Pro/Plus subscription** — no Anthropic API key,
-no OpenAI API key.
+`claude-codex-proxy` lets you use
+[Claude Code](https://www.anthropic.com/claude-code) with your ChatGPT Plus or
+Pro subscription.
 
-It translates Anthropic-shaped `/v1/messages` requests to the Responses API,
-calls `chatgpt.com/backend-api/codex/responses` with your ChatGPT OAuth token,
-and streams the response back in Anthropic SSE format. Claude Code talks to it
-over `ANTHROPIC_BASE_URL` and doesn't know the difference.
+If you want Claude Code's UX with its TUI, slash commands, hooks, skills, and
+plugins, but you don't want to be limited to the Codex CLI or Opencode, this
+proxy makes Claude Code speak to OpenAI's Codex Responses backend using your
+ChatGPT OAuth session.
 
 [Quick start](#quick-start) · [How it works](#how-it-works) ·
 [Configuration](#configuration) · [Limitations](#limitations)
 
 ## Why?
 
-You're already paying for ChatGPT Plus or Pro. You like the Claude Code UX (TUI,
-slash commands, hooks, skills, plugins). This proxy lets you use the former to
-pay for the latter — running Claude Code against GPT-5.x through your existing
-subscription.
+I feel Claude Code is still the best harness around, despite occasional
+frustrations caused by updates. However, Anthropic keeps tightening the usage
+limits, while OpenAI is still much more generous.
+
+If you want to use OpenAI plans, your options are OpenCode and Codex. I tried
+OpenCode, but the UX has many rough edges, especially around skills feeling like
+a second-class feature. Fortunately it's open source and I ended up forking it
+and applying some patches, but would much rather not do it.
 
 ## Quick start
 
@@ -106,8 +109,6 @@ Or set it persistently in `~/.claude/settings.json`:
 }
 ```
 
-
-
 ## Supported models
 
 Set `ANTHROPIC_MODEL` to a model your ChatGPT subscription is allowed to use.
@@ -122,8 +123,8 @@ Also verified working on this project:
 - `gpt-5.4-mini`
 
 If you pass a model your account isn't entitled to, upstream returns a 400 like
-`"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."`
-— the proxy surfaces it verbatim.
+`"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."`.
+The proxy surfaces that verbatim.
 
 ## How it works
 
@@ -150,30 +151,6 @@ sequenceDiagram
     P->>P: reducer: typed events<br/>(text/tool start/delta/stop, finish)
     P-->>CC: Anthropic SSE<br/>(message_start, content_block_*, message_delta, message_stop)
 ```
-
-Key decisions:
-
-- **Transport:** HTTP POST (not WebSocket). The backend accepts both; POST is
-  simpler and battle-tested by opencode.
-- **State:** stateless replay every turn — no `previous_response_id`, no
-  `store: true`. Claude Code sends the full history each turn anyway;
-  `prompt_cache_key` keyed off `x-claude-code-session-id` lets the upstream
-  auto-cache most of it (typically 70%+ hit rate on follow-up turns).
-- **Tool IDs:** identity mapping. Anthropic `tool_use.id` = OpenAI `call_id`
-  verbatim.
-- **Reasoning:** dropped from the response. Responses-style reasoning summaries
-  can't be faked as Anthropic `thinking` blocks with valid signatures, so
-  they're omitted. The **effort level is forwarded**, though: Claude Code's
-  `output_config.effort` (`low | medium | high`, set via `/effort` in the TUI)
-  is mapped 1:1 to Responses `reasoning.effort`. OpenAI's `"minimal"` value
-  isn't reachable because Claude Code doesn't expose it.
-- **System prompt:** Anthropic `system` blocks are concatenated into the
-  Responses API top-level `instructions` field. The rotating
-  `x-anthropic-billing-header:` block Claude Code injects is stripped so it
-  doesn't invalidate the prompt cache on every turn.
-- **Stripped before upstream:** `max_tokens`, `temperature`, `top_p`,
-  `cache_control`, `thinking`, `context_management`, `metadata`, and all
-  `anthropic-beta` headers.
 
 ## Commands
 
@@ -217,7 +194,7 @@ automatically once the tokens are saved.
 claude-codex-proxy auth login
 ```
 
-Sign in with your **ChatGPT Plus/Pro account** — not an OpenAI API account. The
+Sign in with your **ChatGPT Plus/Pro account**, not an OpenAI API account. The
 token file includes the extracted `chatgpt_account_id` so the proxy can set the
 `ChatGPT-Account-Id` header on every upstream call.
 
@@ -277,11 +254,11 @@ Run `auth login` again to re-authenticate.
 
 The proxy speaks enough of the Anthropic API for Claude Code:
 
-- `POST /v1/messages` — the main turn endpoint (streaming and non-streaming)
-- `POST /v1/messages?beta=true` — same (Claude Code always sends `?beta=true`)
-- `POST /v1/messages/count_tokens` — local token count via `gpt-tokenizer`
+- `POST /v1/messages`: the main turn endpoint (streaming and non-streaming)
+- `POST /v1/messages?beta=true`: same (Claude Code always sends `?beta=true`)
+- `POST /v1/messages/count_tokens`: local token count via `gpt-tokenizer`
   (o200k_base); used by Claude Code's compaction logic
-- `GET /healthz` — liveness check
+- `GET /healthz`: liveness check
 
 ## Configuration
 
@@ -296,7 +273,7 @@ Settings are environment variables on the proxy process, not a config file.
 
 ### Files
 
-- `$XDG_STATE_HOME/claude-codex-proxy/proxy.log` — JSON-lines log, rotated at 20
+- `$XDG_STATE_HOME/claude-codex-proxy/proxy.log`: JSON-lines log, rotated at 20
   MiB. Secrets (`authorization`, `access`, `refresh`, `id_token`,
   `ChatGPT-Account-Id`, …) are redacted before write.
 
@@ -313,8 +290,8 @@ Settings are environment variables on the proxy process, not a config file.
 - **Reasoning blocks:** not forwarded to Claude Code (dropped), even if the
   upstream model produced them.
 - **Session title generation:** Claude Code's parallel title-gen request is
-  forwarded to Codex like any other structured-output request — costs a handful
-  of tokens per session rather than being stubbed.
+  forwarded to Codex like any other structured-output request. This costs a
+  handful of tokens per session rather than being stubbed.
 - **OpenAI-flavored `output_config.format`:** translated to Responses API
   `text.format` (json_schema with `strict: true`); other Anthropic-specific
   `output_config` fields are dropped.
@@ -327,8 +304,8 @@ bun src/cli.ts serve  # run locally
 tail -f ~/.local/state/claude-codex-proxy/proxy.log | jq .
 ```
 
-**Install a compiled dev build globally** — compile the current working tree to
-a binary and place it on your `PATH` without linking:
+**Install a compiled dev build globally:** compile the current working tree to a
+binary and place it on your `PATH` without linking:
 
 ```sh
 mkdir -p ~/.local/bin
@@ -337,9 +314,9 @@ bun build ./src/cli.ts --compile --outfile ~/.local/bin/claude-codex-proxy
 
 ## Related projects
 
-- [claude-history](https://github.com/raine/claude-history) — search Claude Code
+- [claude-history](https://github.com/raine/claude-history): search Claude Code
   conversation history from the terminal
-- [git-surgeon](https://github.com/raine/git-surgeon) — non-interactive
+- [git-surgeon](https://github.com/raine/git-surgeon): non-interactive
   hunk-level git staging for AI agents
-- [workmux](https://github.com/raine/workmux) — manage parallel AI coding tasks in
-  separate git worktrees with tmux
+- [workmux](https://github.com/raine/workmux): manage parallel AI coding tasks
+  in separate git worktrees with tmux
