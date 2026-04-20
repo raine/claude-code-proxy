@@ -88,7 +88,6 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions =
     input,
     store: false,
     stream: true,
-    include: ["reasoning.encrypted_content"],
     parallel_tool_calls: true,
     tool_choice: mapToolChoice(req.tool_choice),
     text,
@@ -97,7 +96,10 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions =
   if (tools && tools.length) out.tools = tools
   if (opts.sessionId) out.prompt_cache_key = opts.sessionId
   const effort = req.output_config?.effort
-  if (effort) out.reasoning = { effort }
+  if (effort) {
+    out.reasoning = { effort }
+    out.include = ["reasoning.encrypted_content"]
+  }
   return out
 }
 
