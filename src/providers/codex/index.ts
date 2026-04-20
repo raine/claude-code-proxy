@@ -15,8 +15,10 @@ import { runBrowserLogin } from "./auth/pkce.ts"
 import { runDeviceLogin } from "./auth/device.ts"
 import { persistInitialTokens } from "./auth/manager.ts"
 import { loadAuth, authPath, clearAuth } from "./auth/token-store.ts"
+import { RateLimitsSidecarWriter } from "./rate-limits.ts"
 
 const VERBOSE = !!process.env.CCP_LOG_VERBOSE
+const rateLimitsWriter = new RateLimitsSidecarWriter()
 
 interface SessionCountSnapshot {
   reqId: string
@@ -234,6 +236,10 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       messageId,
       model: body.model,
       log: ctx.childLogger("codex.stream"),
+      accountId: upstream.accountId,
+      rateLimitsWriter,
+      rateLimitsTracker: upstream.rateLimitsTracker,
+      signal: ctx.signal,
       onFinish: VERBOSE
         ? (finish) => {
             const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined
@@ -276,7 +282,15 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
   }
 
   try {
-    const result = await accumulateResponse(upstream.body, { messageId, model: body.model, log: ctx.childLogger("codex.accumulate") })
+    const result = await accumulateResponse(upstream.body, {
+      messageId,
+      model: body.model,
+      log: ctx.childLogger("codex.accumulate"),
+      accountId: upstream.accountId,
+      rateLimitsWriter,
+      rateLimitsTracker: upstream.rateLimitsTracker,
+      signal: ctx.signal,
+    })
     if (VERBOSE) {
       const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)
       log.info("compaction telemetry", {

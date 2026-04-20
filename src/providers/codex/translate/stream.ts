@@ -1,15 +1,9 @@
 import { encodeSseEvent } from "../../../sse.ts"
 import type { Logger } from "../../../log.ts"
+import { mapRateLimitsSnapshot, type RateLimitsSidecarWriter } from "../rate-limits.ts"
+import type { RateLimitsTracker } from "../client.ts"
 import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts"
 
-/**
- * Translate a Codex Responses SSE stream into Anthropic SSE events.
- * Returns a ReadableStream<Uint8Array> ready to pipe to the client.
- *
- * The HTTP status has already been flushed (200) before the first
- * upstream event is consumed, so rate-limit and upstream-failed cases
- * surface as SSE error events rather than non-200 statuses.
- */
 export function translateStream(
   upstream: ReadableStream<Uint8Array>,
   opts: {
@@ -17,8 +11,28 @@ export function translateStream(
     model: string
     log: Logger
     onFinish?: (finish: { stopReason: "end_turn" | "tool_use" | "max_tokens"; usage?: Parameters<typeof mapUsageToAnthropic>[0] }) => void
+    accountId?: string
+    rateLimitsWriter?: RateLimitsSidecarWriter
+    rateLimitsTracker?: RateLimitsTracker
+    signal?: AbortSignal
   },
 ): ReadableStream<Uint8Array> {
+  const trackedUpstream = upstream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        controller.enqueue(chunk)
+      },
+      async flush() {
+        await opts.rateLimitsTracker?.refreshIfNeeded({
+          success: true,
+          accountId: opts.accountId,
+          signal: opts.signal,
+          rateLimitsWriter: opts.rateLimitsWriter,
+          log: opts.log,
+        })
+      },
+    }),
+  )
   const encoder = new TextEncoder()
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -52,7 +66,7 @@ export function translateStream(
       }
 
       try {
-        for await (const e of reduceUpstream(upstream, opts.log)) {
+        for await (const e of reduceUpstream(trackedUpstream, opts.log)) {
           switch (e.kind) {
             case "text-start":
               ensureMessageStart()
@@ -97,6 +111,12 @@ export function translateStream(
               activeTools.delete(e.index)
               emit("content_block_stop", { type: "content_block_stop", index: e.index })
               break
+            case "rate-limits": {
+              opts.rateLimitsTracker?.markSeen()
+              const snapshot = mapRateLimitsSnapshot(e.rateLimits, opts.accountId)
+              if (snapshot) void opts.rateLimitsWriter?.write(snapshot)
+              break
+            }
             case "finish":
               ensureMessageStart()
               opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage })

@@ -1,13 +1,43 @@
-import { CODEX_API_ENDPOINT, ORIGINATOR } from "./auth/constants.ts"
+import { CODEX_API_ENDPOINT, ORIGINATOR, USAGE_API_ENDPOINT } from "./auth/constants.ts"
 import { forceRefresh, getAuth } from "./auth/manager.ts"
 import type { Logger } from "../../log.ts"
 import type { RequestContext } from "../types.ts"
 import type { ResponsesRequest } from "./translate/request.ts"
+import { mapUsageSnapshot, type RateLimitsSidecarWriter } from "./rate-limits.ts"
 
 export interface CodexResponse {
   body: ReadableStream<Uint8Array>
   status: number
   headers: Headers
+  accountId?: string
+  rateLimitsTracker: RateLimitsTracker
+}
+
+export class RateLimitsTracker {
+  private seen = false
+
+  markSeen(): void {
+    this.seen = true
+  }
+
+  async refreshIfNeeded(opts: {
+    success: boolean
+    accountId?: string
+    signal?: AbortSignal
+    rateLimitsWriter?: RateLimitsSidecarWriter
+    log: Logger
+  }): Promise<void> {
+    if (this.seen || !opts.success || !opts.rateLimitsWriter) return
+    try {
+      const snapshot = await fetchUsageSnapshot(opts.accountId, opts.signal, opts.log)
+      if (snapshot) {
+        await opts.rateLimitsWriter.write(snapshot)
+        this.seen = true
+      }
+    } catch (err) {
+      opts.log.warn("failed to refresh usage snapshot", { err: String(err) })
+    }
+  }
 }
 
 export async function postCodex(
@@ -15,6 +45,7 @@ export async function postCodex(
   ctx: RequestContext,
 ): Promise<CodexResponse> {
   const log = ctx.childLogger("codex.client")
+  const rateLimitsTracker = new RateLimitsTracker()
   let auth = await getAuth()
   let resp = await doFetch(auth.access, auth.accountId, body, log, ctx.signal, ctx.sessionId)
 
@@ -47,7 +78,32 @@ export async function postCodex(
 
   if (!resp.body) throw new CodexError(500, "Upstream returned no body")
 
-  return { body: resp.body, status: resp.status, headers: resp.headers }
+  return {
+    body: resp.body,
+    status: resp.status,
+    headers: resp.headers,
+    accountId: auth.accountId,
+    rateLimitsTracker,
+  }
+}
+
+async function fetchUsageSnapshot(
+  accountId: string | undefined,
+  signal: AbortSignal | undefined,
+  log: Logger,
+) {
+  const auth = await getAuth()
+  const headers = new Headers({
+    authorization: `Bearer ${auth.access}`,
+    originator: ORIGINATOR,
+  })
+  if (accountId ?? auth.accountId) headers.set("ChatGPT-Account-Id", accountId ?? auth.accountId ?? "")
+  const resp = await fetch(USAGE_API_ENDPOINT, { headers, signal })
+  if (!resp.ok) {
+    log.warn("usage refresh returned non-ok", { status: resp.status })
+    return null
+  }
+  return mapUsageSnapshot(await resp.json(), accountId ?? auth.accountId)
 }
 
 async function doFetch(
