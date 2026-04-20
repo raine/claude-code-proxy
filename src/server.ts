@@ -46,6 +46,16 @@ function usageWindowTokens(usage: {
   )
 }
 
+function upstreamHeaderSnapshot(headers: Headers): {
+  serverModel?: string
+  serverReasoningIncluded: boolean
+} {
+  return {
+    serverModel: headers.get("OpenAI-Model") || undefined,
+    serverReasoningIncluded: headers.get("X-Reasoning-Included") === "true",
+  }
+}
+
 interface SessionTimelineState {
   seq: number
   lastCount?: SessionCountSnapshot
@@ -273,6 +283,7 @@ async function handleMessages(req: Request, reqId: string): Promise<Response> {
   }
 
   if (wantStream) {
+    const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)
     const stream = translateStream(upstream.body, {
       messageId,
       model: body.model,
@@ -289,6 +300,8 @@ async function handleMessages(req: Request, reqId: string): Promise<Response> {
               sessionSeq,
               requestedModel: body.model,
               resolvedModel,
+              serverModel,
+              serverReasoningIncluded,
               messageCount,
               toolCount,
               localInputTokens,
@@ -323,6 +336,7 @@ async function handleMessages(req: Request, reqId: string): Promise<Response> {
   try {
     const result = await accumulateResponse(upstream.body, { messageId, model: body.model })
     if (VERBOSE) {
+      const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)
       log.info("compaction telemetry", {
         reqId,
         phase: "upstream_finish",
@@ -331,6 +345,8 @@ async function handleMessages(req: Request, reqId: string): Promise<Response> {
         sessionSeq,
         requestedModel: body.model,
         resolvedModel,
+        serverModel,
+        serverReasoningIncluded,
         messageCount,
         toolCount,
         localInputTokens,
