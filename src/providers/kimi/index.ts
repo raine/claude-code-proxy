@@ -200,7 +200,18 @@ const cli: CliHandlers = {
 
 export const kimiProvider: Provider = {
   name: "kimi",
-  supportedModels: new Set(["kimi-for-coding", "kimi-k2.6", "k2.6", "claude-sonnet-4-6"]),
+  supportedModels: new Set([
+    "kimi-for-coding",
+    "kimi-k2.6",
+    "k2.6",
+    "haiku",
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+    "sonnet",
+    "claude-sonnet-4-6",
+    "opus",
+    "claude-opus-4-7",
+  ]),
   handleMessages,
   handleCountTokens,
   cli,
