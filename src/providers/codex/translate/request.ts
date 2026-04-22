@@ -75,6 +75,16 @@ export interface TranslateOptions {
 
 const VALID_EFFORTS = new Set<Effort>(["none", "low", "medium", "high", "xhigh"])
 
+const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max"])
+
+function assertValidEffort(effort: unknown): void {
+  if (effort !== undefined && !ANTHROPIC_EFFORTS.has(effort as string)) {
+    throw new Error(
+      `Invalid output_config.effort: "${effort}". Must be one of: ${Array.from(ANTHROPIC_EFFORTS).join(", ")}`,
+    )
+  }
+}
+
 function toCodexEffort(
   effort: NonNullable<AnthropicRequest["output_config"]>["effort"],
 ): Effort | undefined {
@@ -123,6 +133,7 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions =
   if (instructions) out.instructions = instructions
   if (tools && tools.length) out.tools = tools
   if (opts.sessionId) out.prompt_cache_key = opts.sessionId
+  assertValidEffort(req.output_config?.effort)
   const effort = resolveEffort(toCodexEffort(req.output_config?.effort))
   if (effort) {
     out.reasoning = { effort }

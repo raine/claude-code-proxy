@@ -80,6 +80,7 @@ export function translateRequest(
   const messages = buildMessages(req)
   const tools = req.tools?.map(toKimiTool)
 
+  assertValidEffort(req.output_config?.effort)
   const out: KimiChatRequest = {
     model: req.model,
     messages,
@@ -99,6 +100,16 @@ export function translateRequest(
 function clampMaxTokens(requested: number | undefined): number {
   if (!requested || requested <= 0) return DEFAULT_MAX_TOKENS
   return Math.min(requested, DEFAULT_MAX_TOKENS)
+}
+
+const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max"])
+
+function assertValidEffort(effort: unknown): void {
+  if (effort !== undefined && !ANTHROPIC_EFFORTS.has(effort as string)) {
+    throw new Error(
+      `Invalid output_config.effort: "${effort}". Must be one of: ${Array.from(ANTHROPIC_EFFORTS).join(", ")}`,
+    )
+  }
 }
 
 // Kimi's reasoning_effort is capped at "high"; collapse the proxy's "max"
