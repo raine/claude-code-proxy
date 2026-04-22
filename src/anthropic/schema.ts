@@ -61,7 +61,7 @@ export interface AnthropicRequest {
   stream?: boolean
   thinking?: { type: string; [k: string]: unknown }
   output_config?: {
-    effort?: "low" | "medium" | "high"
+    effort?: "low" | "medium" | "high" | "xhigh"
     format?: { type: "json_schema"; schema: unknown; name?: string; strict?: boolean }
   }
   context_management?: unknown

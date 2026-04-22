@@ -86,7 +86,7 @@ export function translateRequest(
     stream: true,
     stream_options: { include_usage: true },
     max_tokens: clampMaxTokens(req.max_tokens),
-    reasoning_effort: req.output_config?.effort ?? "medium",
+    reasoning_effort: mapReasoningEffort(req.output_config?.effort),
     thinking: { type: "enabled" },
   }
   if (tools && tools.length) out.tools = tools
@@ -99,6 +99,16 @@ export function translateRequest(
 function clampMaxTokens(requested: number | undefined): number {
   if (!requested || requested <= 0) return DEFAULT_MAX_TOKENS
   return Math.min(requested, DEFAULT_MAX_TOKENS)
+}
+
+// Kimi's reasoning_effort is capped at "high"; collapse the proxy's "xhigh"
+// extension to "high" since Kimi has no stronger tier, and default to "medium"
+// when no effort is requested.
+function mapReasoningEffort(
+  effort: NonNullable<AnthropicRequest["output_config"]>["effort"],
+): "low" | "medium" | "high" {
+  if (effort === "xhigh") return "high"
+  return effort ?? "medium"
 }
 
 function mapToolChoice(choice: AnthropicRequest["tool_choice"]): KimiToolChoice {

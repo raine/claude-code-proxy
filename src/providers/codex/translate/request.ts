@@ -7,6 +7,8 @@ import type {
   AnthropicTool,
 } from "../../../anthropic/schema.ts"
 
+export type Effort = "none" | "low" | "medium" | "high" | "xhigh"
+
 // Keep this aligned to the upstream Codex ResponsesApiRequest field set.
 // Do not add plausible-looking top-level fields without source support or a confirmed live test.
 export interface ResponsesRequest {
@@ -20,7 +22,7 @@ export interface ResponsesRequest {
     | "required"
     | { type: "function"; name: string }
   parallel_tool_calls?: boolean
-  reasoning?: { effort?: "low" | "medium" | "high"; summary?: unknown }
+  reasoning?: { effort?: Effort; summary?: unknown }
   store: false
   stream: true
   include?: string[]
@@ -71,6 +73,24 @@ export interface TranslateOptions {
   sessionId?: string
 }
 
+function resolveEffort(effort?: Effort): Effort | undefined {
+  // The CLAUDE_CODEX_PROXY_OPEN_AI_EFFORT_OVERRIDE environment variable allows
+  // for the effort that's used to be overridden so that regardless of whatever
+  // effort is being requested by the harness, the effort which is provided in
+  // that env var is always returned.
+  //
+  // This is useful in cases where you just want the claude-code harness to use
+  // a specific effort all across the way.
+  if (
+    process.env.CLAUDE_CODEX_PROXY_OPEN_AI_EFFORT_OVERRIDE !== undefined &&
+    process.env.CLAUDE_CODEX_PROXY_OPEN_AI_EFFORT_OVERRIDE !== ""
+  ) {
+    return process.env.CLAUDE_CODEX_PROXY_OPEN_AI_EFFORT_OVERRIDE as Effort
+  }
+
+  return effort
+}
+
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions = {}): ResponsesRequest {
   const instructions = buildInstructions(req.system)
   const input = buildInput(req.messages)
@@ -99,7 +119,7 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions =
   if (instructions) out.instructions = instructions
   if (tools && tools.length) out.tools = tools
   if (opts.sessionId) out.prompt_cache_key = opts.sessionId
-  const effort = req.output_config?.effort
+  const effort = resolveEffort(req.output_config?.effort)
   if (effort) {
     out.reasoning = { effort }
     out.include = ["reasoning.encrypted_content"]
