@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.0.5 (2026-04-22)
+
+- Added `CCP_CODEX_MODEL` and `CCP_CODEX_EFFORT` environment variables to
+  override the model and reasoning effort for Codex requests
+  ([#2](https://github.com/raine/claude-code-proxy/pull/2))
+- Added `claude-sonnet-4-6` and additional model aliases so more Claude-style
+  model names resolve correctly
+- Improved request logging with usage summaries, time-to-first-byte metrics, and
+  stream completion details for easier debugging
+- Client disconnections during streaming are now handled gracefully
+
 ## v0.0.4 (2026-04-20)
 
 - Kimi: reasoning content is now preserved across turns as Anthropic thinking
