@@ -101,13 +101,13 @@ function clampMaxTokens(requested: number | undefined): number {
   return Math.min(requested, DEFAULT_MAX_TOKENS)
 }
 
-// Kimi's reasoning_effort is capped at "high"; collapse the proxy's "xhigh"
-// extension to "high" since Kimi has no stronger tier, and default to "medium"
-// when no effort is requested.
+// Kimi's reasoning_effort is capped at "high"; collapse the proxy's "max"
+// to "high" since Kimi has no stronger tier, and default to "medium" when no
+// effort is requested.
 function mapReasoningEffort(
   effort: NonNullable<AnthropicRequest["output_config"]>["effort"],
 ): "low" | "medium" | "high" {
-  if (effort === "xhigh") return "high"
+  if (effort === "max") return "high"
   return effort ?? "medium"
 }
 
