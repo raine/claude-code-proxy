@@ -1,6 +1,6 @@
 import { CLIENT_ID, ISSUER, REFRESH_MARGIN_MS } from "./constants.ts"
 import { extractAccountId, type TokenResponse } from "./jwt.ts"
-import { loadAuth, saveAuth, type StoredAuth } from "./token-store.ts"
+import { clearAuth, loadAuth, saveAuth, type StoredAuth } from "./token-store.ts"
 
 let cached: StoredAuth | undefined
 let inflight: Promise<StoredAuth> | undefined
@@ -44,6 +44,11 @@ async function refreshNow(current: StoredAuth): Promise<StoredAuth> {
       client_id: CLIENT_ID,
     }).toString(),
   })
+  if (resp.status === 401 || resp.status === 403) {
+    cached = undefined
+    await clearAuth().catch(() => undefined)
+    throw new Error(`Token refresh unauthorized (${resp.status})`)
+  }
   if (!resp.ok) throw new Error(`Token refresh failed: ${resp.status} ${await resp.text()}`)
   const tokens = (await resp.json()) as TokenResponse
   const accountId = extractAccountId(tokens) || current.accountId

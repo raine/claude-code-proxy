@@ -49,7 +49,7 @@ export async function saveAuth(auth: StoredAuth): Promise<void> {
     return
   }
 
-  await mkdir(dirname(FILE), { recursive: true })
+  await mkdir(dirname(FILE), { recursive: true, mode: 0o700 })
   const tmp = `${FILE}.${process.pid}.${Date.now()}.tmp`
   await writeFile(tmp, JSON.stringify(auth, null, 2), { encoding: "utf8", mode: 0o600 })
   try {
