@@ -38,8 +38,8 @@ async function main() {
     console.log("Configure Claude Code (pick a model from above):")
     console.log(`  export ANTHROPIC_BASE_URL="http://localhost:${port}"`)
     console.log(`  export ANTHROPIC_AUTH_TOKEN="anything"`)
-    console.log(`  export ANTHROPIC_MODEL="kimi-for-coding"              # or gpt-5.4, etc.`)
-    console.log(`  export ANTHROPIC_SMALL_FAST_MODEL="kimi-for-coding"   # background / title-gen`)
+    console.log(`  export ANTHROPIC_MODEL="kimi-for-coding[1m]"              # or gpt-5.4[1m], etc.`)
+    console.log(`  export ANTHROPIC_SMALL_FAST_MODEL="kimi-for-coding[1m]"   # background / title-gen`)
     console.log(`  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`)
     return
   }

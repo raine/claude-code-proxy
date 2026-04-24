@@ -104,16 +104,16 @@ would 400 because no provider claims it, so set
 # Codex
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.4 \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini \
+ANTHROPIC_MODEL=gpt-5.4[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   claude
 
 # Kimi
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=kimi-for-coding \
-ANTHROPIC_SMALL_FAST_MODEL=kimi-for-coding \
+ANTHROPIC_MODEL=kimi-for-coding[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=kimi-for-coding[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   claude
 ```
@@ -125,52 +125,28 @@ Or set it persistently in `~/.claude/settings.json`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
     "ANTHROPIC_AUTH_TOKEN": "unused",
-    "ANTHROPIC_MODEL": "gpt-5.4",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini",
+    "ANTHROPIC_MODEL": "gpt-5.4[1m]",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini[1m]",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1
   }
 }
 ```
 
-### 5. Optional: disable Claude Code auto-compact
+### 5. Context window size
 
-Claude Code decides auto-compaction locally based on the model context window it
-thinks it has. If the upstream model supports a larger window than Claude Code
-assumes, it may compact earlier than necessary.
+Claude Code decides auto-compaction based on the model's context window. For
+unknown models (like the ones the proxy uses) it defaults to 200K tokens, which
+is smaller than what the upstream models actually support (GPT-5.4: 400K+,
+Kimi: 256K). This causes auto-compact to fire earlier than necessary.
 
-Disable only automatic compaction while keeping manual `/compact` available:
+The `[1m]` suffix on the model name (shown in the examples above) is a Claude
+Code convention that tells it to use a 1M-token context window instead. This
+raises the auto-compact threshold without disabling it entirely.
 
-```sh
-DISABLE_AUTO_COMPACT=1 \
-ANTHROPIC_BASE_URL=http://localhost:18765 \
-ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.4 \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.4-mini \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-  claude
-```
-
-Or add it to `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
-    "ANTHROPIC_AUTH_TOKEN": "unused",
-    "ANTHROPIC_MODEL": "gpt-5.4",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.4-mini",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
-    "DISABLE_AUTO_COMPACT": 1
-  }
-}
-```
-
-Tradeoffs:
-
-- Claude Code will stop proactively compacting before a turn.
-- Manual `/compact` still works.
-- If you let the session grow too far, you may hit prompt-too-long failures
-  instead of a graceful auto-compact.
+If you'd rather disable auto-compact completely, set
+`DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
+`/compact` still works, but you risk hitting real upstream limits before
+Claude Code can compact for you.
 
 ## Toggling between proxy and direct Anthropic
 
@@ -190,10 +166,9 @@ the default.
 if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
     export ANTHROPIC_BASE_URL="http://localhost:18765"
     export ANTHROPIC_AUTH_TOKEN="unused"
-    export ANTHROPIC_MODEL="gpt-5.4"
-    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini"
+    export ANTHROPIC_MODEL="gpt-5.4[1m]"
+    export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini[1m]"
     export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
-    export DISABLE_AUTO_COMPACT=1
 fi
 
 exec "$HOME/.local/bin/claude" "$@"

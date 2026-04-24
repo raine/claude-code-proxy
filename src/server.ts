@@ -100,6 +100,15 @@ function buildCtx(req: Request, reqId: string, providerName: string): RequestCon
   }
 }
 
+// Claude Code uses a [1m] suffix convention (e.g. "gpt-5.4[1m]") to
+// signal that the model should be treated as having a 1M-token context
+// window. Claude Code normalizes this away before sending requests to
+// the API, but we strip it here too as defense-in-depth in case a
+// future version or a different client includes it.
+function normalizeIncomingModel(model: string): string {
+  return model.replace(/\[1m\]$/i, "")
+}
+
 function routeProvider(body: AnthropicRequest, reqId: string): Provider | Response {
   if (!body.model) {
     return jsonError(
@@ -108,6 +117,7 @@ function routeProvider(body: AnthropicRequest, reqId: string): Provider | Respon
       `Missing "model" in request body. ${knownModelsMessage()}`,
     )
   }
+  body.model = normalizeIncomingModel(body.model)
   const provider = providerForModel(body.model)
   if (!provider) {
     rootLog.warn("unknown model", { reqId, model: body.model })
