@@ -8,17 +8,9 @@ export interface PkceCodes {
 }
 
 export async function generatePKCE(): Promise<PkceCodes> {
-  const verifier = generateRandomString(43)
+  const verifier = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))
   return { verifier, challenge: base64UrlEncode(hash) }
-}
-
-function generateRandomString(length: number): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  const bytes = crypto.getRandomValues(new Uint8Array(length))
-  return Array.from(bytes)
-    .map((b) => chars[b % chars.length])
-    .join("")
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
