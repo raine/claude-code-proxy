@@ -47,11 +47,11 @@ async function maybeRotate(): Promise<void> {
       const s = await stat(file).catch(() => undefined)
       if (!s || s.size < MAX_LOG_BYTES) return
       const rotated = join(dir, `proxy.log.${Date.now()}`)
+      await rename(file, rotated)
       if (stream) {
         stream.end()
         stream = undefined
       }
-      await rename(file, rotated).catch(() => {})
     } catch {
       // Never propagate rotation errors — logging must never crash the proxy.
     } finally {
