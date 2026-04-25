@@ -1,4 +1,4 @@
-import { createLogger, logDir } from "./log.ts"
+import { createLogger, logDir, REDACT_KEYS } from "./log.ts"
 
 import type { AnthropicRequest } from "./anthropic/schema.ts"
 import type { Provider, RequestContext } from "./providers/types.ts"
@@ -32,7 +32,7 @@ export function startServer(opts: ServeOptions): { stop: () => void; port: numbe
         reqId,
         method: req.method,
         path: url.pathname,
-        query: url.search,
+        ...(url.search ? { query: redactedQuery(url) } : {}),
       })
       try {
         const resp = await route(req, url, reqId)

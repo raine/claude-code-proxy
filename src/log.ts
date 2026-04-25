@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024 // 20 MiB
-const REDACT_KEYS = new Set([
+export const REDACT_KEYS = new Set([
   "authorization",
   "access",
   "access_token",
