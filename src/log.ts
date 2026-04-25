@@ -34,7 +34,7 @@ async function ensureStream(): Promise<WriteStream> {
   const dir = stateDir()
   await mkdir(dir, { recursive: true })
   const file = join(dir, "proxy.log")
-  stream = createWriteStream(file, { flags: "a" })
+  stream = createWriteStream(file, { flags: "a", mode: 0o600 })
   return stream
 }
 
