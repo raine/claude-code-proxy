@@ -3,6 +3,7 @@ export const ALLOWED_MODELS = new Set([
   "gpt-5.3-codex",
   "gpt-5.4",
   "gpt-5.4-mini",
+  "gpt-5.5",
 ])
 
 export const MODEL_ALIASES = new Map<string, string>([
@@ -11,8 +12,8 @@ export const MODEL_ALIASES = new Map<string, string>([
   ["claude-haiku-4-5-20251001", "gpt-5.4-mini"],
   ["sonnet", "gpt-5.4"],
   ["claude-sonnet-4-6", "gpt-5.4"],
-  ["opus", "gpt-5.4"],
-  ["claude-opus-4-7", "gpt-5.4"],
+  ["opus", "gpt-5.5"],
+  ["claude-opus-4-7", "gpt-5.5"],
 ])
 
 export function resolveModel(model: string): string {

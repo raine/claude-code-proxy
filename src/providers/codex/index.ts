@@ -362,7 +362,7 @@ const cli: CliHandlers = {
 
 export const codexProvider: Provider = {
   name: "codex",
-  supportedModels: new Set(["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"]),
+  supportedModels: new Set(["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]),
   handleMessages,
   handleCountTokens,
   cli,
