@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile, chmod, unlink, rename } from "node:fs/promises"
+import { mkdir, readFile, writeFile, unlink, rename } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { homedir } from "node:os"
 import { keychainGet, keychainSet, keychainDelete } from "../../../keychain.ts"
