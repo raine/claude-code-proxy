@@ -10,6 +10,17 @@ const log = createLogger("kimi.auth")
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504])
 const MAX_REFRESH_ATTEMPTS = 3
 
+function validateTokenResponse(t: unknown): asserts t is TokenResponse {
+  if (!t || typeof t !== "object") throw new Error("Invalid token response: not an object")
+  const o = t as Record<string, unknown>
+  if (typeof o.access_token !== "string" || !o.access_token)
+    throw new Error("Invalid token response: missing access_token")
+  if (typeof o.refresh_token !== "string" || !o.refresh_token)
+    throw new Error("Invalid token response: missing refresh_token")
+  if (o.expires_in !== undefined && (typeof o.expires_in !== "number" || !Number.isFinite(o.expires_in) || o.expires_in <= 0))
+    throw new Error("Invalid token response: bad expires_in")
+}
+
 let cached: StoredAuth | undefined
 let inflight: Promise<StoredAuth> | undefined
 
@@ -50,6 +61,7 @@ export async function forceRefresh(): Promise<StoredAuth> {
 }
 
 export async function persistInitialTokens(tokens: TokenResponse): Promise<StoredAuth> {
+  validateTokenResponse(tokens)
   const auth = tokensToStored(tokens)
   await saveAuth(auth)
   cached = auth
@@ -97,7 +109,8 @@ async function refreshNow(current: StoredAuth): Promise<StoredAuth> {
     }
 
     if (resp.status === 200) {
-      const tokens = (await resp.json()) as TokenResponse
+      const tokens = await resp.json()
+      validateTokenResponse(tokens)
       const next: StoredAuth = {
         ...tokensToStored(tokens),
         refresh: tokens.refresh_token || current.refresh,
