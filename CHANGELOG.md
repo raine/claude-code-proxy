@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.0.8 (2026-04-30)
+
+- Added exponential backoff retry on upstream 429 errors, respecting
+  `Retry-After` headers when present
+- Added `config.json` as an alternative to environment variables (read from
+  `~/.config/claude-code-proxy/config.json` on macOS, XDG-compliant on Linux)
+- Made the `originator` and `User-Agent` headers configurable via new env vars
+  (`CCP_CODEX_ORIGINATOR`, `CCP_CODEX_USER_AGENT`, `CCP_KIMI_USER_AGENT`,
+  `CCP_ORIGINATOR`, `CCP_USER_AGENT`) and the config file
+- Codex now sends a default `User-Agent: claude-code-proxy/<version>` header
+- Stopped including the `v` prefix in build version strings
+
 ## v0.0.7 (2026-04-25)
 
 - Some security hardening inspired by [#5](https://github.com/raine/claude-code-proxy/pull/5)
