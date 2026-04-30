@@ -10,7 +10,6 @@
   (`CCP_CODEX_ORIGINATOR`, `CCP_CODEX_USER_AGENT`, `CCP_KIMI_USER_AGENT`,
   `CCP_ORIGINATOR`, `CCP_USER_AGENT`) and the config file
 - Codex now sends a default `User-Agent: claude-code-proxy/<version>` header
-- Stopped including the `v` prefix in build version strings
 
 ## v0.0.7 (2026-04-25)
 
