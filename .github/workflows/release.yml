@@ -40,7 +40,7 @@ jobs:
           bun build ./src/cli.ts \
             --compile \
             --target=${{ matrix.target }} \
-            --define BUILD_VERSION="\"${VERSION}\"" \
+            --define BUILD_VERSION="\"${VERSION#v}\"" \
             --outfile dist/${BIN_NAME}
       - name: Package
         run: |
