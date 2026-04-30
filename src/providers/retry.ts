@@ -27,7 +27,11 @@ export function computeBackoffDelay(attempt: number, retryAfter?: string): Backo
     }
   }
   const exp = RETRY_INITIAL_DELAY_MS * Math.pow(RETRY_BACKOFF_FACTOR, attempt)
-  return { waitMs: Math.min(exp, RETRY_MAX_DELAY_MS), exceedsBudget: false }
+  const capped = Math.min(exp, RETRY_MAX_DELAY_MS)
+  // Equal jitter on the exponential fallback to avoid synchronized retries
+  // across concurrent requests. Never jitter an explicit Retry-After.
+  const jittered = capped / 2 + Math.random() * (capped / 2)
+  return { waitMs: Math.round(jittered), exceedsBudget: false }
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

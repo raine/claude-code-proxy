@@ -17,14 +17,20 @@ const silentLog = {
 }
 
 describe("computeBackoffDelay", () => {
-  it("uses exponential backoff without retry-after", () => {
-    expect(computeBackoffDelay(0).waitMs).toBe(RETRY_INITIAL_DELAY_MS)
-    expect(computeBackoffDelay(1).waitMs).toBe(RETRY_INITIAL_DELAY_MS * 2)
-    expect(computeBackoffDelay(2).waitMs).toBe(RETRY_INITIAL_DELAY_MS * 4)
+  it("uses jittered exponential backoff without retry-after", () => {
+    // equal jitter: result is in [cap/2, cap]
+    for (const attempt of [0, 1, 2]) {
+      const cap = RETRY_INITIAL_DELAY_MS * 2 ** attempt
+      const { waitMs } = computeBackoffDelay(attempt)
+      expect(waitMs).toBeGreaterThanOrEqual(cap / 2)
+      expect(waitMs).toBeLessThanOrEqual(cap)
+    }
   })
 
   it("caps exponential backoff at max delay", () => {
-    expect(computeBackoffDelay(20).waitMs).toBe(RETRY_MAX_DELAY_MS)
+    const { waitMs } = computeBackoffDelay(20)
+    expect(waitMs).toBeGreaterThanOrEqual(RETRY_MAX_DELAY_MS / 2)
+    expect(waitMs).toBeLessThanOrEqual(RETRY_MAX_DELAY_MS)
   })
 
   it("respects numeric retry-after as seconds", () => {
@@ -38,7 +44,9 @@ describe("computeBackoffDelay", () => {
   })
 
   it("rejects non-numeric retry-after garbage", () => {
-    expect(computeBackoffDelay(0, "1abc").waitMs).toBe(RETRY_INITIAL_DELAY_MS)
+    const { waitMs } = computeBackoffDelay(0, "1abc")
+    expect(waitMs).toBeGreaterThanOrEqual(RETRY_INITIAL_DELAY_MS / 2)
+    expect(waitMs).toBeLessThanOrEqual(RETRY_INITIAL_DELAY_MS)
   })
 
   it("parses HTTP-date retry-after", () => {
