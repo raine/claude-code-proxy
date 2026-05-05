@@ -9,6 +9,14 @@ import {
   codexUserAgent,
   codexModel,
   codexEffort,
+  codexDefaultEffort,
+  claudeAliasProvider,
+  geminiModel,
+  geminiSmallFastModel,
+  geminiOauthCredsPath,
+  geminiEnableFallback,
+  geminiEnableGoogleOneCredits,
+  geminiDefaultEffort,
   kimiUserAgent,
   kimiOauthHost,
   kimiBaseUrl,
@@ -43,6 +51,14 @@ describe("config defaults", () => {
     expect(codexUserAgent("default-ua")).toBe("default-ua")
     expect(codexModel()).toBeUndefined()
     expect(codexEffort()).toBeUndefined()
+    expect(codexDefaultEffort()).toBeUndefined()
+    expect(claudeAliasProvider()).toBe("none")
+    expect(geminiModel()).toBeUndefined()
+    expect(geminiSmallFastModel()).toBeUndefined()
+    expect(geminiOauthCredsPath()).toBeUndefined()
+    expect(geminiEnableFallback()).toBe(true)
+    expect(geminiEnableGoogleOneCredits()).toBe(false)
+    expect(geminiDefaultEffort()).toBeUndefined()
     expect(kimiUserAgent("default-kimi-ua")).toBe("default-kimi-ua")
     expect(kimiOauthHost()).toBe("https://auth.kimi.com")
     expect(kimiBaseUrl()).toBe("https://api.kimi.com/coding/v1")
@@ -76,6 +92,31 @@ describe("file overrides default", () => {
     expect(kimiOauthHost()).toBe("https://auth.example.com")
   })
 
+  it("routing and gemini settings from config.json", () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: { claudeAliasProvider: "gemini" },
+        gemini: {
+          model: "gemini-3.1-pro-preview",
+          smallFastModel: "gemini-3-flash-preview",
+          oauthCredsPath: "/tmp/gemini-oauth.json",
+          enableFallback: false,
+          enableGoogleOneCredits: true,
+          defaultEffort: "max",
+        },
+      }),
+    )
+    setEnv({})
+    expect(claudeAliasProvider()).toBe("gemini")
+    expect(geminiModel()).toBe("gemini-3.1-pro-preview")
+    expect(geminiSmallFastModel()).toBe("gemini-3-flash-preview")
+    expect(geminiOauthCredsPath()).toBe("/tmp/gemini-oauth.json")
+    expect(geminiEnableFallback()).toBe(false)
+    expect(geminiEnableGoogleOneCredits()).toBe(true)
+    expect(geminiDefaultEffort()).toBe("max")
+  })
+
   it("log.verbose from config.json", () => {
     writeFileSync(configPath, JSON.stringify({ log: { verbose: true } }))
     setEnv({})
@@ -97,6 +138,36 @@ describe("env overrides file", () => {
     )
     setEnv({ CCP_CODEX_USER_AGENT: "from-env" })
     expect(codexUserAgent("default")).toBe("from-env")
+  })
+
+  it("CCP_CODEX_DEFAULT_EFFORT env wins over config", () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({ codex: { defaultEffort: "medium" } }),
+    )
+    setEnv({ CCP_CODEX_DEFAULT_EFFORT: "high" })
+    expect(codexDefaultEffort()).toBe("high")
+  })
+
+  it("CCP_CLAUDE_ALIAS_PROVIDER env wins over config", () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({ routing: { claudeAliasProvider: "gemini" } }),
+    )
+    setEnv({ CCP_CLAUDE_ALIAS_PROVIDER: "codex" })
+    expect(claudeAliasProvider()).toBe("codex")
+  })
+
+  it("CCP_GEMINI_ENABLE_FALLBACK env can disable fallback", () => {
+    writeFileSync(configPath, JSON.stringify({ gemini: { enableFallback: true } }))
+    setEnv({ CCP_GEMINI_ENABLE_FALLBACK: "false" })
+    expect(geminiEnableFallback()).toBe(false)
+  })
+
+  it("CCP_GEMINI_ENABLE_GOOGLE_ONE_CREDITS env can enable credit usage", () => {
+    writeFileSync(configPath, JSON.stringify({ gemini: { enableGoogleOneCredits: false } }))
+    setEnv({ CCP_GEMINI_ENABLE_GOOGLE_ONE_CREDITS: "1" })
+    expect(geminiEnableGoogleOneCredits()).toBe(true)
   })
 
   it("CCP_USER_AGENT env (generic fallback) is preferred over file", () => {
@@ -126,6 +197,12 @@ describe("empty-string semantics", () => {
   it("empty CCP_CODEX_MODEL env with no file value returns undefined", () => {
     setEnv({ CCP_CODEX_MODEL: "" })
     expect(codexModel()).toBeUndefined()
+  })
+
+  it("empty CCP_CODEX_DEFAULT_EFFORT env falls through to file value", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { defaultEffort: "low" } }))
+    setEnv({ CCP_CODEX_DEFAULT_EFFORT: "" })
+    expect(codexDefaultEffort()).toBe("low")
   })
 
   it("empty PORT env falls through to file value", () => {

@@ -2,7 +2,9 @@ import { createLogger, logDir, REDACT_KEYS } from "./log.ts"
 
 import type { AnthropicRequest } from "./anthropic/schema.ts"
 import type { Provider, RequestContext } from "./providers/types.ts"
-import { allSupportedModels, providerForModel } from "./providers/registry.ts"
+import { allSupportedModels, getProvider, providerForModel } from "./providers/registry.ts"
+import { resolveModelRoute } from "./providers/model-routing.ts"
+import { CodexUsageError, getCodexUsage } from "./providers/codex/usage.ts"
 
 const rootLog = createLogger("server")
 
@@ -59,9 +61,23 @@ export function startServer(opts: ServeOptions): { stop: () => void; port: numbe
 
 async function route(req: Request, url: URL, reqId: string): Promise<Response> {
   if (url.pathname === "/healthz") {
-    return new Response(JSON.stringify({ ok: true }), {
-      headers: { "content-type": "application/json" },
-    })
+    return jsonResponse({ ok: true })
+  }
+
+  if (req.method === "GET" && url.pathname === "/_claude-code-proxy/usage") {
+    const ctx = buildCtx(req, reqId, "codex")
+    try {
+      return jsonResponse(await getCodexUsage(ctx.childLogger("provider.codex.usage"), {
+        signal: req.signal,
+      }))
+    } catch (err) {
+      if (err instanceof CodexUsageError) {
+        const type =
+          err.status === 401 || err.status === 403 ? "authentication_error" : "api_error"
+        return jsonError(err.status, type, err.detail || err.message)
+      }
+      throw err
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
@@ -117,7 +133,21 @@ function routeProvider(body: AnthropicRequest, reqId: string): Provider | Respon
       `Missing "model" in request body. ${knownModelsMessage()}`,
     )
   }
+  const originalModel = body.model
   body.model = normalizeIncomingModel(body.model)
+  const routed = resolveModelRoute(body.model)
+  if (routed) {
+    rootLog.info("model route", {
+      reqId,
+      originalModel,
+      normalizedModel: body.model,
+      aliasProvider: routed.aliasProvider,
+      routedProvider: routed.provider,
+      routedModel: routed.model,
+    })
+    body.model = routed.model
+    return getProvider(routed.provider)
+  }
   const provider = providerForModel(body.model)
   if (!provider) {
     rootLog.warn("unknown model", { reqId, model: body.model })
@@ -208,6 +238,13 @@ function redactedQuery(url: URL): Record<string, string> {
 
 function jsonError(status: number, type: string, message: string): Response {
   return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  })
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
   })

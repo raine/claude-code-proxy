@@ -2,7 +2,8 @@
 
 `claude-code-proxy` lets you use
 [Claude Code](https://www.anthropic.com/claude-code) with your **ChatGPT
-Plus/Pro** subscription or your **Kimi Code** (kimi.com) account.
+Plus/Pro** subscription, your **Gemini Code Assist** OAuth session, or your
+**Kimi Code** (kimi.com) account.
 
 <img src="meta/claude-code-screenshot.webp" alt="Claude Code running through claude-code-proxy" width="630" />
 
@@ -42,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/script
 
 ### 2. Pick a provider and authenticate
 
-The proxy supports two upstream providers. Pick one and run its login flow; the
+The proxy supports three upstream providers. Pick one and run its login flow; the
 proxy will refuse to start traffic until a token is stored.
 
 **Codex (ChatGPT Plus/Pro):**
@@ -64,13 +65,26 @@ claude-code-proxy kimi auth login      # device-code flow (prints URL + code)
 Sign in with your **kimi.com account**. The verification URL is displayed; open
 it in any browser, confirm the code, and the CLI polls until done.
 
-On macOS credentials go to Keychain; on other platforms they are written to
-`~/.config/claude-code-proxy/<provider>/auth.json` (mode 0600).
+**Gemini (Google Gemini Code Assist OAuth):**
+
+```sh
+claude-code-proxy gemini auth login    # browser OAuth
+```
+
+This uses the same Google OAuth client and credential file convention as Gemini
+CLI (`~/.gemini/oauth_creds.json` by default). If you already authenticated with
+Gemini CLI, `gemini auth status` should usually work without logging in again.
+
+Codex and Kimi credentials go to Keychain on macOS; on other platforms they are
+written to `~/.config/claude-code-proxy/<provider>/auth.json` (mode 0600).
+Gemini credentials use Gemini CLI's file convention unless you override the
+path.
 
 Verify:
 
 ```sh
 claude-code-proxy codex auth status
+claude-code-proxy gemini auth status
 claude-code-proxy kimi auth status
 ```
 
@@ -89,6 +103,7 @@ upstream for each request is chosen from `ANTHROPIC_MODEL`.
 `ANTHROPIC_MODEL` selects the provider:
 
 - `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
+- `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-3-flash-preview` → **gemini**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
 
 An unknown model returns a 400 listing the supported ids. There is no
@@ -115,6 +130,15 @@ ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=kimi-for-coding[1m] \
 ANTHROPIC_SMALL_FAST_MODEL=kimi-for-coding[1m] \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  claude
+
+# Gemini
+ANTHROPIC_BASE_URL=http://localhost:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=gemini-3.1-pro-preview[1m] \
+ANTHROPIC_SMALL_FAST_MODEL=gemini-3-flash-preview[1m] \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -210,6 +234,20 @@ Run `claude-proxy-toggle` to flip between routing through the proxy (Codex /
 Kimi) and talking to Anthropic directly. New or continued `claude` sessions pick up
 the change immediately; existing sessions keep whatever they started with.
 
+## Local usage endpoint
+
+When authenticated with Codex, the proxy exposes a local status endpoint for
+ChatGPT/Codex plan usage:
+
+```sh
+curl http://localhost:18765/_claude-code-proxy/usage | jq
+```
+
+The endpoint returns normalized primary and secondary usage windows, including
+used percentage, window duration, and reset time. It is intended for statusline
+or monitoring integrations and is cached briefly by the proxy to avoid polling
+ChatGPT on every prompt render.
+
 ## Providers
 
 ### Codex (ChatGPT)
@@ -265,6 +303,37 @@ Auth:
 | `kimi auth status` | Show user ID + token expiry           |
 | `kimi auth logout` | Delete stored credentials             |
 
+### Gemini (Gemini Code Assist)
+
+Upstream: `https://cloudcode-pa.googleapis.com/v1internal:*` (Gemini Code
+Assist).
+
+Accepted models:
+
+- `gemini-3.1-pro-preview`
+- `gemini-3-pro-preview`
+- `gemini-3-flash-preview`
+- `gemini-2.5-pro`
+- `gemini-2.5-flash`
+- `gemini-2.5-flash-lite`
+
+Preview model fallback is enabled by default:
+
+- `gemini-3.1-pro-preview` → `gemini-3-pro-preview` → `gemini-2.5-pro`
+- `gemini-3-pro-preview` → `gemini-2.5-pro`
+- `gemini-3-flash-preview` → `gemini-2.5-flash`
+
+Reasoning effort is translated to Gemini thinking settings. `max` and `xhigh`
+map to the highest Gemini tier exposed by Code Assist.
+
+Auth:
+
+| Command              | What it does                                      |
+| -------------------- | ------------------------------------------------- |
+| `gemini auth login`  | Browser OAuth using Gemini CLI's OAuth client     |
+| `gemini auth status` | Show token expiry and credential file path        |
+| `gemini auth logout` | Delete `~/.gemini/oauth_creds.json` or configured path |
+
 ## How it works
 
 ```mermaid
@@ -297,6 +366,7 @@ sequenceDiagram
 | --------------------------------------------------- | ------------------------- |
 | [`serve`](#serve)                                   | Start the proxy on `PORT` |
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management    |
+| `gemini auth login` / `status` / `logout`           | Gemini OAuth management   |
 | `kimi  auth login` / `status` / `logout`            | Kimi OAuth management     |
 
 ---
@@ -452,7 +522,19 @@ directory the auth tokens use, deliberately not `~/Library`) and at
     "originator": "claude-code-proxy",
     "userAgent": "claude-code-proxy/dev",
     "model": "gpt-5.4",
-    "effort": "medium"
+    "effort": "medium",
+    "defaultEffort": "high"
+  },
+  "routing": {
+    "claudeAliasProvider": "none"
+  },
+  "gemini": {
+    "model": "gemini-3.1-pro-preview",
+    "smallFastModel": "gemini-3-flash-preview",
+    "oauthCredsPath": "~/.gemini/oauth_creds.json",
+    "enableFallback": true,
+    "enableGoogleOneCredits": false,
+    "defaultEffort": "high"
   },
   "kimi": {
     "userAgent": "KimiCLI/1.37.0",
@@ -472,10 +554,22 @@ directory the auth tokens use, deliberately not `~/Library`) and at
 | `XDG_STATE_HOME`       | —                   | `~/.local/state`                 | Base dir for `proxy.log`                                                                       |
 | `CCP_LOG_STDERR`       | `log.stderr`        | unset                            | Also mirror log lines to stderr                                                                |
 | `CCP_LOG_VERBOSE`      | `log.verbose`       | unset                            | Log full request/response bodies + every SSE event                                             |
+| `CCP_CLAUDE_ALIAS_PROVIDER` | `routing.claudeAliasProvider` | `none`              | Route Claude family aliases (`opus`, `sonnet`, `haiku`, `claude-opus-4-7`, etc.) to `codex`, `gemini`, or `kimi` |
 | `CCP_KIMI_OAUTH_HOST`      | `kimi.oauthHost`    | `https://auth.kimi.com`          | Override Kimi's OAuth host (debugging only)                                                    |
 | `CCP_KIMI_BASE_URL`        | `kimi.baseUrl`      | `https://api.kimi.com/coding/v1` | Override Kimi's API base URL                                                                   |
 | `CCP_CODEX_MODEL`      | `codex.model`       | unset                            | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.4`, `gpt-5.4-mini`) |
-| `CCP_CODEX_EFFORT`     | `codex.effort`      | unset                            | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`)   |
+| `CCP_CODEX_EFFORT`     | `codex.effort`      | unset                            | Force all Codex requests to this reasoning effort, ignoring Claude Code `/effort` (`none`, `low`, `medium`, `high`, `xhigh`; `max` aliases to `xhigh`) |
+| `CCP_CODEX_DEFAULT_EFFORT` | `codex.defaultEffort` | unset                        | Default Codex reasoning effort when Claude Code does not send one; Claude Code `/effort` wins (`none`, `low`, `medium`, `high`, `xhigh`; `max` aliases to `xhigh`) |
+| `CCP_GEMINI_MODEL`     | `gemini.model`      | unset                            | Force all Gemini requests to this model                                                        |
+| `CCP_GEMINI_SMALL_FAST_MODEL` | `gemini.smallFastModel` | unset                   | Wrapper/config hint for Gemini background requests                                             |
+| `CCP_GEMINI_OAUTH_CREDS_PATH` | `gemini.oauthCredsPath` | `~/.gemini/oauth_creds.json` | Gemini OAuth credential file path                                                          |
+| `CCP_GEMINI_OAUTH_CLIENT_ID` | — | read from installed Gemini CLI | Override Gemini OAuth client ID if Gemini CLI is unavailable                                |
+| `CCP_GEMINI_OAUTH_CLIENT_SECRET` | — | read from installed Gemini CLI | Override Gemini OAuth client secret if Gemini CLI is unavailable                            |
+| `CCP_GEMINI_ENABLE_FALLBACK` | `gemini.enableFallback` | `true`                    | Enable preview-model fallback chains                                                           |
+| `CCP_GEMINI_ENABLE_GOOGLE_ONE_CREDITS` | `gemini.enableGoogleOneCredits` | `false` | Opt in to Gemini Code Assist Google One AI credits for eligible preview models when available |
+| `CCP_GEMINI_DEFAULT_EFFORT` | `gemini.defaultEffort` | unset                      | Default Gemini thinking effort when Claude Code does not send one (`none`, `low`, `medium`, `high`, `max`, `xhigh`) |
+| `CCP_GEMINI_CODE_ASSIST_ENDPOINT` | `gemini.endpoint` | `https://cloudcode-pa.googleapis.com` | Override Gemini Code Assist endpoint (debugging only)                                 |
+| `CCP_GEMINI_CODE_ASSIST_API_VERSION` | `gemini.apiVersion` | `v1internal`         | Override Gemini Code Assist API version (debugging only)                                      |
 | `CCP_CODEX_ORIGINATOR` | `codex.originator`  | `claude-code-proxy`              | Override the `originator` header sent to Codex                                                 |
 | `CCP_CODEX_USER_AGENT` | `codex.userAgent`   | `claude-code-proxy/<version>`    | Override the `User-Agent` header sent to Codex                                                 |
 | `CCP_KIMI_USER_AGENT`  | `kimi.userAgent`    | `KimiCLI/1.37.0`                 | Override the `User-Agent` header sent to Kimi                                                  |
@@ -505,6 +599,8 @@ affecting other keys.
 - `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/device_id` —
   persistent UUID bound into the Kimi JWT at login. Reused for the lifetime
   of the install.
+- `~/.gemini/oauth_creds.json` — Gemini OAuth credentials by default. Override
+  with `CCP_GEMINI_OAUTH_CREDS_PATH` or `gemini.oauthCredsPath`.
 
 ## Limitations
 

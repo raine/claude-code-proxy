@@ -1,9 +1,11 @@
 import type { Provider } from "./types.ts"
 import { codexProvider } from "./codex/index.ts"
+import { geminiProvider } from "./gemini/index.ts"
 import { kimiProvider } from "./kimi/index.ts"
 
 const PROVIDERS: Record<string, Provider> = {
   codex: codexProvider,
+  gemini: geminiProvider,
   kimi: kimiProvider,
 }
 

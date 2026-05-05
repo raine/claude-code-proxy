@@ -102,7 +102,7 @@ function clampMaxTokens(requested: number | undefined): number {
   return Math.min(requested, DEFAULT_MAX_TOKENS)
 }
 
-const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max"])
+const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max", "xhigh"])
 
 function assertValidEffort(effort: unknown): void {
   if (effort !== undefined && !ANTHROPIC_EFFORTS.has(effort as string)) {
@@ -118,7 +118,7 @@ function assertValidEffort(effort: unknown): void {
 function mapReasoningEffort(
   effort: NonNullable<AnthropicRequest["output_config"]>["effort"],
 ): "low" | "medium" | "high" {
-  if (effort === "max") return "high"
+  if (effort === "max" || effort === "xhigh") return "high"
   return effort ?? "medium"
 }
 

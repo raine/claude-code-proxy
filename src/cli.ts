@@ -128,11 +128,41 @@ function printConfigSummary(): void {
   if (cfg.env.CCP_KIMI_USER_AGENT) overrides.push("CCP_KIMI_USER_AGENT (env)")
   else if (fromFile.kimi?.userAgent) overrides.push("kimi.userAgent (config)")
 
+  if (cfg.env.CCP_CLAUDE_ALIAS_PROVIDER) overrides.push("CCP_CLAUDE_ALIAS_PROVIDER (env)")
+  else if (fromFile.routing?.claudeAliasProvider) overrides.push("routing.claudeAliasProvider (config)")
+
   if (cfg.env.CCP_CODEX_MODEL) overrides.push("CCP_CODEX_MODEL (env)")
   else if (fromFile.codex?.model) overrides.push("codex.model (config)")
 
   if (cfg.env.CCP_CODEX_EFFORT) overrides.push("CCP_CODEX_EFFORT (env)")
   else if (fromFile.codex?.effort) overrides.push("codex.effort (config)")
+
+  if (cfg.env.CCP_GEMINI_MODEL) overrides.push("CCP_GEMINI_MODEL (env)")
+  else if (fromFile.gemini?.model) overrides.push("gemini.model (config)")
+
+  if (cfg.env.CCP_GEMINI_SMALL_FAST_MODEL) overrides.push("CCP_GEMINI_SMALL_FAST_MODEL (env)")
+  else if (fromFile.gemini?.smallFastModel) overrides.push("gemini.smallFastModel (config)")
+
+  if (cfg.env.CCP_GEMINI_OAUTH_CREDS_PATH) overrides.push("CCP_GEMINI_OAUTH_CREDS_PATH (env)")
+  else if (fromFile.gemini?.oauthCredsPath) overrides.push("gemini.oauthCredsPath (config)")
+
+  if (cfg.env.CCP_GEMINI_ENABLE_FALLBACK) overrides.push("CCP_GEMINI_ENABLE_FALLBACK (env)")
+  else if (fromFile.gemini?.enableFallback !== undefined) overrides.push("gemini.enableFallback (config)")
+
+  if (cfg.env.CCP_GEMINI_ENABLE_GOOGLE_ONE_CREDITS) {
+    overrides.push("CCP_GEMINI_ENABLE_GOOGLE_ONE_CREDITS (env)")
+  } else if (fromFile.gemini?.enableGoogleOneCredits !== undefined) {
+    overrides.push("gemini.enableGoogleOneCredits (config)")
+  }
+
+  if (cfg.env.CCP_GEMINI_DEFAULT_EFFORT) overrides.push("CCP_GEMINI_DEFAULT_EFFORT (env)")
+  else if (fromFile.gemini?.defaultEffort) overrides.push("gemini.defaultEffort (config)")
+
+  if (cfg.env.CCP_GEMINI_CODE_ASSIST_ENDPOINT) overrides.push("CCP_GEMINI_CODE_ASSIST_ENDPOINT (env)")
+  else if (fromFile.gemini?.endpoint) overrides.push("gemini.endpoint (config)")
+
+  if (cfg.env.CCP_GEMINI_CODE_ASSIST_API_VERSION) overrides.push("CCP_GEMINI_CODE_ASSIST_API_VERSION (env)")
+  else if (fromFile.gemini?.apiVersion) overrides.push("gemini.apiVersion (config)")
 
   if (cfg.env.CCP_LOG_VERBOSE !== undefined) overrides.push("CCP_LOG_VERBOSE (env)")
   else if (fromFile.log?.verbose) overrides.push("log.verbose (config)")

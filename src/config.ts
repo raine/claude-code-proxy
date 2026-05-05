@@ -11,11 +11,25 @@ import { configDir } from "./paths.ts"
 
 export interface FileConfig {
   port?: number
+  routing?: {
+    claudeAliasProvider?: string
+  }
   codex?: {
     originator?: string
     userAgent?: string
     model?: string
     effort?: string
+    defaultEffort?: string
+  }
+  gemini?: {
+    model?: string
+    smallFastModel?: string
+    oauthCredsPath?: string
+    enableFallback?: boolean
+    enableGoogleOneCredits?: boolean
+    defaultEffort?: string
+    endpoint?: string
+    apiVersion?: string
   }
   kimi?: {
     userAgent?: string
@@ -65,7 +79,7 @@ function validate(raw: unknown): FileConfig {
     else warnInvalid("port", "number", r.port)
   }
 
-  const validateStringSection = <K extends "codex" | "kimi" | "log">(
+  const validateStringSection = <K extends "routing" | "codex" | "gemini" | "kimi" | "log">(
     key: K,
     keys: ReadonlyArray<keyof NonNullable<FileConfig[K]>>,
     types: Record<string, "string" | "boolean">,
@@ -87,13 +101,44 @@ function validate(raw: unknown): FileConfig {
     return acc as NonNullable<FileConfig[K]>
   }
 
-  const codex = validateStringSection("codex", ["originator", "userAgent", "model", "effort"], {
+  const routing = validateStringSection("routing", ["claudeAliasProvider"], {
+    claudeAliasProvider: "string",
+  })
+  if (routing) out.routing = routing
+
+  const codex = validateStringSection("codex", ["originator", "userAgent", "model", "effort", "defaultEffort"], {
     originator: "string",
     userAgent: "string",
     model: "string",
     effort: "string",
+    defaultEffort: "string",
   })
   if (codex) out.codex = codex
+
+  const gemini = validateStringSection(
+    "gemini",
+    [
+      "model",
+      "smallFastModel",
+      "oauthCredsPath",
+      "enableFallback",
+      "enableGoogleOneCredits",
+      "defaultEffort",
+      "endpoint",
+      "apiVersion",
+    ],
+    {
+      model: "string",
+      smallFastModel: "string",
+      oauthCredsPath: "string",
+      enableFallback: "boolean",
+      enableGoogleOneCredits: "boolean",
+      defaultEffort: "string",
+      endpoint: "string",
+      apiVersion: "string",
+    },
+  )
+  if (gemini) out.gemini = gemini
 
   const kimi = validateStringSection("kimi", ["userAgent", "oauthHost", "baseUrl"], {
     userAgent: "string",
@@ -160,6 +205,29 @@ export function port(): number {
   return c.file.port ?? 18765
 }
 
+export type ClaudeAliasProvider = "codex" | "gemini" | "kimi" | "none"
+
+const CLAUDE_ALIAS_PROVIDERS = new Set<ClaudeAliasProvider>([
+  "codex",
+  "gemini",
+  "kimi",
+  "none",
+])
+
+export function claudeAliasProvider(): ClaudeAliasProvider {
+  const c = getConfig()
+  const raw = emptyOrUnset(c.env.CCP_CLAUDE_ALIAS_PROVIDER) ??
+    emptyOrUnset(c.file.routing?.claudeAliasProvider) ??
+    "none"
+  if (CLAUDE_ALIAS_PROVIDERS.has(raw as ClaudeAliasProvider)) {
+    return raw as ClaudeAliasProvider
+  }
+  process.stderr.write(
+    `claude-code-proxy: ignoring invalid Claude alias provider "${raw}"; expected one of ${Array.from(CLAUDE_ALIAS_PROVIDERS).join(", ")}\n`,
+  )
+  return "none"
+}
+
 export function codexOriginator(defaultValue: string): string {
   const c = getConfig()
   return (
@@ -182,7 +250,7 @@ export function codexUserAgent(defaultValue: string): string {
 
 // Returns undefined when neither env nor file specifies a value. Empty
 // string in env is intentionally treated as "unset" (preserves the
-// long-standing CCP_CODEX_MODEL escape hatch).
+// long-standing model/effort escape hatches).
 export function codexModel(): string | undefined {
   const c = getConfig()
   return emptyOrUnset(c.env.CCP_CODEX_MODEL) ?? emptyOrUnset(c.file.codex?.model)
@@ -191,6 +259,62 @@ export function codexModel(): string | undefined {
 export function codexEffort(): string | undefined {
   const c = getConfig()
   return emptyOrUnset(c.env.CCP_CODEX_EFFORT) ?? emptyOrUnset(c.file.codex?.effort)
+}
+
+export function codexDefaultEffort(): string | undefined {
+  const c = getConfig()
+  return emptyOrUnset(c.env.CCP_CODEX_DEFAULT_EFFORT) ?? emptyOrUnset(c.file.codex?.defaultEffort)
+}
+
+export function geminiModel(): string | undefined {
+  const c = getConfig()
+  return emptyOrUnset(c.env.CCP_GEMINI_MODEL) ?? emptyOrUnset(c.file.gemini?.model)
+}
+
+export function geminiSmallFastModel(): string | undefined {
+  const c = getConfig()
+  return emptyOrUnset(c.env.CCP_GEMINI_SMALL_FAST_MODEL) ??
+    emptyOrUnset(c.file.gemini?.smallFastModel)
+}
+
+export function geminiOauthCredsPath(): string | undefined {
+  const c = getConfig()
+  return emptyOrUnset(c.env.CCP_GEMINI_OAUTH_CREDS_PATH) ??
+    emptyOrUnset(c.file.gemini?.oauthCredsPath)
+}
+
+export function geminiEnableFallback(): boolean {
+  const c = getConfig()
+  const raw = emptyOrUnset(c.env.CCP_GEMINI_ENABLE_FALLBACK)
+  if (raw !== undefined) return !["0", "false", "no", "off"].includes(raw.toLowerCase())
+  return c.file.gemini?.enableFallback ?? true
+}
+
+export function geminiEnableGoogleOneCredits(): boolean {
+  const c = getConfig()
+  const raw = emptyOrUnset(c.env.CCP_GEMINI_ENABLE_GOOGLE_ONE_CREDITS)
+  if (raw !== undefined) return !["0", "false", "no", "off"].includes(raw.toLowerCase())
+  return c.file.gemini?.enableGoogleOneCredits ?? false
+}
+
+export function geminiDefaultEffort(): string | undefined {
+  const c = getConfig()
+  return emptyOrUnset(c.env.CCP_GEMINI_DEFAULT_EFFORT) ??
+    emptyOrUnset(c.file.gemini?.defaultEffort)
+}
+
+export function geminiEndpoint(): string {
+  const c = getConfig()
+  return c.env.CCP_GEMINI_CODE_ASSIST_ENDPOINT ??
+    c.file.gemini?.endpoint ??
+    "https://cloudcode-pa.googleapis.com"
+}
+
+export function geminiApiVersion(): string {
+  const c = getConfig()
+  return c.env.CCP_GEMINI_CODE_ASSIST_API_VERSION ??
+    c.file.gemini?.apiVersion ??
+    "v1internal"
 }
 
 export function kimiUserAgent(defaultValue: string): string {
