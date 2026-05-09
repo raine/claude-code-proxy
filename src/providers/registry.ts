@@ -1,8 +1,10 @@
 import type { Provider } from "./types.ts"
 import { codexProvider } from "./codex/index.ts"
 import { kimiProvider } from "./kimi/index.ts"
+import { anthropicProvider } from "./anthropic/index.ts"
 
 const PROVIDERS: Record<string, Provider> = {
+  anthropic: anthropicProvider,
   codex: codexProvider,
   kimi: kimiProvider,
 }
