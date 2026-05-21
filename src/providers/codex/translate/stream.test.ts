@@ -185,6 +185,84 @@ test("translateStream emits complete tool blocks only after upstream output_item
   expect(messageDelta!.data.delta.stop_reason).toBe("tool_use")
 })
 
+
+function streamReadErrorUpstream(message: string): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(sseEvent("error", {
+        type: "error",
+        error: { message },
+      })))
+      controller.close()
+    },
+  })
+}
+
+test("translateStream retries pre-content transient stream_read_error before emitting downstream events", async () => {
+  let retries = 0
+  const sse = await collect(
+    translateStream(streamReadErrorUpstream("stream_read_error"), {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+      maxStreamRetries: 1,
+      retryUpstream: async () => {
+        retries += 1
+        return {
+          body: upstreamFromEvents([
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: { type: "message", id: "msg_1" },
+              },
+            },
+            {
+              event: "response.output_text.delta",
+              data: {
+                type: "response.output_text.delta",
+                output_index: 0,
+                delta: "retried ok",
+              },
+            },
+            {
+              event: "response.output_item.done",
+              data: {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: { type: "message", id: "msg_1" },
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 10, output_tokens: 2 } },
+              },
+            },
+          ]),
+        }
+      },
+    }),
+  )
+  const events = parseSseEvents(sse)
+
+  expect(retries).toBe(1)
+  expect(events.map((e) => e.event)).toEqual([
+    "message_start",
+    "ping",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ])
+  expect(events[3]?.data.delta).toEqual({ type: "text_delta", text: "retried ok" })
+  expect(sse).not.toContain("stream_read_error")
+  expect(sse).not.toContain("event: error")
+})
+
 test("translateStream finalizes partial text when upstream reports a transient stream failure after content", async () => {
   const upstream = upstreamFromEvents([
     {

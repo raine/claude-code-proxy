@@ -308,6 +308,14 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       accountId: upstream.accountId,
       rateLimitsWriter,
       rateLimitsTracker: upstream.rateLimitsTracker,
+      retryUpstream: async () => {
+        const retry = await postCodex(translated, ctx)
+        return {
+          body: retry.body,
+          accountId: retry.accountId,
+          rateLimitsTracker: retry.rateLimitsTracker,
+        }
+      },
       signal: ctx.signal,
       readOffsetHints,
       compactResponse,

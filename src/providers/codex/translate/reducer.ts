@@ -272,6 +272,7 @@ function isTransientNetworkErrorMessage(message: string): boolean {
   if (lower.includes("econnreset")) return true
   if (lower.includes("etimedout")) return true
   if (lower.includes("fetch failed")) return true
+  if (lower.includes("stream_read_error")) return true
   return false
 }
 
