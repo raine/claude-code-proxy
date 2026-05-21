@@ -4,7 +4,7 @@ import { logVerbose } from "../../../config.ts"
 
 export class UpstreamStreamError extends Error {
   constructor(
-    public kind: "rate_limit" | "failed",
+    public kind: "rate_limit" | "failed" | "network",
     message: string,
     public retryAfterSeconds?: number,
   ) {
@@ -20,7 +20,7 @@ export interface CodexUsage {
   output_tokens_details?: { reasoning_tokens?: number }
 }
 
-export type StopReason = "end_turn" | "tool_use" | "max_tokens"
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "compaction"
 
 export type ReducerEvent =
   | { kind: "text-start"; index: number }
@@ -29,6 +29,7 @@ export type ReducerEvent =
   | { kind: "tool-start"; index: number; id: string; name: string }
   | { kind: "tool-delta"; index: number; partialJson: string }
   | { kind: "tool-stop"; index: number }
+  | { kind: "rate-limits"; rateLimits: unknown }
   | { kind: "finish"; stopReason: StopReason; usage: CodexUsage | undefined }
 
 interface TextState {
@@ -43,24 +44,47 @@ interface ToolState {
   name: string
   argsAccum: string
   hadDelta: boolean
-  bufferUntilDone: boolean
-  emittedArgs: boolean
 }
 type BlockState = TextState | ToolState
 
-function shouldBufferToolArgs(name: string): boolean {
-  return name === "Read"
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value)
 }
 
-function sanitizeToolArgs(name: string, args: string): string {
+function textMentionsLineNumber(text: string, line: number): boolean {
+  if (!text) return false
+  const escaped = String(line).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return new RegExp(`(?:行号|行|line|lines|around|near|附近|读取|read)\\D{0,20}${escaped}\\b|\\b${escaped}\\D{0,12}(?:行号|行|line|lines)`, "i").test(text)
+}
+
+function normalizeReadOffset(parsed: Record<string, unknown>, recentText: string): void {
+  const offsetValue = parsed.offset
+  if (typeof offsetValue !== "number") return
+  const offset = offsetValue
+  if (!Number.isSafeInteger(offset) || offset <= 0) return
+  const offsetText = String(offset)
+  if (!offsetText.endsWith("0")) return
+  const candidate = offset / 10
+  if (!Number.isSafeInteger(candidate) || candidate < 20) return
+  if (textMentionsLineNumber(recentText, offset)) return
+  if (!textMentionsLineNumber(recentText, candidate)) return
+  parsed.offset = candidate
+}
+
+function sanitizeToolArgs(name: string, args: string, recentText = ""): string {
   if (name !== "Read" || !args) return args
   try {
     const parsed = JSON.parse(args)
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return args
-    if (!("pages" in parsed) || parsed.pages !== "") return args
-    const sanitized = { ...parsed }
-    delete sanitized.pages
-    return JSON.stringify(sanitized)
+    if (!isRecord(parsed)) return args
+    let changed = false
+    if ("pages" in parsed && parsed.pages === "") {
+      delete parsed.pages
+      changed = true
+    }
+    const beforeOffset = parsed.offset
+    normalizeReadOffset(parsed, recentText)
+    if (parsed.offset !== beforeOffset) changed = true
+    return changed ? JSON.stringify(parsed) : args
   } catch {
     return args
   }
@@ -78,6 +102,7 @@ function sanitizeToolArgs(name: string, args: string): string {
 export async function* reduceUpstream(
   upstream: ReadableStream<Uint8Array>,
   log: Logger,
+  opts: { readOffsetHints?: string } = {},
 ): AsyncGenerator<ReducerEvent> {
   const blocksByOutputIndex = new Map<number, BlockState>()
   const itemIdToOutputIndex = new Map<string, number>()
@@ -85,6 +110,7 @@ export async function* reduceUpstream(
   let sawToolUse = false
   let finalUsage: CodexUsage | undefined
   let incomplete = false
+  let recentText = opts.readOffsetHints ?? ""
 
   for await (const evt of parseSseStream(upstream)) {
     if (!evt.data) continue
@@ -107,11 +133,12 @@ export async function* reduceUpstream(
           p.rate_limits?.primary?.reset_after_seconds,
         )
       }
+      yield { kind: "rate-limits", rateLimits: p.rate_limits }
       continue
     }
     if (t === "response.failed" || t === "response.error" || t === "error") {
       const message = p?.response?.error?.message || p?.error?.message || "Upstream error"
-      throw new UpstreamStreamError("failed", message)
+      throw new UpstreamStreamError(isTransientNetworkErrorMessage(message) ? "network" : "failed", message)
     }
 
     if (t === "response.output_item.added") {
@@ -136,10 +163,7 @@ export async function* reduceUpstream(
           name: item.name,
           argsAccum: "",
           hadDelta: false,
-          bufferUntilDone: shouldBufferToolArgs(item.name),
-          emittedArgs: false,
         })
-        yield { kind: "tool-start", index: idx, id: item.call_id, name: item.name }
         continue
       }
 
@@ -170,10 +194,6 @@ export async function* reduceUpstream(
       if (!delta) continue
       state.argsAccum += delta
       state.hadDelta = true
-      if (!state.bufferUntilDone) {
-        state.emittedArgs = true
-        yield { kind: "tool-delta", index: state.index, partialJson: delta }
-      }
       continue
     }
 
@@ -203,15 +223,10 @@ export async function* reduceUpstream(
           (typeof item.arguments === "string" && item.arguments.length
             ? item.arguments
             : state.argsAccum) || ""
-        if (finalArgs.length) {
-          state.argsAccum = sanitizeToolArgs(state.name, finalArgs)
-          if (state.bufferUntilDone || !state.emittedArgs) {
-            state.emittedArgs = true
-            yield { kind: "tool-delta", index: state.index, partialJson: state.argsAccum }
-          }
-        }
+        state.argsAccum = sanitizeToolArgs(state.name, finalArgs, recentText)
       }
       if (state.kind === "text") {
+        recentText = `${recentText}\n${state.textAccum}`.slice(-2000)
         log.debug("text block complete", { index: state.index, text: state.textAccum })
         yield { kind: "text-stop", index: state.index }
       } else {
@@ -221,6 +236,10 @@ export async function* reduceUpstream(
           name: state.name,
           args: state.argsAccum,
         })
+        yield { kind: "tool-start", index: state.index, id: state.callId, name: state.name }
+        if (state.argsAccum.length) {
+          yield { kind: "tool-delta", index: state.index, partialJson: state.argsAccum }
+        }
         yield { kind: "tool-stop", index: state.index }
       }
       blocksByOutputIndex.delete(p.output_index)
@@ -243,6 +262,18 @@ export async function* reduceUpstream(
 
   const stopReason: StopReason = incomplete ? "max_tokens" : sawToolUse ? "tool_use" : "end_turn"
   yield { kind: "finish", stopReason, usage: finalUsage }
+}
+
+function isTransientNetworkErrorMessage(message: string): boolean {
+  const lower = message.toLowerCase()
+  if (lower.includes("socket connection was closed unexpectedly")) return true
+  if (lower.includes("connection closed")) return true
+  if (lower.includes("connection reset")) return true
+  if (lower.includes("econnreset")) return true
+  if (lower.includes("etimedout")) return true
+  if (lower.includes("fetch failed")) return true
+  if (lower.includes("stream_read_error")) return true
+  return false
 }
 
 export function mapUsageToAnthropic(u: CodexUsage | undefined): {

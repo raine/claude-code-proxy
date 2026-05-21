@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
 import { join } from "node:path"
 import { configDir } from "./paths.ts"
 
@@ -21,6 +22,8 @@ export interface FileConfig {
     effort?: string
     serviceTier?: string
     baseUrl?: string
+    authMode?: "chatgpt" | "openai" | "auto"
+    apiKey?: string
   }
   kimi?: {
     userAgent?: string
@@ -103,7 +106,7 @@ function validate(raw: unknown): FileConfig {
 
   const codex = validateStringSection(
     "codex",
-    ["originator", "userAgent", "model", "effort", "serviceTier", "baseUrl"],
+    ["originator", "userAgent", "model", "effort", "serviceTier", "baseUrl", "authMode", "apiKey"],
     {
       originator: "string",
       userAgent: "string",
@@ -111,9 +114,18 @@ function validate(raw: unknown): FileConfig {
       effort: "string",
       serviceTier: "string",
       baseUrl: "string",
+      authMode: "string",
+      apiKey: "string",
     },
   )
-  if (codex) out.codex = codex
+  if (codex) {
+    const authMode = codex.authMode
+    if (authMode !== undefined && authMode !== "chatgpt" && authMode !== "openai" && authMode !== "auto") {
+      warnInvalid("codex.authMode", '"chatgpt", "openai", or "auto"', authMode)
+      delete codex.authMode
+    }
+    out.codex = codex
+  }
 
   const kimi = validateStringSection("kimi", ["userAgent", "oauthHost", "baseUrl"], {
     userAgent: "string",
@@ -220,7 +232,111 @@ export function codexServiceTier(): string | undefined {
 
 export function codexBaseUrl(defaultValue: string): string {
   const c = getConfig()
-  return c.env.CCP_CODEX_BASE_URL ?? c.file.codex?.baseUrl ?? defaultValue
+  return c.env.CCP_CODEX_BASE_URL ?? c.file.codex?.baseUrl ?? codexConfigBaseUrl(c.env) ?? defaultValue
+}
+
+export function codexAuthMode(): "chatgpt" | "openai" | "auto" | undefined {
+  const c = getConfig()
+  const mode = emptyOrUnset(c.env.CCP_CODEX_AUTH_MODE) ?? emptyOrUnset(c.file.codex?.authMode)
+  if (mode === "chatgpt" || mode === "openai" || mode === "auto") return mode
+  if (mode !== undefined) warnInvalid("CCP_CODEX_AUTH_MODE", '"chatgpt", "openai", or "auto"', mode)
+  return undefined
+}
+
+export function codexApiKey(): string | undefined {
+  const c = getConfig()
+  return (
+    emptyOrUnset(c.env.CCP_CODEX_API_KEY) ??
+    emptyOrUnset(c.env.OPENAI_API_KEY) ??
+    emptyOrUnset(c.file.codex?.apiKey) ??
+    codexConfigApiKey(c.env)
+  )
+}
+
+export function codexConfigBaseUrl(env: NodeJS.ProcessEnv = getConfig().env): string | undefined {
+  const provider = codexConfigProvider(env)
+  if (!provider?.base_url) return undefined
+  return responsesEndpointForBaseUrl(provider.base_url)
+}
+
+function responsesEndpointForBaseUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl)
+    const path = url.pathname.replace(/\/+$/, "")
+    if (path.endsWith("/responses") || path.includes("/backend-api/")) return rawUrl
+    url.pathname = `${path}/v1/responses`.replace(/^\/\//, "/")
+    return url.toString().replace(/\/$/, "")
+  } catch {
+    return rawUrl
+  }
+}
+
+export function codexConfigApiKey(env: NodeJS.ProcessEnv = getConfig().env): string | undefined {
+  return codexAuthJsonApiKey(env)
+}
+
+function codexConfigProvider(env: NodeJS.ProcessEnv): { base_url?: string } | undefined {
+  const config = parseCodexConfigToml(env)
+  const providerName = config.modelProvider
+  if (!providerName) return undefined
+  return config.providers.get(providerName)
+}
+
+function parseCodexConfigToml(env: NodeJS.ProcessEnv): { modelProvider?: string; providers: Map<string, { base_url?: string }> } {
+  const out = { providers: new Map<string, { base_url?: string }>() } as {
+    modelProvider?: string
+    providers: Map<string, { base_url?: string }>
+  }
+  const path = join(codexCliConfigDir(env), "config.toml")
+  let text: string
+  try {
+    text = readFileSync(path, "utf8")
+  } catch {
+    return out
+  }
+  let currentProvider: string | undefined
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, "").trim()
+    if (!line) continue
+    const table = line.match(/^\[model_providers\.([^\]]+)\]$/)
+    if (table) {
+      currentProvider = table[1]?.trim()
+      if (currentProvider && !out.providers.has(currentProvider)) out.providers.set(currentProvider, {})
+      continue
+    }
+    if (line.startsWith("[")) {
+      currentProvider = undefined
+      continue
+    }
+    const kv = line.match(/^([A-Za-z0-9_-]+)\s*=\s*"([^"]*)"\s*$/)
+    if (!kv) continue
+    const key = kv[1]
+    const value = kv[2]
+    if (!currentProvider && key === "model_provider") {
+      out.modelProvider = value
+      continue
+    }
+    if (currentProvider && key === "base_url") {
+      out.providers.get(currentProvider)!.base_url = value
+    }
+  }
+  return out
+}
+
+function codexCliConfigDir(env: NodeJS.ProcessEnv): string {
+  return env.CODEX_HOME || join(env.HOME || homedir(), ".codex")
+}
+
+function codexAuthJsonApiKey(env: NodeJS.ProcessEnv): string | undefined {
+  const path = join(codexCliConfigDir(env), "auth.json")
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>
+    return typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY
+      ? parsed.OPENAI_API_KEY
+      : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export function aliasProvider(): AliasProvider {

@@ -18,6 +18,9 @@ import { runDeviceLogin } from "./auth/device.ts"
 import { persistInitialTokens } from "./auth/manager.ts"
 import { loadAuth, authPath, clearAuth } from "./auth/token-store.ts"
 import { logVerbose } from "../../config.ts"
+import { RateLimitsSidecarWriter } from "./rate-limits.ts"
+
+const rateLimitsWriter = new RateLimitsSidecarWriter()
 
 interface SessionCountSnapshot {
   reqId: string
@@ -67,6 +70,31 @@ function usageWindowTokens(usage: {
   )
 }
 
+function recentReadOffsetHints(body: AnthropicRequest, maxChars = 4000): string | undefined {
+  const hints: string[] = []
+  for (const msg of body.messages ?? []) {
+    if (msg.role !== "user" || typeof msg.content === "string") continue
+    for (const block of msg.content) {
+      if (block.type !== "tool_result") continue
+      const content = block.content
+      const text =
+        typeof content === "string"
+          ? content
+          : content
+              .filter(
+                (part): part is { type: "text"; text: string } =>
+                  part.type === "text" &&
+                  typeof (part as { text?: unknown }).text === "string",
+              )
+              .map((part) => part.text)
+              .join("\n")
+      if (/^\s*\d{1,7}: /m.test(text)) hints.push(text)
+    }
+  }
+  if (!hints.length) return undefined
+  return hints.join("\n").slice(-maxChars)
+}
+
 function upstreamHeaderSnapshot(headers: Headers): {
   serverModel?: string
   serverReasoningIncluded: boolean
@@ -82,6 +110,19 @@ function jsonError(status: number, type: string, message: string): Response {
     status,
     headers: { "content-type": "application/json" },
   })
+}
+
+function isCompactContextManagement(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const edits = (value as { edits?: unknown }).edits
+  if (!Array.isArray(edits)) return false
+  return edits.some(
+    (edit) =>
+      !!edit &&
+      typeof edit === "object" &&
+      !Array.isArray(edit) &&
+      (edit as { type?: unknown }).type === "compact_20260112",
+  )
 }
 
 function invalidServiceTierResponse(err: InvalidServiceTierError): Response {
@@ -149,6 +190,8 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
   const messageCount = body.messages?.length ?? 0
   const toolCount = body.tools?.length ?? 0
   const contextManagement = body.context_management
+  const compactResponse = isCompactContextManagement(contextManagement)
+  const readOffsetHints = recentReadOffsetHints(body)
   const state = sessionState(ctx.sessionId)
 
   log.debug("anthropic request", {
@@ -158,6 +201,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     stream: wantStream,
     requestedMaxTokens: body.max_tokens,
     hasContextManagement: contextManagement !== undefined,
+    compactResponse,
     hasJsonSchemaFormat: body.output_config?.format?.type === "json_schema",
   })
   if (logVerbose()) log.debug("anthropic request body", { body })
@@ -203,6 +247,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     hasInstructions: !!translated.instructions,
     requestedMaxTokens: body.max_tokens,
     hasContextManagement: contextManagement !== undefined,
+    compactResponse,
     promptCacheKey: translated.prompt_cache_key,
   })
   if (logVerbose()) log.debug("translated request body", { body: translated })
@@ -220,6 +265,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       hasInstructions: !!translated.instructions,
       requestedMaxTokens: body.max_tokens,
       hasContextManagement: contextManagement !== undefined,
+      compactResponse,
       contextManagement,
       previousCountReqId: state?.lastCount?.reqId,
       previousCountModel: state?.lastCount?.model,
@@ -259,6 +305,20 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       messageId,
       model: body.model,
       log: ctx.childLogger("codex.stream"),
+      accountId: upstream.accountId,
+      rateLimitsWriter,
+      rateLimitsTracker: upstream.rateLimitsTracker,
+      retryUpstream: async () => {
+        const retry = await postCodex(translated, ctx)
+        return {
+          body: retry.body,
+          accountId: retry.accountId,
+          rateLimitsTracker: retry.rateLimitsTracker,
+        }
+      },
+      signal: ctx.signal,
+      readOffsetHints,
+      compactResponse,
       onFinish: logVerbose()
         ? (finish) => {
             const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined
@@ -275,6 +335,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
               translatedInputTokens,
               requestedMaxTokens: body.max_tokens,
               hasContextManagement: contextManagement !== undefined,
+              compactResponse,
               contextManagement,
               upstreamInputTokens: finish.usage?.input_tokens ?? 0,
               upstreamOutputTokens: finish.usage?.output_tokens ?? 0,
@@ -301,7 +362,17 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
   }
 
   try {
-    const result = await accumulateResponse(upstream.body, { messageId, model: body.model, log: ctx.childLogger("codex.accumulate") })
+    const result = await accumulateResponse(upstream.body, {
+      messageId,
+      model: body.model,
+      log: ctx.childLogger("codex.accumulate"),
+      accountId: upstream.accountId,
+      rateLimitsWriter,
+      rateLimitsTracker: upstream.rateLimitsTracker,
+      signal: ctx.signal,
+      readOffsetHints,
+      compactResponse,
+    })
     if (logVerbose()) {
       const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)
       log.info("compaction telemetry", {
@@ -317,6 +388,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
         translatedInputTokens,
         requestedMaxTokens: body.max_tokens,
         hasContextManagement: contextManagement !== undefined,
+        compactResponse,
         contextManagement,
         upstreamInputTokens: result.rawUsage?.input_tokens ?? 0,
         upstreamOutputTokens: result.rawUsage?.output_tokens ?? 0,

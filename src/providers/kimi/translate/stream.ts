@@ -174,7 +174,9 @@ export function translateStream(
             activeToolNames,
             activeToolCalls,
           })
-          ensureMessageStart()
+          // Keep error-only streams as pure error events. Fabricating an empty
+          // message_start before the error can leave Claude Code without a
+          // final usage frame and trigger internal compact/accounting crashes.
           emit("error", {
             type: "error",
             error: {
@@ -188,7 +190,6 @@ export function translateStream(
             activeToolNames,
             activeToolCalls,
           })
-          ensureMessageStart()
           emit("error", {
             type: "error",
             error: { type: "api_error", message: String(err) },

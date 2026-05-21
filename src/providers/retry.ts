@@ -52,17 +52,22 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-export interface RateLimitInfo {
+export interface RetryInfo {
   retryAfter?: string
+  reason?: string
 }
 
 export interface RetryOptions {
   log: Logger
   signal?: AbortSignal
-  classify: (err: unknown) => RateLimitInfo | undefined
+  classify: (err: unknown) => RetryInfo | undefined
 }
 
 export async function retryOn429<T>(run: () => Promise<T>, opts: RetryOptions): Promise<T> {
+  return retryTransient(run, opts)
+}
+
+export async function retryTransient<T>(run: () => Promise<T>, opts: RetryOptions): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await run()
@@ -71,13 +76,15 @@ export async function retryOn429<T>(run: () => Promise<T>, opts: RetryOptions): 
       if (!info || attempt >= MAX_RATE_LIMIT_RETRIES) throw err
       const { waitMs, exceedsBudget } = computeBackoffDelay(attempt, info.retryAfter)
       if (exceedsBudget) {
-        opts.log.warn("upstream 429 retry-after exceeds budget; giving up", {
+        opts.log.warn("upstream retry-after exceeds budget; giving up", {
+          reason: info.reason,
           retryAfter: info.retryAfter,
           maxDelayMs: RETRY_MAX_DELAY_MS,
         })
         throw err
       }
-      opts.log.warn("upstream 429, retrying after backoff", {
+      opts.log.warn("upstream transient error, retrying after backoff", {
+        reason: info.reason,
         attempt: attempt + 1,
         maxRetries: MAX_RATE_LIMIT_RETRIES,
         waitMs,
@@ -86,4 +93,20 @@ export async function retryOn429<T>(run: () => Promise<T>, opts: RetryOptions): 
       await sleep(waitMs, opts.signal)
     }
   }
+}
+
+export function isTransientNetworkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  if (err.name === "AbortError") return false
+  const message = `${err.name}: ${err.message}`.toLowerCase()
+  if (message.includes("socket connection was closed unexpectedly")) return true
+  if (message.includes("connection closed")) return true
+  if (message.includes("connection reset")) return true
+  if (message.includes("econnreset")) return true
+  if (message.includes("etimedout")) return true
+  if (message.includes("fetch failed")) return true
+
+  const cause = (err as Error & { cause?: unknown }).cause
+  if (cause && cause !== err) return isTransientNetworkError(cause)
+  return false
 }

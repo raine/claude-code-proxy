@@ -1,32 +1,92 @@
 import { encodeSseEvent } from "../../../sse.ts"
 import type { Logger } from "../../../log.ts"
+import { mapRateLimitsSnapshot, type RateLimitsSidecarWriter } from "../rate-limits.ts"
+import type { RateLimitsTracker } from "../client.ts"
 import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts"
+import { isTransientNetworkError } from "../../retry.ts"
 
-/**
- * Translate a Codex Responses SSE stream into Anthropic SSE events.
- * Returns a ReadableStream<Uint8Array> ready to pipe to the client.
- *
- * The HTTP status has already been flushed (200) before the first
- * upstream event is consumed, so rate-limit and upstream-failed cases
- * surface as SSE error events rather than non-200 statuses.
- */
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError"
+}
+
+function isPreContentTransientStreamError(err: unknown): boolean {
+  if (err instanceof UpstreamStreamError && err.kind === "network") return true
+  return isTransientNetworkError(err)
+}
+
 export function translateStream(
   upstream: ReadableStream<Uint8Array>,
   opts: {
     messageId: string
     model: string
     log: Logger
-    onFinish?: (finish: { stopReason: "end_turn" | "tool_use" | "max_tokens"; usage?: Parameters<typeof mapUsageToAnthropic>[0] }) => void
+    onFinish?: (finish: { stopReason: "end_turn" | "tool_use" | "max_tokens" | "compaction"; usage?: Parameters<typeof mapUsageToAnthropic>[0] }) => void
+    compactResponse?: boolean
+    accountId?: string
+    rateLimitsWriter?: RateLimitsSidecarWriter
+    rateLimitsTracker?: RateLimitsTracker
+    retryUpstream?: () => Promise<{
+      body: ReadableStream<Uint8Array>
+      accountId?: string
+      rateLimitsTracker?: RateLimitsTracker
+    }>
+    maxStreamRetries?: number
+    signal?: AbortSignal
+    readOffsetHints?: string
   },
 ): ReadableStream<Uint8Array> {
+  const makeTrackedUpstream = (source: {
+    body: ReadableStream<Uint8Array>
+    accountId?: string
+    rateLimitsTracker?: RateLimitsTracker
+  }) =>
+    source.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          controller.enqueue(chunk)
+        },
+        async flush() {
+          await source.rateLimitsTracker?.refreshIfNeeded({
+            success: true,
+            accountId: source.accountId,
+            signal: opts.signal,
+            rateLimitsWriter: opts.rateLimitsWriter,
+            log: opts.log,
+          })
+        },
+      }),
+    )
   const encoder = new TextEncoder()
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      const emit = (event: string, data: unknown) => {
-        controller.enqueue(encoder.encode(encodeSseEvent(event, data)))
+      let controllerClosed = false
+      const emit = (event: string, data: unknown): boolean => {
+        if (controllerClosed) return false
+        try {
+          controller.enqueue(encoder.encode(encodeSseEvent(event, data)))
+          return true
+        } catch {
+          controllerClosed = true
+          return false
+        }
       }
+
       const activeTools = new Map<number, { id: string; name: string }>()
+      const activeTextBlocks = new Set<number>()
+      let emittedToolUse = false
       let messageStarted = false
+      let currentUpstream: {
+        body: ReadableStream<Uint8Array>
+        accountId?: string
+        rateLimitsTracker?: RateLimitsTracker
+      } = {
+        body: upstream,
+        accountId: opts.accountId,
+        rateLimitsTracker: opts.rateLimitsTracker,
+      }
+      let streamRetryCount = 0
+      const maxStreamRetries = opts.maxStreamRetries ?? 2
+
       const ensureMessageStart = () => {
         if (messageStarted) return
         messageStarted = true
@@ -51,96 +111,186 @@ export function translateStream(
         emit("ping", { type: "ping" })
       }
 
+      const finalizePartialAfterTransientClose = (
+        detail: Record<string, unknown>,
+        activeToolNames: string[],
+        activeToolCalls: Array<{ id: string; name: string }>,
+      ) => {
+        opts.log.warn("upstream stream closed after content; finalizing partial response", {
+          ...detail,
+          activeToolNames,
+          activeToolCalls,
+          openTextBlocks: Array.from(activeTextBlocks),
+        })
+        for (const index of activeTextBlocks) {
+          emit("content_block_stop", { type: "content_block_stop", index })
+        }
+        activeTextBlocks.clear()
+        const stopReason = opts.compactResponse
+          ? "compaction"
+          : emittedToolUse
+            ? "tool_use"
+            : "end_turn"
+        opts.onFinish?.({ stopReason, usage: undefined })
+        emit("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: mapUsageToAnthropic(undefined),
+        })
+        emit("message_stop", { type: "message_stop" })
+      }
+
       try {
-        for await (const e of reduceUpstream(upstream, opts.log)) {
-          switch (e.kind) {
-            case "text-start":
-              ensureMessageStart()
-              emit("content_block_start", {
-                type: "content_block_start",
-                index: e.index,
-                content_block: { type: "text", text: "" },
+        while (true) {
+          try {
+            for await (const e of reduceUpstream(makeTrackedUpstream(currentUpstream), opts.log, { readOffsetHints: opts.readOffsetHints })) {
+              switch (e.kind) {
+                case "text-start":
+                  activeTextBlocks.add(e.index)
+                  ensureMessageStart()
+                  emit("content_block_start", {
+                    type: "content_block_start",
+                    index: e.index,
+                    content_block: opts.compactResponse
+                      ? { type: "compaction", content: "" }
+                      : { type: "text", text: "" },
+                  })
+                  break
+                case "text-delta":
+                  emit("content_block_delta", {
+                    type: "content_block_delta",
+                    index: e.index,
+                    delta: opts.compactResponse
+                      ? { type: "compaction_delta", content: e.text }
+                      : { type: "text_delta", text: e.text },
+                  })
+                  break
+                case "text-stop":
+                  activeTextBlocks.delete(e.index)
+                  emit("content_block_stop", { type: "content_block_stop", index: e.index })
+                  break
+                case "tool-start":
+                  emittedToolUse = true
+                  activeTools.set(e.index, { id: e.id, name: e.name })
+                  ensureMessageStart()
+                  emit("content_block_start", {
+                    type: "content_block_start",
+                    index: e.index,
+                    content_block: {
+                      type: "tool_use",
+                      id: e.id,
+                      name: e.name,
+                      input: {},
+                    },
+                  })
+                  break
+                case "tool-delta":
+                  emit("content_block_delta", {
+                    type: "content_block_delta",
+                    index: e.index,
+                    delta: { type: "input_json_delta", partial_json: e.partialJson },
+                  })
+                  break
+                case "tool-stop":
+                  activeTools.delete(e.index)
+                  emit("content_block_stop", { type: "content_block_stop", index: e.index })
+                  break
+                case "rate-limits": {
+                  currentUpstream.rateLimitsTracker?.markSeen()
+                  const snapshot = mapRateLimitsSnapshot(e.rateLimits, currentUpstream.accountId)
+                  if (snapshot) void opts.rateLimitsWriter?.write(snapshot)
+                  break
+                }
+                case "finish": {
+                  ensureMessageStart()
+                  const stopReason = opts.compactResponse ? "compaction" : e.stopReason
+                  opts.onFinish?.({ stopReason, usage: e.usage })
+                  emit("message_delta", {
+                    type: "message_delta",
+                    delta: { stop_reason: stopReason, stop_sequence: null },
+                    usage: mapUsageToAnthropic(e.usage),
+                  })
+                  emit("message_stop", { type: "message_stop" })
+                  break
+                }
+              }
+            }
+            break
+          } catch (err) {
+            const canRetryBeforeEmitting =
+              !messageStarted &&
+              activeTools.size === 0 &&
+              activeTextBlocks.size === 0 &&
+              streamRetryCount < maxStreamRetries &&
+              !!opts.retryUpstream &&
+              isPreContentTransientStreamError(err) &&
+              !opts.signal?.aborted
+
+            if (canRetryBeforeEmitting) {
+              streamRetryCount += 1
+              opts.log.warn("upstream stream failed before content; retrying streamed request", {
+                attempt: streamRetryCount,
+                maxStreamRetries,
+                err: String(err),
+                kind: err instanceof UpstreamStreamError ? err.kind : undefined,
+                message: err instanceof Error ? err.message : undefined,
               })
-              break
-            case "text-delta":
-              emit("content_block_delta", {
-                type: "content_block_delta",
-                index: e.index,
-                delta: { type: "text_delta", text: e.text },
+              currentUpstream = await opts.retryUpstream!()
+              continue
+            }
+
+            const activeToolNames = Array.from(activeTools.values(), (tool) => tool.name)
+            const activeToolCalls = Array.from(activeTools.values())
+            if (isAbortError(err) && opts.signal?.aborted) {
+              opts.log.info("client disconnected")
+            } else if (err instanceof UpstreamStreamError && err.kind === "network" && messageStarted && activeTools.size === 0) {
+              finalizePartialAfterTransientClose(
+                { kind: err.kind, message: err.message },
+                activeToolNames,
+                activeToolCalls,
+              )
+            } else if (err instanceof UpstreamStreamError) {
+              opts.log.warn("upstream stream error", {
+                kind: err.kind,
+                message: err.message,
+                activeToolNames,
+                activeToolCalls,
               })
-              break
-            case "text-stop":
-              emit("content_block_stop", { type: "content_block_stop", index: e.index })
-              break
-            case "tool-start":
-              activeTools.set(e.index, { id: e.id, name: e.name })
-              ensureMessageStart()
-              emit("content_block_start", {
-                type: "content_block_start",
-                index: e.index,
-                content_block: {
-                  type: "tool_use",
-                  id: e.id,
-                  name: e.name,
-                  input: {},
+              // If upstream fails before any content starts, emitting a synthetic
+              // message_start without a matching final usage frame can trigger
+              // Claude Code's internal usage accounting crash during /compact.
+              // In that case, surface a plain SSE error event instead.
+              emit("error", {
+                type: "error",
+                error: {
+                  type: err.kind === "rate_limit" ? "rate_limit_error" : "api_error",
+                  message: err.message,
                 },
               })
-              break
-            case "tool-delta":
-              emit("content_block_delta", {
-                type: "content_block_delta",
-                index: e.index,
-                delta: { type: "input_json_delta", partial_json: e.partialJson },
+            } else if (isTransientNetworkError(err) && messageStarted && activeTools.size === 0) {
+              finalizePartialAfterTransientClose({ err: String(err) }, activeToolNames, activeToolCalls)
+            } else {
+              opts.log.error("stream translation error", {
+                err: String(err),
+                activeToolNames,
+                activeToolCalls,
               })
-              break
-            case "tool-stop":
-              activeTools.delete(e.index)
-              emit("content_block_stop", { type: "content_block_stop", index: e.index })
-              break
-            case "finish":
-              ensureMessageStart()
-              opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage })
-              emit("message_delta", {
-                type: "message_delta",
-                delta: { stop_reason: e.stopReason, stop_sequence: null },
-                usage: mapUsageToAnthropic(e.usage),
+              emit("error", {
+                type: "error",
+                error: { type: "api_error", message: String(err) },
               })
-              emit("message_stop", { type: "message_stop" })
-              break
+            }
+            break
           }
         }
-      } catch (err) {
-        const activeToolNames = Array.from(activeTools.values(), (tool) => tool.name)
-        const activeToolCalls = Array.from(activeTools.values())
-        if (err instanceof UpstreamStreamError) {
-          opts.log.warn("upstream stream error", {
-            kind: err.kind,
-            message: err.message,
-            activeToolNames,
-            activeToolCalls,
-          })
-          ensureMessageStart()
-          emit("error", {
-            type: "error",
-            error: {
-              type: err.kind === "rate_limit" ? "rate_limit_error" : "api_error",
-              message: err.message,
-            },
-          })
-        } else {
-          opts.log.error("stream translation error", {
-            err: String(err),
-            activeToolNames,
-            activeToolCalls,
-          })
-          ensureMessageStart()
-          emit("error", {
-            type: "error",
-            error: { type: "api_error", message: String(err) },
-          })
-        }
       } finally {
-        controller.close()
+        if (!controllerClosed) {
+          try {
+            controller.close()
+          } catch {
+            // ignore if controller already errored or cancelled
+          }
+        }
       }
     },
   })
