@@ -70,6 +70,31 @@ function usageWindowTokens(usage: {
   )
 }
 
+function recentReadOffsetHints(body: AnthropicRequest, maxChars = 4000): string | undefined {
+  const hints: string[] = []
+  for (const msg of body.messages ?? []) {
+    if (msg.role !== "user" || typeof msg.content === "string") continue
+    for (const block of msg.content) {
+      if (block.type !== "tool_result") continue
+      const content = block.content
+      const text =
+        typeof content === "string"
+          ? content
+          : content
+              .filter(
+                (part): part is { type: "text"; text: string } =>
+                  part.type === "text" &&
+                  typeof (part as { text?: unknown }).text === "string",
+              )
+              .map((part) => part.text)
+              .join("\n")
+      if (/^\s*\d{1,7}: /m.test(text)) hints.push(text)
+    }
+  }
+  if (!hints.length) return undefined
+  return hints.join("\n").slice(-maxChars)
+}
+
 function upstreamHeaderSnapshot(headers: Headers): {
   serverModel?: string
   serverReasoningIncluded: boolean
@@ -152,6 +177,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
   const messageCount = body.messages?.length ?? 0
   const toolCount = body.tools?.length ?? 0
   const contextManagement = body.context_management
+  const readOffsetHints = recentReadOffsetHints(body)
   const state = sessionState(ctx.sessionId)
 
   log.debug("anthropic request", {
@@ -266,6 +292,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       rateLimitsWriter,
       rateLimitsTracker: upstream.rateLimitsTracker,
       signal: ctx.signal,
+      readOffsetHints,
       onFinish: logVerbose()
         ? (finish) => {
             const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined
@@ -316,6 +343,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       rateLimitsWriter,
       rateLimitsTracker: upstream.rateLimitsTracker,
       signal: ctx.signal,
+      readOffsetHints,
     })
     if (logVerbose()) {
       const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)

@@ -19,6 +19,7 @@ export function translateStream(
     rateLimitsWriter?: RateLimitsSidecarWriter
     rateLimitsTracker?: RateLimitsTracker
     signal?: AbortSignal
+    readOffsetHints?: string
   },
 ): ReadableStream<Uint8Array> {
   const trackedUpstream = upstream.pipeThrough(
@@ -78,7 +79,7 @@ export function translateStream(
       }
 
       try {
-        for await (const e of reduceUpstream(trackedUpstream, opts.log)) {
+        for await (const e of reduceUpstream(trackedUpstream, opts.log, { readOffsetHints: opts.readOffsetHints })) {
           switch (e.kind) {
             case "text-start":
               ensureMessageStart()

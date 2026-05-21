@@ -219,3 +219,173 @@ test("translateStream does not expose a partial tool_use block when upstream fai
   expect(sse).not.toContain("event: content_block_start")
   expect(sse).not.toContain("input_json_delta")
 })
+
+
+test("translateStream corrects Read offsets with a spurious trailing zero", async () => {
+  const upstream = upstreamFromEvents([
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_1" },
+      },
+    },
+    {
+      event: "response.output_text.delta",
+      data: {
+        type: "response.output_text.delta",
+        output_index: 0,
+        delta: "我会读取 347 行附近的 readiness 代码。",
+      },
+    },
+    {
+      event: "response.output_item.done",
+      data: {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "message" },
+      },
+    },
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", call_id: "call_1", name: "Read" },
+      },
+    },
+    {
+      event: "response.output_item.done",
+      data: {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: {
+          type: "function_call",
+          call_id: "call_1",
+          name: "Read",
+          arguments: '{"file_path":"/tmp/a.ts","offset":3470,"limit":120}',
+        },
+      },
+    },
+    {
+      event: "response.completed",
+      data: { type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 4 } } },
+    },
+  ])
+
+  const sse = await collect(
+    translateStream(upstream, {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+    }),
+  )
+  const toolDelta = parseSseEvents(sse).find((e) => e.data?.delta?.type === "input_json_delta")
+
+  expect(toolDelta?.data.delta.partial_json).toBe('{"file_path":"/tmp/a.ts","offset":347,"limit":120}')
+})
+
+test("translateStream preserves Read offsets when the text names the larger line", async () => {
+  const upstream = upstreamFromEvents([
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_1" },
+      },
+    },
+    {
+      event: "response.output_text.delta",
+      data: {
+        type: "response.output_text.delta",
+        output_index: 0,
+        delta: "我会读取 3470 行附近的代码。",
+      },
+    },
+    {
+      event: "response.output_item.done",
+      data: { type: "response.output_item.done", output_index: 0, item: { type: "message" } },
+    },
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", call_id: "call_1", name: "Read" },
+      },
+    },
+    {
+      event: "response.output_item.done",
+      data: {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: {
+          type: "function_call",
+          call_id: "call_1",
+          name: "Read",
+          arguments: '{"file_path":"/tmp/a.ts","offset":3470,"limit":120}',
+        },
+      },
+    },
+    {
+      event: "response.completed",
+      data: { type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 4 } } },
+    },
+  ])
+
+  const sse = await collect(
+    translateStream(upstream, {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+    }),
+  )
+  const toolDelta = parseSseEvents(sse).find((e) => e.data?.delta?.type === "input_json_delta")
+
+  expect(toolDelta?.data.delta.partial_json).toBe('{"file_path":"/tmp/a.ts","offset":3470,"limit":120}')
+})
+
+
+test("translateStream corrects Read offsets using prior tool-result line hints", async () => {
+  const upstream = upstreamFromEvents([
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "function_call", call_id: "call_1", name: "Read" },
+      },
+    },
+    {
+      event: "response.output_item.done",
+      data: {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          call_id: "call_1",
+          name: "Read",
+          arguments: '{"file_path":"/tmp/a.ts","offset":5870,"limit":85}',
+        },
+      },
+    },
+    {
+      event: "response.completed",
+      data: { type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 4 } } },
+    },
+  ])
+
+  const sse = await collect(
+    translateStream(upstream, {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+      readOffsetHints: "581: async function ensureManagedProviderReady() {\n587: if (state === 'running') return true",
+    }),
+  )
+  const toolDelta = parseSseEvents(sse).find((e) => e.data?.delta?.type === "input_json_delta")
+
+  expect(toolDelta?.data.delta.partial_json).toBe('{"file_path":"/tmp/a.ts","offset":587,"limit":85}')
+})

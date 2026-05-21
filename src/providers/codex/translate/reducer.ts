@@ -47,15 +47,44 @@ interface ToolState {
 }
 type BlockState = TextState | ToolState
 
-function sanitizeToolArgs(name: string, args: string): string {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+}
+
+function textMentionsLineNumber(text: string, line: number): boolean {
+  if (!text) return false
+  const escaped = String(line).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  return new RegExp(`(?:行号|行|line|lines|around|near|附近|读取|read)\\D{0,20}${escaped}\\b|\\b${escaped}\\D{0,12}(?:行号|行|line|lines)`, "i").test(text)
+}
+
+function normalizeReadOffset(parsed: Record<string, unknown>, recentText: string): void {
+  const offsetValue = parsed.offset
+  if (typeof offsetValue !== "number") return
+  const offset = offsetValue
+  if (!Number.isSafeInteger(offset) || offset <= 0) return
+  const offsetText = String(offset)
+  if (!offsetText.endsWith("0")) return
+  const candidate = offset / 10
+  if (!Number.isSafeInteger(candidate) || candidate < 20) return
+  if (textMentionsLineNumber(recentText, offset)) return
+  if (!textMentionsLineNumber(recentText, candidate)) return
+  parsed.offset = candidate
+}
+
+function sanitizeToolArgs(name: string, args: string, recentText = ""): string {
   if (name !== "Read" || !args) return args
   try {
     const parsed = JSON.parse(args)
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return args
-    if (!("pages" in parsed) || parsed.pages !== "") return args
-    const sanitized = { ...parsed }
-    delete sanitized.pages
-    return JSON.stringify(sanitized)
+    if (!isRecord(parsed)) return args
+    let changed = false
+    if ("pages" in parsed && parsed.pages === "") {
+      delete parsed.pages
+      changed = true
+    }
+    const beforeOffset = parsed.offset
+    normalizeReadOffset(parsed, recentText)
+    if (parsed.offset !== beforeOffset) changed = true
+    return changed ? JSON.stringify(parsed) : args
   } catch {
     return args
   }
@@ -73,6 +102,7 @@ function sanitizeToolArgs(name: string, args: string): string {
 export async function* reduceUpstream(
   upstream: ReadableStream<Uint8Array>,
   log: Logger,
+  opts: { readOffsetHints?: string } = {},
 ): AsyncGenerator<ReducerEvent> {
   const blocksByOutputIndex = new Map<number, BlockState>()
   const itemIdToOutputIndex = new Map<string, number>()
@@ -80,6 +110,7 @@ export async function* reduceUpstream(
   let sawToolUse = false
   let finalUsage: CodexUsage | undefined
   let incomplete = false
+  let recentText = opts.readOffsetHints ?? ""
 
   for await (const evt of parseSseStream(upstream)) {
     if (!evt.data) continue
@@ -192,9 +223,10 @@ export async function* reduceUpstream(
           (typeof item.arguments === "string" && item.arguments.length
             ? item.arguments
             : state.argsAccum) || ""
-        state.argsAccum = sanitizeToolArgs(state.name, finalArgs)
+        state.argsAccum = sanitizeToolArgs(state.name, finalArgs, recentText)
       }
       if (state.kind === "text") {
+        recentText = `${recentText}\n${state.textAccum}`.slice(-2000)
         log.debug("text block complete", { index: state.index, text: state.textAccum })
         yield { kind: "text-stop", index: state.index }
       } else {

@@ -142,6 +142,32 @@ describe("translateRequest", () => {
     )
   })
 
+
+  it("adds exact-line offset guidance to the Read tool schema", () => {
+    const translated = translateRequest({
+      ...baseRequest,
+      tools: [
+        {
+          name: "Read",
+          description: "Reads a file",
+          input_schema: {
+            type: "object",
+            properties: {
+              file_path: { type: "string" },
+              offset: { type: "number", description: "Line to start from" },
+              limit: { type: "number" },
+            },
+          },
+        },
+      ],
+    })
+
+    const readTool = translated.tools?.[0] as { description?: string; parameters: { properties: { offset: { description?: string } } } }
+    expect(translated.instructions).toContain("Preserve the requested line number exactly")
+    expect(readTool.description).toContain("Preserve the requested line number exactly")
+    expect(readTool.parameters.properties.offset.description).toContain("Preserve the requested line number exactly")
+  })
+
   it("returns only the expected top-level upstream request fields", () => {
     const translated = translateRequest({
       ...baseRequest,

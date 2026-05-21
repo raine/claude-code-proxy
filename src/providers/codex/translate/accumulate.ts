@@ -40,6 +40,7 @@ export async function accumulateResponse(
     rateLimitsWriter?: RateLimitsSidecarWriter
     rateLimitsTracker?: RateLimitsTracker
     signal?: AbortSignal
+    readOffsetHints?: string
   },
 ): Promise<AccumulatedResponse> {
   const trackedUpstream = upstream.pipeThrough(
@@ -69,7 +70,7 @@ export async function accumulateResponse(
   let usage: ReturnType<typeof mapUsageToAnthropic> | undefined
   let rawUsage: CodexUsage | undefined
 
-  for await (const e of reduceUpstream(trackedUpstream, opts.log)) {
+  for await (const e of reduceUpstream(trackedUpstream, opts.log, { readOffsetHints: opts.readOffsetHints })) {
     switch (e.kind) {
       case "text-start":
         blocks.set(e.index, { kind: "text", text: "" })

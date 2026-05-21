@@ -134,7 +134,10 @@ function resolveServiceTier(modelServiceTier?: ServiceTier): ServiceTier | undef
 }
 
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions = {}): ResponsesRequest {
-  const instructions = buildInstructions(req.system)
+  const hasReadTool = req.tools?.some((tool) => tool.name === "Read") ?? false
+  const instructions = hasReadTool
+    ? appendGuidance(buildInstructions(req.system), READ_OFFSET_GUIDANCE)
+    : buildInstructions(req.system)
   const input = buildInput(req.messages)
   const tools = req.tools?.map(toResponsesTool)
 
@@ -307,11 +310,38 @@ export function toolResultToString(
     .join("\n")
 }
 
+const READ_OFFSET_GUIDANCE =
+  "For the Read tool, offset is the exact line number to start from. Preserve the requested line number exactly; do not scale it, round it, infer a page number, or append digits."
+
+function appendGuidance(text: string | undefined, guidance: string): string {
+  if (!text) return guidance
+  if (text.includes(guidance)) return text
+  return `${text}\n\n${guidance}`
+}
+
+function addReadOffsetGuidance(schema: unknown): unknown {
+  if (!isRecord(schema)) return schema
+  const copy: Record<string, unknown> = { ...schema }
+  const properties = isRecord(schema.properties) ? { ...schema.properties } : undefined
+  if (properties && isRecord(properties.offset)) {
+    properties.offset = {
+      ...properties.offset,
+      description: appendGuidance(
+        typeof properties.offset.description === "string" ? properties.offset.description : undefined,
+        READ_OFFSET_GUIDANCE,
+      ),
+    }
+    copy.properties = properties
+  }
+  return copy
+}
+
 function toResponsesTool(tool: AnthropicTool): ResponsesTool {
+  const isReadTool = tool.name === "Read"
   return {
     type: "function",
     name: tool.name,
-    description: tool.description,
-    parameters: tool.input_schema,
+    description: isReadTool ? appendGuidance(tool.description, READ_OFFSET_GUIDANCE) : tool.description,
+    parameters: isReadTool ? addReadOffsetGuidance(tool.input_schema) : tool.input_schema,
   }
 }
