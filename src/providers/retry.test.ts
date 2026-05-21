@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test"
 import {
   computeBackoffDelay,
+  isTransientNetworkError,
   MAX_RATE_LIMIT_RETRIES,
   RETRY_INITIAL_DELAY_MS,
   RETRY_MAX_DELAY_MS,
   retryOn429,
+  retryTransient,
   sleep,
 } from "./retry.ts"
 
@@ -165,6 +167,35 @@ describe("retryOn429", () => {
       },
     )
     expect(result).toBe("recovered")
+    expect(calls).toBe(2)
+  })
+})
+
+describe("isTransientNetworkError", () => {
+  it("detects Bun socket-close fetch failures", () => {
+    expect(isTransientNetworkError(new TypeError("The socket connection was closed unexpectedly"))).toBe(true)
+  })
+
+  it("does not classify explicit aborts as retryable", () => {
+    expect(isTransientNetworkError(new DOMException("Aborted", "AbortError"))).toBe(false)
+  })
+})
+
+describe("retryTransient", () => {
+  it("retries classified transient network errors", async () => {
+    let calls = 0
+    const result = await retryTransient(
+      async () => {
+        calls++
+        if (calls === 1) throw new TypeError("The socket connection was closed unexpectedly")
+        return "ok"
+      },
+      {
+        log: silentLog,
+        classify: (err) => (isTransientNetworkError(err) ? { reason: "network" } : undefined),
+      },
+    )
+    expect(result).toBe("ok")
     expect(calls).toBe(2)
   })
 })

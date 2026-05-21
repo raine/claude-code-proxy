@@ -4,7 +4,7 @@ import { forceRefresh, getAuth, KimiAuthUnauthorizedError } from "./auth/manager
 import type { Logger } from "../../log.ts"
 import type { RequestContext } from "../types.ts"
 import type { KimiChatRequest } from "./translate/request.ts"
-import { retryOn429 } from "../retry.ts"
+import { isTransientNetworkError, retryTransient } from "../retry.ts"
 
 export interface KimiResponse {
   body: ReadableStream<Uint8Array>
@@ -30,13 +30,16 @@ export async function postKimi(
   ctx: RequestContext,
 ): Promise<KimiResponse> {
   const log = ctx.childLogger("kimi.client")
-  return retryOn429(() => attemptPostKimi(body, ctx, log), {
+  return retryTransient(() => attemptPostKimi(body, ctx, log), {
     log,
     signal: ctx.signal,
-    classify: (err) =>
-      err instanceof KimiError && err.status === 429
-        ? { retryAfter: err.meta?.retryAfter }
-        : undefined,
+    classify: (err) => {
+      if (err instanceof KimiError && err.status === 429) {
+        return { retryAfter: err.meta?.retryAfter, reason: "rate_limit" }
+      }
+      if (isTransientNetworkError(err)) return { reason: "network" }
+      return undefined
+    },
   })
 }
 

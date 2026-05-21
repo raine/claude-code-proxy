@@ -77,3 +77,17 @@ test("postCodex auto-selects OpenAI auth for non-ChatGPT base URL with API key",
   expect(seenHeaders.get("authorization")).toBe("Bearer sk-openai")
   expect(seenHeaders.has("openai-beta")).toBe(false)
 })
+
+test("postCodex retries transient socket failures before headers", async () => {
+  configure({ CCP_CODEX_AUTH_MODE: "openai", CCP_CODEX_API_KEY: "sk-test", CCP_CODEX_BASE_URL: "https://api.q1ngyuan.top" })
+  let calls = 0
+  globalThis.fetch = (async (_input: Request | URL | string, _init?: RequestInit) => {
+    calls++
+    if (calls === 1) throw new TypeError("The socket connection was closed unexpectedly")
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.close() } }), { status: 200 })
+  }) as typeof fetch
+
+  await postCodex(body, ctx)
+
+  expect(calls).toBe(2)
+})

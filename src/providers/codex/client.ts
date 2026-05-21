@@ -10,7 +10,7 @@ import { forceRefresh, getAuth } from "./auth/manager.ts"
 import type { Logger } from "../../log.ts"
 import type { RequestContext } from "../types.ts"
 import type { ResponsesRequest } from "./translate/request.ts"
-import { retryOn429 } from "../retry.ts"
+import { isTransientNetworkError, retryTransient } from "../retry.ts"
 import { mapUsageSnapshot, type RateLimitsSidecarWriter } from "./rate-limits.ts"
 
 declare const BUILD_VERSION: string | undefined
@@ -69,13 +69,16 @@ export async function postCodex(
   ctx: RequestContext,
 ): Promise<CodexResponse> {
   const log = ctx.childLogger("codex.client")
-  return retryOn429(() => attemptPostCodex(body, ctx, log), {
+  return retryTransient(() => attemptPostCodex(body, ctx, log), {
     log,
     signal: ctx.signal,
-    classify: (err) =>
-      err instanceof CodexError && err.status === 429
-        ? { retryAfter: err.meta?.retryAfter }
-        : undefined,
+    classify: (err) => {
+      if (err instanceof CodexError && err.status === 429) {
+        return { retryAfter: err.meta?.retryAfter, reason: "rate_limit" }
+      }
+      if (isTransientNetworkError(err)) return { reason: "network" }
+      return undefined
+    },
   })
 }
 
