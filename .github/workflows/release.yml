@@ -19,12 +19,28 @@ jobs:
         include:
           - target: bun-darwin-arm64
             platform: darwin-arm64
+            ext: ""
+            archive: tar.gz
           - target: bun-darwin-x64
             platform: darwin-amd64
+            ext: ""
+            archive: tar.gz
           - target: bun-linux-x64
             platform: linux-amd64
+            ext: ""
+            archive: tar.gz
           - target: bun-linux-arm64
             platform: linux-arm64
+            ext: ""
+            archive: tar.gz
+          - target: bun-windows-x64
+            platform: windows-amd64
+            ext: .exe
+            archive: zip
+          - target: bun-windows-arm64
+            platform: windows-arm64
+            ext: .exe
+            archive: zip
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
@@ -40,22 +56,38 @@ jobs:
           bun build ./src/cli.ts \
             --compile \
             --target=${{ matrix.target }} \
-            --define BUILD_VERSION="\"${VERSION}\"" \
-            --outfile dist/${BIN_NAME}
+            --define BUILD_VERSION="\"${VERSION#v}\"" \
+            --outfile dist/${BIN_NAME}${{ matrix.ext }}
       - name: Package
         run: |
-          archive="${BIN_NAME}-${{ matrix.platform }}.tar.gz"
-          tar -C dist -czf "$archive" ${BIN_NAME}
+          archive="${BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd dist && zip "../$archive" ${BIN_NAME}${{ matrix.ext }})
+          else
+            tar -C dist -czf "$archive" ${BIN_NAME}${{ matrix.ext }}
+          fi
           shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
           path: |
-            ${{ env.BIN_NAME }}-${{ matrix.platform }}.tar.gz
+            ${{ env.BIN_NAME }}-${{ matrix.platform }}.${{ matrix.archive }}
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
 
-  release:
+  smoke-windows:
     needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: windows-amd64
+      - shell: pwsh
+        run: |
+          Expand-Archive claude-code-proxy-windows-amd64.zip -DestinationPath .
+          .\claude-code-proxy.exe --version
+
+  release:
+    needs: [build, smoke-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -69,6 +101,7 @@ jobs:
           generate_release_notes: true
           files: |
             *.tar.gz
+            *.zip
             *.sha256
 
   update-tap:

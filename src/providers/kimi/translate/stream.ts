@@ -1,7 +1,11 @@
 import { encodeSseEvent } from "../../../sse.ts"
 import type { Logger } from "../../../log.ts"
-import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts"
+import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError, type KimiUsage } from "./reducer.ts"
 import { makeThinkingSignature } from "./signature.ts"
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError"
+}
 
 /**
  * Translate a Kimi chat-completions SSE stream into Anthropic SSE events.
@@ -15,6 +19,7 @@ export function translateStream(
     messageId: string
     model: string
     log: Logger
+    requestStartTime?: number
     onFinish?: (finish: {
       stopReason: "end_turn" | "tool_use" | "max_tokens"
       usage?: Parameters<typeof mapUsageToAnthropic>[0]
@@ -53,8 +58,19 @@ export function translateStream(
         emit("ping", { type: "ping" })
       }
 
+      const streamStart = Date.now()
+      let firstChunkAt: number | undefined
+      let reasoningChars = 0
+      let contentChars = 0
+      let toolCount = 0
+      let finishUsage: KimiUsage | undefined
+      let finishStopReason: string | undefined
+      const stats = { chunkCount: 0 }
+
       try {
-        for await (const e of reduceUpstream(upstream, opts.log)) {
+        for await (const e of reduceUpstream(upstream, stats, opts.log)) {
+          if (firstChunkAt === undefined) firstChunkAt = Date.now()
+
           switch (e.kind) {
             case "thinking-start":
               ensureMessageStart()
@@ -65,6 +81,7 @@ export function translateStream(
               })
               break
             case "thinking-delta":
+              reasoningChars += e.text.length
               emit("content_block_delta", {
                 type: "content_block_delta",
                 index: e.index,
@@ -95,6 +112,7 @@ export function translateStream(
               })
               break
             case "text-delta":
+              contentChars += e.text.length
               emit("content_block_delta", {
                 type: "content_block_delta",
                 index: e.index,
@@ -105,6 +123,7 @@ export function translateStream(
               emit("content_block_stop", { type: "content_block_stop", index: e.index })
               break
             case "tool-start":
+              toolCount++
               activeTools.set(e.index, { id: e.id, name: e.name })
               ensureMessageStart()
               emit("content_block_start", {
@@ -131,6 +150,8 @@ export function translateStream(
               break
             case "finish":
               ensureMessageStart()
+              finishUsage = e.usage
+              finishStopReason = e.stopReason
               opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage })
               emit("message_delta", {
                 type: "message_delta",
@@ -144,7 +165,9 @@ export function translateStream(
       } catch (err) {
         const activeToolNames = Array.from(activeTools.values(), (t) => t.name)
         const activeToolCalls = Array.from(activeTools.values())
-        if (err instanceof UpstreamStreamError) {
+        if (isAbortError(err)) {
+          opts.log.info("client disconnected")
+        } else if (err instanceof UpstreamStreamError) {
           opts.log.warn("upstream stream error", {
             kind: err.kind,
             message: err.message,
@@ -173,7 +196,26 @@ export function translateStream(
           })
         }
       } finally {
-        controller.close()
+        const now = Date.now()
+        const timeToFirstChunkMs = opts.requestStartTime && firstChunkAt
+          ? firstChunkAt - opts.requestStartTime
+          : undefined
+        opts.log.debug("stream summary", {
+          chunkCount: stats.chunkCount,
+          timeToFirstChunkMs,
+          streamDurationMs: firstChunkAt ? now - firstChunkAt : undefined,
+          totalMs: opts.requestStartTime ? now - opts.requestStartTime : now - streamStart,
+          reasoningChars,
+          contentChars,
+          toolCount,
+          stopReason: finishStopReason,
+          usage: finishUsage,
+        })
+        try {
+          controller.close()
+        } catch {
+          // ignore if controller already errored or cancelled
+        }
       }
     },
   })

@@ -1,4 +1,4 @@
-import { CLIENT_ID, OAUTH_HOST } from "./constants.ts"
+import { CLIENT_ID, oauthHost } from "./constants.ts"
 import { commonHeaders } from "./headers.ts"
 
 export interface TokenResponse {
@@ -24,7 +24,7 @@ const POLL_SAFETY_MARGIN_MS = 500
 export async function runDeviceLogin(): Promise<TokenResponse> {
   const headers = await commonHeaders()
 
-  const initResp = await fetch(`${OAUTH_HOST}/api/oauth/device_authorization`, {
+  const initResp = await fetch(`${oauthHost()}/api/oauth/device_authorization`, {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ client_id: CLIENT_ID }).toString(),
@@ -39,7 +39,7 @@ export async function runDeviceLogin(): Promise<TokenResponse> {
   console.log(`Code:  ${auth.user_code}\n`)
 
   while (true) {
-    const resp = await fetch(`${OAUTH_HOST}/api/oauth/token`, {
+    const resp = await fetch(`${oauthHost()}/api/oauth/token`, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({

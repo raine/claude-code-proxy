@@ -1,12 +1,12 @@
-import { mkdir, appendFile, stat, rename } from "node:fs/promises"
+import { mkdir, stat, rename } from "node:fs/promises"
 import { createWriteStream, type WriteStream } from "node:fs"
-import { join } from "node:path"
-import { homedir } from "node:os"
+import { dirname } from "node:path"
+import { logFile } from "./paths.ts"
+import { logStderr, logVerbose } from "./config.ts"
 
 const MAX_LOG_BYTES = 20 * 1024 * 1024 // 20 MiB
-const REDACT_KEYS = new Set([
+export const REDACT_KEYS = new Set([
   "authorization",
-  "Authorization",
   "access",
   "access_token",
   "refresh",
@@ -14,18 +14,14 @@ const REDACT_KEYS = new Set([
   "id_token",
   "code",
   "code_verifier",
-  "ChatGPT-Account-Id",
   "chatgpt-account-id",
   "x-api-key",
 ])
 
-export function stateDir(): string {
-  const base = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state")
-  return join(base, "claude-code-proxy")
-}
+export { logFile }
 
 export function logDir(): string {
-  return stateDir()
+  return dirname(logFile())
 }
 
 let stream: WriteStream | undefined
@@ -33,10 +29,9 @@ let rotating: Promise<void> | undefined
 
 async function ensureStream(): Promise<WriteStream> {
   if (stream) return stream
-  const dir = stateDir()
-  await mkdir(dir, { recursive: true })
-  const file = join(dir, "proxy.log")
-  stream = createWriteStream(file, { flags: "a" })
+  const file = logFile()
+  await mkdir(dirname(file), { recursive: true })
+  stream = createWriteStream(file, { flags: "a", mode: 0o600 })
   return stream
 }
 
@@ -44,16 +39,15 @@ async function maybeRotate(): Promise<void> {
   if (rotating) return rotating
   rotating = (async () => {
     try {
-      const dir = stateDir()
-      const file = join(dir, "proxy.log")
+      const file = logFile()
       const s = await stat(file).catch(() => undefined)
       if (!s || s.size < MAX_LOG_BYTES) return
-      const rotated = join(dir, `proxy.log.${Date.now()}`)
+      const rotated = `${file}.${Date.now()}`
+      await rename(file, rotated)
       if (stream) {
         stream.end()
         stream = undefined
       }
-      await rename(file, rotated).catch(() => {})
     } catch {
       // Never propagate rotation errors — logging must never crash the proxy.
     } finally {
@@ -63,20 +57,18 @@ async function maybeRotate(): Promise<void> {
   return rotating
 }
 
-const VERBOSE = !!process.env.CCP_LOG_VERBOSE
-
 function redact(value: unknown, depth = 0): unknown {
   if (depth > 6) return "[depth-limit]"
   if (value == null) return value
   if (typeof value === "string") {
-    if (!VERBOSE && value.length > 4000) return value.slice(0, 4000) + `…[${value.length - 4000} more]`
+    if (!logVerbose() && value.length > 4000) return value.slice(0, 4000) + `…[${value.length - 4000} more]`
     return value
   }
   if (typeof value !== "object") return value
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1))
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (REDACT_KEYS.has(k)) {
+    if (REDACT_KEYS.has(k.toLowerCase())) {
       out[k] = typeof v === "string" ? `[redacted len=${v.length}]` : "[redacted]"
     } else {
       out[k] = redact(v, depth + 1)
@@ -102,7 +94,7 @@ async function write(level: Level, service: string, msg: string, fields?: Record
   } catch {
     // swallow; also print to stderr for visibility
   }
-  if (level === "error" || level === "warn" || process.env.CCP_LOG_STDERR) {
+  if (level === "error" || level === "warn" || logStderr()) {
     process.stderr.write(line + "\n")
   }
 }

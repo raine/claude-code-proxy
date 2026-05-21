@@ -1,6 +1,7 @@
-import { mkdir, readFile, writeFile, chmod, unlink, rename } from "node:fs/promises"
+import { mkdir, readFile, writeFile, unlink, rename } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { homedir } from "node:os"
+import { keychainGet, keychainSet, keychainDelete } from "../../../keychain.ts"
+import { codexAuthFile, legacyConfigDir } from "../../../paths.ts"
 
 export interface StoredAuth {
   access: string
@@ -9,23 +10,33 @@ export interface StoredAuth {
   accountId?: string
 }
 
-const DIR = join(homedir(), ".config", "claude-code-proxy", "codex")
-const FILE = join(DIR, "auth.json")
+function file(): string {
+  return codexAuthFile()
+}
+function legacyFile(): string {
+  return join(legacyConfigDir(), "codex", "auth.json")
+}
 const KEYCHAIN_SERVICE = "claude-code-proxy.codex"
 const KEYCHAIN_ACCOUNT = "auth"
 
 export async function loadAuth(): Promise<StoredAuth | undefined> {
   if (process.platform === "darwin") {
-    const raw = await readKeychain().catch((err: Error & { code?: number }) => {
-      if (err.code === 44) return undefined
-      throw err
-    })
+    const raw = keychainGet(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
     if (!raw) return undefined
     return JSON.parse(raw) as StoredAuth
   }
 
+  const primary = file()
   try {
-    const raw = await readFile(FILE, "utf8")
+    const raw = await readFile(primary, "utf8")
+    return JSON.parse(raw) as StoredAuth
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") throw err
+  }
+  const legacy = legacyFile()
+  if (legacy === primary) return undefined
+  try {
+    const raw = await readFile(legacy, "utf8")
     return JSON.parse(raw) as StoredAuth
   } catch (err: any) {
     if (err?.code === "ENOENT") return undefined
@@ -35,70 +46,32 @@ export async function loadAuth(): Promise<StoredAuth | undefined> {
 
 export async function saveAuth(auth: StoredAuth): Promise<void> {
   if (process.platform === "darwin") {
-    await runSecurity([
-      "add-generic-password",
-      "-U",
-      "-a",
-      KEYCHAIN_ACCOUNT,
-      "-s",
-      KEYCHAIN_SERVICE,
-      "-w",
-      JSON.stringify(auth),
-    ])
+    keychainSet(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, JSON.stringify(auth))
     return
   }
 
-  await mkdir(dirname(FILE), { recursive: true })
-  const tmp = `${FILE}.${process.pid}.${Date.now()}.tmp`
+  const path = file()
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`
   await writeFile(tmp, JSON.stringify(auth, null, 2), { encoding: "utf8", mode: 0o600 })
-  try {
-    await chmod(tmp, 0o600)
-  } catch {
-    // best-effort; mode in writeFile options usually suffices
-  }
-  await rename(tmp, FILE)
+  await rename(tmp, path)
 }
 
 export async function clearAuth(): Promise<void> {
   if (process.platform === "darwin") {
-    await runSecurity(["delete-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE]).catch(
-      (err: Error & { code?: number }) => {
-        if (err.code !== 44) throw err
-      },
-    )
+    keychainDelete(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
     return
   }
 
-  try {
-    await unlink(FILE)
-  } catch (err: any) {
-    if (err?.code !== "ENOENT") throw err
+  for (const path of [file(), legacyFile()]) {
+    try {
+      await unlink(path)
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err
+    }
   }
 }
 
 export function authPath(): string {
-  return process.platform === "darwin" ? "macOS Keychain" : FILE
-}
-
-async function readKeychain(): Promise<string> {
-  const { stdout } = await runSecurity(["find-generic-password", "-w", "-a", KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE])
-  return stdout.trim()
-}
-
-async function runSecurity(args: string[]): Promise<{ stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["security", ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  if (exitCode !== 0) {
-    const err = new Error(stderr.trim() || `security exited with ${exitCode}`) as Error & { code?: number }
-    err.code = exitCode
-    throw err
-  }
-  return { stdout, stderr }
+  return process.platform === "darwin" ? "macOS Keychain" : file()
 }

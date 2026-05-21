@@ -19,11 +19,8 @@ export interface CliHandlers {
 
 export interface Provider {
   name: string
-  // Unambiguous model identifiers this provider claims. The server uses
-  // these to dispatch a request body's `model` field to the right
-  // provider when multiple are registered. Cross-provider aliases like
-  // `haiku`/`sonnet` are deliberately excluded — they fall back to the
-  // default provider.
+  // Unambiguous model identifiers this provider claims. Cross-provider
+  // Anthropic-style aliases are resolved by registry-level alias routing.
   supportedModels: Set<string>
   handleMessages(body: AnthropicRequest, ctx: RequestContext): Promise<Response>
   handleCountTokens(body: AnthropicRequest, ctx: RequestContext): Promise<Response>

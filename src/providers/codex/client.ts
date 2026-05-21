@@ -1,9 +1,14 @@
-import { CODEX_API_ENDPOINT, ORIGINATOR, USAGE_API_ENDPOINT } from "./auth/constants.ts"
+import { CODEX_API_ENDPOINT, ORIGINATOR as ORIGINATOR_DEFAULT, USAGE_API_ENDPOINT } from "./auth/constants.ts"
+import { codexBaseUrl, codexOriginator, codexUserAgent } from "../../config.ts"
 import { forceRefresh, getAuth } from "./auth/manager.ts"
 import type { Logger } from "../../log.ts"
 import type { RequestContext } from "../types.ts"
 import type { ResponsesRequest } from "./translate/request.ts"
+import { retryOn429 } from "../retry.ts"
 import { mapUsageSnapshot, type RateLimitsSidecarWriter } from "./rate-limits.ts"
+
+declare const BUILD_VERSION: string | undefined
+const PROXY_VERSION = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev"
 
 export interface CodexResponse {
   body: ReadableStream<Uint8Array>
@@ -45,6 +50,21 @@ export async function postCodex(
   ctx: RequestContext,
 ): Promise<CodexResponse> {
   const log = ctx.childLogger("codex.client")
+  return retryOn429(() => attemptPostCodex(body, ctx, log), {
+    log,
+    signal: ctx.signal,
+    classify: (err) =>
+      err instanceof CodexError && err.status === 429
+        ? { retryAfter: err.meta?.retryAfter }
+        : undefined,
+  })
+}
+
+async function attemptPostCodex(
+  body: ResponsesRequest,
+  ctx: RequestContext,
+  log: Logger,
+): Promise<CodexResponse> {
   const rateLimitsTracker = new RateLimitsTracker()
   let auth = await getAuth()
   let resp = await doFetch(auth.access, auth.accountId, body, log, ctx.signal, ctx.sessionId)
@@ -95,10 +115,12 @@ async function fetchUsageSnapshot(
   const auth = await getAuth()
   const headers = new Headers({
     authorization: `Bearer ${auth.access}`,
-    originator: ORIGINATOR,
+    originator: codexOriginator(ORIGINATOR_DEFAULT),
   })
+  const userAgent = codexUserAgent(`claude-code-proxy/${PROXY_VERSION}`)
+  if (userAgent) headers.set("User-Agent", userAgent)
   if (accountId ?? auth.accountId) headers.set("ChatGPT-Account-Id", accountId ?? auth.accountId ?? "")
-  const resp = await fetch(USAGE_API_ENDPOINT, { headers, signal })
+  const resp = await fetch(codexBaseUrl(USAGE_API_ENDPOINT), { headers, signal })
   if (!resp.ok) {
     log.warn("usage refresh returned non-ok", { status: resp.status })
     return null
@@ -118,9 +140,11 @@ async function doFetch(
     "Content-Type": "application/json",
     accept: "text/event-stream",
     authorization: `Bearer ${accessToken}`,
-    originator: ORIGINATOR,
+    originator: codexOriginator(ORIGINATOR_DEFAULT),
     "openai-beta": "responses=experimental",
   })
+  const userAgent = codexUserAgent(`claude-code-proxy/${PROXY_VERSION}`)
+  if (userAgent) headers.set("User-Agent", userAgent)
   if (accountId) headers.set("ChatGPT-Account-Id", accountId)
   if (sessionId) {
     headers.set("session_id", sessionId)
@@ -128,14 +152,16 @@ async function doFetch(
     headers.set("x-codex-window-id", `${sessionId}:0`)
   }
 
+  const codexUrl = codexBaseUrl(CODEX_API_ENDPOINT)
+
   log.debug("posting to codex", {
-    url: CODEX_API_ENDPOINT,
+    url: codexUrl,
     model: body.model,
     inputCount: body.input.length,
     toolCount: body.tools?.length ?? 0,
   })
 
-  return fetch(CODEX_API_ENDPOINT, {
+  return fetch(codexUrl, {
     method: "POST",
     headers,
     body: JSON.stringify(body),

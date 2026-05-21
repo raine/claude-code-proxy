@@ -1,11 +1,13 @@
 import type { AnthropicRequest } from "../../anthropic/schema.ts"
 import type { Provider, RequestContext, CliHandlers } from "../types.ts"
 import {
+  ALLOWED_MODELS,
   assertAllowedModel,
+  FAST_MODEL_ALIASES,
   ModelNotAllowedError,
-  resolveModel,
+  resolveModelRequest,
 } from "./translate/model-allowlist.ts"
-import { translateRequest } from "./translate/request.ts"
+import { InvalidServiceTierError, translateRequest } from "./translate/request.ts"
 import { translateStream } from "./translate/stream.ts"
 import { accumulateResponse, UpstreamStreamError } from "./translate/accumulate.ts"
 import { mapUsageToAnthropic } from "./translate/reducer.ts"
@@ -15,9 +17,9 @@ import { runBrowserLogin } from "./auth/pkce.ts"
 import { runDeviceLogin } from "./auth/device.ts"
 import { persistInitialTokens } from "./auth/manager.ts"
 import { loadAuth, authPath, clearAuth } from "./auth/token-store.ts"
+import { logVerbose } from "../../config.ts"
 import { RateLimitsSidecarWriter } from "./rate-limits.ts"
 
-const VERBOSE = !!process.env.CCP_LOG_VERBOSE
 const rateLimitsWriter = new RateLimitsSidecarWriter()
 
 interface SessionCountSnapshot {
@@ -85,10 +87,29 @@ function jsonError(status: number, type: string, message: string): Response {
   })
 }
 
+function invalidServiceTierResponse(err: InvalidServiceTierError): Response {
+  return jsonError(400, "invalid_request_error", err.message)
+}
+
 async function handleCountTokens(body: AnthropicRequest, ctx: RequestContext): Promise<Response> {
   const log = ctx.childLogger("provider.codex")
-  const resolvedModel = resolveModel(body.model)
-  const translated = translateRequest({ ...body, model: resolvedModel })
+  const resolved = resolveModelRequest(body.model)
+  const resolvedModel = resolved.model
+  let translated
+  try {
+    assertAllowedModel(resolvedModel)
+    translated = translateRequest({ ...body, model: resolvedModel }, { serviceTier: resolved.serviceTier })
+  } catch (err) {
+    if (err instanceof ModelNotAllowedError) {
+      return jsonError(
+        400,
+        "invalid_request_error",
+        `Model "${body.model}" resolves to unsupported model "${err.model}"`,
+      )
+    }
+    if (err instanceof InvalidServiceTierError) return invalidServiceTierResponse(err)
+    throw err
+  }
   const tokens = countTranslatedTokens(translated)
   const messageCount = body.messages?.length ?? 0
   const toolCount = body.tools?.length ?? 0
@@ -103,7 +124,7 @@ async function handleCountTokens(body: AnthropicRequest, ctx: RequestContext): P
       tokens,
     }
   }
-  if (VERBOSE) {
+  if (logVerbose()) {
     log.info("compaction telemetry", {
       phase: "count_tokens",
       model: body.model,
@@ -142,12 +163,18 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     hasContextManagement: contextManagement !== undefined,
     hasJsonSchemaFormat: body.output_config?.format?.type === "json_schema",
   })
-  if (VERBOSE) log.debug("anthropic request body", { body })
+  if (logVerbose()) log.debug("anthropic request body", { body })
 
-  const resolvedModel = resolveModel(body.model)
+  const resolved = resolveModelRequest(body.model)
+  const resolvedModel = resolved.model
 
+  let translated
   try {
     assertAllowedModel(resolvedModel)
+    translated = translateRequest(
+      { ...body, model: resolvedModel },
+      { sessionId: ctx.sessionId, serviceTier: resolved.serviceTier },
+    )
   } catch (err) {
     if (err instanceof ModelNotAllowedError) {
       return jsonError(
@@ -156,12 +183,11 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
         `Model "${body.model}" resolves to unsupported model "${err.model}"`,
       )
     }
+    if (err instanceof InvalidServiceTierError) return invalidServiceTierResponse(err)
     throw err
   }
-
-  const translated = translateRequest({ ...body, model: resolvedModel }, { sessionId: ctx.sessionId })
-  const localInputTokens = VERBOSE ? countTokens(body) : undefined
-  const translatedInputTokens = VERBOSE ? countTranslatedTokens(translated) : undefined
+  const localInputTokens = logVerbose() ? countTokens(body) : undefined
+  const translatedInputTokens = logVerbose() ? countTranslatedTokens(translated) : undefined
   if (state) {
     state.lastMessage = {
       reqId: ctx.reqId,
@@ -182,8 +208,8 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     hasContextManagement: contextManagement !== undefined,
     promptCacheKey: translated.prompt_cache_key,
   })
-  if (VERBOSE) log.debug("translated request body", { body: translated })
-  if (VERBOSE) {
+  if (logVerbose()) log.debug("translated request body", { body: translated })
+  if (logVerbose()) {
     log.info("compaction telemetry", {
       phase: "translated_request",
       requestedModel: body.model,
@@ -240,7 +266,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       rateLimitsWriter,
       rateLimitsTracker: upstream.rateLimitsTracker,
       signal: ctx.signal,
-      onFinish: VERBOSE
+      onFinish: logVerbose()
         ? (finish) => {
             const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined
             log.info("compaction telemetry", {
@@ -291,7 +317,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       rateLimitsTracker: upstream.rateLimitsTracker,
       signal: ctx.signal,
     })
-    if (VERBOSE) {
+    if (logVerbose()) {
       const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)
       log.info("compaction telemetry", {
         phase: "upstream_finish",
@@ -376,7 +402,7 @@ const cli: CliHandlers = {
 
 export const codexProvider: Provider = {
   name: "codex",
-  supportedModels: new Set(["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini"]),
+  supportedModels: new Set([...ALLOWED_MODELS, ...FAST_MODEL_ALIASES]),
   handleMessages,
   handleCountTokens,
   cli,

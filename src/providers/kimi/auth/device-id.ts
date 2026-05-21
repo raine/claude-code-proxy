@@ -1,22 +1,30 @@
 import { mkdir, readFile, writeFile, chmod } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { homedir } from "node:os"
+import { kimiDeviceIdFile, legacyConfigDir } from "../../../paths.ts"
 
-const PATH = join(homedir(), ".config", "claude-code-proxy", "kimi", "device_id")
+function path(): string {
+  return kimiDeviceIdFile()
+}
+function legacyPath(): string {
+  return join(legacyConfigDir(), "kimi", "device_id")
+}
 
 export async function getDeviceId(): Promise<string> {
-  try {
-    const raw = await readFile(PATH, "utf8")
-    const trimmed = raw.trim()
-    if (trimmed) return trimmed
-  } catch (err: any) {
-    if (err?.code !== "ENOENT") throw err
+  for (const candidate of [path(), legacyPath()]) {
+    try {
+      const raw = await readFile(candidate, "utf8")
+      const trimmed = raw.trim()
+      if (trimmed) return trimmed
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err
+    }
   }
   const id = crypto.randomUUID().replace(/-/g, "")
-  await mkdir(dirname(PATH), { recursive: true })
-  await writeFile(PATH, id, { encoding: "utf8", mode: 0o600 })
+  const target = path()
+  await mkdir(dirname(target), { recursive: true })
+  await writeFile(target, id, { encoding: "utf8", mode: 0o600 })
   try {
-    await chmod(PATH, 0o600)
+    await chmod(target, 0o600)
   } catch {}
   return id
 }

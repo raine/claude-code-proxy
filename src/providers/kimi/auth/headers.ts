@@ -1,6 +1,7 @@
 import { hostname, release, arch, platform } from "node:os"
 import { KIMI_CLI_VERSION } from "./constants.ts"
 import { getDeviceId } from "./device-id.ts"
+import { kimiUserAgent } from "../../../config.ts"
 
 function deviceModel(): string {
   const a = arch()
@@ -25,6 +26,6 @@ export async function commonHeaders(): Promise<Record<string, string>> {
     "X-Msh-Device-Model": asciiOnly(deviceModel()),
     "X-Msh-Os-Version": asciiOnly(release()),
     "X-Msh-Device-Id": deviceId,
-    "User-Agent": `KimiCLI/${KIMI_CLI_VERSION}`,
+    "User-Agent": kimiUserAgent(`KimiCLI/${KIMI_CLI_VERSION}`),
   }
 }

@@ -1,6 +1,7 @@
 import { mkdir, rename, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { createLogger, stateDir } from "../../log.ts"
+import { createLogger } from "../../log.ts"
+import { stateDir } from "../../paths.ts"
 
 const log = createLogger("codex.rate-limits")
 

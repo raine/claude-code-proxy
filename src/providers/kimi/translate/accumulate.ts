@@ -44,8 +44,12 @@ export async function accumulateResponse(
   let stopReason: AnthropicNonStreamResponse["stop_reason"] = null
   let usage: ReturnType<typeof mapUsageToAnthropic> | undefined
   let rawUsage: KimiUsage | undefined
+  let reasoningChars = 0
+  let contentChars = 0
+  let toolCount = 0
+  const stats = { chunkCount: 0 }
 
-  for await (const e of reduceUpstream(upstream, opts.log)) {
+  for await (const e of reduceUpstream(upstream, stats, opts.log)) {
     switch (e.kind) {
       case "thinking-start":
         blocks.set(e.index, { kind: "thinking", text: "" })
@@ -53,7 +57,10 @@ export async function accumulateResponse(
         break
       case "thinking-delta": {
         const b = blocks.get(e.index)
-        if (b?.kind === "thinking") b.text += e.text
+        if (b?.kind === "thinking") {
+          b.text += e.text
+          reasoningChars += e.text.length
+        }
         break
       }
       case "text-start":
@@ -62,10 +69,14 @@ export async function accumulateResponse(
         break
       case "text-delta": {
         const b = blocks.get(e.index)
-        if (b?.kind === "text") b.text += e.text
+        if (b?.kind === "text") {
+          b.text += e.text
+          contentChars += e.text.length
+        }
         break
       }
       case "tool-start":
+        toolCount++
         blocks.set(e.index, { kind: "tool", id: e.id, name: e.name, args: "" })
         ordered.push(e.index)
         break
@@ -109,6 +120,15 @@ export async function accumulateResponse(
       content.push({ type: "tool_use", id: b.id, name: b.name, input })
     }
   }
+
+  opts.log.debug("accumulate summary", {
+    chunkCount: stats.chunkCount,
+    reasoningChars,
+    contentChars,
+    toolCount,
+    stopReason,
+    usage: rawUsage,
+  })
 
   return {
     rawUsage,
