@@ -44,14 +44,8 @@ interface ToolState {
   name: string
   argsAccum: string
   hadDelta: boolean
-  bufferUntilDone: boolean
-  emittedArgs: boolean
 }
 type BlockState = TextState | ToolState
-
-function shouldBufferToolArgs(name: string): boolean {
-  return name === "Read"
-}
 
 function sanitizeToolArgs(name: string, args: string): string {
   if (name !== "Read" || !args) return args
@@ -138,10 +132,7 @@ export async function* reduceUpstream(
           name: item.name,
           argsAccum: "",
           hadDelta: false,
-          bufferUntilDone: shouldBufferToolArgs(item.name),
-          emittedArgs: false,
         })
-        yield { kind: "tool-start", index: idx, id: item.call_id, name: item.name }
         continue
       }
 
@@ -172,10 +163,6 @@ export async function* reduceUpstream(
       if (!delta) continue
       state.argsAccum += delta
       state.hadDelta = true
-      if (!state.bufferUntilDone) {
-        state.emittedArgs = true
-        yield { kind: "tool-delta", index: state.index, partialJson: delta }
-      }
       continue
     }
 
@@ -205,13 +192,7 @@ export async function* reduceUpstream(
           (typeof item.arguments === "string" && item.arguments.length
             ? item.arguments
             : state.argsAccum) || ""
-        if (finalArgs.length) {
-          state.argsAccum = sanitizeToolArgs(state.name, finalArgs)
-          if (state.bufferUntilDone || !state.emittedArgs) {
-            state.emittedArgs = true
-            yield { kind: "tool-delta", index: state.index, partialJson: state.argsAccum }
-          }
-        }
+        state.argsAccum = sanitizeToolArgs(state.name, finalArgs)
       }
       if (state.kind === "text") {
         log.debug("text block complete", { index: state.index, text: state.textAccum })
@@ -223,6 +204,10 @@ export async function* reduceUpstream(
           name: state.name,
           args: state.argsAccum,
         })
+        yield { kind: "tool-start", index: state.index, id: state.callId, name: state.name }
+        if (state.argsAccum.length) {
+          yield { kind: "tool-delta", index: state.index, partialJson: state.argsAccum }
+        }
         yield { kind: "tool-stop", index: state.index }
       }
       blocksByOutputIndex.delete(p.output_index)
