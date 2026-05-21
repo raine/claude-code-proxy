@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test"
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -11,6 +11,8 @@ import {
   codexEffort,
   codexServiceTier,
   codexBaseUrl,
+  codexAuthMode,
+  codexApiKey,
   aliasProvider,
   kimiUserAgent,
   kimiOauthHost,
@@ -21,14 +23,21 @@ import {
 
 let dir: string
 let configPath: string
+let codexDir: string
+let codexConfigPath: string
+let codexAuthPath: string
 
 function setEnv(env: NodeJS.ProcessEnv) {
-  loadConfig({ configPath, env, forceReload: true })
+  loadConfig({ configPath, env: { HOME: dir, ...env }, forceReload: true })
 }
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "ccp-config-"))
   configPath = join(dir, "config.json")
+  codexDir = join(dir, ".codex")
+  codexConfigPath = join(codexDir, "config.toml")
+  codexAuthPath = join(codexDir, "auth.json")
+  mkdirSync(codexDir, { recursive: true })
 })
 
 afterEach(() => {
@@ -48,6 +57,8 @@ describe("config defaults", () => {
     expect(codexEffort()).toBeUndefined()
     expect(codexServiceTier()).toBeUndefined()
     expect(codexBaseUrl("default-codex-url")).toBe("default-codex-url")
+    expect(codexAuthMode()).toBeUndefined()
+    expect(codexApiKey()).toBeUndefined()
     expect(aliasProvider()).toBe("codex")
     expect(kimiUserAgent("default-kimi-ua")).toBe("default-kimi-ua")
     expect(kimiOauthHost()).toBe("https://auth.kimi.com")
@@ -77,6 +88,13 @@ describe("file overrides default", () => {
     writeFileSync(configPath, JSON.stringify({ codex: { serviceTier: "fast" } }))
     setEnv({})
     expect(codexServiceTier()).toBe("fast")
+  })
+
+  it("codex.authMode and apiKey from config.json", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { authMode: "openai", apiKey: "sk-file" } }))
+    setEnv({})
+    expect(codexAuthMode()).toBe("openai")
+    expect(codexApiKey()).toBe("sk-file")
   })
 
   it("codex.baseUrl from config.json", () => {
@@ -136,6 +154,27 @@ describe("env overrides file", () => {
     expect(codexServiceTier()).toBe("fast")
   })
 
+  it("CCP_CODEX_AUTH_MODE and CCP_CODEX_API_KEY env win over config", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { authMode: "chatgpt", apiKey: "sk-file" } }))
+    setEnv({ CCP_CODEX_AUTH_MODE: "openai", CCP_CODEX_API_KEY: "sk-env" })
+    expect(codexAuthMode()).toBe("openai")
+    expect(codexApiKey()).toBe("sk-env")
+  })
+
+  it("reads active Codex CLI provider base URL and auth API key as fallbacks", () => {
+    writeFileSync(codexConfigPath, `model_provider = "sub2api"\n\n[model_providers.sub2api]\nbase_url = "https://api.q1ngyuan.top"\nwire_api = "responses"\n`)
+    writeFileSync(codexAuthPath, JSON.stringify({ OPENAI_API_KEY: "sk-codex" }))
+    setEnv({})
+    expect(codexBaseUrl("default")).toBe("https://api.q1ngyuan.top/v1/responses")
+    expect(codexApiKey()).toBe("sk-codex")
+  })
+
+  it("OPENAI_API_KEY env is a fallback for Codex API key", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { apiKey: "sk-file" } }))
+    setEnv({ OPENAI_API_KEY: "sk-openai" })
+    expect(codexApiKey()).toBe("sk-openai")
+  })
+
   it("CCP_CODEX_BASE_URL env wins over config", () => {
     writeFileSync(
       configPath,
@@ -178,6 +217,13 @@ describe("empty-string semantics", () => {
   it("empty CCP_CODEX_MODEL env with no file value returns undefined", () => {
     setEnv({ CCP_CODEX_MODEL: "" })
     expect(codexModel()).toBeUndefined()
+  })
+
+  it("empty CCP_CODEX_AUTH_MODE and CCP_CODEX_API_KEY env fall through to file values", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { authMode: "openai", apiKey: "sk-file" } }))
+    setEnv({ CCP_CODEX_AUTH_MODE: "", CCP_CODEX_API_KEY: "" })
+    expect(codexAuthMode()).toBe("openai")
+    expect(codexApiKey()).toBe("sk-file")
   })
 
   it("empty CCP_CODEX_SERVICE_TIER env falls through to file value", () => {

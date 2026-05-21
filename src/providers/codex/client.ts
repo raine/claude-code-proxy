@@ -1,5 +1,11 @@
 import { CODEX_API_ENDPOINT, ORIGINATOR as ORIGINATOR_DEFAULT, USAGE_API_ENDPOINT } from "./auth/constants.ts"
-import { codexBaseUrl, codexOriginator, codexUserAgent } from "../../config.ts"
+import {
+  codexApiKey,
+  codexAuthMode,
+  codexBaseUrl,
+  codexOriginator,
+  codexUserAgent,
+} from "../../config.ts"
 import { forceRefresh, getAuth } from "./auth/manager.ts"
 import type { Logger } from "../../log.ts"
 import type { RequestContext } from "../types.ts"
@@ -9,6 +15,14 @@ import { mapUsageSnapshot, type RateLimitsSidecarWriter } from "./rate-limits.ts
 
 declare const BUILD_VERSION: string | undefined
 const PROXY_VERSION = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev"
+
+export type CodexAuthKind = "chatgpt" | "openai"
+
+interface CodexAuthContext {
+  kind: CodexAuthKind
+  token: string
+  accountId?: string
+}
 
 export interface CodexResponse {
   body: ReadableStream<Uint8Array>
@@ -20,6 +34,11 @@ export interface CodexResponse {
 
 export class RateLimitsTracker {
   private seen = false
+  private readonly enabled: boolean
+
+  constructor(opts: { enabled?: boolean } = {}) {
+    this.enabled = opts.enabled ?? true
+  }
 
   markSeen(): void {
     this.seen = true
@@ -32,7 +51,7 @@ export class RateLimitsTracker {
     rateLimitsWriter?: RateLimitsSidecarWriter
     log: Logger
   }): Promise<void> {
-    if (this.seen || !opts.success || !opts.rateLimitsWriter) return
+    if (!this.enabled || this.seen || !opts.success || !opts.rateLimitsWriter) return
     try {
       const snapshot = await fetchUsageSnapshot(opts.accountId, opts.signal, opts.log)
       if (snapshot) {
@@ -65,15 +84,15 @@ async function attemptPostCodex(
   ctx: RequestContext,
   log: Logger,
 ): Promise<CodexResponse> {
-  const rateLimitsTracker = new RateLimitsTracker()
-  let auth = await getAuth()
-  let resp = await doFetch(auth.access, auth.accountId, body, log, ctx.signal, ctx.sessionId)
+  let auth = await getCodexAuth()
+  const rateLimitsTracker = new RateLimitsTracker({ enabled: auth.kind === "chatgpt" })
+  let resp = await doFetch(auth, body, log, ctx.signal, ctx.sessionId)
 
-  if (resp.status === 401) {
+  if (resp.status === 401 && auth.kind === "chatgpt") {
     log.warn("got 401, refreshing token", {})
     try {
-      auth = await forceRefresh()
-      resp = await doFetch(auth.access, auth.accountId, body, log, ctx.signal, ctx.sessionId)
+      auth = chatgptAuth(await forceRefresh())
+      resp = await doFetch(auth, body, log, ctx.signal, ctx.sessionId)
     } catch (err) {
       log.error("refresh after 401 failed", { err: String(err) })
     }
@@ -107,19 +126,43 @@ async function attemptPostCodex(
   }
 }
 
+async function getCodexAuth(): Promise<CodexAuthContext> {
+  const mode = codexAuthMode() ?? "auto"
+  const apiKey = codexApiKey()
+  if (mode === "openai") {
+    if (!apiKey) throw new Error("OpenAI-compatible Codex auth selected but no API key found. Set CCP_CODEX_API_KEY or OPENAI_API_KEY.")
+    return openaiAuth(apiKey)
+  }
+  if (mode === "auto" && apiKey && !isChatGptBackendUrl(codexBaseUrl(CODEX_API_ENDPOINT))) {
+    return openaiAuth(apiKey)
+  }
+  return chatgptAuth(await getAuth())
+}
+
+function openaiAuth(apiKey: string): CodexAuthContext {
+  return { kind: "openai", token: apiKey }
+}
+
+function chatgptAuth(auth: { access: string; accountId?: string }): CodexAuthContext {
+  return { kind: "chatgpt", token: auth.access, accountId: auth.accountId }
+}
+
+function isChatGptBackendUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl)
+    return url.hostname === "chatgpt.com" && url.pathname.includes("/backend-api/")
+  } catch {
+    return false
+  }
+}
+
 async function fetchUsageSnapshot(
   accountId: string | undefined,
   signal: AbortSignal | undefined,
   log: Logger,
 ) {
-  const auth = await getAuth()
-  const headers = new Headers({
-    authorization: `Bearer ${auth.access}`,
-    originator: codexOriginator(ORIGINATOR_DEFAULT),
-  })
-  const userAgent = codexUserAgent(`claude-code-proxy/${PROXY_VERSION}`)
-  if (userAgent) headers.set("User-Agent", userAgent)
-  if (accountId ?? auth.accountId) headers.set("ChatGPT-Account-Id", accountId ?? auth.accountId ?? "")
+  const auth = chatgptAuth(await getAuth())
+  const headers = codexHeaders(auth)
   const resp = await fetch(codexBaseUrl(USAGE_API_ENDPOINT), { headers, signal })
   if (!resp.ok) {
     log.warn("usage refresh returned non-ok", { status: resp.status })
@@ -129,33 +172,18 @@ async function fetchUsageSnapshot(
 }
 
 async function doFetch(
-  accessToken: string,
-  accountId: string | undefined,
+  auth: CodexAuthContext,
   body: ResponsesRequest,
   log: Logger,
   signal?: AbortSignal,
   sessionId?: string,
 ): Promise<Response> {
-  const headers = new Headers({
-    "Content-Type": "application/json",
-    accept: "text/event-stream",
-    authorization: `Bearer ${accessToken}`,
-    originator: codexOriginator(ORIGINATOR_DEFAULT),
-    "openai-beta": "responses=experimental",
-  })
-  const userAgent = codexUserAgent(`claude-code-proxy/${PROXY_VERSION}`)
-  if (userAgent) headers.set("User-Agent", userAgent)
-  if (accountId) headers.set("ChatGPT-Account-Id", accountId)
-  if (sessionId) {
-    headers.set("session_id", sessionId)
-    headers.set("x-client-request-id", sessionId)
-    headers.set("x-codex-window-id", `${sessionId}:0`)
-  }
-
+  const headers = codexHeaders(auth, sessionId)
   const codexUrl = codexBaseUrl(CODEX_API_ENDPOINT)
 
   log.debug("posting to codex", {
     url: codexUrl,
+    authKind: auth.kind,
     model: body.model,
     inputCount: body.input.length,
     toolCount: body.tools?.length ?? 0,
@@ -167,6 +195,29 @@ async function doFetch(
     body: JSON.stringify(body),
     signal,
   })
+}
+
+function codexHeaders(auth: CodexAuthContext, sessionId?: string): Headers {
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    accept: "text/event-stream",
+    authorization: `Bearer ${auth.token}`,
+  })
+  const userAgent = codexUserAgent(`claude-code-proxy/${PROXY_VERSION}`)
+  if (userAgent) headers.set("User-Agent", userAgent)
+
+  if (auth.kind === "chatgpt") {
+    headers.set("originator", codexOriginator(ORIGINATOR_DEFAULT))
+    headers.set("openai-beta", "responses=experimental")
+    if (auth.accountId) headers.set("ChatGPT-Account-Id", auth.accountId)
+    if (sessionId) {
+      headers.set("session_id", sessionId)
+      headers.set("x-client-request-id", sessionId)
+      headers.set("x-codex-window-id", `${sessionId}:0`)
+    }
+  }
+
+  return headers
 }
 
 async function safeText(resp: Response): Promise<string> {

@@ -466,7 +466,9 @@ Windows, and at
     "model": "gpt-5.4",
     "effort": "medium",
     "serviceTier": "fast",
-    "baseUrl": "https://chatgpt.com/backend-api/codex/responses"
+    "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
+    "authMode": "auto",
+    "apiKey": "sk-..."
   },
   "kimi": {
     "userAgent": "KimiCLI/1.37.0",
@@ -492,7 +494,9 @@ Windows, and at
 | `CCP_CODEX_MODEL`        | `codex.model`       | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`)        |
 | `CCP_CODEX_EFFORT`       | `codex.effort`      | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`)                     |
 | `CCP_CODEX_SERVICE_TIER` | `codex.serviceTier` | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`) |
-| `CCP_CODEX_BASE_URL`     | `codex.baseUrl`     | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                            |
+| `CCP_CODEX_BASE_URL`     | `codex.baseUrl`     | Codex CLI provider base URL, else `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                            |
+| `CCP_CODEX_AUTH_MODE`    | `codex.authMode`    | `auto`                                            | `auto`, `chatgpt`, or `openai`; `auto` uses OpenAI-compatible bearer auth when the base URL is not ChatGPT and an API key is available |
+| `CCP_CODEX_API_KEY`      | `codex.apiKey`      | `OPENAI_API_KEY`, then `~/.codex/auth.json`       | API key for OpenAI-compatible Responses providers such as a Codex CLI `wire_api = "responses"` gateway          |
 | `CCP_CODEX_ORIGINATOR`   | `codex.originator`  | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                   |
 | `CCP_CODEX_USER_AGENT`   | `codex.userAgent`   | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                   |
 | `CCP_KIMI_USER_AGENT`    | `kimi.userAgent`    | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                    |
@@ -502,6 +506,14 @@ Windows, and at
 A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
+
+For Codex, the proxy can also reuse Codex CLI configuration. If
+`~/.codex/config.toml` selects a provider with `base_url` (for example
+`https://api.q1ngyuan.top`) and `~/.codex/auth.json` contains
+`OPENAI_API_KEY`, `authMode: "auto"` sends OpenAI-compatible Responses
+requests with `Authorization: Bearer <api key>` instead of ChatGPT OAuth
+headers. Set `CCP_CODEX_AUTH_MODE=chatgpt` to force the legacy ChatGPT backend
+path.
 
 ### Files
 
