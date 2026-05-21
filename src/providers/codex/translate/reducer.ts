@@ -4,7 +4,7 @@ import { logVerbose } from "../../../config.ts"
 
 export class UpstreamStreamError extends Error {
   constructor(
-    public kind: "rate_limit" | "failed",
+    public kind: "rate_limit" | "failed" | "network",
     message: string,
     public retryAfterSeconds?: number,
   ) {
@@ -138,7 +138,7 @@ export async function* reduceUpstream(
     }
     if (t === "response.failed" || t === "response.error" || t === "error") {
       const message = p?.response?.error?.message || p?.error?.message || "Upstream error"
-      throw new UpstreamStreamError("failed", message)
+      throw new UpstreamStreamError(isTransientNetworkErrorMessage(message) ? "network" : "failed", message)
     }
 
     if (t === "response.output_item.added") {
@@ -262,6 +262,17 @@ export async function* reduceUpstream(
 
   const stopReason: StopReason = incomplete ? "max_tokens" : sawToolUse ? "tool_use" : "end_turn"
   yield { kind: "finish", stopReason, usage: finalUsage }
+}
+
+function isTransientNetworkErrorMessage(message: string): boolean {
+  const lower = message.toLowerCase()
+  if (lower.includes("socket connection was closed unexpectedly")) return true
+  if (lower.includes("connection closed")) return true
+  if (lower.includes("connection reset")) return true
+  if (lower.includes("econnreset")) return true
+  if (lower.includes("etimedout")) return true
+  if (lower.includes("fetch failed")) return true
+  return false
 }
 
 export function mapUsageToAnthropic(u: CodexUsage | undefined): {

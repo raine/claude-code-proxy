@@ -3,6 +3,7 @@ import type { Logger } from "../../../log.ts"
 import { mapRateLimitsSnapshot, type RateLimitsSidecarWriter } from "../rate-limits.ts"
 import type { RateLimitsTracker } from "../client.ts"
 import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts"
+import { isTransientNetworkError } from "../../retry.ts"
 
 function isAbortError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError"
@@ -54,7 +55,37 @@ export function translateStream(
         }
       }
       const activeTools = new Map<number, { id: string; name: string }>()
+      const activeTextBlocks = new Set<number>()
+      let emittedToolUse = false
       let messageStarted = false
+      const finalizePartialAfterTransientClose = (
+        detail: Record<string, unknown>,
+        activeToolNames: string[],
+        activeToolCalls: Array<{ id: string; name: string }>,
+      ) => {
+        opts.log.warn("upstream stream closed after content; finalizing partial response", {
+          ...detail,
+          activeToolNames,
+          activeToolCalls,
+          openTextBlocks: Array.from(activeTextBlocks),
+        })
+        for (const index of activeTextBlocks) {
+          emit("content_block_stop", { type: "content_block_stop", index })
+        }
+        activeTextBlocks.clear()
+        const stopReason = opts.compactResponse
+          ? "compaction"
+          : emittedToolUse
+            ? "tool_use"
+            : "end_turn"
+        opts.onFinish?.({ stopReason, usage: undefined })
+        emit("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: mapUsageToAnthropic(undefined),
+        })
+        emit("message_stop", { type: "message_stop" })
+      }
       const ensureMessageStart = () => {
         if (messageStarted) return
         messageStarted = true
@@ -83,6 +114,7 @@ export function translateStream(
         for await (const e of reduceUpstream(trackedUpstream, opts.log, { readOffsetHints: opts.readOffsetHints })) {
           switch (e.kind) {
             case "text-start":
+              activeTextBlocks.add(e.index)
               ensureMessageStart()
               emit("content_block_start", {
                 type: "content_block_start",
@@ -102,9 +134,11 @@ export function translateStream(
               })
               break
             case "text-stop":
+              activeTextBlocks.delete(e.index)
               emit("content_block_stop", { type: "content_block_stop", index: e.index })
               break
             case "tool-start":
+              emittedToolUse = true
               activeTools.set(e.index, { id: e.id, name: e.name })
               ensureMessageStart()
               emit("content_block_start", {
@@ -153,6 +187,12 @@ export function translateStream(
         const activeToolCalls = Array.from(activeTools.values())
         if (isAbortError(err) && opts.signal?.aborted) {
           opts.log.info("client disconnected")
+        } else if (err instanceof UpstreamStreamError && err.kind === "network" && messageStarted && activeTools.size === 0) {
+          finalizePartialAfterTransientClose(
+            { kind: err.kind, message: err.message },
+            activeToolNames,
+            activeToolCalls,
+          )
         } else if (err instanceof UpstreamStreamError) {
           opts.log.warn("upstream stream error", {
             kind: err.kind,
@@ -171,6 +211,8 @@ export function translateStream(
               message: err.message,
             },
           })
+        } else if (isTransientNetworkError(err) && messageStarted && activeTools.size === 0) {
+          finalizePartialAfterTransientClose({ err: String(err) }, activeToolNames, activeToolCalls)
         } else {
           opts.log.error("stream translation error", {
             err: String(err),

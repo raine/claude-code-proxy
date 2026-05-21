@@ -185,6 +185,58 @@ test("translateStream emits complete tool blocks only after upstream output_item
   expect(messageDelta!.data.delta.stop_reason).toBe("tool_use")
 })
 
+test("translateStream finalizes partial text when upstream reports a transient stream failure after content", async () => {
+  const upstream = upstreamFromEvents([
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_1" },
+      },
+    },
+    {
+      event: "response.output_text.delta",
+      data: {
+        type: "response.output_text.delta",
+        output_index: 0,
+        delta: "partial but usable",
+      },
+    },
+    {
+      event: "error",
+      data: {
+        type: "error",
+        error: {
+          message: "The socket connection was closed unexpectedly",
+        },
+      },
+    },
+  ])
+
+  const sse = await collect(
+    translateStream(upstream, {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+    }),
+  )
+  const events = parseSseEvents(sse)
+
+  expect(events.map((e) => e.event)).toEqual([
+    "message_start",
+    "ping",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ])
+  expect(events[3]?.data.delta).toEqual({ type: "text_delta", text: "partial but usable" })
+  expect(events[5]?.data.delta.stop_reason).toBe("end_turn")
+  expect(sse).not.toContain("event: error")
+})
+
 test("translateStream maps compact responses to Anthropic compaction blocks", async () => {
   const upstream = upstreamFromEvents([
     {
