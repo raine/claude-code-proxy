@@ -4,6 +4,10 @@ import { mapRateLimitsSnapshot, type RateLimitsSidecarWriter } from "../rate-lim
 import type { RateLimitsTracker } from "../client.ts"
 import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts"
 
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError"
+}
+
 export function translateStream(
   upstream: ReadableStream<Uint8Array>,
   opts: {
@@ -36,8 +40,16 @@ export function translateStream(
   const encoder = new TextEncoder()
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      const emit = (event: string, data: unknown) => {
-        controller.enqueue(encoder.encode(encodeSseEvent(event, data)))
+      let controllerClosed = false
+      const emit = (event: string, data: unknown): boolean => {
+        if (controllerClosed) return false
+        try {
+          controller.enqueue(encoder.encode(encodeSseEvent(event, data)))
+          return true
+        } catch {
+          controllerClosed = true
+          return false
+        }
       }
       const activeTools = new Map<number, { id: string; name: string }>()
       let messageStarted = false
@@ -132,7 +144,9 @@ export function translateStream(
       } catch (err) {
         const activeToolNames = Array.from(activeTools.values(), (tool) => tool.name)
         const activeToolCalls = Array.from(activeTools.values())
-        if (err instanceof UpstreamStreamError) {
+        if (isAbortError(err) && opts.signal?.aborted) {
+          opts.log.info("client disconnected")
+        } else if (err instanceof UpstreamStreamError) {
           opts.log.warn("upstream stream error", {
             kind: err.kind,
             message: err.message,
@@ -162,7 +176,13 @@ export function translateStream(
           })
         }
       } finally {
-        controller.close()
+        if (!controllerClosed) {
+          try {
+            controller.close()
+          } catch {
+            // ignore if controller already errored or cancelled
+          }
+        }
       }
     },
   })

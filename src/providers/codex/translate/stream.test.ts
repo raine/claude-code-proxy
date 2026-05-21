@@ -20,6 +20,14 @@ function erroringUpstream(message: string): ReadableStream<Uint8Array> {
   })
 }
 
+function abortErroringUpstream(): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.error(new DOMException("The connection was closed.", "AbortError"))
+    },
+  })
+}
+
 async function collect(stream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
@@ -44,4 +52,19 @@ test("translateStream emits only an error event for pre-content upstream failure
 
   expect(sse).toContain("event: error")
   expect(sse).not.toContain("event: message_start")
+})
+
+
+test("translateStream reports upstream aborts as SSE errors when the client is still connected", async () => {
+  const sse = await collect(
+    translateStream(abortErroringUpstream(), {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+      signal: new AbortController().signal,
+    }),
+  )
+
+  expect(sse).toContain("event: error")
+  expect(sse).toContain("AbortError")
 })

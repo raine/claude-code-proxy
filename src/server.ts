@@ -233,17 +233,26 @@ function wrapStreamResponse(
         const { done, value } = await reader.read()
         if (done) {
           log.info("request_completed", { reqId, status: resp.status, ms: Date.now() - start })
-          controller.close()
+          safeClose(controller)
           return
         }
-        controller.enqueue(value)
+        try {
+          controller.enqueue(value)
+        } catch (err) {
+          if (isControllerClosedError(err)) {
+            log.info("client disconnected", { reqId, ms: Date.now() - start })
+            await reader.cancel().catch(() => {})
+            return
+          }
+          throw err
+        }
       } catch (err) {
         if (isAbortError(err)) {
           log.info("client disconnected", { reqId, ms: Date.now() - start })
         } else {
           log.error("stream error", { reqId, err: String(err) })
         }
-        controller.error(err)
+        safeError(controller, err)
       }
     },
     cancel() {
@@ -259,6 +268,26 @@ function wrapStreamResponse(
     statusText: resp.statusText,
     headers,
   })
+}
+
+function isControllerClosedError(err: unknown): boolean {
+  return err instanceof TypeError && String(err).includes("Controller is already closed")
+}
+
+function safeClose(controller: ReadableStreamDefaultController<Uint8Array>): void {
+  try {
+    controller.close()
+  } catch {
+    // ignore if the client disconnected while the upstream stream finished
+  }
+}
+
+function safeError(controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): void {
+  try {
+    controller.error(err)
+  } catch {
+    // ignore if the stream was already closed or cancelled
+  }
 }
 
 function redactedQuery(url: URL): Record<string, string> {
