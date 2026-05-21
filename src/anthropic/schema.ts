@@ -31,12 +31,19 @@ export interface AnthropicThinkingBlock {
   signature?: string
 }
 
+export interface AnthropicCompactionBlock {
+  type: "compaction"
+  content: string
+  cache_control?: { type: "ephemeral" }
+}
+
 export type AnthropicToolResultContentBlock =
   | AnthropicTextBlock
   | AnthropicImageBlock
   | AnthropicToolUseBlock
   | AnthropicToolResultBlock
   | AnthropicThinkingBlock
+  | AnthropicCompactionBlock
   | (Record<string, unknown> & { type?: unknown })
 
 export type AnthropicContentBlock =
@@ -45,6 +52,7 @@ export type AnthropicContentBlock =
   | AnthropicToolUseBlock
   | AnthropicToolResultBlock
   | AnthropicThinkingBlock
+  | AnthropicCompactionBlock
 
 export interface AnthropicMessage {
   role: "user" | "assistant"

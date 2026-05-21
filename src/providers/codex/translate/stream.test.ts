@@ -185,6 +185,58 @@ test("translateStream emits complete tool blocks only after upstream output_item
   expect(messageDelta!.data.delta.stop_reason).toBe("tool_use")
 })
 
+test("translateStream maps compact responses to Anthropic compaction blocks", async () => {
+  const upstream = upstreamFromEvents([
+    {
+      event: "response.output_item.added",
+      data: {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "message", id: "msg_1" },
+      },
+    },
+    {
+      event: "response.output_text.delta",
+      data: {
+        type: "response.output_text.delta",
+        output_index: 0,
+        delta: "summary chunk",
+      },
+    },
+    {
+      event: "response.output_item.done",
+      data: {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "message" },
+      },
+    },
+    {
+      event: "response.completed",
+      data: {
+        type: "response.completed",
+        response: { usage: { input_tokens: 10, output_tokens: 4 } },
+      },
+    },
+  ])
+
+  const sse = await collect(
+    translateStream(upstream, {
+      messageId: "msg_test",
+      model: "gpt-5.5",
+      log: noopLogger,
+      compactResponse: true,
+    }),
+  )
+  const events = parseSseEvents(sse)
+  const start = events.find((e) => e.event === "content_block_start")
+  const delta = events.find((e) => e.event === "content_block_delta")
+
+  expect(start?.data.content_block).toEqual({ type: "compaction", content: "" })
+  expect(delta?.data.delta).toEqual({ type: "compaction_delta", content: "summary chunk" })
+  expect(events.find((e) => e.event === "message_delta")?.data.delta.stop_reason).toBe("compaction")
+})
+
 test("translateStream does not expose a partial tool_use block when upstream fails mid-arguments", async () => {
   const encoder = new TextEncoder()
   const upstream = new ReadableStream<Uint8Array>({

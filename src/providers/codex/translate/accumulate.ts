@@ -13,9 +13,10 @@ export interface AnthropicNonStreamResponse {
   model: string
   content: Array<
     | { type: "text"; text: string }
+    | { type: "compaction"; content: string }
     | { type: "tool_use"; id: string; name: string; input: unknown }
   >
-  stop_reason: "end_turn" | "tool_use" | "max_tokens" | null
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "compaction" | null
   stop_sequence: null
   usage: {
     input_tokens: number
@@ -41,6 +42,7 @@ export async function accumulateResponse(
     rateLimitsTracker?: RateLimitsTracker
     signal?: AbortSignal
     readOffsetHints?: string
+    compactResponse?: boolean
   },
 ): Promise<AccumulatedResponse> {
   const trackedUpstream = upstream.pipeThrough(
@@ -112,7 +114,13 @@ export async function accumulateResponse(
     const b = blocks.get(i)
     if (!b) continue
     if (b.kind === "text") {
-      if (b.text) content.push({ type: "text", text: b.text })
+      if (b.text) {
+        content.push(
+          opts.compactResponse
+            ? { type: "compaction", content: b.text }
+            : { type: "text", text: b.text },
+        )
+      }
     } else {
       let input: unknown = {}
       try {
@@ -132,7 +140,7 @@ export async function accumulateResponse(
       role: "assistant",
       model: opts.model,
       content,
-      stop_reason: stopReason,
+      stop_reason: opts.compactResponse ? "compaction" : stopReason,
       stop_sequence: null,
       usage: usage ?? {
         input_tokens: 0,

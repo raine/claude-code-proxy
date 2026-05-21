@@ -239,6 +239,8 @@ function buildInput(messages: AnthropicMessage[]): ResponsesInputItem[] {
       for (const block of blocks) {
         if (block.type === "text") {
           textParts.push({ type: "output_text", text: block.text })
+        } else if (block.type === "compaction") {
+          textParts.push({ type: "output_text", text: block.content })
         } else if (block.type === "tool_use") {
           flushText()
           out.push({

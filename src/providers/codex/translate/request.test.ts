@@ -98,6 +98,26 @@ describe("translateRequest", () => {
     ])
   })
 
+  it("preserves assistant compaction blocks as replayable assistant output", () => {
+    const translated = translateRequest({
+      ...baseRequest,
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "compaction", content: "compact summary" }],
+        },
+      ],
+    })
+
+    expect(translated.input).toEqual([
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "compact summary" }],
+      },
+    ])
+  })
+
   it("preserves text and image tool result stringification", () => {
     expect(
       toolResultToString([

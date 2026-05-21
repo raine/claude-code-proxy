@@ -112,6 +112,19 @@ function jsonError(status: number, type: string, message: string): Response {
   })
 }
 
+function isCompactContextManagement(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const edits = (value as { edits?: unknown }).edits
+  if (!Array.isArray(edits)) return false
+  return edits.some(
+    (edit) =>
+      !!edit &&
+      typeof edit === "object" &&
+      !Array.isArray(edit) &&
+      (edit as { type?: unknown }).type === "compact_20260112",
+  )
+}
+
 function invalidServiceTierResponse(err: InvalidServiceTierError): Response {
   return jsonError(400, "invalid_request_error", err.message)
 }
@@ -177,6 +190,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
   const messageCount = body.messages?.length ?? 0
   const toolCount = body.tools?.length ?? 0
   const contextManagement = body.context_management
+  const compactResponse = isCompactContextManagement(contextManagement)
   const readOffsetHints = recentReadOffsetHints(body)
   const state = sessionState(ctx.sessionId)
 
@@ -187,6 +201,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     stream: wantStream,
     requestedMaxTokens: body.max_tokens,
     hasContextManagement: contextManagement !== undefined,
+    compactResponse,
     hasJsonSchemaFormat: body.output_config?.format?.type === "json_schema",
   })
   if (logVerbose()) log.debug("anthropic request body", { body })
@@ -232,6 +247,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
     hasInstructions: !!translated.instructions,
     requestedMaxTokens: body.max_tokens,
     hasContextManagement: contextManagement !== undefined,
+    compactResponse,
     promptCacheKey: translated.prompt_cache_key,
   })
   if (logVerbose()) log.debug("translated request body", { body: translated })
@@ -249,6 +265,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       hasInstructions: !!translated.instructions,
       requestedMaxTokens: body.max_tokens,
       hasContextManagement: contextManagement !== undefined,
+      compactResponse,
       contextManagement,
       previousCountReqId: state?.lastCount?.reqId,
       previousCountModel: state?.lastCount?.model,
@@ -293,6 +310,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       rateLimitsTracker: upstream.rateLimitsTracker,
       signal: ctx.signal,
       readOffsetHints,
+      compactResponse,
       onFinish: logVerbose()
         ? (finish) => {
             const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined
@@ -309,6 +327,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
               translatedInputTokens,
               requestedMaxTokens: body.max_tokens,
               hasContextManagement: contextManagement !== undefined,
+              compactResponse,
               contextManagement,
               upstreamInputTokens: finish.usage?.input_tokens ?? 0,
               upstreamOutputTokens: finish.usage?.output_tokens ?? 0,
@@ -344,6 +363,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       rateLimitsTracker: upstream.rateLimitsTracker,
       signal: ctx.signal,
       readOffsetHints,
+      compactResponse,
     })
     if (logVerbose()) {
       const { serverModel, serverReasoningIncluded } = upstreamHeaderSnapshot(upstream.headers)
@@ -360,6 +380,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
         translatedInputTokens,
         requestedMaxTokens: body.max_tokens,
         hasContextManagement: contextManagement !== undefined,
+        compactResponse,
         contextManagement,
         upstreamInputTokens: result.rawUsage?.input_tokens ?? 0,
         upstreamOutputTokens: result.rawUsage?.output_tokens ?? 0,

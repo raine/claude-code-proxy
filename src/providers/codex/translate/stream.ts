@@ -14,7 +14,8 @@ export function translateStream(
     messageId: string
     model: string
     log: Logger
-    onFinish?: (finish: { stopReason: "end_turn" | "tool_use" | "max_tokens"; usage?: Parameters<typeof mapUsageToAnthropic>[0] }) => void
+    onFinish?: (finish: { stopReason: "end_turn" | "tool_use" | "max_tokens" | "compaction"; usage?: Parameters<typeof mapUsageToAnthropic>[0] }) => void
+    compactResponse?: boolean
     accountId?: string
     rateLimitsWriter?: RateLimitsSidecarWriter
     rateLimitsTracker?: RateLimitsTracker
@@ -86,14 +87,18 @@ export function translateStream(
               emit("content_block_start", {
                 type: "content_block_start",
                 index: e.index,
-                content_block: { type: "text", text: "" },
+                content_block: opts.compactResponse
+                  ? { type: "compaction", content: "" }
+                  : { type: "text", text: "" },
               })
               break
             case "text-delta":
               emit("content_block_delta", {
                 type: "content_block_delta",
                 index: e.index,
-                delta: { type: "text_delta", text: e.text },
+                delta: opts.compactResponse
+                  ? { type: "compaction_delta", content: e.text }
+                  : { type: "text_delta", text: e.text },
               })
               break
             case "text-stop":
@@ -132,10 +137,11 @@ export function translateStream(
             }
             case "finish":
               ensureMessageStart()
-              opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage })
+              const stopReason = opts.compactResponse ? "compaction" : e.stopReason
+              opts.onFinish?.({ stopReason, usage: e.usage })
               emit("message_delta", {
                 type: "message_delta",
-                delta: { stop_reason: e.stopReason, stop_sequence: null },
+                delta: { stop_reason: stopReason, stop_sequence: null },
                 usage: mapUsageToAnthropic(e.usage),
               })
               emit("message_stop", { type: "message_stop" })

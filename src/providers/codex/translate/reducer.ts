@@ -20,7 +20,7 @@ export interface CodexUsage {
   output_tokens_details?: { reasoning_tokens?: number }
 }
 
-export type StopReason = "end_turn" | "tool_use" | "max_tokens"
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "compaction"
 
 export type ReducerEvent =
   | { kind: "text-start"; index: number }
