@@ -2,6 +2,7 @@ import { aliasProvider, type AliasProvider } from "../config.ts"
 import type { Provider } from "./types.ts"
 import { codexProvider } from "./codex/index.ts"
 import { kimiProvider } from "./kimi/index.ts"
+import { anthropicProvider } from "./anthropic/index.ts"
 
 export const ANTHROPIC_STYLE_ALIASES = new Set([
   "haiku",
@@ -14,6 +15,7 @@ export const ANTHROPIC_STYLE_ALIASES = new Set([
 ])
 
 const PROVIDERS: Record<string, Provider> = {
+  anthropic: anthropicProvider,
   codex: codexProvider,
   kimi: kimiProvider,
 }
