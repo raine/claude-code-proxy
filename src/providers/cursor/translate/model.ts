@@ -9,6 +9,11 @@ export interface CursorModelSelection {
 
 type AnthropicEffort = NonNullable<AnthropicRequest["output_config"]>["effort"];
 
+const COMPOSER_2_5_MODEL: CursorModelRequest = {
+  modelId: "composer-2.5",
+  parameters: [{ id: "fast", value: "false" }],
+};
+
 const LEGACY_CURSOR_MODELS = [
   "cursor",
   "cursor-agent",
@@ -61,7 +66,7 @@ export function resolveCursorModel(req: Pick<AnthropicRequest, "model" | "metada
       return { requestedModel: { modelId: "default" }, mode };
     case "cursor-composer":
     case "composer-2.5":
-      return { requestedModel: { modelId: "composer-2.5" }, mode };
+      return { requestedModel: COMPOSER_2_5_MODEL, mode };
     case "cursor-composer-fast":
     case "composer-2.5-fast":
       return {
@@ -74,6 +79,7 @@ export function resolveCursorModel(req: Pick<AnthropicRequest, "model" | "metada
 }
 
 function parseRawCursorModel(raw: string): CursorModelRequest {
+  if (raw === "composer-2.5") return COMPOSER_2_5_MODEL;
   if (CURSOR_AGENT_MODEL_ID_SET.has(raw)) return { modelId: raw };
   if (raw.endsWith("-fast")) {
     return {

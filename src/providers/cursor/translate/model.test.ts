@@ -17,7 +17,10 @@ describe("Cursor model selection", () => {
   it("maps composer aliases explicitly", () => {
     expect(resolveCursorModel({ model: "cursor-composer", metadata: undefined })).toEqual({
       mode: "AGENT_MODE_AGENT",
-      requestedModel: { modelId: "composer-2.5" },
+      requestedModel: {
+        modelId: "composer-2.5",
+        parameters: [{ id: "fast", value: "false" }],
+      },
     });
     expect(resolveCursorModel({ model: "cursor-composer-fast", metadata: undefined })).toEqual({
       mode: "AGENT_MODE_AGENT",
@@ -49,6 +52,14 @@ describe("Cursor model selection", () => {
     expect(selected.requestedModel).toEqual({
       modelId: "claude-sonnet-4-6",
       parameters: [{ id: "fast", value: "true" }],
+    });
+
+    expect(resolveCursorModel({
+      model: "cursor:composer-2.5",
+      metadata: undefined,
+    }).requestedModel).toEqual({
+      modelId: "composer-2.5",
+      parameters: [{ id: "fast", value: "false" }],
     });
   });
 

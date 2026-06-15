@@ -108,7 +108,7 @@ upstream for each request is chosen from `ANTHROPIC_MODEL`.
 
 - `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
-- `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
+- `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
 An unknown model returns a 400 listing the supported ids. There is no
 implicit default provider.
