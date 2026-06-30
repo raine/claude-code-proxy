@@ -472,4 +472,71 @@ describe("translateStream", () => {
 
     expect(output).not.toContain("event: error");
   });
+
+  it("renders a thinking block (empty signature) before the text block", async () => {
+    const output = await collectFromChunks([
+      sse("response.reasoning_summary_text.delta", {
+        output_index: 0,
+        summary_index: 0,
+        delta: "Working it out",
+      }),
+      sse("response.output_item.done", {
+        output_index: 0,
+        item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+      }),
+      sse("response.output_item.added", { output_index: 1, item: { type: "message", id: "m" } }),
+      sse("response.output_text.delta", { output_index: 1, delta: "answer" }),
+      sse("response.output_item.done", { output_index: 1, item: { type: "message", id: "m" } }),
+      sse("response.completed", { response: { usage: {} } }),
+    ]);
+
+    expect(output).toContain('"content_block":{"type":"thinking","thinking":"","signature":""}');
+    expect(output).toContain('"type":"thinking_delta","thinking":"Working it out"');
+    expect(output).toContain("event: message_stop");
+    expect(output).not.toContain("event: error");
+    expect(output.indexOf('"type":"thinking_delta"')).toBeLessThan(
+      output.indexOf('"type":"text_delta"'),
+    );
+  });
+
+  it("emits no thinking block for a reasoning item with an empty summary", async () => {
+    const output = await collectFromChunks([
+      sse("response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+      }),
+      sse("response.output_item.done", {
+        output_index: 0,
+        item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+      }),
+      sse("response.output_item.added", { output_index: 1, item: { type: "message", id: "m" } }),
+      sse("response.output_text.delta", { output_index: 1, delta: "answer" }),
+      sse("response.output_item.done", { output_index: 1, item: { type: "message", id: "m" } }),
+      sse("response.completed", { response: { usage: {} } }),
+    ]);
+
+    expect(output).not.toContain('"type":"thinking"');
+    expect(output).toContain("event: message_stop");
+    expect(output).not.toContain("event: error");
+  });
+
+  it("renders thinking alongside web search without an open-block error", async () => {
+    const output = await collectFromChunks([
+      sse("response.reasoning_summary_text.delta", {
+        output_index: 0,
+        summary_index: 0,
+        delta: "Deciding to search",
+      }),
+      sse("response.output_item.done", {
+        output_index: 0,
+        item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+      }),
+      ...webSearchChunks(),
+    ]);
+
+    expect(output).toContain('"type":"thinking_delta","thinking":"Deciding to search"');
+    expect(output).toContain('"type":"web_search_tool_result"');
+    expect(output).toContain("event: message_stop");
+    expect(output).not.toContain("event: error");
+  });
 });

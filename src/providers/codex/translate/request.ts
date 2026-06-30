@@ -4,7 +4,7 @@ import type {
   AnthropicRequest,
   AnthropicTool,
 } from "../../../anthropic/schema.ts";
-import { codexEffort, codexServiceTier } from "../../../config.ts";
+import { codexEffort, codexReasoningSummary, codexServiceTier } from "../../../config.ts";
 import {
   assertValidEffort,
   mapToolChoice as mapAnthropicToolChoice,
@@ -210,7 +210,9 @@ export function translateRequest(
   assertValidEffort(req.output_config?.effort);
   const effort = resolveEffort(toCodexEffort(req.output_config?.effort));
   if (effort) {
-    out.reasoning = { effort };
+    const summary = codexReasoningSummary();
+    out.reasoning =
+      summary === "off" || summary === "none" ? { effort } : { effort, summary: "auto" };
     out.include = ["reasoning.encrypted_content"];
   }
   return out;

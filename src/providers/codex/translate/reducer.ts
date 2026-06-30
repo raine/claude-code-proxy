@@ -30,6 +30,9 @@ export type TerminalType = "response.completed" | "response.incomplete" | "respo
 
 export type ReducerEvent =
   | TextToolReducerEvent
+  | { kind: "thinking-start"; index: number }
+  | { kind: "thinking-delta"; index: number; text: string }
+  | { kind: "thinking-stop"; index: number }
   | { kind: "tool-progress"; index: number }
   | { kind: "progress" }
   | {
@@ -292,6 +295,7 @@ export async function* reduceUpstream(
   const outputItemsByIndex = new Map<number, ResponsesInputItem>();
   const itemIdToOutputIndex = new Map<string, number>();
   let anthropicIndex = 0;
+  let thinkingIndex: number | undefined;
   let sawToolUse = false;
   let finalUsage: CodexUsage | undefined;
   let responseId: string | undefined;
@@ -326,6 +330,14 @@ export async function* reduceUpstream(
       arguments: state.argsAccum,
     });
   }
+
+  const closeThinking = function* () {
+    if (thinkingIndex !== undefined) {
+      const idx = thinkingIndex;
+      thinkingIndex = undefined;
+      yield { kind: "thinking-stop" as const, index: idx };
+    }
+  };
 
   const events = parseSseStream(upstream, diagnostics.stats);
   while (true) {
@@ -406,6 +418,7 @@ export async function* reduceUpstream(
         continue;
       }
       if (item.type === "message") {
+        yield* closeThinking();
         const idx = anthropicIndex++;
         blocksByOutputIndex.set(outputIndex, { kind: "text", index: idx, textAccum: "" });
         if (item.id) itemIdToOutputIndex.set(item.id, outputIndex);
@@ -413,6 +426,7 @@ export async function* reduceUpstream(
         continue;
       }
       if (item.type === "function_call") {
+        yield* closeThinking();
         sawToolUse = true;
         const idx = anthropicIndex++;
         const bufferUntilDone = shouldBufferToolArgs(item.name);
@@ -445,7 +459,25 @@ export async function* reduceUpstream(
       continue;
     }
 
+    if (t === "response.reasoning_summary_part.added") {
+      if (thinkingIndex !== undefined) {
+        yield { kind: "thinking-delta", index: thinkingIndex, text: "\n\n" };
+      }
+      continue;
+    }
+    if (t === "response.reasoning_summary_text.delta") {
+      const delta: string = p.delta ?? "";
+      if (!delta) continue;
+      if (thinkingIndex === undefined) {
+        thinkingIndex = anthropicIndex++;
+        yield { kind: "thinking-start", index: thinkingIndex };
+      }
+      yield { kind: "thinking-delta", index: thinkingIndex, text: delta };
+      continue;
+    }
+
     if (t === "response.output_text.delta") {
+      yield* closeThinking();
       const outputIndex: number | undefined = p.output_index;
       const itemId: string | undefined = p.item_id;
       let state: BlockState | undefined;
@@ -479,6 +511,7 @@ export async function* reduceUpstream(
         yield { kind: "tool-delta", index: state.index, partialJson: state.argsAccum };
         yield { kind: "tool-stop", index: state.index };
         blocksByOutputIndex.delete(p.output_index);
+        yield* closeThinking();
         const outputItems = Array.from(outputItemsByIndex.entries())
           .sort(([a], [b]) => a - b)
           .map(([, item]) => item);
@@ -525,6 +558,10 @@ export async function* reduceUpstream(
 
     if (t === "response.output_item.done") {
       const item = p.item;
+      if (item?.type === "reasoning") {
+        yield* closeThinking();
+        continue;
+      }
       if (item?.type === "web_search_call") {
         const idx = anthropicIndex++;
         const resultIndex = anthropicIndex++;
@@ -550,7 +587,6 @@ export async function* reduceUpstream(
         blocksByOutputIndex.delete(p.output_index);
         continue;
       }
-      if (item.type === "reasoning") continue;
       if (state.kind === "tool") {
         const finalArgs =
           (typeof item.arguments === "string" && item.arguments.length
@@ -626,6 +662,8 @@ export async function* reduceUpstream(
         : "Upstream stream ended without a terminal response event",
     );
   }
+
+  yield* closeThinking();
 
   const stopReason: StopReason = incomplete ? "max_tokens" : sawToolUse ? "tool_use" : "end_turn";
   const outputItems = Array.from(outputItemsByIndex.entries())

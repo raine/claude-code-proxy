@@ -20,6 +20,7 @@ export interface FileConfig {
     userAgent?: string;
     model?: string;
     effort?: string;
+    reasoningSummary?: string;
     serviceTier?: string;
     baseUrl?: string;
     transport?: CodexTransport;
@@ -140,6 +141,7 @@ function validate(raw: unknown): FileConfig {
       "userAgent",
       "model",
       "effort",
+      "reasoningSummary",
       "serviceTier",
       "baseUrl",
       "transport",
@@ -150,6 +152,7 @@ function validate(raw: unknown): FileConfig {
       userAgent: "string",
       model: "string",
       effort: "string",
+      reasoningSummary: "string",
       serviceTier: "string",
       baseUrl: "string",
       transport: "string",
@@ -261,6 +264,13 @@ export function codexEffort(): string | undefined {
   return emptyOrUnset(c.env.CCP_CODEX_EFFORT) ?? emptyOrUnset(c.file.codex?.effort);
 }
 
+export function codexReasoningSummary(): string | undefined {
+  const c = getConfig();
+  return (
+    emptyOrUnset(c.env.CCP_CODEX_REASONING_SUMMARY) ?? emptyOrUnset(c.file.codex?.reasoningSummary)
+  );
+}
+
 export function codexServiceTier(): string | undefined {
   const c = getConfig();
   return emptyOrUnset(c.env.CCP_CODEX_SERVICE_TIER) ?? emptyOrUnset(c.file.codex?.serviceTier);
@@ -307,7 +317,9 @@ export function cursorBaseUrl(): string {
 
 export function cursorClientVersion(): string {
   const c = getConfig();
-  return c.env.CCP_CURSOR_CLIENT_VERSION ?? c.file.cursor?.clientVersion ?? "cli-2026.06.04-5fd875e";
+  return (
+    c.env.CCP_CURSOR_CLIENT_VERSION ?? c.file.cursor?.clientVersion ?? "cli-2026.06.04-5fd875e"
+  );
 }
 
 function resolvedCodexTransport(c: LoadedConfig): CodexTransport {
@@ -339,7 +351,9 @@ function resolvedCursorBaseUrl(c: LoadedConfig): string {
 }
 
 function resolvedCursorClientVersion(c: LoadedConfig): string {
-  return c.env.CCP_CURSOR_CLIENT_VERSION ?? c.file.cursor?.clientVersion ?? "cli-2026.06.04-5fd875e";
+  return (
+    c.env.CCP_CURSOR_CLIENT_VERSION ?? c.file.cursor?.clientVersion ?? "cli-2026.06.04-5fd875e"
+  );
 }
 
 export function configOverrideSummaryLines(cfg: LoadedConfig = getConfig()): string[] {
@@ -362,6 +376,9 @@ export function configOverrideSummaryLines(cfg: LoadedConfig = getConfig()): str
   if (cfg.env.CCP_CODEX_EFFORT) overrides.push("CCP_CODEX_EFFORT (env)");
   else if (fromFile.codex?.effort) overrides.push("codex.effort (config)");
 
+  if (cfg.env.CCP_CODEX_REASONING_SUMMARY) overrides.push("CCP_CODEX_REASONING_SUMMARY (env)");
+  else if (fromFile.codex?.reasoningSummary) overrides.push("codex.reasoningSummary (config)");
+
   if (cfg.env.CCP_CODEX_SERVICE_TIER) overrides.push("CCP_CODEX_SERVICE_TIER (env)");
   else if (fromFile.codex?.serviceTier) overrides.push("codex.serviceTier (config)");
 
@@ -378,8 +395,10 @@ export function configOverrideSummaryLines(cfg: LoadedConfig = getConfig()): str
   else if (fromFile.codex?.previousResponseId !== undefined)
     overrides.push(`codex.previousResponseId=${fromFile.codex.previousResponseId} (config)`);
 
-  if (cfg.env.CCP_ALIAS_PROVIDER) overrides.push(`CCP_ALIAS_PROVIDER=${resolvedAliasProvider(cfg)} (env)`);
-  else if (fromFile.aliasProvider) overrides.push(`aliasProvider=${fromFile.aliasProvider} (config)`);
+  if (cfg.env.CCP_ALIAS_PROVIDER)
+    overrides.push(`CCP_ALIAS_PROVIDER=${resolvedAliasProvider(cfg)} (env)`);
+  else if (fromFile.aliasProvider)
+    overrides.push(`aliasProvider=${fromFile.aliasProvider} (config)`);
 
   if (cfg.env.CCP_LOG_VERBOSE !== undefined) overrides.push("CCP_LOG_VERBOSE (env)");
   else if (fromFile.log?.verbose) overrides.push("log.verbose (config)");

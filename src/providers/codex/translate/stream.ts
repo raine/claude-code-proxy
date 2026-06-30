@@ -56,7 +56,10 @@ export function translateStream(
   const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
-      const openBlocks = new Map<number, { type: "text" | "tool"; id?: string; name?: string }>();
+      const openBlocks = new Map<
+        number,
+        { type: "text" | "tool" | "thinking"; id?: string; name?: string }
+      >();
       let diagnostics = attachTrafficCapture(createUpstreamStreamDiagnostics(), opts.traffic);
       let closed = false;
       let messageStarted = false;
@@ -174,6 +177,9 @@ export function translateStream(
         }
       };
       const isContentEvent = (event: ReducerEvent): boolean =>
+        event.kind === "thinking-start" ||
+        event.kind === "thinking-delta" ||
+        event.kind === "thinking-stop" ||
         event.kind === "text-start" ||
         event.kind === "text-delta" ||
         event.kind === "text-stop" ||
@@ -182,6 +188,26 @@ export function translateStream(
         event.kind === "tool-stop";
       const emitContentEvent = (e: ReducerEvent) => {
         switch (e.kind) {
+          case "thinking-start":
+            openBlocks.set(e.index, { type: "thinking" });
+            ensureMessageStart();
+            emit("content_block_start", {
+              type: "content_block_start",
+              index: e.index,
+              content_block: { type: "thinking", thinking: "", signature: "" },
+            });
+            break;
+          case "thinking-delta":
+            emit("content_block_delta", {
+              type: "content_block_delta",
+              index: e.index,
+              delta: { type: "thinking_delta", thinking: e.text },
+            });
+            break;
+          case "thinking-stop":
+            openBlocks.delete(e.index);
+            emit("content_block_stop", { type: "content_block_stop", index: e.index });
+            break;
           case "text-start":
             openBlocks.set(e.index, { type: "text" });
             ensureMessageStart();
@@ -250,6 +276,9 @@ export function translateStream(
                 continue;
               }
               switch (e.kind) {
+                case "thinking-start":
+                case "thinking-delta":
+                case "thinking-stop":
                 case "text-start":
                 case "text-delta":
                 case "text-stop":

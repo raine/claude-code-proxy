@@ -12,6 +12,7 @@ import {
   codexUserAgent,
   codexModel,
   codexEffort,
+  codexReasoningSummary,
   codexServiceTier,
   codexBaseUrl,
   codexTransport,
@@ -87,6 +88,7 @@ describe("config defaults", () => {
     expect(codexUserAgent("default-ua")).toBe("default-ua");
     expect(codexModel()).toBeUndefined();
     expect(codexEffort()).toBeUndefined();
+    expect(codexReasoningSummary()).toBeUndefined();
     expect(codexServiceTier()).toBeUndefined();
     expect(codexBaseUrl("default-codex-url")).toBe("default-codex-url");
     expect(codexTransport()).toBe("websocket");
@@ -120,6 +122,20 @@ describe("file overrides default", () => {
     writeFileSync(configPath, JSON.stringify({ codex: { serviceTier: "fast" } }));
     setEnv({});
     expect(codexServiceTier()).toBe("fast");
+  });
+
+  it("codex.reasoningSummary from config.json", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { reasoningSummary: "off" } }));
+    setEnv({});
+    expect(codexReasoningSummary()).toBe("off");
+  });
+
+  it("codex.reasoningSummary env beats file and empty env falls through", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { reasoningSummary: "off" } }));
+    setEnv({ CCP_CODEX_REASONING_SUMMARY: "auto" });
+    expect(codexReasoningSummary()).toBe("auto");
+    setEnv({ CCP_CODEX_REASONING_SUMMARY: "" });
+    expect(codexReasoningSummary()).toBe("off");
   });
 
   it("codex.baseUrl from config.json", () => {
@@ -397,6 +413,7 @@ describe("config summary", () => {
       CCP_KIMI_USER_AGENT: "env-kimi-ua",
       CCP_CODEX_MODEL: "gpt-5.5",
       CCP_CODEX_EFFORT: "medium",
+      CCP_CODEX_REASONING_SUMMARY: "off",
       CCP_CODEX_SERVICE_TIER: "fast",
       CCP_CODEX_BASE_URL: "https://codex-env.example.com",
       CCP_CODEX_TRANSPORT: "auto",
@@ -417,6 +434,7 @@ describe("config summary", () => {
       "CCP_KIMI_USER_AGENT (env)",
       "CCP_CODEX_MODEL (env)",
       "CCP_CODEX_EFFORT (env)",
+      "CCP_CODEX_REASONING_SUMMARY (env)",
       "CCP_CODEX_SERVICE_TIER (env)",
       "CCP_CODEX_BASE_URL (env)",
       "CCP_CODEX_TRANSPORT=auto (env)",

@@ -31,8 +31,39 @@ describe("translateRequest", () => {
       output_config: { effort: "medium" },
     });
 
-    expect(translated.reasoning).toEqual({ effort: "medium" });
+    expect(translated.reasoning).toEqual({ effort: "medium", summary: "auto" });
     expect(translated.include).toEqual(["reasoning.encrypted_content"]);
+  });
+
+  for (const value of ["off", "none"]) {
+    it(`disables the reasoning summary when CCP_CODEX_REASONING_SUMMARY=${value}`, () => {
+      loadConfig({ env: { CCP_CODEX_REASONING_SUMMARY: value }, forceReload: true });
+      const translated = translateRequest({
+        ...baseRequest,
+        output_config: { effort: "medium" },
+      });
+
+      expect(translated.reasoning).toEqual({ effort: "medium" });
+      expect(translated.include).toEqual(["reasoning.encrypted_content"]);
+    });
+  }
+
+  it("keeps the summary on (auto) for any non-disabling override value", () => {
+    loadConfig({ env: { CCP_CODEX_REASONING_SUMMARY: "detailed" }, forceReload: true });
+    const translated = translateRequest({
+      ...baseRequest,
+      output_config: { effort: "medium" },
+    });
+
+    expect(translated.reasoning).toEqual({ effort: "medium", summary: "auto" });
+  });
+
+  it("produces byte-identical reasoning across calls so continuation stays stable", () => {
+    const req = { ...baseRequest, output_config: { effort: "high" as const } };
+    const a = translateRequest(req);
+    const b = translateRequest(req);
+
+    expect(JSON.stringify(a.reasoning)).toBe(JSON.stringify(b.reasoning));
   });
 
   it("translates Anthropic web search to the Codex hosted web_search tool", () => {
