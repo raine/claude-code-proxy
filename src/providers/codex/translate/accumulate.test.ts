@@ -69,4 +69,62 @@ describe("accumulateResponse", () => {
     ]);
     expect(result.response.usage.server_tool_use).toEqual({ web_search_requests: 1 });
   });
+
+  it("materialises reasoning summaries as a thinking block before the text", async () => {
+    const result = await accumulateResponse(
+      upstreamFromChunks([
+        sse("response.reasoning_summary_text.delta", {
+          output_index: 0,
+          summary_index: 0,
+          delta: "part one",
+        }),
+        sse("response.reasoning_summary_part.added", {
+          output_index: 0,
+          summary_index: 1,
+          part: { type: "summary_text", text: "" },
+        }),
+        sse("response.reasoning_summary_text.delta", {
+          output_index: 0,
+          summary_index: 1,
+          delta: "part two",
+        }),
+        sse("response.output_item.done", {
+          output_index: 0,
+          item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+        }),
+        sse("response.output_item.added", { output_index: 1, item: { type: "message", id: "m" } }),
+        sse("response.output_text.delta", { output_index: 1, delta: "answer" }),
+        sse("response.output_item.done", { output_index: 1, item: { type: "message", id: "m" } }),
+        sse("response.completed", { response: { id: "resp_1", usage: {} } }),
+      ]),
+      { messageId: "msg_1", model: "gpt-5.5", log: silentLog },
+    );
+
+    expect(result.response.content).toEqual([
+      { type: "thinking", thinking: "part one\n\npart two", signature: "" },
+      { type: "text", text: "answer" },
+    ]);
+  });
+
+  it("emits no thinking block for a reasoning item with an empty summary", async () => {
+    const result = await accumulateResponse(
+      upstreamFromChunks([
+        sse("response.output_item.added", {
+          output_index: 0,
+          item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+        }),
+        sse("response.output_item.done", {
+          output_index: 0,
+          item: { type: "reasoning", summary: [], encrypted_content: "enc" },
+        }),
+        sse("response.output_item.added", { output_index: 1, item: { type: "message", id: "m" } }),
+        sse("response.output_text.delta", { output_index: 1, delta: "answer" }),
+        sse("response.output_item.done", { output_index: 1, item: { type: "message", id: "m" } }),
+        sse("response.completed", { response: { id: "resp_1", usage: {} } }),
+      ]),
+      { messageId: "msg_1", model: "gpt-5.5", log: silentLog },
+    );
+
+    expect(result.response.content).toEqual([{ type: "text", text: "answer" }]);
+  });
 });

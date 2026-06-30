@@ -35,7 +35,7 @@ export async function accumulateResponse(
   upstream: ReadableStream<Uint8Array>,
   opts: { messageId: string; model: string; log: Logger; traffic?: TrafficCapture },
 ): Promise<AccumulatedResponse> {
-  const blockAccumulator = createBlockAccumulator();
+  const blockAccumulator = createBlockAccumulator({ includeThinking: true });
   let stopReason: AnthropicNonStreamResponse["stop_reason"] = null;
   let usage: ReturnType<typeof mapUsageToAnthropic> | undefined;
   let rawUsage: CodexUsage | undefined;
@@ -49,6 +49,13 @@ export async function accumulateResponse(
 
   for await (const e of reduceUpstream(upstream, opts.log, diagnostics)) {
     switch (e.kind) {
+      case "thinking-start":
+        blockAccumulator.onThinkingStart(e.index);
+        break;
+      case "thinking-delta": {
+        blockAccumulator.onThinkingDelta(e.index, e.text);
+        break;
+      }
       case "text-start":
         blockAccumulator.onTextStart(e.index);
         break;
@@ -66,6 +73,7 @@ export async function accumulateResponse(
       case "web-search":
         webSearchEvents.push(e);
         break;
+      case "thinking-stop":
       case "text-stop":
       case "tool-stop":
         break;
@@ -89,7 +97,13 @@ export async function accumulateResponse(
     ...buildWebSearchCompatBlocks(webSearchEvents, text),
   ];
   for (const block of accumulatedBlocks) {
-    if (block.kind === "text") {
+    if (block.kind === "thinking") {
+      if (block.text)
+        indexedContent.push({
+          index: block.index,
+          content: { type: "thinking", thinking: block.text, signature: "" },
+        });
+    } else if (block.kind === "text") {
       if (block.text)
         indexedContent.push({ index: block.index, content: { type: "text", text: block.text } });
     } else if (block.kind === "tool") {
