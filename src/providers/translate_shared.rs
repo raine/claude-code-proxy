@@ -63,7 +63,7 @@ pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error>
     };
     match output_config.get("effort") {
         Some(Value::String(s)) => {
-            let valid = ["low", "medium", "high", "max"];
+            let valid = ["low", "medium", "high", "xhigh", "max"];
             if valid.contains(&s.as_str()) {
                 Ok(Some(s.as_str()))
             } else {

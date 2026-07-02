@@ -190,6 +190,7 @@ pub struct TranslateOptions {
 fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     match effort {
         Some("max") => Some(Effort::Xhigh),
+        Some("xhigh") => Some(Effort::Xhigh),
         Some("low") => Some(Effort::Low),
         Some("medium") => Some(Effort::Medium),
         Some("high") => Some(Effort::High),
@@ -748,6 +749,22 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         let value = serde_json::to_value(out).unwrap();
         assert!(value.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn translate_effort_xhigh_maps_to_xhigh() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Xhigh)));
+        assert_eq!(
+            out.include,
+            Some(vec!["reasoning.encrypted_content".to_string()])
+        );
     }
 
     #[test]
