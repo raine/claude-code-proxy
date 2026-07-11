@@ -1,6 +1,9 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, or **Cursor**.
+`claude-code-proxy` lets you use
+[Claude Code](https://www.anthropic.com/claude-code) with your **ChatGPT
+Plus/Pro** subscription, your **Kimi Code** (kimi.com) account, **Cursor
+Agent**, or an **xAI SuperGrok / X Premium+** subscription.
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
@@ -44,7 +47,8 @@ artifacts are published as `claude-code-proxy-windows-amd64.zip` and
 ### 2. Pick a provider and authenticate
 
 The proxy supports four upstream providers. Pick one and run its login flow; the
-proxy will refuse to start traffic until a token is stored.
+proxy will refuse to start traffic until a token is stored (except optional xAI
+API-key fallback).
 
 **Codex (ChatGPT Plus/Pro):**
 
@@ -85,9 +89,23 @@ Cursor authentication uses Cursor's browser login, but the proxy stores its own
 tokens. It does not read Cursor Agent's Keychain/auth.json. You can also set
 `CCP_CURSOR_AUTH_TOKEN` for the proxy process.
 
-On macOS credentials go to Keychain. On Windows they are written under
-`%APPDATA%\claude-code-proxy\<provider>\auth.json`; on Linux they are written
-under `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`
+**xAI SuperGrok / X Premium+:**
+
+```sh
+claude-code-proxy xai auth login      # browser OAuth (PKCE)
+# or, on a headless machine:
+claude-code-proxy xai auth device     # device-code flow
+```
+
+Sign in with a **SuperGrok** or **X Premium+** account. No `XAI_API_KEY` is
+required for the OAuth path. Optional escape hatch: `CCP_XAI_API_KEY` /
+`XAI_API_KEY` if OAuth login succeeds but inference returns 403 (xAI tier
+gating).
+
+On macOS credentials go to Keychain (where a provider uses keychain storage). On
+Windows they are written under `%APPDATA%\claude-code-proxy\<provider>\auth.json`;
+on Linux they are written under
+`${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`
 (mode 0600 where supported). Set `CCP_CONFIG_DIR` before `cursor auth login` to
 store a separate Cursor login at `$CCP_CONFIG_DIR/cursor/auth.json`.
 
@@ -98,6 +116,7 @@ claude-code-proxy codex auth status
 claude-code-proxy kimi auth status
 claude-code-proxy grok auth status
 claude-code-proxy cursor auth status
+claude-code-proxy xai auth status
 ```
 
 ### 3. Start the proxy
@@ -353,27 +372,47 @@ Auth:
 | `kimi auth status` | Show user ID + token expiry           |
 | `kimi auth logout` | Delete stored credentials             |
 
-### Grok
+### xAI (SuperGrok / X Premium+)
 
-Upstream: `https://cli-chat-proxy.grok.com/v1/responses` (Responses API).
+Upstream: `https://api.x.ai/v1/responses` (Responses API), authenticated with
+SuperGrok / X Premium+ OAuth (or optional API key fallback).
 
-Supported model ids are `grok-composer-2.5-fast` and `grok-4.5`. Model access
-can vary by account and region. The proxy translates Claude Code messages,
-function tools, tool results, thinking, token counts, and streaming events.
-Grok reasoning text appears in Claude Code as Anthropic `thinking` blocks.
-Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
-search X use Grok's hosted `x_search` tool, with citations and search usage
-reported in Claude Code.
+Set `ANTHROPIC_MODEL` to an allowlisted Grok model, for example:
 
-Authentication uses browser OAuth with S256 PKCE through `auth.x.ai` and an
-ephemeral loopback callback. The proxy stores its own access and refresh tokens,
-refreshes them five minutes before expiry, and does not use `~/.grok/auth.json`.
+- `grok-build-0.1` (coding default; Grok Build)
+- `grok-composer-2.5-fast`
+- `grok-4.3`
+- `grok-4.5`
+- `grok-4.20-0309-reasoning`
+- `grok-4.20-0309-non-reasoning`
+- `grok-4.20-multi-agent-0309`
 
-| Command            | What it does                        |
-| ------------------ | ----------------------------------- |
-| `grok auth login`  | Browser OAuth with a local callback |
-| `grok auth status` | Show token expiry and storage path  |
-| `grok auth logout` | Delete proxy-owned credentials      |
+Aliases such as `grok-build` and `grok-4.3-latest` resolve to the matching wire
+id. Unknown model strings are rejected (no silent remap).
+
+Reasoning effort: Claude Code's `output_config.effort` is forwarded as Responses
+`reasoning.effort` (`none` / `low` / `medium` / `high` / `xhigh` / `max`, subject
+to model support). Thinking/reasoning content is mapped back to Anthropic
+thinking blocks when present.
+
+Session continuity: with a session id, the proxy can attach
+`previous_response_id` on append-only follow-ups (enabled by default;
+`xai.previousResponseId` / `CCP_XAI_PREVIOUS_RESPONSE_ID`).
+
+Auth:
+
+| Command           | What it does                                      |
+| ----------------- | ------------------------------------------------- |
+| `xai auth login`  | Browser OAuth (PKCE) via `auth.x.ai` (port 56121) |
+| `xai auth device` | Device-code OAuth for headless machines           |
+| `xai auth status` | Show token expiry + scope                         |
+| `xai auth logout` | Delete stored credentials                         |
+
+Some SuperGrok plans return HTTP 403 on the OAuth API surface even when the
+in-app subscription is active (tier gating). Re-login usually does not fix
+that. The proxy keeps OAuth tokens and, if configured, retries once with
+`CCP_XAI_API_KEY` / `XAI_API_KEY`. Otherwise check your plan at
+[x.ai/grok](https://x.ai/grok).
 
 ### Cursor Agent
 
@@ -467,6 +506,7 @@ sequenceDiagram
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management      |
 | `kimi  auth login` / `status` / `logout`            | Kimi OAuth management       |
 | `cursor auth login` / `status` / `logout`           | Cursor OAuth management     |
+| `xai   auth login` / `device` / `status` / `logout` | xAI SuperGrok OAuth         |
 
 ---
 
@@ -683,6 +723,13 @@ Windows, and at
     "clientVersion": "cli-2026.06.04-5fd875e",
     "agentBundle": "/path/to/cursor-agent/index.js"
   },
+  "xai": {
+    "baseUrl": "https://api.x.ai/v1",
+    "oauthIssuer": "https://auth.x.ai",
+    "effort": "high",
+    "reasoningSummary": "auto",
+    "previousResponseId": true
+  },
   "log": {
     "stderr": false,
     "verbose": false
@@ -698,7 +745,13 @@ Windows, and at
 | `CCP_LOG_STDERR`                 | `log.stderr`               | unset                                             | Also mirror log lines to stderr; any env value enables it                                                                                                                         |
 | `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                                                                              |
 | `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                                                                            |
-| `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
+| `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex`, `kimi`, or `xai`                                                                            |
+| `CCP_XAI_BASE_URL`               | `xai.baseUrl`              | `https://api.x.ai/v1`                             | Override xAI API base (HTTPS `*.x.ai` hosts only for OAuth bearer)                                                                                                                |
+| `CCP_XAI_OAUTH_ISSUER`           | `xai.oauthIssuer`          | `https://auth.x.ai`                               | Override xAI OAuth issuer                                                                                                                                                         |
+| `CCP_XAI_EFFORT`                 | `xai.effort`               | unset                                             | Force xAI reasoning effort                                                                                                                                                        |
+| `CCP_XAI_REASONING_SUMMARY`      | `xai.reasoningSummary`     | unset                                             | Request reasoning summaries when effort is set; `off`/`none` suppress                                                                                                             |
+| `CCP_XAI_PREVIOUS_RESPONSE_ID`   | `xai.previousResponseId`   | `true`                                            | Enable Responses continuation with `previous_response_id` when the request is append-only                                                                                         |
+| `CCP_XAI_API_KEY` / `XAI_API_KEY`| —                          | unset                                             | Optional API-key fallback when OAuth is unavailable or returns entitlement 403                                                                                                    |
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-iterra`) |

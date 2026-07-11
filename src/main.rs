@@ -52,7 +52,7 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
-    Grok {
+    Xai {
         #[command(subcommand)]
         command: ProviderGroup,
     },
@@ -134,7 +134,7 @@ fn main() -> Result<()> {
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
-        Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Xai { command } => run_provider_cli("xai", command),
     }
 }
 
@@ -194,7 +194,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "cursor"] {
+    for provider in ["codex", "kimi", "cursor", "xai"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };

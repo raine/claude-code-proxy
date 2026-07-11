@@ -25,6 +25,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(out.contains("codex:"));
     assert!(out.contains("kimi:"));
     assert!(out.contains("cursor:"));
+    assert!(out.contains("xai:"));
 
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["models", "--full"]);
@@ -90,8 +91,10 @@ fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let codex_pos = out.find("codex:").unwrap_or(0);
     let kimi_pos = out.find("kimi:").unwrap_or(0);
     let cursor_pos = out.find("cursor:").unwrap_or(0);
+    let xai_pos = out.find("xai:").unwrap_or(0);
     assert!(codex_pos < kimi_pos);
     assert!(kimi_pos < cursor_pos);
+    assert!(cursor_pos < xai_pos);
     Ok(())
 }
 
@@ -108,5 +111,46 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
     cmd.args(["kimi", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success().stdout(contains("User: u"));
+    Ok(())
+}
+
+#[test]
+fn xai_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let auth_dir = temp.path().join("xai");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid profile email offline_access"}"#,
+    )?;
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.args(["xai", "auth", "status"]);
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.assert()
+        .success()
+        .stdout(contains("Authenticated: true"))
+        .stdout(contains("Scope:"));
+    Ok(())
+}
+
+#[test]
+fn xai_auth_status_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.args(["xai", "auth", "status"]);
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+    let output = cmd.output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stdout)?.contains("Not authenticated"));
+    Ok(())
+}
+
+#[test]
+fn xai_auth_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.args(["xai", "auth", "logout"]);
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.assert().success();
     Ok(())
 }

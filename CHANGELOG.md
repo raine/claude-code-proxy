@@ -1,13 +1,16 @@
 # Changelog
 
-## v0.1.11 (2026-07-11)
+- Add **xAI SuperGrok OAuth** provider (`xai auth login` / `device` / `status` /
+  `logout`): SuperGrok / X Premium+ subscription via `auth.x.ai`, Responses API
+  at `api.x.ai/v1/responses`, Anthropic Messages translation with tools,
+  reasoning/effort, streaming, and optional `previous_response_id` continuity.
+  Optional `CCP_XAI_API_KEY` / `XAI_API_KEY` fallback for entitlement 403s
+  (OAuth tokens are kept on tier denial; API key is tried once). Models include
+  `grok-build-0.1`, `grok-composer-2.5-fast`, `grok-4.3`, `grok-4.5`, and Grok
+  4.20 variants; `aliasProvider: "xai"` routes Anthropic-style aliases to
+  `grok-build-0.1`. Base URL / issuer overrides are pinned to HTTPS `*.x.ai`.
+  ([#25](https://github.com/raine/claude-code-proxy/issues/25))
 
-- Grok subscriptions can power Claude Code through browser login, with support for
-  Grok 4.5 and Composer 2.5 Fast, streaming, thinking, tools, and token counts.
-- Codex WebSocket requests recover from handshake failures and stay marked active
-  until the full response body finishes streaming.
-- The monitor shows local timestamps, clearer request status and detail indicators,
-  more compact columns, arrow-key pane navigation, and an uncluttered display.
 - Forward Claude Code's `max` effort as Codex `reasoning.effort: "max"` so
   GPT-5.6 can use its highest supported reasoning level instead of silently
   receiving `xhigh`. ([#28](https://github.com/raine/claude-code-proxy/pull/28))

@@ -51,6 +51,17 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
+/// Explicit allowlist for SuperGrok OAuth (Hermes pins build + composer first).
+pub(crate) const XAI_MODELS: &[&str] = &[
+    "grok-build-0.1",
+    "grok-composer-2.5-fast",
+    "grok-4.3",
+    "grok-4.5",
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
+];
+
 pub struct Registry {
     alias_provider: AliasProvider,
     models: BTreeMap<String, Vec<String>>,
@@ -67,11 +78,8 @@ impl Registry {
         );
         models.insert("cursor".into(), build_cursor_models());
         models.insert(
-            "grok".into(),
-            GROK_MODELS
-                .iter()
-                .map(|model| (*model).to_string())
-                .collect(),
+            "xai".into(),
+            XAI_MODELS.iter().map(|m| (*m).to_string()).collect(),
         );
 
         let mut handlers = BTreeMap::new();
@@ -80,7 +88,7 @@ impl Registry {
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
-                "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "xai" => Arc::new(crate::providers::xai::XaiProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -205,7 +213,7 @@ impl PlaceholderProvider {
             "codex" => "codex",
             "kimi" => "kimi",
             "cursor" => "cursor",
-            "grok" => "grok",
+            "xai" => "xai",
             _ => "codex",
         };
         Self { name, models }
@@ -227,7 +235,7 @@ impl Provider for PlaceholderProvider {
             "codex" => &CODEX_CLI,
             "kimi" => &KIMI_CLI,
             "cursor" => &CURSOR_CLI,
-            "grok" => &GROK_CLI,
+            "xai" => &XAI_CLI,
             _ => &CODEX_CLI,
         }
     }
@@ -286,7 +294,7 @@ impl CliHandlers for PlaceholderCli {
 const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
-const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
+const XAI_CLI: PlaceholderCli = PlaceholderCli { provider: "xai" };
 
 fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
@@ -329,6 +337,21 @@ mod tests {
         let p = registry.provider_for_model("haiku", None);
         assert!(p.is_some());
         assert_eq!(p.expect("provider").name(), "kimi");
+    }
+
+    #[test]
+    fn alias_routes_to_xai() {
+        let registry = Registry::new(AliasProvider::Xai);
+        let p = registry.provider_for_model("haiku", None);
+        assert!(p.is_some());
+        assert_eq!(p.expect("provider").name(), "xai");
+        assert_eq!(
+            registry
+                .provider_for_model("grok-build-0.1", None)
+                .unwrap()
+                .name(),
+            "xai"
+        );
     }
 
     #[test]
