@@ -25,7 +25,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(out.contains("codex:"));
     assert!(out.contains("kimi:"));
     assert!(out.contains("cursor:"));
-    assert!(out.contains("xai:"));
+    assert!(out.contains("grok:"));
 
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["models", "--full"]);
@@ -91,10 +91,10 @@ fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let codex_pos = out.find("codex:").unwrap_or(0);
     let kimi_pos = out.find("kimi:").unwrap_or(0);
     let cursor_pos = out.find("cursor:").unwrap_or(0);
-    let xai_pos = out.find("xai:").unwrap_or(0);
+    let grok_pos = out.find("grok:").unwrap_or(0);
     assert!(codex_pos < kimi_pos);
     assert!(kimi_pos < cursor_pos);
-    assert!(cursor_pos < xai_pos);
+    assert!(cursor_pos < grok_pos);
     Ok(())
 }
 
@@ -115,16 +115,16 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
-fn xai_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>> {
+fn grok_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
-    let auth_dir = temp.path().join("xai");
+    let auth_dir = temp.path().join("grok");
     std::fs::create_dir_all(&auth_dir)?;
     std::fs::write(
         auth_dir.join("auth.json"),
         r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid profile email offline_access"}"#,
     )?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["xai", "auth", "status"]);
+    cmd.args(["grok", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert()
         .success()
@@ -134,10 +134,10 @@ fn xai_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
-fn xai_auth_status_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
+fn grok_auth_status_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["xai", "auth", "status"]);
+    cmd.args(["grok", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     let output = cmd.output()?;
     assert_eq!(output.status.code(), Some(1));
@@ -146,10 +146,10 @@ fn xai_auth_status_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn xai_auth_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
+fn grok_auth_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["xai", "auth", "logout"]);
+    cmd.args(["grok", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success();
     Ok(())

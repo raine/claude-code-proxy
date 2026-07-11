@@ -1,316 +1,290 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use futures_util::StreamExt;
-use http::StatusCode;
+use crate::config;
+use crate::retry::{MAX_RATE_LIMIT_RETRIES, compute_backoff_delay};
 
+use super::auth::constants::{TIER_DENIED_HINT, api_base_url};
 use super::auth::manager::GrokAuthManager;
 use super::auth::token_store::{StoredAuth, file_store};
-use super::translate::request::GrokResponsesRequest;
-use crate::traffic::TrafficCapture;
+use super::continuation::ContinuationCandidate;
+use super::translate::request::ResponsesRequest;
 
-const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
-const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-
-pub struct GrokClient {
-    client: Arc<reqwest::Client>,
-    auth: Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
-    url: String,
-    client_version: String,
+#[derive(Debug)]
+pub struct GrokError {
+    pub status: u16,
+    pub message: String,
+    pub detail: Option<String>,
+    pub retry_after: Option<String>,
+    /// When true, caller should treat this as OAuth entitlement failure (not a bad login).
+    pub tier_denied: bool,
 }
 
 pub struct GrokResponse {
-    response: reqwest::Response,
-}
-pub struct GrokError {
-    pub status: StatusCode,
-    pub retry_after: Option<String>,
-    pub message: String,
+    pub body: Vec<u8>,
+    pub status: u16,
 }
 
-impl GrokResponse {
-    pub fn into_response(self) -> reqwest::Response {
-        self.response
+pub struct GrokHttpClient {
+    client: reqwest::blocking::Client,
+    auth_manager: GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>,
+}
+
+impl Default for GrokHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GrokHttpClient {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .expect("failed to create HTTP client"),
+            auth_manager: GrokAuthManager::new(file_store()),
+        }
     }
 
-    pub fn into_stream(
-        self,
-    ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, GrokError>> + Send {
-        self.response.bytes_stream().map(|chunk| {
-            chunk.map_err(|_| GrokError {
-                status: StatusCode::BAD_GATEWAY,
-                retry_after: None,
-                message: "Grok upstream stream failed".into(),
-            })
+    pub fn post_responses(
+        &self,
+        body: &ResponsesRequest,
+        continuation: Option<&ContinuationCandidate>,
+    ) -> Result<GrokResponse, GrokError> {
+        let mut body_json = serde_json::to_value(body).map_err(|e| GrokError {
+            status: 500,
+            message: "Failed to serialize request".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            tier_denied: false,
+        })?;
+        apply_continuation(&mut body_json, continuation);
+
+        let body_str = serde_json::to_string(&body_json).map_err(|e| GrokError {
+            status: 500,
+            message: "Failed to serialize request".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            tier_denied: false,
+        })?;
+
+        // Prefer OAuth; fall back to API key when missing OAuth or on tier 403.
+        let oauth_result = self.auth_manager.get_auth();
+        if let Ok(mut auth) = oauth_result {
+            let mut attempt = 0u32;
+            loop {
+                match self.attempt_post(&auth.access, &body_str) {
+                    Ok(response) if response.status == 401 && attempt == 0 => {
+                        match self.auth_manager.force_refresh() {
+                            Ok(new_auth) => {
+                                auth = new_auth;
+                                attempt += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                // Refresh already explained tier denial; try API key if set.
+                                if msg.contains("403") || msg.contains("SuperGrok") {
+                                    if let Some(resp) = self.try_api_key_fallback(&body_str) {
+                                        return resp;
+                                    }
+                                    return Err(GrokError {
+                                        status: 403,
+                                        message: TIER_DENIED_HINT.to_string(),
+                                        detail: Some(msg),
+                                        retry_after: None,
+                                        tier_denied: true,
+                                    });
+                                }
+                                return Err(GrokError {
+                                    status: 401,
+                                    message: "Unauthorized".to_string(),
+                                    detail: Some(msg),
+                                    retry_after: None,
+                                    tier_denied: false,
+                                });
+                            }
+                        }
+                    }
+                    Ok(response) if response.status == 403 => {
+                        // Entitlement: keep OAuth tokens; try API key once.
+                        if let Some(resp) = self.try_api_key_fallback(&body_str) {
+                            return resp;
+                        }
+                        return Err(map_error_response(403, &response.body));
+                    }
+                    Ok(response) if response.status == 429 => {
+                        if attempt < MAX_RATE_LIMIT_RETRIES {
+                            let delay = compute_backoff_delay(attempt, None);
+                            std::thread::sleep(Duration::from_millis(delay.wait_ms));
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(GrokError {
+                            status: 429,
+                            message: "Rate limited".to_string(),
+                            detail: Some(String::from_utf8_lossy(&response.body).into_owned()),
+                            retry_after: Some("5".into()),
+                            tier_denied: false,
+                        });
+                    }
+                    Ok(response) if response.status >= 400 => {
+                        return Err(map_error_response(response.status, &response.body));
+                    }
+                    Ok(response) => return Ok(response),
+                    Err(err) if err.status == 429 && attempt < MAX_RATE_LIMIT_RETRIES => {
+                        let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
+                        std::thread::sleep(Duration::from_millis(delay.wait_ms));
+                        attempt += 1;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        if let Some(resp) = self.try_api_key_fallback(&body_str) {
+            return resp;
+        }
+
+        let oauth_err = oauth_result.err().map(|e| e.to_string());
+        Err(GrokError {
+            status: 401,
+            message: "Not authenticated".to_string(),
+            detail: Some(oauth_err.unwrap_or_else(|| {
+                "Run `claude-code-proxy grok auth login` (or `grok auth device`), \
+                 or set CCP_GROK_API_KEY / XAI_API_KEY"
+                    .into()
+            })),
+            retry_after: None,
+            tier_denied: false,
         })
     }
 
-    pub async fn into_bytes(self) -> Result<Vec<u8>, GrokError> {
-        let mut stream = self.into_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_BUFFERED_RESPONSE_BYTES {
-                return Err(GrokError {
-                    status: StatusCode::BAD_GATEWAY,
-                    retry_after: None,
-                    message: "Grok upstream response exceeds the size limit".into(),
-                });
+    fn try_api_key_fallback(&self, body: &str) -> Option<Result<GrokResponse, GrokError>> {
+        let api_key = config::grok_api_key()?;
+        Some(match self.attempt_post(&api_key, body) {
+            Ok(response) if response.status >= 400 => {
+                Err(map_error_response(response.status, &response.body))
             }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
-    }
-}
-
-impl GrokClient {
-    pub fn new(base_url: String, client_version: String) -> anyhow::Result<Self> {
-        let client = Arc::new(
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(120))
-                .build()?,
-        );
-        let auth = Arc::new(GrokAuthManager::new(file_store())?);
-        Ok(Self::with_shared(
-            url_for(base_url)?,
-            client_version,
-            client,
-            auth,
-        ))
+            Ok(response) => Ok(response),
+            Err(err) => Err(err),
+        })
     }
 
-    fn with_shared(
-        url: String,
-        client_version: String,
-        client: Arc<reqwest::Client>,
-        auth: Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
-    ) -> Self {
-        Self {
-            client,
-            auth,
-            url,
-            client_version,
-        }
-    }
+    fn attempt_post(&self, bearer: &str, body: &str) -> Result<GrokResponse, GrokError> {
+        // api_base_url() already pins to HTTPS *.x.ai with default fallback.
+        let base = api_base_url();
+        let url = format!("{base}/responses");
 
-    pub async fn post(
-        &self,
-        body: &GrokResponsesRequest,
-        traffic: Option<Arc<TrafficCapture>>,
-    ) -> Result<GrokResponse, GrokError> {
-        if let Some(capture) = traffic.as_ref() {
-            let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
-            capture.write_json("020-upstream-request", &body_value);
-            capture.write_json("021-upstream-request-metadata", &serde_json::json!({
-                "method": "POST", "url": safe_url(&self.url), "provider": "grok", "transport": "http",
-                "headers": {"accept":"text/event-stream", "content-type":"application/json", "authorization":"[redacted]", "x-xai-token-auth":"[redacted]"},
-                "body_bytes": serde_json::to_vec(body).map(|v| v.len()).unwrap_or(0),
-            }));
-        }
-        let auth = match self.auth.get_auth().await {
-            Ok(auth) => auth,
-            Err(error) => {
-                capture_failure(traffic.as_deref(), "auth", "authentication", 0);
-                return Err(auth_error(error));
-            }
-        };
-        let response = self
-            .attempt(&auth.access, body, 1, traffic.as_deref())
-            .await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            let refreshed = self
-                .auth
-                .force_refresh(&auth.access)
-                .await
-                .map_err(|error| {
-                    capture_failure(traffic.as_deref(), "auth", "refresh", 1);
-                    auth_error(error)
-                })?;
-            let replay = self
-                .attempt(&refreshed.access, body, 2, traffic.as_deref())
-                .await?;
-            if replay.status() == StatusCode::UNAUTHORIZED {
-                capture_failure(traffic.as_deref(), "auth", "unauthorized", 2);
-                return Err(auth_error(anyhow::anyhow!("unauthorized")));
-            }
-            return Ok(self.captured_response(replay, traffic.as_deref()));
-        }
-        Ok(self.captured_response(response, traffic.as_deref()))
-    }
-
-    fn captured_response(
-        &self,
-        response: reqwest::Response,
-        traffic: Option<&TrafficCapture>,
-    ) -> GrokResponse {
-        if let Some(capture) = traffic.as_ref() {
-            capture.write_json("030-upstream-response-headers", &serde_json::json!({
-                "status": response.status().as_u16(), "headers": safe_headers(response.headers()),
-            }));
-        }
-        GrokResponse { response }
-    }
-
-    async fn attempt(
-        &self,
-        access: &str,
-        body: &GrokResponsesRequest,
-        attempt: u8,
-        traffic: Option<&TrafficCapture>,
-    ) -> Result<reqwest::Response, GrokError> {
-        let started = Instant::now();
-        let response = self
+        let resp = self
             .client
-            .post(&self.url)
-            .header("accept", "text/event-stream")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {access}"))
-            .header("x-xai-token-auth", "xai-grok-cli")
-            .header("x-grok-client-identifier", "grok-shell")
-            .header("x-grok-client-version", &self.client_version)
-            .json(body)
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream, application/json")
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("x-grok-source", "claude-code-proxy")
+            .body(body.to_string())
             .send()
-            .await
-            .map_err(|_| {
-                capture_failure(traffic, "transport", "transport", attempt);
-                GrokError {
-                    status: StatusCode::BAD_GATEWAY,
-                    retry_after: None,
-                    message: "Grok upstream request failed".into(),
-                }
+            .map_err(|e| GrokError {
+                status: 0,
+                message: "Network error".to_string(),
+                detail: Some(e.to_string()),
+                retry_after: None,
+                tier_denied: false,
             })?;
-        let status = response.status();
-        if let Some(capture) = traffic {
-            capture.write_json("022-upstream-attempt", &serde_json::json!({"attempt":attempt,"status":status.as_u16(),"elapsed_ms":started.elapsed().as_millis(),"headers":safe_headers(response.headers())}));
-        }
-        if !status.is_success() && status != StatusCode::UNAUTHORIZED {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            if let Some(capture) = traffic {
-                let (body, truncated) = read_rejected_body(response, 64 * 1024).await;
-                let detail = serde_json::from_slice::<serde_json::Value>(&body)
-                    .unwrap_or_else(|_| serde_json::json!({"body_bytes": body.len()}));
-                capture.write_json(
-                    "031-upstream-error-body",
-                    &serde_json::json!({"attempt":attempt,"status":status.as_u16(),"truncated":truncated,"body":detail}),
-                );
-            }
+
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let body = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
+
+        if status == 429 {
             return Err(GrokError {
-                status,
+                status: 429,
+                message: "Rate limited".to_string(),
+                detail: Some(String::from_utf8_lossy(&body).into_owned()),
                 retry_after,
-                message: "Grok upstream rejected the request".into(),
+                tier_denied: false,
             });
         }
-        Ok(response)
+
+        Ok(GrokResponse { body, status })
     }
 }
 
-async fn read_rejected_body(response: reqwest::Response, limit: usize) -> (Vec<u8>, bool) {
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
-        let remaining = limit.saturating_sub(body.len());
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            return (body, true);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    (body, false)
-}
-
-pub(super) fn capture_failure(
-    traffic: Option<&TrafficCapture>,
-    stage: &str,
-    kind: &str,
-    attempt: u8,
+fn apply_continuation(
+    body: &mut serde_json::Value,
+    continuation: Option<&ContinuationCandidate>,
 ) {
-    if let Some(capture) = traffic {
-        capture.write_json(
-            "060-grok-stream-error",
-            &serde_json::json!({"stage":stage,"kind":kind,"attempt":attempt}),
+    let Some(candidate) = continuation else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if let Some(ref prev_id) = candidate.previous_response_id {
+        obj.insert(
+            "previous_response_id".to_string(),
+            serde_json::json!(prev_id),
+        );
+    }
+    if let Some(ref delta) = candidate.input_delta {
+        obj.insert(
+            "input".to_string(),
+            serde_json::to_value(delta).unwrap_or_default(),
         );
     }
 }
 
-fn safe_headers(headers: &reqwest::header::HeaderMap) -> serde_json::Value {
-    let mut result = serde_json::Map::new();
-    for name in [
-        "content-type",
-        "content-length",
-        "retry-after",
-        "x-request-id",
-    ] {
-        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-            result.insert(
-                name.to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
-        }
+fn map_error_response(status: u16, body: &[u8]) -> GrokError {
+    let text = String::from_utf8_lossy(body).into_owned();
+    if status == 403 {
+        return GrokError {
+            status: 403,
+            message: TIER_DENIED_HINT.to_string(),
+            detail: Some(text),
+            retry_after: None,
+            tier_denied: true,
+        };
     }
-    serde_json::Value::Object(result)
-}
-
-fn safe_url(raw: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(raw) else {
-        return "[invalid-url]".into();
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.to_string()
-}
-
-fn url_for(base_url: String) -> anyhow::Result<String> {
-    responses_url(&base_url)
-}
-fn responses_url(base_url: &str) -> anyhow::Result<String> {
-    let base_url = if base_url.trim().is_empty() {
-        DEFAULT_BASE_URL
+    let message = if status == 401 {
+        "Authentication failed. Run `claude-code-proxy grok auth login` or set CCP_GROK_API_KEY."
+            .to_string()
     } else {
-        base_url.trim()
+        "Upstream error".to_string()
     };
-    let mut url = reqwest::Url::parse(base_url)?;
-    let path = url.path().trim_end_matches('/');
-    if !path.ends_with("/responses") {
-        url.set_path(&format!("{path}/responses"));
-    }
-    Ok(url.to_string().trim_end_matches('/').to_string())
-}
-
-fn auth_error(_: anyhow::Error) -> GrokError {
     GrokError {
-        status: StatusCode::UNAUTHORIZED,
+        status,
+        message,
+        detail: Some(text),
         retry_after: None,
-        message: "Grok authentication requires official CLI login and proxy import".into(),
+        tier_denied: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::responses_url;
+    use super::*;
+    use crate::providers::grok::auth::constants::pin_grok_https_origin;
+
     #[test]
-    fn responses_url_appends_responses_to_base_path() {
-        assert_eq!(
-            responses_url("http://127.0.0.1:8080/v1").unwrap(),
-            "http://127.0.0.1:8080/v1/responses"
-        );
+    fn pin_accepts_api_x_ai() {
+        assert!(pin_grok_https_origin("https://api.x.ai/v1", "https://api.x.ai/v1").is_ok());
     }
+
     #[test]
-    fn responses_url_preserves_responses_endpoint() {
-        assert_eq!(
-            responses_url("https://example.com/custom/responses/").unwrap(),
-            "https://example.com/custom/responses"
-        );
+    fn pin_rejects_http_and_foreign_hosts() {
+        assert!(pin_grok_https_origin("http://api.x.ai/v1", "https://api.x.ai/v1").is_err());
+        assert!(pin_grok_https_origin("https://evil.example/v1", "https://api.x.ai/v1").is_err());
     }
+
     #[test]
-    fn responses_url_rejects_invalid_url() {
-        assert!(responses_url(":invalid").is_err());
+    fn map_403_is_tier_denied() {
+        let err = map_error_response(403, br#"{"error":"permission"}"#);
+        assert!(err.tier_denied);
+        assert!(err.message.contains("CCP_GROK_API_KEY"));
     }
 }

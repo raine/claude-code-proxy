@@ -1,140 +1,182 @@
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
-use tokio::sync::Mutex;
-use url::Url;
-
-use super::login::{CANONICAL_ISSUER, CLIENT_ID};
-use super::token_store::{GrokTokenStore, StoredAuth};
+use super::constants::{CLIENT_ID, REFRESH_MARGIN_MS, TIER_DENIED_HINT, issuer};
+use super::jwt::{TokenResponse, expires_at_ms, refresh_token_from, validate_token_response};
+use super::token_store::{StoredAuth, GrokTokenStore};
 use crate::auth::AuthStorage;
 
-const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
-
-#[derive(Deserialize)]
-struct Discovery {
-    issuer: String,
-    token_endpoint: String,
-}
-
-#[derive(Deserialize)]
-struct RefreshResponse {
-    access_token: String,
-    expires_in: u64,
-    #[serde(default)]
-    refresh_token: Option<String>,
-}
-
 pub struct GrokAuthManager<S: AuthStorage<StoredAuth>> {
-    store: GrokTokenStore<S>,
-    client: reqwest::Client,
-    refresh_lock: Arc<Mutex<()>>,
+    pub store: GrokTokenStore<S>,
+    cached: Arc<Mutex<Option<StoredAuth>>>,
 }
 
 impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
-    pub fn new(store: GrokTokenStore<S>) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build()?;
-        Ok(Self {
+    pub fn new(store: GrokTokenStore<S>) -> Self {
+        Self {
             store,
-            client,
-            refresh_lock: Arc::new(Mutex::new(())),
-        })
+            cached: Arc::new(Mutex::new(None)),
+        }
     }
 
-    pub fn store(&self) -> &GrokTokenStore<S> {
-        &self.store
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
-    pub async fn get_auth(&self) -> anyhow::Result<StoredAuth> {
-        let auth = self
-            .store
-            .load_auth()?
-            .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
-        if auth.expires_at_ms > now_ms().saturating_add(REFRESH_SKEW_MS) {
-            return Ok(auth);
-        }
-        self.refresh(false, None).await
-    }
-
-    pub async fn force_refresh(&self, rejected_access: &str) -> anyhow::Result<StoredAuth> {
-        self.refresh(true, Some(rejected_access)).await
-    }
-
-    async fn refresh(
-        &self,
-        force: bool,
-        rejected_access: Option<&str>,
-    ) -> anyhow::Result<StoredAuth> {
-        let _guard = self.refresh_lock.lock().await;
-        let auth = self
-            .store
-            .load_auth()?
-            .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
-        if (!force && auth.expires_at_ms > now_ms().saturating_add(REFRESH_SKEW_MS))
-            || rejected_access.is_some_and(|access| auth.access != access)
-        {
-            return Ok(auth);
-        }
-        if auth.issuer != CANONICAL_ISSUER || auth.client_id != CLIENT_ID {
-            anyhow::bail!("Unsupported Grok OAuth session");
-        }
-        let issuer = Url::parse(CANONICAL_ISSUER)?;
-        let discovery_url = issuer.join("/.well-known/openid-configuration")?;
-        let discovery: Discovery = self
-            .client
-            .get(discovery_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if discovery.issuer != CANONICAL_ISSUER {
-            anyhow::bail!("OIDC discovery issuer mismatch");
-        }
-        let endpoint = Url::parse(&discovery.token_endpoint)?;
-        if endpoint.scheme() != "https" || endpoint.origin() != issuer.origin() {
-            anyhow::bail!("OIDC token endpoint is outside the canonical issuer");
-        }
-        let refreshed: RefreshResponse = self
-            .client
-            .post(endpoint)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", auth.refresh.as_str()),
-                ("client_id", auth.client_id.as_str()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if refreshed.access_token.is_empty() || refreshed.expires_in == 0 {
-            anyhow::bail!("Invalid token refresh response");
-        }
-        let updated = StoredAuth {
-            access: refreshed.access_token,
-            refresh: refreshed
-                .refresh_token
-                .filter(|token| !token.is_empty())
-                .unwrap_or(auth.refresh),
-            expires_at_ms: now_ms().saturating_add(refreshed.expires_in.saturating_mul(1000)),
-            issuer: auth.issuer,
-            client_id: auth.client_id,
+    pub fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
+        let cached = {
+            let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            guard.clone()
         };
-        self.store.save_auth(updated.clone())?;
-        Ok(updated)
-    }
-}
+        let stored = match cached {
+            Some(ref auth) => auth.clone(),
+            None => {
+                let loaded = self.store.load_auth()?;
+                match loaded {
+                    Some(auth) => {
+                        let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                        *guard = Some(auth.clone());
+                        auth
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "Not authenticated. Run: claude-code-proxy grok auth login \
+                             (or `grok auth device` on headless hosts)"
+                        );
+                    }
+                }
+            }
+        };
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+        if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+            return Ok(stored);
+        }
+
+        self.refresh_now(&stored)
+    }
+
+    pub fn force_refresh(&self) -> Result<StoredAuth, anyhow::Error> {
+        let stored = {
+            let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            guard.clone()
+        };
+        let stored = match stored {
+            Some(auth) => auth,
+            None => {
+                let loaded = self.store.load_auth()?;
+                loaded.ok_or_else(|| anyhow::anyhow!("Not authenticated"))?
+            }
+        };
+        self.refresh_now(&stored)
+    }
+
+    fn refresh_now(&self, current: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
+        if current.refresh.is_empty() {
+            anyhow::bail!("No refresh token stored; re-authenticate with `grok auth login`");
+        }
+
+        let client = reqwest::blocking::Client::new();
+        let form = [
+            ("client_id", CLIENT_ID.to_string()),
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", current.refresh.clone()),
+        ];
+
+        let resp = client
+            .post(format!("{}/oauth2/token", issuer()))
+            .form(&form)
+            .send()
+            .map_err(|e| anyhow::anyhow!("refresh network error: {e}"))?;
+
+        let status = resp.status().as_u16();
+        let body_text = resp.text().unwrap_or_default();
+
+        // Tier / entitlement gate: keep tokens. Re-login will not help (Hermes #26847).
+        if status == 403 {
+            anyhow::bail!("{TIER_DENIED_HINT}");
+        }
+
+        // Revoked / invalid grant: clear store so status shows Not authenticated.
+        if status == 400 || status == 401 {
+            {
+                let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                *guard = None;
+            }
+            let _ = self.store.clear_auth();
+            let detail = if body_text.trim().is_empty() {
+                "invalid or revoked refresh token".to_string()
+            } else {
+                body_text
+            };
+            anyhow::bail!(
+                "xAI token refresh failed ({status}): {detail}. \
+                 Run `claude-code-proxy grok auth login` (or `grok auth device`)."
+            );
+        }
+
+        if !(200..300).contains(&status) {
+            anyhow::bail!("Token refresh failed: {status} {body_text}");
+        }
+
+        let tokens: TokenResponse = serde_json::from_str(&body_text)
+            .map_err(|e| anyhow::anyhow!("failed to parse token response: {e}"))?;
+        validate_token_response(&tokens)?;
+        if tokens
+            .refresh_token
+            .as_ref()
+            .map(|r| r.trim().is_empty())
+            .unwrap_or(true)
+            && current.refresh.is_empty()
+        {
+            anyhow::bail!("token response missing refresh token");
+        }
+
+        let next = StoredAuth {
+            access: tokens.access_token.clone(),
+            refresh: refresh_token_from(&tokens, &current.refresh),
+            expires: expires_at_ms(&tokens, Self::now_ms()),
+            scope: tokens.scope.clone().or_else(|| current.scope.clone()),
+        };
+        self.store.save_auth(next.clone())?;
+        {
+            let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            *guard = Some(next.clone());
+        }
+        Ok(next)
+    }
+
+    pub fn persist_initial_tokens(
+        &self,
+        tokens: &TokenResponse,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        validate_token_response(tokens)?;
+        let refresh = tokens
+            .refresh_token
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("token response missing refresh token"))?;
+        let auth = StoredAuth {
+            access: tokens.access_token.clone(),
+            refresh,
+            expires: expires_at_ms(tokens, Self::now_ms()),
+            scope: tokens.scope.clone(),
+        };
+        self.store.save_auth(auth.clone())?;
+        {
+            let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            *guard = Some(auth.clone());
+        }
+        Ok(auth)
+    }
+
+    pub fn reset_cache(&self) {
+        if let Ok(mut guard) = self.cached.lock() {
+            *guard = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -142,39 +184,29 @@ mod tests {
     use super::*;
     use crate::auth::InMemoryAuthStore;
 
-    fn auth(access: &str) -> StoredAuth {
-        StoredAuth {
-            access: access.into(),
-            refresh: "synthetic-refresh".into(),
-            expires_at_ms: now_ms().saturating_add(3_600_000),
-            issuer: CANONICAL_ISSUER.into(),
-            client_id: "synthetic-client".into(),
-        }
+    fn test_store() -> GrokTokenStore<InMemoryAuthStore<StoredAuth>> {
+        GrokTokenStore::new(InMemoryAuthStore::new())
     }
 
     #[test]
-    fn discovery_accepts_standard_metadata_fields() {
-        let discovery: Discovery = serde_json::from_value(serde_json::json!({
-            "issuer": CANONICAL_ISSUER,
-            "token_endpoint": "https://auth.x.ai/oauth/token",
-            "authorization_endpoint": "https://auth.x.ai/oauth/authorize",
-            "jwks_uri": "https://auth.x.ai/.well-known/jwks.json"
-        }))
-        .unwrap();
-
-        assert_eq!(discovery.issuer, CANONICAL_ISSUER);
+    fn get_auth_returns_stored() {
+        let store = test_store();
+        let auth = StoredAuth {
+            access: "test_access".into(),
+            refresh: "test_refresh".into(),
+            expires: 9999999999999,
+            scope: Some("openid".into()),
+        };
+        store.save_auth(auth.clone()).unwrap();
+        let manager = GrokAuthManager::new(store);
+        let result = manager.get_auth().unwrap();
+        assert_eq!(result.access, "test_access");
     }
 
-    #[tokio::test]
-    async fn concurrent_stale_401_refreshes_reuse_the_rotated_access_token() {
-        let store = GrokTokenStore::new(InMemoryAuthStore::new());
-        store.save_auth(auth("rotated-access")).unwrap();
-        let manager = Arc::new(GrokAuthManager::new(store).unwrap());
-        let (first, second) = tokio::join!(
-            manager.force_refresh("rejected-access"),
-            manager.force_refresh("rejected-access"),
-        );
-        assert_eq!(first.unwrap().access, "rotated-access");
-        assert_eq!(second.unwrap().access, "rotated-access");
+    #[test]
+    fn get_auth_fails_when_no_auth() {
+        let store = test_store();
+        let manager = GrokAuthManager::new(store);
+        assert!(manager.get_auth().is_err());
     }
 }

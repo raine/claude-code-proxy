@@ -1,13 +1,13 @@
 # Changelog
 
-- Add **xAI SuperGrok OAuth** provider (`xai auth login` / `device` / `status` /
-  `logout`): SuperGrok / X Premium+ subscription via `auth.x.ai`, Responses API
-  at `api.x.ai/v1/responses`, Anthropic Messages translation with tools,
+- Add **Grok** provider for xAI SuperGrok / X Premium+ (`grok auth login` /
+  `device` / `status` / `logout`): OAuth via `auth.x.ai`, Responses API at
+  `api.x.ai/v1/responses`, Anthropic Messages translation with tools,
   reasoning/effort, streaming, and optional `previous_response_id` continuity.
-  Optional `CCP_XAI_API_KEY` / `XAI_API_KEY` fallback for entitlement 403s
+  Optional `CCP_GROK_API_KEY` / `XAI_API_KEY` fallback for entitlement 403s
   (OAuth tokens are kept on tier denial; API key is tried once). Models include
   `grok-build-0.1`, `grok-composer-2.5-fast`, `grok-4.3`, `grok-4.5`, and Grok
-  4.20 variants; `aliasProvider: "xai"` routes Anthropic-style aliases to
+  4.20 variants; `aliasProvider: "grok"` routes Anthropic-style aliases to
   `grok-build-0.1`. Base URL / issuer overrides are pinned to HTTPS `*.x.ai`.
   ([#25](https://github.com/raine/claude-code-proxy/issues/25))
 

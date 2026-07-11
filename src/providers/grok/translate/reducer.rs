@@ -1,507 +1,1579 @@
-use std::collections::HashMap;
+use crate::anthropic::sse::parse_sse_events;
 
-use serde_json::Value;
+use super::read_rewrite::sanitize_read_args;
+use super::request::ResponsesInputItem;
 
-use super::stream::SseDecoder;
+#[derive(Debug, Clone)]
+pub struct UpstreamStreamError {
+    pub kind: UpstreamErrorKind,
+    pub message: String,
+    pub retry_after_seconds: Option<u64>,
+    pub diagnostics: Option<UpstreamStreamDiagnostics>,
+}
 
-const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
-const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamErrorKind {
+    RateLimit,
+    Overloaded,
+    Transient,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct UpstreamStreamDiagnostics {
+    pub event_count: usize,
+    pub last_event_type: Option<String>,
+    pub saw_terminal_event: bool,
+    pub open_blocks: Vec<OpenBlockDiagnostic>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenBlockDiagnostic {
+    pub output_index: usize,
+    pub anthropic_index: usize,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub input_tokens_details_cached: Option<u64>,
+    pub output_tokens_details_reasoning: Option<u64>,
+}
+
+pub type StopReason = &'static str;
+pub const STOP_END_TURN: &str = "end_turn";
+pub const STOP_TOOL_USE: &str = "tool_use";
+pub const STOP_MAX_TOKENS: &str = "max_tokens";
+
+pub type TerminalType = &'static str;
+pub const TERM_COMPLETED: &str = "response.completed";
+pub const TERM_INCOMPLETE: &str = "response.incomplete";
+pub const TERM_DONE: &str = "response.done";
+
+const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
+const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
-    ThinkingStart(usize),
-    ThinkingDelta(usize, String),
-    ThinkingStop(usize),
-    TextStart(usize),
-    TextDelta(usize, String),
-    TextStop(usize),
-    ToolStart(usize, String, String),
-    ToolDelta(usize, String),
-    ToolStop(usize),
-    HostedSearch {
+    ThinkingStart {
+        index: usize,
+    },
+    ThinkingDelta {
+        index: usize,
+        text: String,
+    },
+    ThinkingStop {
+        index: usize,
+    },
+    TextStart {
+        index: usize,
+    },
+    TextDelta {
+        index: usize,
+        text: String,
+    },
+    TextStop {
+        index: usize,
+    },
+    ToolStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolDelta {
+        index: usize,
+        partial_json: String,
+    },
+    ToolStop {
+        index: usize,
+    },
+    ToolProgress {
+        index: usize,
+    },
+    Progress,
+    WebSearch {
         index: usize,
         result_index: usize,
         id: String,
-        name: String,
         query: String,
     },
-    Citation(usize, Value),
     Finish {
-        stop_reason: String,
-        input_tokens: u64,
-        output_tokens: u64,
-        web_search_requests: u64,
-        x_search_requests: u64,
+        stop_reason: StopReason,
+        terminal_type: String,
+        continuation_eligible: bool,
+        usage: Option<CodexUsage>,
+        web_search_requests: usize,
+        response_id: Option<String>,
+        output_items: Vec<ResponsesInputItem>,
     },
 }
 
-#[derive(Default)]
-pub struct Reducer {
-    next_index: usize,
-    active: Option<(String, usize)>,
-    calls: HashMap<String, (usize, String)>,
-    item_calls: HashMap<String, String>,
-    tool_args: HashMap<String, String>,
-    completed_arguments: HashMap<String, bool>,
-    hosted_calls: HashMap<String, (String, String)>,
-    web_search_requests: u64,
-    x_search_requests: u64,
-    saw_tool: bool,
-    completed: bool,
+#[derive(Debug, Clone)]
+pub struct FinishMetadata {
+    pub continuation_eligible: bool,
+    pub response_id: Option<String>,
+    pub output_items: Vec<ResponsesInputItem>,
 }
 
-impl Reducer {
-    pub fn push(&mut self, value: Value) -> anyhow::Result<Vec<ReducerEvent>> {
-        if self.completed {
-            anyhow::bail!("event after terminal completion");
-        }
-        let typ = value
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("event lacks type"))?;
-        match typ {
-            "response.created" | "response.in_progress" => Ok(vec![]),
-            "response.reasoning_summary_part.added"
-            | "response.reasoning_summary_part.done"
-            | "response.content_part.added" => Ok(vec![]),
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => self
-                .delta(
-                    "thinking",
-                    value
-                        .get("delta")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("reasoning delta is invalid"))?,
-                ),
-            "response.custom_tool_call_input.delta" => {
-                let id = value
-                    .get("item_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("custom tool delta lacks item id"))?;
-                let delta = value
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("custom tool delta is invalid"))?;
-                let (_, input) = self
-                    .hosted_calls
-                    .get_mut(id)
-                    .ok_or_else(|| anyhow::anyhow!("custom tool delta is out of order"))?;
-                if input.len().saturating_add(delta.len()) > MAX_TOOL_ARGUMENT_BYTES {
-                    anyhow::bail!("custom tool input exceeds the size limit");
+enum BlockState {
+    Text {
+        index: usize,
+        text_accum: String,
+    },
+    Tool {
+        index: usize,
+        #[allow(dead_code)]
+        output_index: usize,
+        call_id: String,
+        name: String,
+        args_accum: String,
+        had_delta: bool,
+        buffer_until_done: bool,
+        emitted_args: bool,
+    },
+}
+
+pub fn finish_metadata_from_upstream(
+    input: &[u8],
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    let events = reduce_upstream_bytes(input)?;
+    Ok(events.into_iter().rev().find_map(|event| match event {
+        ReducerEvent::Finish {
+            continuation_eligible,
+            response_id,
+            output_items,
+            ..
+        } => Some(FinishMetadata {
+            continuation_eligible,
+            response_id,
+            output_items,
+        }),
+        _ => None,
+    }))
+}
+
+pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    let sse_events = parse_sse_events(input);
+    let mut out = Vec::new();
+
+    let mut blocks_by_output_index: std::collections::HashMap<usize, BlockState> =
+        std::collections::HashMap::new();
+    let mut output_items_by_index: std::collections::BTreeMap<usize, ResponsesInputItem> =
+        std::collections::BTreeMap::new();
+    let mut item_id_to_output_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut anthropic_index = 0usize;
+    let mut thinking_index: Option<usize> = None;
+    let mut saw_tool_use = false;
+    let mut final_usage: Option<CodexUsage> = None;
+    let mut response_id: Option<String> = None;
+    let mut terminal_type: Option<String> = None;
+    let mut continuation_eligible = false;
+    let mut incomplete = false;
+    let mut web_search_requests = 0usize;
+    let mut _saw_terminal = false;
+    let mut event_count = 0usize;
+    let mut last_event_type: Option<String> = None;
+
+    fn capture_output_item(
+        output_index: usize,
+        state: &BlockState,
+        items: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
+    ) {
+        match state {
+            BlockState::Text {
+                index: _,
+                text_accum,
+            } => {
+                if text_accum.is_empty() {
+                    return;
                 }
-                input.push_str(delta);
-                Ok(vec![])
+                items.insert(
+                    output_index,
+                    ResponsesInputItem::Message {
+                        role: "assistant".to_string(),
+                        content: vec![super::request::ResponsesContentPart::OutputText {
+                            text: text_accum.clone(),
+                        }],
+                    },
+                );
             }
-            "response.custom_tool_call_input.done"
-            | "response.web_search_call.in_progress"
-            | "response.web_search_call.searching"
-            | "response.web_search_call.completed" => Ok(vec![]),
-            "response.output_text.annotation.added" => {
-                let Some((kind, index)) = self.active.as_ref() else {
-                    return Ok(vec![]);
-                };
-                let Some(annotation) = value.get("annotation") else {
-                    return Ok(vec![]);
-                };
-                if kind == "text"
-                    && annotation.get("type").and_then(Value::as_str) == Some("url_citation")
-                {
-                    Ok(vec![ReducerEvent::Citation(*index, annotation.clone())])
-                } else {
-                    Ok(vec![])
-                }
+            BlockState::Tool {
+                args_accum,
+                name,
+                call_id,
+                ..
+            } => {
+                items.insert(
+                    output_index,
+                    ResponsesInputItem::FunctionCall {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: args_accum.clone(),
+                    },
+                );
             }
-            "response.output_text.delta" => self.delta(
-                "text",
-                value
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("text delta is invalid"))?,
-            ),
-            "response.output_item.added" => {
-                let item = value
-                    .get("item")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| anyhow::anyhow!("output item is invalid"))?;
-                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
-                    let id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("custom tool call id is invalid"))?;
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or("x_search");
-                    let name = if name.starts_with("x_") {
-                        "x_search"
-                    } else {
-                        name
-                    };
-                    self.hosted_calls
-                        .insert(id.into(), (name.into(), String::new()));
-                    Ok(vec![])
-                } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|v| !v.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("function call id is invalid"))?;
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|v| !v.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("function call name is invalid"))?;
-                    if self.calls.contains_key(id) {
-                        anyhow::bail!("duplicate function call id");
-                    }
-                    if self.calls.len() >= MAX_INCOMPLETE_TOOL_CALLS {
-                        anyhow::bail!("too many incomplete function calls");
-                    }
-                    let mut out = self.close_active()?;
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    self.calls.insert(id.into(), (index, name.into()));
-                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
-                        self.item_calls.insert(item_id.into(), id.into());
-                    }
-                    self.tool_args.insert(id.into(), String::new());
-                    self.completed_arguments.insert(id.into(), false);
-                    self.saw_tool = true;
-                    out.push(ReducerEvent::ToolStart(index, id.into(), name.into()));
-                    Ok(out)
-                } else {
-                    Ok(vec![])
-                }
-            }
-            "response.function_call_arguments.delta" => {
-                let id = value
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .and_then(|item_id| self.item_calls.get(item_id).map(String::as_str))
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("function delta lacks call id"))?;
-                let delta = value
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("function delta is invalid"))?;
-                let (index, _) = self
-                    .calls
-                    .get(id)
-                    .ok_or_else(|| anyhow::anyhow!("function delta is out of order"))?
-                    .clone();
-                let args = self
-                    .tool_args
-                    .get_mut(id)
-                    .ok_or_else(|| anyhow::anyhow!("function delta is out of order"))?;
-                if args.len().saturating_add(delta.len()) > MAX_TOOL_ARGUMENT_BYTES {
-                    anyhow::bail!("function arguments exceed the size limit");
-                }
-                args.push_str(delta);
-                Ok(vec![ReducerEvent::ToolDelta(index, delta.into())])
-            }
-            "response.function_call_arguments.done" => {
-                let id = value
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .and_then(|item_id| self.item_calls.get(item_id).map(String::as_str))
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("function completion lacks call id"))?;
-                let args = value.get("arguments").and_then(Value::as_str);
-                let accumulated = self
-                    .tool_args
-                    .get(id)
-                    .ok_or_else(|| anyhow::anyhow!("function completion is out of order"))?;
-                let index = self
-                    .calls
-                    .get(id)
-                    .map(|(index, _)| *index)
-                    .ok_or_else(|| anyhow::anyhow!("function completion is out of order"))?;
-                let output = match args {
-                    Some(args) if accumulated.is_empty() && !args.is_empty() => {
-                        self.tool_args.get_mut(id).unwrap().push_str(args);
-                        vec![ReducerEvent::ToolDelta(index, args.into())]
-                    }
-                    Some(args) if args != accumulated => {
-                        anyhow::bail!("function completion arguments disagree with deltas")
-                    }
-                    _ => vec![],
-                };
-                self.completed_arguments.insert(id.into(), true);
-                Ok(output)
-            }
-            "response.output_text.done" => self.close_kind("text"),
-            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
-                self.close_kind("thinking")
-            }
-            "response.content_part.done" => Ok(vec![]),
-            "response.output_item.done" => {
-                let item = value
-                    .get("item")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| anyhow::anyhow!("completed output item is invalid"))?;
-                match item.get("type").and_then(Value::as_str) {
-                    Some("web_search_call") => {
-                        let id = item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .ok_or_else(|| anyhow::anyhow!("completed web search lacks id"))?;
-                        let query = item
-                            .get("action")
-                            .and_then(|action| action.get("query"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let mut out = self.close_active()?;
-                        let index = self.next_index;
-                        let result_index = index + 1;
-                        self.next_index += 2;
-                        self.web_search_requests += 1;
-                        out.push(ReducerEvent::HostedSearch {
-                            index,
-                            result_index,
-                            id: format!("srvtoolu_{id}"),
-                            name: "web_search".into(),
-                            query: query.into(),
-                        });
-                        Ok(out)
-                    }
-                    Some("custom_tool_call") => {
-                        let id = item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .ok_or_else(|| anyhow::anyhow!("completed custom tool lacks id"))?;
-                        let (name, input) = self.hosted_calls.remove(id).unwrap_or_else(|| {
-                            (
-                                item.get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("x_search")
-                                    .into(),
-                                String::new(),
-                            )
-                        });
-                        if name != "x_search" {
-                            return Ok(vec![]);
-                        }
-                        let query = serde_json::from_str::<Value>(&input)
-                            .ok()
-                            .and_then(|input| {
-                                input
-                                    .get("query")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .unwrap_or_default();
-                        let mut out = self.close_active()?;
-                        let index = self.next_index;
-                        let result_index = index + 1;
-                        self.next_index += 2;
-                        self.x_search_requests += 1;
-                        out.push(ReducerEvent::HostedSearch {
-                            index,
-                            result_index,
-                            id: format!("srvtoolu_{id}"),
-                            name,
-                            query,
-                        });
-                        Ok(out)
-                    }
-                    Some("function_call") => {
-                        let id = item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
-                            anyhow::anyhow!("completed function call lacks call id")
-                        })?;
-                        let (index, _) = self
-                            .calls
-                            .remove(id)
-                            .ok_or_else(|| anyhow::anyhow!("completed function call is unknown"))?;
-                        let args = self.tool_args.remove(id).unwrap_or_default();
-                        self.completed_arguments.remove(id);
-                        serde_json::from_str::<Value>(&args)
-                            .map_err(|_| anyhow::anyhow!("function arguments are incomplete"))?;
-                        Ok(vec![ReducerEvent::ToolStop(index)])
-                    }
-                    _ => Ok(vec![]),
-                }
-            }
-            "response.completed" => {
-                if !self.calls.is_empty() {
-                    anyhow::bail!("function call is incomplete");
-                }
-                let mut out = self.close_active()?;
-                let response = value.get("response").unwrap_or(&value);
-                let usage = response.get("usage").unwrap_or(&Value::Null);
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let stop = if self.saw_tool {
-                    "tool_use"
-                } else {
-                    "end_turn"
-                };
-                self.completed = true;
-                out.push(ReducerEvent::Finish {
-                    stop_reason: stop.into(),
-                    input_tokens: input,
-                    output_tokens: output,
-                    web_search_requests: self.web_search_requests,
-                    x_search_requests: self.x_search_requests,
-                });
-                Ok(out)
-            }
-            "error" | "response.failed" => anyhow::bail!("upstream Grok stream failed"),
-            _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
         }
     }
-    fn delta(&mut self, kind: &str, delta: &str) -> anyhow::Result<Vec<ReducerEvent>> {
-        let mut out = Vec::new();
-        if self
-            .active
-            .as_ref()
-            .is_none_or(|(active, _)| active != kind)
+
+    fn close_thinking(out: &mut Vec<ReducerEvent>, thinking_index: &mut Option<usize>) {
+        if let Some(index) = thinking_index.take() {
+            out.push(ReducerEvent::ThinkingStop { index });
+        }
+    }
+
+    for evt in &sse_events {
+        let data = evt.data.trim();
+        if data.is_empty() {
+            continue;
+        }
+
+        let p: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let t = p
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        event_count += 1;
+        last_event_type = Some(t.clone());
+
+        if t == "codex.rate_limits" {
+            if let Some(true) = p
+                .get("rate_limits")
+                .and_then(|r| r.get("limit_reached"))
+                .and_then(|v| v.as_bool())
+            {
+                let retry_after = p
+                    .get("rate_limits")
+                    .and_then(|r| r.get("primary"))
+                    .and_then(|r| r.get("reset_after_seconds"))
+                    .and_then(|v| v.as_f64());
+                return Err(UpstreamStreamError {
+                    kind: UpstreamErrorKind::RateLimit,
+                    message: "rate limit reached".to_string(),
+                    retry_after_seconds: retry_after.map(|f| f as u64),
+                    diagnostics: None,
+                });
+            }
+            out.push(ReducerEvent::Progress);
+            continue;
+        }
+
+        if t == "keepalive" {
+            out.push(ReducerEvent::Progress);
+            continue;
+        }
+
+        if t == "response.web_search_call.in_progress"
+            || t == "response.web_search_call.searching"
+            || t == "response.web_search_call.completed"
         {
-            out.extend(self.close_active()?);
-            let index = self.next_index;
-            self.next_index += 1;
-            self.active = Some((kind.into(), index));
-            out.push(if kind == "thinking" {
-                ReducerEvent::ThinkingStart(index)
-            } else {
-                ReducerEvent::TextStart(index)
+            out.push(ReducerEvent::Progress);
+            continue;
+        }
+
+        if t == "response.failed" || t == "response.error" || t == "error" {
+            let msg = p
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    p.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("Upstream error");
+            let kind = upstream_failure_kind(&p, msg);
+            let retry_after = retry_after_from_payload(&p);
+            return Err(UpstreamStreamError {
+                kind,
+                message: msg.to_string(),
+                retry_after_seconds: retry_after,
+                diagnostics: None,
             });
         }
-        let index = self.active.as_ref().unwrap().1;
-        out.push(if kind == "thinking" {
-            ReducerEvent::ThinkingDelta(index, delta.into())
-        } else {
-            ReducerEvent::TextDelta(index, delta.into())
-        });
-        Ok(out)
-    }
-    fn close_active(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
-        Ok(match self.active.take() {
-            Some((kind, index)) if kind == "thinking" => vec![ReducerEvent::ThinkingStop(index)],
-            Some((_, index)) => vec![ReducerEvent::TextStop(index)],
-            None => vec![],
-        })
-    }
-    fn close_kind(&mut self, kind: &str) -> anyhow::Result<Vec<ReducerEvent>> {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|(active, _)| active == kind)
-        {
-            self.close_active()
-        } else {
-            Ok(vec![])
+
+        if t == "response.output_item.added" {
+            let item = match p.get("item") {
+                Some(v) => v,
+                None => continue,
+            };
+            let output_index: usize =
+                p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "reasoning" {
+                continue;
+            }
+            if item_type == "web_search_call" {
+                out.push(ReducerEvent::Progress);
+                continue;
+            }
+
+            if item_type == "message" {
+                close_thinking(&mut out, &mut thinking_index);
+                let idx = anthropic_index;
+                anthropic_index += 1;
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    item_id_to_output_index.insert(id.to_string(), output_index);
+                }
+                blocks_by_output_index.insert(
+                    output_index,
+                    BlockState::Text {
+                        index: idx,
+                        text_accum: String::new(),
+                    },
+                );
+                out.push(ReducerEvent::TextStart { index: idx });
+                continue;
+            }
+
+            if item_type == "function_call" {
+                close_thinking(&mut out, &mut thinking_index);
+                saw_tool_use = true;
+                let idx = anthropic_index;
+                anthropic_index += 1;
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let buffer_until_done = should_buffer_tool_args(&name);
+                blocks_by_output_index.insert(
+                    output_index,
+                    BlockState::Tool {
+                        index: idx,
+                        output_index,
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        args_accum: String::new(),
+                        had_delta: false,
+                        buffer_until_done,
+                        emitted_args: false,
+                    },
+                );
+                out.push(ReducerEvent::ToolStart {
+                    index: idx,
+                    id: call_id,
+                    name,
+                });
+                continue;
+            }
+
+            continue;
+        }
+
+        if t == "response.reasoning_summary_part.added" {
+            if let Some(index) = thinking_index {
+                out.push(ReducerEvent::ThinkingDelta {
+                    index,
+                    text: "\n\n".to_string(),
+                });
+            }
+            continue;
+        }
+
+        if t == "response.reasoning_summary_text.delta" {
+            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if delta.is_empty() {
+                continue;
+            }
+            if thinking_index.is_none() {
+                let index = anthropic_index;
+                anthropic_index += 1;
+                thinking_index = Some(index);
+                out.push(ReducerEvent::ThinkingStart { index });
+            }
+            out.push(ReducerEvent::ThinkingDelta {
+                index: thinking_index.unwrap(),
+                text: delta.to_string(),
+            });
+            continue;
+        }
+
+        if t == "response.output_text.delta" {
+            close_thinking(&mut out, &mut thinking_index);
+            let output_index = p
+                .get("output_index")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let item_id = p.get("item_id").and_then(|v| v.as_str());
+            let state = if let Some(oi) = output_index {
+                blocks_by_output_index.get_mut(&oi)
+            } else if let Some(id) = item_id {
+                item_id_to_output_index
+                    .get(id)
+                    .and_then(|oi| blocks_by_output_index.get_mut(oi))
+            } else {
+                None
+            };
+            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if delta.is_empty() {
+                continue;
+            }
+            match state {
+                Some(BlockState::Text { index, text_accum }) => {
+                    text_accum.push_str(delta);
+                    out.push(ReducerEvent::TextDelta {
+                        index: *index,
+                        text: delta.to_string(),
+                    });
+                }
+                _ => continue,
+            }
+            continue;
+        }
+
+        if t == "response.function_call_arguments.delta" {
+            let output_index = match p.get("output_index").and_then(|v| v.as_u64()) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if delta.is_empty() {
+                continue;
+            }
+            let state = match blocks_by_output_index.get_mut(&output_index) {
+                Some(s) => s,
+                None => continue,
+            };
+            let mut repaired_read: Option<(usize, String)> = None;
+            match state {
+                BlockState::Tool {
+                    args_accum,
+                    had_delta,
+                    buffer_until_done,
+                    emitted_args,
+                    name,
+                    index,
+                    call_id,
+                    ..
+                } => {
+                    args_accum.push_str(delta);
+                    *had_delta = true;
+                    if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                        return Err(UpstreamStreamError {
+                            kind: UpstreamErrorKind::Failed,
+                            message: format!("Buffered {name} tool arguments exceeded safe limits"),
+                            retry_after_seconds: None,
+                            diagnostics: None,
+                        });
+                    }
+
+                    if *buffer_until_done {
+                        if let Some(repaired) = repair_whitespace_stalled_read_args(
+                            name,
+                            args_accum,
+                            Some(call_id.as_str()),
+                        ) {
+                            *args_accum = repaired.clone();
+                            *emitted_args = true;
+                            repaired_read = Some((*index, repaired));
+                        } else {
+                            out.push(ReducerEvent::ToolProgress { index: *index });
+                        }
+                    } else {
+                        *emitted_args = true;
+                        out.push(ReducerEvent::ToolDelta {
+                            index: *index,
+                            partial_json: delta.to_string(),
+                        });
+                    }
+                }
+                _ => continue,
+            }
+            if let Some((index, repaired)) = repaired_read {
+                if let Some(state) = blocks_by_output_index.remove(&output_index) {
+                    capture_output_item(output_index, &state, &mut output_items_by_index);
+                }
+                out.push(ReducerEvent::ToolDelta {
+                    index,
+                    partial_json: repaired,
+                });
+                out.push(ReducerEvent::ToolStop { index });
+                let output_items: Vec<ResponsesInputItem> =
+                    output_items_by_index.into_values().collect();
+                out.push(ReducerEvent::Finish {
+                    stop_reason: STOP_TOOL_USE,
+                    terminal_type: TERM_INCOMPLETE.to_string(),
+                    continuation_eligible: false,
+                    usage: None,
+                    web_search_requests,
+                    response_id: None,
+                    output_items,
+                });
+                return Ok(out);
+            }
+            continue;
+        }
+
+        if t == "response.function_call_arguments.done" {
+            let output_index = match p.get("output_index").and_then(|v| v.as_u64()) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            if let Some(BlockState::Tool { args_accum, .. }) =
+                blocks_by_output_index.get_mut(&output_index)
+                && let Some(args) = p.get("arguments").and_then(|v| v.as_str())
+                && args_accum.is_empty()
+            {
+                *args_accum = args.to_string();
+            }
+            continue;
+        }
+
+        if t == "response.output_item.done" {
+            let output_index: usize =
+                p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let item = p.get("item");
+
+            if let Some(item_val) = item
+                && item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning")
+            {
+                close_thinking(&mut out, &mut thinking_index);
+                continue;
+            }
+
+            if let Some(item_val) = item
+                && item_val.get("type").and_then(|v| v.as_str()) == Some("web_search_call")
+            {
+                close_thinking(&mut out, &mut thinking_index);
+                let idx = anthropic_index;
+                anthropic_index += 1;
+                let result_index = anthropic_index;
+                anthropic_index += 1;
+                web_search_requests += 1;
+                let id_val = item_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let id = server_tool_use_id_from_codex_web_search_id(id_val);
+                let query = web_search_query(item_val);
+                out.push(ReducerEvent::WebSearch {
+                    index: idx,
+                    result_index,
+                    id,
+                    query,
+                });
+                continue;
+            }
+
+            let state = blocks_by_output_index.remove(&output_index);
+            let mut state = match state {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if let Some(item_val) = item {
+                if let BlockState::Tool {
+                    args_accum,
+                    name,
+                    call_id,
+                    buffer_until_done,
+                    emitted_args,
+                    had_delta,
+                    index,
+                    ..
+                } = &mut state
+                {
+                    if let Some(final_args) = item_val
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        if !args_accum.is_empty() && !*emitted_args {
+                            // Already have accum from deltas - skip
+                        } else if *had_delta {
+                            // Already emitted deltas
+                        } else {
+                            *args_accum = final_args.to_string();
+                        }
+                    }
+
+                    if !args_accum.is_empty() {
+                        let sanitized =
+                            sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                        *args_accum = sanitized;
+                        if *buffer_until_done || !*emitted_args {
+                            *emitted_args = true;
+                            out.push(ReducerEvent::ToolDelta {
+                                index: *index,
+                                partial_json: args_accum.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            capture_output_item(output_index, &state, &mut output_items_by_index);
+
+            match &state {
+                BlockState::Text { index, .. } => {
+                    out.push(ReducerEvent::TextStop { index: *index });
+                }
+                BlockState::Tool { index, .. } => {
+                    out.push(ReducerEvent::ToolStop { index: *index });
+                }
+            }
+            continue;
+        }
+
+        if t == "response.completed" || t == "response.incomplete" || t == "response.done" {
+            _saw_terminal = true;
+            terminal_type = Some(t.clone());
+            response_id = p
+                .get("response")
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            final_usage = p.get("response").map(parse_codex_usage);
+            if response_is_incomplete(&p, &t) {
+                incomplete = true;
+            }
+            continuation_eligible =
+                (t == "response.completed" || t == "response.done") && !incomplete;
+            continue;
         }
     }
-    pub fn finished(&self) -> bool {
-        self.completed
+
+    let open_blocks = describe_open_blocks(&blocks_by_output_index);
+    if !_saw_terminal || !open_blocks.is_empty() {
+        let diagnostics = UpstreamStreamDiagnostics {
+            event_count,
+            last_event_type,
+            saw_terminal_event: _saw_terminal,
+            open_blocks,
+        };
+        return Err(UpstreamStreamError {
+            kind: UpstreamErrorKind::Transient,
+            message: if diagnostics.saw_terminal_event {
+                "upstream stream ended with open Codex output blocks".to_string()
+            } else {
+                "upstream stream ended before terminal Codex response event".to_string()
+            },
+            retry_after_seconds: None,
+            diagnostics: Some(diagnostics),
+        });
+    }
+
+    close_thinking(&mut out, &mut thinking_index);
+
+    let stop_reason: StopReason = if incomplete {
+        STOP_MAX_TOKENS
+    } else if saw_tool_use {
+        STOP_TOOL_USE
+    } else {
+        STOP_END_TURN
+    };
+
+    let output_items: Vec<ResponsesInputItem> = output_items_by_index.into_values().collect();
+
+    out.push(ReducerEvent::Finish {
+        stop_reason,
+        terminal_type: terminal_type.unwrap_or_else(|| TERM_INCOMPLETE.to_string()),
+        continuation_eligible,
+        usage: final_usage,
+        web_search_requests,
+        response_id,
+        output_items,
+    });
+
+    Ok(out)
+}
+
+fn describe_open_blocks(
+    blocks: &std::collections::HashMap<usize, BlockState>,
+) -> Vec<OpenBlockDiagnostic> {
+    let mut out: Vec<_> = blocks
+        .iter()
+        .map(|(output_index, state)| match state {
+            BlockState::Text { index, text_accum } => OpenBlockDiagnostic {
+                output_index: *output_index,
+                anthropic_index: *index,
+                kind: "text".to_string(),
+                name: None,
+                call_id: None,
+                text_bytes: Some(text_accum.len()),
+                argument_bytes: None,
+            },
+            BlockState::Tool {
+                index,
+                call_id,
+                name,
+                args_accum,
+                ..
+            } => OpenBlockDiagnostic {
+                output_index: *output_index,
+                anthropic_index: *index,
+                kind: "tool".to_string(),
+                name: Some(name.clone()),
+                call_id: Some(call_id.clone()),
+                text_bytes: None,
+                argument_bytes: Some(args_accum.len()),
+            },
+        })
+        .collect();
+    out.sort_by_key(|block| block.output_index);
+    out
+}
+
+fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
+    let usage = match response.get("usage") {
+        Some(u) => u,
+        None => return CodexUsage::default(),
+    };
+    CodexUsage {
+        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
+        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
+        input_tokens_details_cached: usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64()),
+        output_tokens_details_reasoning: usage
+            .get("output_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64()),
     }
 }
 
-pub fn reduce_upstream_bytes(bytes: &[u8]) -> anyhow::Result<Vec<ReducerEvent>> {
-    let mut reducer = Reducer::default();
-    let mut out = Vec::new();
-    let mut decoder = SseDecoder::default();
-    for event in decoder.push(bytes)? {
-        let value: Value = serde_json::from_str(&event.data)
-            .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))?;
-        out.extend(reducer.push(value)?);
-    }
-    decoder.finish()?;
-    if !reducer.finished() {
-        anyhow::bail!("Grok stream ended without completion");
-    }
-    Ok(out)
+fn response_is_incomplete(payload: &serde_json::Value, event_type: &str) -> bool {
+    event_type == "response.incomplete"
+        || payload
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(|v| v.as_str())
+            == Some("incomplete")
+        || payload
+            .get("response")
+            .and_then(|r| r.get("incomplete_details"))
+            .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str())
+            .is_some()
 }
+
+fn should_buffer_tool_args(name: &str) -> bool {
+    name == "Read"
+}
+
+fn repair_whitespace_stalled_read_args(
+    name: &str,
+    args: &str,
+    call_id: Option<&str>,
+) -> Option<String> {
+    if name != "Read" {
+        return None;
+    }
+    let trimmed = args.trim_end();
+    let trailing_whitespace = args.len().saturating_sub(trimmed.len());
+    if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
+        return None;
+    }
+    parse_read_args_candidate(trimmed, call_id).or_else(|| {
+        let with_brace = format!("{trimmed}}}");
+        parse_read_args_candidate(&with_brace, call_id)
+    })
+}
+
+fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+    if !is_valid_read_args(&parsed) {
+        return None;
+    }
+    Some(sanitize_read_args(
+        "Read",
+        &serde_json::to_string(&parsed).ok()?,
+        call_id,
+    ))
+}
+
+fn is_valid_read_args(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "file_path" | "offset" | "limit" | "pages") {
+            return false;
+        }
+    }
+    let Some(file_path) = obj.get("file_path").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if file_path.is_empty() {
+        return false;
+    }
+    if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64())
+        && offset < 0
+    {
+        return false;
+    }
+    if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64())
+        && limit <= 0
+    {
+        return false;
+    }
+    if obj.get("offset").is_some_and(|v| !v.is_i64()) {
+        return false;
+    }
+    if obj.get("limit").is_some_and(|v| !v.is_i64()) {
+        return false;
+    }
+    if obj.get("pages").is_some_and(|v| !v.is_string()) {
+        return false;
+    }
+    true
+}
+
+fn web_search_query(item: &serde_json::Value) -> String {
+    let action = match item.get("action") {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    if let Some(query) = action.get("query").and_then(|v| v.as_str()) {
+        return query.to_string();
+    }
+    if let Some(queries) = action.get("queries").and_then(|v| v.as_array()) {
+        for q in queries {
+            if let Some(s) = q.as_str() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
+    let suffix: String = id
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("srvtoolu_{suffix}")
+}
+
+fn upstream_failure_kind(payload: &serde_json::Value, message: &str) -> UpstreamErrorKind {
+    let status = payload
+        .get("status")
+        .or_else(|| payload.get("status_code"))
+        .and_then(|v| v.as_u64());
+    let code = payload
+        .get("response")
+        .and_then(|r| r.get("error"))
+        .and_then(|e| e.get("code"))
+        .or_else(|| payload.get("error").and_then(|e| e.get("code")))
+        .and_then(|v| v.as_str());
+    let err_type = payload
+        .get("response")
+        .and_then(|r| r.get("error"))
+        .and_then(|e| e.get("type"))
+        .or_else(|| payload.get("error").and_then(|e| e.get("type")))
+        .and_then(|v| v.as_str());
+    let lower_msg = message.to_lowercase();
+
+    if status == Some(529)
+        || code == Some("overloaded_error")
+        || err_type == Some("overloaded_error")
+        || lower_msg.contains("overloaded")
+    {
+        return UpstreamErrorKind::Overloaded;
+    }
+
+    if (status.is_some_and(|s| (500..600).contains(&s)))
+        || code == Some("server_error")
+        || code == Some("internal_server_error")
+        || code == Some("internal_error")
+        || err_type == Some("server_error")
+        || err_type == Some("internal_server_error")
+        || err_type == Some("internal_error")
+        || is_retryable_transport_message(&lower_msg)
+    {
+        return UpstreamErrorKind::Transient;
+    }
+
+    UpstreamErrorKind::Failed
+}
+
+fn retry_after_from_payload(payload: &serde_json::Value) -> Option<u64> {
+    let raw = payload
+        .get("response")
+        .and_then(|r| r.get("error"))
+        .and_then(|e| e.get("retry_after_seconds"))
+        .or_else(|| {
+            payload
+                .get("error")
+                .and_then(|e| e.get("retry_after_seconds"))
+        })
+        .or_else(|| payload.get("retry_after_seconds"))
+        .or_else(|| payload.get("headers").and_then(|h| h.get("retry-after")))
+        .or_else(|| payload.get("headers").and_then(|h| h.get("Retry-After")));
+    let value = match raw {
+        Some(v) if v.is_number() => v.as_f64(),
+        Some(v) if v.is_string() => v.as_str().and_then(|s| s.parse::<f64>().ok()),
+        _ => None,
+    };
+    value.map(|f| f as u64)
+}
+
+fn is_retryable_transport_message(msg: &str) -> bool {
+    msg.contains("you can retry your request")
+        || msg.contains("socket connection was closed unexpectedly")
+        || msg.contains("connection closed unexpectedly")
+        || msg.contains("connection reset")
+        || msg.contains("operation timed out")
+        || msg.contains("econnreset")
+        || msg.contains("epipe")
+        || msg.contains("etimedout")
+        || msg.contains("und_err_socket")
+        || msg.contains("fetch failed")
+}
+
+pub fn map_codex_usage_to_anthropic(
+    u: &Option<CodexUsage>,
+    web_search_requests: Option<usize>,
+) -> AnthropicUsage {
+    let usage = match u {
+        Some(u) => u,
+        None => return AnthropicUsage::default(),
+    };
+    let cached = usage.input_tokens_details_cached.unwrap_or(0);
+    let total_input = usage.input_tokens.unwrap_or(0);
+    let input_tokens = total_input.saturating_sub(cached);
+
+    let mut result = AnthropicUsage {
+        input_tokens,
+        output_tokens: usage.output_tokens.unwrap_or(0),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: cached,
+        server_tool_use: None,
+    };
+
+    if let Some(requests) = web_search_requests
+        && requests > 0
+    {
+        result.server_tool_use = Some(WebSearchUsage {
+            web_search_requests: requests,
+        });
+    }
+
+    result
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AnthropicUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<WebSearchUsage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WebSearchUsage {
+    pub web_search_requests: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn sse(type_name: &str, payload: serde_json::Value) -> String {
+        let mut obj = payload.as_object().cloned().unwrap_or_default();
+        obj.insert("type".into(), json!(type_name));
+        format!("data: {}\n\n", serde_json::to_string(&obj).unwrap())
+    }
+
     #[test]
-    fn grok_reducer_handles_text_tool_and_completion() {
-        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
-        assert!(
-            matches!(events.last(), Some(ReducerEvent::Finish { stop_reason, .. }) if stop_reason == "tool_use")
+    fn reduce_text_response() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({
+                    "output_index":0,"delta":"hello"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,"item":{"type":"message"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","status":"completed","incomplete_details":null,"usage":{"input_tokens":5,"output_tokens":1}}
+                })
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            stop_reason,
+            response_id,
+            usage,
+            ..
+        } = last
+        {
+            assert_eq!(*stop_reason, "end_turn");
+            assert_eq!(response_id.as_deref(), Some("resp_1"));
+            assert_eq!(usage.as_ref().unwrap().input_tokens, Some(5));
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_tool_use_response() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                })
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":0,"delta":"{\"file_path\":"
+                })
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":0,"delta":"\"/tmp/a\"}"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish { stop_reason, .. } = last {
+            assert_eq!(*stop_reason, "tool_use");
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_rate_limit_throws() {
+        let upstream = sse(
+            "codex.rate_limits",
+            json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+        );
+        let result = reduce_upstream_bytes(upstream.as_bytes());
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind, UpstreamErrorKind::RateLimit);
+    }
+
+    #[test]
+    fn reduce_repairs_whitespace_stalled_read_args() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                })
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":0,
+                    "delta": format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+                })
+            )
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(out.iter().any(|event| {
+            matches!(
+                event,
+                ReducerEvent::ToolDelta { partial_json, .. }
+                    if partial_json == "{\"file_path\":\"/tmp/a\"}"
+            )
+        }));
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            stop_reason,
+            continuation_eligible,
+            ..
+        } = last
+        {
+            assert_eq!(*stop_reason, "tool_use");
+            assert!(!continuation_eligible);
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_upstream_error_event() {
+        let upstream = sse("error", json!({"error":{"message":"upstream failure"}}));
+        let result = reduce_upstream_bytes(upstream.as_bytes());
+        assert!(result.is_err());
+        match result.unwrap_err().kind {
+            UpstreamErrorKind::Failed => {}
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn reduce_web_search_output() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1","action":{"query":"test query"}}
+                })
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({
+                    "output_index":1,"delta":"result"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":3}}
+                })
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let has_web_search = out
+            .iter()
+            .any(|e| matches!(e, ReducerEvent::WebSearch { .. }));
+        assert!(has_web_search, "expected WebSearch event");
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            web_search_requests,
+            ..
+        } = last
+        {
+            assert_eq!(*web_search_requests, 1);
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_missing_terminal_is_error() {
+        let upstream = format!(
+            "{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({
+                    "output_index":0,"delta":"partial"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,"item":{"type":"message"}
+                })
+            ),
+        );
+        let err = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+        assert_eq!(err.kind, UpstreamErrorKind::Transient);
+        assert!(err.message.contains("terminal"));
+    }
+
+    #[test]
+    fn reduce_incomplete_is_max_tokens() {
+        let upstream = sse(
+            "response.incomplete",
+            json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            stop_reason,
+            continuation_eligible,
+            ..
+        } = last
+        {
+            assert_eq!(*stop_reason, "max_tokens");
+            assert!(!continuation_eligible);
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_completed_with_null_incomplete_details_is_end_turn() {
+        let upstream = sse(
+            "response.completed",
+            json!({"response":{"id":"resp_1","status":"completed","incomplete_details":null,"usage":{}}}),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            stop_reason,
+            continuation_eligible,
+            ..
+        } = last
+        {
+            assert_eq!(*stop_reason, "end_turn");
+            assert!(continuation_eligible);
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_completed_is_continuation_eligible() {
+        let upstream = sse(
+            "response.completed",
+            json!({"response":{"id":"resp_1","usage":{}}}),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            continuation_eligible,
+            ..
+        } = last
+        {
+            assert!(continuation_eligible);
+        } else {
+            panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn finish_metadata_extracts_continuation_state() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({
+                    "output_index":0,"delta":"hello"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,"item":{"type":"message"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let metadata = finish_metadata_from_upstream(upstream.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(metadata.continuation_eligible);
+        assert_eq!(metadata.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(metadata.output_items.len(), 1);
+    }
+
+    #[test]
+    fn sanitize_tool_args_removes_empty_pages() {
+        let args = r#"{"file_path":"/tmp/a","pages":""}"#;
+        let sanitized = sanitize_read_args("Read", args, None);
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert!(parsed.get("pages").is_none());
+        assert_eq!(
+            parsed.get("file_path").and_then(|v| v.as_str()),
+            Some("/tmp/a")
         );
     }
 
     #[test]
-    fn grok_reducer_maps_item_id_argument_events() {
-        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"Bash\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"arguments\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, ReducerEvent::ToolDelta(_, delta) if delta == "{}"))
-        );
-        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
+    fn map_usage_reports_cached_prompt_tokens() {
+        let usage = CodexUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            input_tokens_details_cached: Some(20),
+            output_tokens_details_reasoning: None,
+        };
+        let mapped = map_codex_usage_to_anthropic(&Some(usage), None);
+        assert_eq!(mapped.input_tokens, 80);
+        assert_eq!(mapped.output_tokens, 50);
+        assert_eq!(mapped.cache_read_input_tokens, 20);
     }
 
     #[test]
-    fn grok_reducer_accepts_live_reasoning_text_events() {
-        let input = b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
-        assert!(matches!(events[0], ReducerEvent::ThinkingStart(0)));
+    fn reduce_reasoning_summary_before_text() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"Plan"})
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"ning"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({"output_index":1,"delta":"answer"})
+            ),
+            format!(
+                "{}{}",
+                sse(
+                    "response.output_item.done",
+                    json!({"output_index":1,"item":{"type":"message"}})
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":{}}})
+                )
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
         assert!(matches!(
-            &events[1],
-            ReducerEvent::ThinkingDelta(0, delta) if delta == "think"
+            out.iter()
+                .find(|event| matches!(event, ReducerEvent::ThinkingStart { .. })),
+            Some(ReducerEvent::ThinkingStart { index: 0 })
         ));
-        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
+        let thinking_text: String = out
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_text, "Planning");
+        let thinking_stop = out
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+            .unwrap();
+        let text_start = out
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::TextStart { .. }))
+            .unwrap();
+        assert!(thinking_stop < text_start);
+        assert!(matches!(
+            out.iter()
+                .find(|event| matches!(event, ReducerEvent::TextStart { .. })),
+            Some(ReducerEvent::TextStart { index: 1 })
+        ));
     }
 
     #[test]
-    fn grok_reducer_accepts_hosted_search_lifecycle() {
-        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_keyword_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"search_1\",\"delta\":\"{\\\"query\\\":\\\"test\\\"}\"}\n\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"search_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_keyword_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"result\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
-        assert!(events.iter().any(|event| matches!(
+    fn reduce_empty_reasoning_summary_emits_no_thinking() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
+            ),
+            format!(
+                "{}{}{}",
+                sse(
+                    "response.output_text.delta",
+                    json!({"output_index":1,"delta":"answer"})
+                ),
+                sse(
+                    "response.output_item.done",
+                    json!({"output_index":1,"item":{"type":"message"}})
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":{}}})
+                )
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(!out.iter().any(|event| matches!(
             event,
-            ReducerEvent::HostedSearch { name, query, .. }
-                if name == "x_search" && query == "test"
+            ReducerEvent::ThinkingStart { .. }
+                | ReducerEvent::ThinkingDelta { .. }
+                | ReducerEvent::ThinkingStop { .. }
         )));
-        assert!(matches!(
-            events.last(),
-            Some(ReducerEvent::Finish {
-                x_search_requests: 1,
-                ..
-            })
-        ));
     }
 
     #[test]
-    fn grok_reducer_accepts_reasoning_summary_part_completion() {
-        let input = b"data: {\"type\":\"response.reasoning_summary_part.added\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\"}\n\ndata: {\"type\":\"response.reasoning_summary_part.done\",\"part\":{\"type\":\"summary_text\",\"text\":\"think\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
-        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
+    fn reduce_multiple_reasoning_summary_parts() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"part one"})
+            ),
+            sse(
+                "response.reasoning_summary_part.added",
+                json!({"output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}})
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":1,"delta":"part two"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let deltas: Vec<&str> = out
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["part one", "\n\n", "part two"]);
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn grok_reducer_accepts_complete_observed_lifecycle() {
-        let input = b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.in_progress\"}\n\ndata: {\"type\":\"response.reasoning_summary_part.added\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\ndata: {\"type\":\"response.content_part.added\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.content_part.done\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
-        assert!(matches!(
-            events.last(),
-            Some(ReducerEvent::Finish {
-                input_tokens: 4,
-                output_tokens: 2,
-                ..
+    fn reduce_two_reasoning_items() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"first"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":1,"summary_index":0,"delta":"second"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":1,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, ReducerEvent::ThinkingStart { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+                .count(),
+            2
+        );
+        let deltas: Vec<&str> = out
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
             })
-        ));
+            .collect();
+        assert_eq!(deltas, vec!["first", "second"]);
     }
 }

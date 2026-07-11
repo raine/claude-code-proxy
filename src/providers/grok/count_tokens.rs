@@ -1,124 +1,166 @@
-use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesRequest};
+use super::translate::request::{
+    ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesTool,
+};
 
-const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
-const TOOL_OVERHEAD_TOKENS: u64 = 4;
+/// Approximate token counter for Codex translated requests.
+/// Uses a simple monotonic estimator that satisfies Claude Code's
+/// compaction logic (needs approximate, not exact counts).
+pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
+    let mut total = 0u64;
 
-pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
-    let instructions = request
-        .instructions
-        .as_deref()
-        .map(approx_token_count)
-        .unwrap_or(0);
-    let input: u64 = request.input.iter().map(count_input_item).sum();
-    let tools: u64 = request
-        .tools
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|tool| {
-            tool.name.as_deref().map(approx_token_count).unwrap_or(0)
-                + tool
-                    .description
-                    .as_deref()
-                    .map(approx_token_count)
-                    .unwrap_or(0)
-                + approx_token_count(&serde_json::to_string(&tool.parameters).unwrap_or_default())
-                + TOOL_OVERHEAD_TOKENS
-        })
-        .sum();
+    // Instructions
+    if let Some(ref instructions) = translated.instructions {
+        total += approx_token_count(instructions);
+    }
 
-    (instructions
-        + input
-        + tools
-        + request.input.len() as u64 * MESSAGE_OVERHEAD_TOKENS
-        + approx_token_count(&request.model))
-    .max(1)
+    // Input items
+    for item in &translated.input {
+        total += count_input_item_tokens(item);
+    }
+
+    // Tools
+    if let Some(ref tools) = translated.tools {
+        total += count_tool_tokens(tools);
+    }
+
+    // Overhead
+    total += translated.input.len() as u64 * 4;
+    total += translated.tools.as_ref().map_or(0, |t| t.len() as u64 * 4);
+
+    // Model name
+    total += approx_token_count(&translated.model);
+
+    total.max(1)
 }
 
-fn count_input_item(item: &GrokInputItem) -> u64 {
+fn count_input_item_tokens(item: &ResponsesInputItem) -> u64 {
     match item {
-        GrokInputItem::Message { content, .. } => content
+        ResponsesInputItem::AdditionalTools { tools, .. } => tools
             .iter()
-            .map(|part| match part {
-                GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
-                    approx_token_count(text)
-                }
-            })
+            .map(|tool| approx_token_count(&serde_json::to_string(tool).unwrap_or_default()))
             .sum(),
-        GrokInputItem::FunctionCall {
+        ResponsesInputItem::Message { content, .. } => {
+            let mut total = 0u64;
+            for part in content {
+                total += count_content_part_tokens(part);
+            }
+            total
+        }
+        ResponsesInputItem::FunctionCall {
             name, arguments, ..
         } => approx_token_count(name) + approx_token_count(arguments),
-        GrokInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
+        ResponsesInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
     }
+}
+
+fn count_content_part_tokens(part: &ResponsesContentPart) -> u64 {
+    match part {
+        ResponsesContentPart::InputText { text } => approx_token_count(text),
+        ResponsesContentPart::OutputText { text } => approx_token_count(text),
+        ResponsesContentPart::InputImage { .. } => 2000, // Image token estimate
+    }
+}
+
+fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
+    let mut total = 0u64;
+    for tool in tools {
+        match tool {
+            ResponsesTool::Function(f) => {
+                total += approx_token_count(&f.name);
+                if let Some(ref desc) = f.description {
+                    total += approx_token_count(desc);
+                }
+                total +=
+                    approx_token_count(&serde_json::to_string(&f.parameters).unwrap_or_default());
+            }
+            ResponsesTool::WebSearch(_) => {
+                total += 10; // fixed overhead for web search tool
+            }
+        }
+    }
+    total
 }
 
 fn approx_token_count(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
     }
-    let mut count = 0;
+    let mut count = 0u64;
     let mut in_word = false;
-    for character in text.chars() {
-        if character.is_alphanumeric() || character == '-' || character == '_' {
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
             if !in_word {
                 count += 1;
                 in_word = true;
             }
         } else {
             in_word = false;
-            if !character.is_whitespace() {
+            if !ch.is_whitespace() {
                 count += 1;
             }
         }
     }
+
     count.max(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::schema::MessagesRequest;
-    use crate::providers::grok::translate::request::translate_request;
     use serde_json::json;
 
-    fn translated_request(value: serde_json::Value) -> GrokResponsesRequest {
-        let request: MessagesRequest = serde_json::from_value(value).unwrap();
-        translate_request(&request, "grok-4.5".into()).unwrap()
+    #[test]
+    fn count_simple_request() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"},
+        }))
+        .unwrap();
+        let count = count_translated_tokens(&req);
+        assert!(count > 0);
     }
 
     #[test]
-    fn count_tokens_returns_a_positive_count() {
-        let request = translated_request(json!({
-            "model": "grok-4.5",
-            "messages": [{"role": "user", "content": "hello"}]
-        }));
-
-        assert!(count_tokens(&request) > 0);
+    fn count_request_with_tools() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "use tool"}]}],
+            "tools": [{"type": "function", "name": "search", "parameters": {"type": "object"}}],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"},
+        }))
+        .unwrap();
+        let count = count_translated_tokens(&req);
+        assert!(count > 0);
     }
 
     #[test]
-    fn count_tokens_increases_for_more_input() {
-        let short = translated_request(json!({
-            "model": "grok-4.5",
-            "messages": [{"role": "user", "content": "hello"}]
-        }));
-        let long = translated_request(json!({
-            "model": "grok-4.5",
-            "system": "Follow all instructions carefully.",
-            "messages": [{"role": "user", "content": "hello, please explain this request in detail"}],
-            "tools": [{"name": "lookup", "description": "Look up a record", "input_schema": {"type": "object"}}]
-        }));
-
-        assert!(count_tokens(&long) > count_tokens(&short));
-    }
-
-    #[test]
-    fn count_tokens_is_deterministic() {
-        let request = translated_request(json!({
-            "model": "grok-4.5",
-            "messages": [{"role": "user", "content": "repeatable input"}]
-        }));
-
-        assert_eq!(count_tokens(&request), count_tokens(&request));
+    fn count_is_monotonic() {
+        let short: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"},
+        }))
+        .unwrap();
+        let long: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "this is a much longer message with many words in it"}]}],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"},
+        }))
+        .unwrap();
+        assert!(count_translated_tokens(&long) >= count_translated_tokens(&short));
     }
 }

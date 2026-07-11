@@ -1,385 +1,690 @@
-use super::reducer::{Reducer, ReducerEvent};
-use crate::anthropic::sse::{SseEvent, encode_sse_event};
+use std::collections::BTreeMap;
 
-pub const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+use crate::anthropic::sse::encode_sse_event;
+use crate::traffic::TrafficCapture;
 
-#[derive(Default)]
-pub struct SseDecoder {
-    frame: Vec<u8>,
-    line_start: usize,
-    skip_lf: bool,
+use super::reducer::{
+    ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes,
+};
+use super::web_search_compat::build_web_search_compat_blocks;
+
+#[allow(dead_code)]
+enum OpenBlock {
+    Thinking,
+    Text,
+    Tool { id: String, name: String },
 }
 
-impl SseDecoder {
-    pub fn push(&mut self, input: &[u8]) -> anyhow::Result<Vec<SseEvent>> {
-        let mut events = Vec::new();
-        for &byte in input {
-            if self.skip_lf {
-                self.skip_lf = false;
-                if byte == b'\n' {
-                    continue;
+fn emit(
+    out: &mut Vec<u8>,
+    traffic: Option<&TrafficCapture>,
+    event: &str,
+    data: &serde_json::Value,
+) {
+    if let Some(traffic) = traffic {
+        traffic.write_json_event(
+            "050-downstream-event",
+            &serde_json::json!({
+                "event": event,
+                "data": data,
+            }),
+        );
+    }
+    out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
+}
+
+fn ensure_message_start(
+    out: &mut Vec<u8>,
+    traffic: Option<&TrafficCapture>,
+    message_started: &mut bool,
+    message_id: &str,
+    model: &str,
+) {
+    if !*message_started {
+        *message_started = true;
+        let data = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
                 }
             }
-            match byte {
-                b'\n' => self.end_line(&mut events)?,
-                b'\r' => {
-                    self.end_line(&mut events)?;
-                    self.skip_lf = true;
-                }
-                _ => self.push_byte(byte)?,
-            }
-        }
-        Ok(events)
-    }
-
-    pub fn finish(&mut self) -> anyhow::Result<()> {
-        if self.frame.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!("Grok SSE stream ended with an incomplete frame")
-        }
-    }
-
-    fn push_byte(&mut self, byte: u8) -> anyhow::Result<()> {
-        if self.frame.len() >= MAX_SSE_FRAME_BYTES {
-            anyhow::bail!("Grok SSE frame exceeds the size limit");
-        }
-        self.frame.push(byte);
-        Ok(())
-    }
-
-    fn end_line(&mut self, events: &mut Vec<SseEvent>) -> anyhow::Result<()> {
-        if self.frame.len() == self.line_start {
-            if !self.frame.is_empty() {
-                events.push(parse_frame(&self.frame)?);
-            }
-            self.frame.clear();
-            self.line_start = 0;
-            return Ok(());
-        }
-        self.push_byte(b'\n')?;
-        self.line_start = self.frame.len();
-        Ok(())
+        });
+        emit(out, traffic, "message_start", &data);
     }
 }
 
-fn parse_frame(frame: &[u8]) -> anyhow::Result<SseEvent> {
-    let frame = std::str::from_utf8(frame)
-        .map_err(|_| anyhow::anyhow!("Grok SSE frame contains invalid UTF-8"))?;
-    let mut event = None;
-    let mut data = Vec::new();
-    for line in frame.lines() {
-        if line.starts_with(':') {
-            continue;
+fn emit_content_event(
+    out: &mut Vec<u8>,
+    traffic: Option<&TrafficCapture>,
+    message_started: &mut bool,
+    open_blocks: &mut BTreeMap<usize, OpenBlock>,
+    message_id: &str,
+    model: &str,
+    event: &ReducerEvent,
+) -> bool {
+    match event {
+        ReducerEvent::ThinkingStart { index } => {
+            ensure_message_start(out, traffic, message_started, message_id, model);
+            open_blocks.insert(*index, OpenBlock::Thinking);
+            emit(
+                out,
+                traffic,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                }),
+            );
+            true
         }
-        let (field, value) = line.split_once(':').unwrap_or((line, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "event" => event = Some(value.to_owned()),
-            "data" => data.push(value),
-            _ => {}
+        ReducerEvent::ThinkingDelta { index, text } => {
+            emit(
+                out,
+                traffic,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": text}
+                }),
+            );
+            true
         }
+        ReducerEvent::ThinkingStop { index } => {
+            open_blocks.remove(index);
+            emit(
+                out,
+                traffic,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+            true
+        }
+        ReducerEvent::TextStart { index } => {
+            ensure_message_start(out, traffic, message_started, message_id, model);
+            open_blocks.insert(*index, OpenBlock::Text);
+            emit(
+                out,
+                traffic,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            );
+            true
+        }
+        ReducerEvent::TextDelta { index, text } => {
+            emit(
+                out,
+                traffic,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": text}
+                }),
+            );
+            true
+        }
+        ReducerEvent::TextStop { index } => {
+            open_blocks.remove(index);
+            emit(
+                out,
+                traffic,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+            true
+        }
+        ReducerEvent::ToolStart { index, id, name } => {
+            ensure_message_start(out, traffic, message_started, message_id, model);
+            open_blocks.insert(
+                *index,
+                OpenBlock::Tool {
+                    id: id.clone(),
+                    name: name.clone(),
+                },
+            );
+            emit(
+                out,
+                traffic,
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": {}
+                    }
+                }),
+            );
+            true
+        }
+        ReducerEvent::ToolDelta {
+            index,
+            partial_json,
+        } => {
+            emit(
+                out,
+                traffic,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": partial_json
+                    }
+                }),
+            );
+            true
+        }
+        ReducerEvent::ToolStop { index } => {
+            open_blocks.remove(index);
+            emit(
+                out,
+                traffic,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+            true
+        }
+        _ => false,
     }
-    if data.is_empty() {
-        anyhow::bail!("Grok SSE frame lacks data")
-    }
-    Ok(SseEvent {
+}
+
+fn is_content_event(event: &ReducerEvent) -> bool {
+    matches!(
         event,
-        data: data.join("\n"),
-    })
-}
-
-pub struct StreamTranslator {
-    message_id: String,
-    model: String,
-    started: bool,
-    finished: bool,
-}
-
-pub struct LiveStreamTranslator {
-    decoder: SseDecoder,
-    reducer: Reducer,
-    renderer: StreamTranslator,
-}
-
-impl LiveStreamTranslator {
-    pub fn new(message_id: String, model: String) -> Self {
-        Self {
-            decoder: SseDecoder::default(),
-            reducer: Reducer::default(),
-            renderer: StreamTranslator::new(message_id, model),
-        }
-    }
-
-    pub fn push(&mut self, chunk: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut out = Vec::new();
-        for event in self.decoder.push(chunk)? {
-            let value = serde_json::from_str(&event.data)
-                .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))?;
-            out.extend(self.renderer.render(self.reducer.push(value)?)?);
-        }
-        Ok(out)
-    }
-
-    pub fn finish(mut self) -> anyhow::Result<()> {
-        self.decoder.finish()?;
-        if !self.reducer.finished() {
-            anyhow::bail!("Grok stream ended without completion");
-        }
-        Ok(())
-    }
-}
-
-impl StreamTranslator {
-    pub fn new(message_id: String, model: String) -> Self {
-        Self {
-            message_id,
-            model,
-            started: false,
-            finished: false,
-        }
-    }
-
-    pub fn render(&mut self, events: Vec<ReducerEvent>) -> anyhow::Result<Vec<u8>> {
-        if self.finished && !events.is_empty() {
-            anyhow::bail!("event after terminal completion");
-        }
-        let mut out = Vec::new();
-        for event in events {
-            if !self.started
-                && matches!(
-                    event,
-                    ReducerEvent::ThinkingStart(_)
-                        | ReducerEvent::TextStart(_)
-                        | ReducerEvent::ToolStart(_, _, _)
-                        | ReducerEvent::HostedSearch { .. }
-                        | ReducerEvent::Finish { .. }
-                )
-            {
-                self.started = true;
-                emit(
-                    &mut out,
-                    "message_start",
-                    serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}),
-                );
-            }
-            if matches!(event, ReducerEvent::Finish { .. }) {
-                self.finished = true;
-            }
-            render(&mut out, event);
-        }
-        Ok(out)
-    }
+        ReducerEvent::ThinkingStart { .. }
+            | ReducerEvent::ThinkingDelta { .. }
+            | ReducerEvent::ThinkingStop { .. }
+            | ReducerEvent::TextStart { .. }
+            | ReducerEvent::TextDelta { .. }
+            | ReducerEvent::TextStop { .. }
+            | ReducerEvent::ToolStart { .. }
+            | ReducerEvent::ToolDelta { .. }
+            | ReducerEvent::ToolStop { .. }
+    )
 }
 
 pub fn translate_stream_bytes(
     upstream: &[u8],
     message_id: &str,
     model: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let mut decoder = SseDecoder::default();
-    let mut reducer = Reducer::default();
-    let mut translator = StreamTranslator::new(message_id.into(), model.into());
+) -> Result<Vec<u8>, anyhow::Error> {
+    translate_stream_bytes_with_traffic(upstream, message_id, model, None)
+}
+
+pub fn translate_stream_bytes_with_traffic(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let events = match reduce_upstream_bytes(upstream) {
+        Ok(events) => events,
+        Err(err) => {
+            write_reducer_error_capture(traffic, &err);
+            return Err(anyhow::anyhow!(
+                "upstream stream error: {} ({:?})",
+                err.message,
+                err.kind
+            ));
+        }
+    };
+
     let mut out = Vec::new();
-    for event in decoder.push(upstream)? {
-        let value = serde_json::from_str(&event.data)
-            .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))?;
-        out.extend(translator.render(reducer.push(value)?)?);
+    let mut message_started = false;
+    let mut open_blocks: BTreeMap<usize, OpenBlock> = BTreeMap::new();
+    let mut web_search_events: Vec<ReducerEvent> = Vec::new();
+    let mut deferred_content_events: Vec<ReducerEvent> = Vec::new();
+
+    for event in &events {
+        if matches!(event, ReducerEvent::WebSearch { .. }) {
+            web_search_events.push(event.clone());
+            continue;
+        }
+        if !web_search_events.is_empty() && is_content_event(event) {
+            deferred_content_events.push(event.clone());
+            continue;
+        }
+
+        if emit_content_event(
+            &mut out,
+            traffic,
+            &mut message_started,
+            &mut open_blocks,
+            message_id,
+            model,
+            event,
+        ) {
+            continue;
+        }
+
+        match event {
+            ReducerEvent::ToolProgress { .. } | ReducerEvent::Progress => {}
+            ReducerEvent::Finish {
+                stop_reason,
+                usage,
+                web_search_requests,
+                ..
+            } => {
+                // Emit web search compat blocks
+                if !web_search_events.is_empty() {
+                    let text_from_deferred: String = deferred_content_events
+                        .iter()
+                        .filter_map(|e| match e {
+                            ReducerEvent::TextDelta { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let compat_blocks =
+                        build_web_search_compat_blocks(&web_search_events, &text_from_deferred);
+                    for block in &compat_blocks {
+                        use super::web_search_compat::WebSearchCompatContent;
+                        match &block.content {
+                            WebSearchCompatContent::ServerToolUse { id, name, input } => {
+                                ensure_message_start(
+                                    &mut out,
+                                    traffic,
+                                    &mut message_started,
+                                    message_id,
+                                    model,
+                                );
+                                emit(
+                                    &mut out,
+                                    traffic,
+                                    "content_block_start",
+                                    &serde_json::json!({
+                                        "type": "content_block_start",
+                                        "index": block.index,
+                                        "content_block": {
+                                            "type": "server_tool_use",
+                                            "id": id,
+                                            "name": name,
+                                            "input": {}
+                                        }
+                                    }),
+                                );
+                                emit(
+                                    &mut out,
+                                    traffic,
+                                    "content_block_delta",
+                                    &serde_json::json!({
+                                        "type": "content_block_delta",
+                                        "index": block.index,
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": serde_json::to_string(input).unwrap_or_default()
+                                        }
+                                    }),
+                                );
+                                emit(
+                                    &mut out,
+                                    traffic,
+                                    "content_block_stop",
+                                    &serde_json::json!({
+                                        "type": "content_block_stop",
+                                        "index": block.index,
+                                    }),
+                                );
+                            }
+                            WebSearchCompatContent::WebSearchToolResult {
+                                tool_use_id,
+                                content: results,
+                            } => {
+                                let result_content: Vec<serde_json::Value> = results
+                                    .iter()
+                                    .map(|r| {
+                                        serde_json::json!({
+                                            "type": "web_search_result",
+                                            "title": r.title,
+                                            "url": r.url,
+                                        })
+                                    })
+                                    .collect();
+                                emit(
+                                    &mut out,
+                                    traffic,
+                                    "content_block_start",
+                                    &serde_json::json!({
+                                        "type": "content_block_start",
+                                        "index": block.index,
+                                        "content_block": {
+                                            "type": "web_search_tool_result",
+                                            "tool_use_id": tool_use_id,
+                                            "content": result_content,
+                                        }
+                                    }),
+                                );
+                                emit(
+                                    &mut out,
+                                    traffic,
+                                    "content_block_stop",
+                                    &serde_json::json!({
+                                        "type": "content_block_stop",
+                                        "index": block.index,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Emit deferred content
+                for deferred in &deferred_content_events {
+                    emit_content_event(
+                        &mut out,
+                        traffic,
+                        &mut message_started,
+                        &mut open_blocks,
+                        message_id,
+                        model,
+                        deferred,
+                    );
+                }
+
+                ensure_message_start(&mut out, traffic, &mut message_started, message_id, model);
+
+                let mapped = map_codex_usage_to_anthropic(usage, Some(*web_search_requests));
+                emit(
+                    &mut out,
+                    traffic,
+                    "message_delta",
+                    &serde_json::json!({
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": stop_reason,
+                            "stop_sequence": null
+                        },
+                        "usage": mapped,
+                    }),
+                );
+                emit(
+                    &mut out,
+                    traffic,
+                    "message_stop",
+                    &serde_json::json!({"type": "message_stop"}),
+                );
+            }
+            _ => {}
+        }
     }
-    decoder.finish()?;
-    if !reducer.finished() {
-        anyhow::bail!("Grok stream ended without completion");
-    }
+
     Ok(out)
 }
 
-pub fn stream_error() -> Vec<u8> {
-    let data = serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}});
-    encode_sse_event(Some("error"), &data.to_string())
-}
-
-fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
-    out.extend(encode_sse_event(Some(event), &data.to_string()));
-}
-
-fn render(out: &mut Vec<u8>, event: ReducerEvent) {
-    match event {
-        ReducerEvent::ThinkingStart(i) => emit(
-            out,
-            "content_block_start",
-            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"thinking","thinking":"","signature":""}}),
-        ),
-        ReducerEvent::ThinkingDelta(i, t) => emit(
-            out,
-            "content_block_delta",
-            serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":t}}),
-        ),
-        ReducerEvent::ThinkingStop(i) | ReducerEvent::TextStop(i) | ReducerEvent::ToolStop(i) => {
-            emit(
-                out,
-                "content_block_stop",
-                serde_json::json!({"type":"content_block_stop","index":i}),
-            )
-        }
-        ReducerEvent::TextStart(i) => emit(
-            out,
-            "content_block_start",
-            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}}),
-        ),
-        ReducerEvent::TextDelta(i, t) => emit(
-            out,
-            "content_block_delta",
-            serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"text_delta","text":t}}),
-        ),
-        ReducerEvent::ToolStart(i, id, name) => emit(
-            out,
-            "content_block_start",
-            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
-        ),
-        ReducerEvent::ToolDelta(i, t) => emit(
-            out,
-            "content_block_delta",
-            serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":t}}),
-        ),
-        ReducerEvent::HostedSearch {
-            index,
-            result_index,
-            id,
-            name,
-            query,
-        } => {
-            let result_type = format!("{name}_tool_result");
-            emit(
-                out,
-                "content_block_start",
-                serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"server_tool_use","id":id,"name":name,"input":{}}}),
-            );
-            emit(
-                out,
-                "content_block_delta",
-                serde_json::json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":serde_json::json!({"query":query}).to_string()}}),
-            );
-            emit(
-                out,
-                "content_block_stop",
-                serde_json::json!({"type":"content_block_stop","index":index}),
-            );
-            emit(
-                out,
-                "content_block_start",
-                serde_json::json!({"type":"content_block_start","index":result_index,"content_block":{"type":result_type,"tool_use_id":id,"content":[]}}),
-            );
-            emit(
-                out,
-                "content_block_stop",
-                serde_json::json!({"type":"content_block_stop","index":result_index}),
-            );
-        }
-        ReducerEvent::Citation(i, annotation) => {
-            let citation = serde_json::json!({
-                "type":"web_search_result_location",
-                "url":annotation.get("url").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                "title":annotation.get("title").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                "cited_text":annotation.get("text").and_then(serde_json::Value::as_str).unwrap_or_default()
-            });
-            emit(
-                out,
-                "content_block_delta",
-                serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"citations_delta","citation":citation}}),
-            );
-        }
-        ReducerEvent::Finish {
-            stop_reason,
-            output_tokens,
-            web_search_requests,
-            x_search_requests,
-            ..
-        } => {
-            let hosted_search_requests = web_search_requests + x_search_requests;
-            emit(
-                out,
-                "message_delta",
-                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"server_tool_use":{"web_search_requests":hosted_search_requests,"x_search_requests":x_search_requests}}}),
-            );
-            emit(
-                out,
-                "message_stop",
-                serde_json::json!({"type":"message_stop"}),
-            );
-        }
-    }
+fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamStreamError) {
+    let Some(traffic) = traffic else {
+        return;
+    };
+    traffic.write_json(
+        "060-codex-stream-reducer-error",
+        &serde_json::json!({
+            "kind": format!("{:?}", err.kind),
+            "message": err.message,
+            "retryAfterSeconds": err.retry_after_seconds,
+            "diagnostics": err.diagnostics,
+        }),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn decoder_accepts_every_boundary_and_line_ending() {
-        let input = b": note\r\nevent: ignored\r\ndata: first\r\ndata: second\r\n\r\n";
-        let expected = vec![SseEvent {
-            event: Some("ignored".into()),
-            data: "first\nsecond".into(),
-        }];
-        for split in 0..=input.len() {
-            let mut decoder = SseDecoder::default();
-            let mut events = decoder.push(&input[..split]).unwrap();
-            events.extend(decoder.push(&input[split..]).unwrap());
-            decoder.finish().unwrap();
-            assert_eq!(events, expected);
-        }
+    fn sse_event(type_name: &str, payload: serde_json::Value) -> String {
+        let mut obj = if let serde_json::Value::Object(m) = payload {
+            m
+        } else {
+            return String::new();
+        };
+        obj.insert("type".into(), serde_json::json!(type_name));
+        format!(
+            "data: {}\n\n",
+            serde_json::to_string(&serde_json::Value::Object(obj)).unwrap()
+        )
     }
 
     #[test]
-    fn decoder_requires_terminated_valid_frames_and_bounds_them() {
-        assert!(SseDecoder::default().push(b"data: \xff\n\n").is_err());
-        let mut decoder = SseDecoder::default();
-        decoder.push(b"data: incomplete").unwrap();
-        assert!(decoder.finish().is_err());
-        let mut decoder = SseDecoder::default();
-        let exact = vec![b'x'; MAX_SSE_FRAME_BYTES - b"data: \n".len()];
-        assert!(decoder.push(b"data: ").is_ok());
-        assert!(decoder.push(&exact).is_ok());
-        let events = decoder.push(b"\n\n").unwrap();
-        assert_eq!(events[0].data.len(), exact.len());
-        decoder.finish().unwrap();
-        let mut decoder = SseDecoder::default();
-        assert!(decoder.push(b"data: ").is_ok());
-        assert!(decoder.push(&vec![b'x'; exact.len() + 1]).is_ok());
-        assert!(decoder.push(b"\n").is_err());
+    fn stream_translates_text_response() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": 0,
+                    "item": {"type":"message","id":"item_1"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "output_index":0,"delta":"hello"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":1}}
+                })
+            ),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        assert!(out.contains("message_start"));
+        assert!(out.contains("text_delta"));
+        assert!(out.contains("message_stop"));
     }
 
     #[test]
-    fn stream_translates_hosted_web_search_and_citations() {
-        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\ndata: {\"type\":\"response.web_search_call.in_progress\",\"item_id\":\"ws_1\"}\n\ndata: {\"type\":\"response.web_search_call.searching\",\"item_id\":\"ws_1\"}\n\ndata: {\"type\":\"response.web_search_call.completed\",\"item_id\":\"ws_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"action\":{\"query\":\"rust news\"}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Result\"}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\"}}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
-        let output =
-            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
-        assert!(output.contains("server_tool_use"));
-        assert!(output.contains("web_search_tool_result"));
-        assert!(output.contains("citations_delta"));
-        assert!(output.contains("https://example.com"));
-        assert!(output.contains("\"web_search_requests\":1"));
+    fn stream_translates_web_search_response() {
+        let upstream = format!(
+            "{}{}{}{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                })
+            ),
+            sse_event(
+                "response.web_search_call.in_progress",
+                serde_json::json!({
+                    "output_index":0,"item_id":"ws_1"
+                })
+            ),
+            sse_event(
+                "response.web_search_call.completed",
+                serde_json::json!({
+                    "output_index":0,"item_id":"ws_1"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1","action":{"query":"test query"}}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "output_index":1,"delta":"See [Result](https://result.com)"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":3,"output_tokens":1}}
+                })
+            ),
+        );
+        let result = translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
+        let out = String::from_utf8(result).unwrap();
+        assert!(out.contains("server_tool_use"), "missing server_tool_use");
+        assert!(
+            out.contains("web_search_tool_result"),
+            "missing web_search_tool_result"
+        );
     }
 
     #[test]
-    fn stream_translates_hosted_x_search_usage_and_citations() {
-        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"claude-code-proxy\\\"}\"}\n\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Recent post\"}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://x.com/example/status/1\",\"title\":\"Example post\"}}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n";
-        let output =
-            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
-        assert!(output.contains("\"name\":\"x_search\""));
-        assert!(output.contains("x_search_tool_result"));
-        assert!(output.contains("https://x.com/example/status/1"));
-        assert!(output.contains("\"web_search_requests\":1"));
-        assert!(output.contains("\"x_search_requests\":1"));
-        assert!(!output.contains("\"name\":\"Bash\""));
+    fn stream_translates_reasoning_summary_to_thinking() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse_event(
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({
+                    "output_index":0,"summary_index":0,"delta":"Working it out"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "output_index":1,"delta":"answer"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":1,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        assert!(out.contains("\"type\":\"thinking\""));
+        assert!(out.contains("\"signature\":\"\""));
+        assert!(out.contains("\"type\":\"thinking_delta\""));
+        assert!(out.contains("\"thinking\":\"Working it out\""));
+        assert!(out.contains("event: message_stop"));
+        assert!(
+            out.find("\"type\":\"thinking_delta\"").unwrap()
+                < out.find("\"type\":\"text_delta\"").unwrap()
+        );
     }
 
     #[test]
-    fn live_translator_emits_first_event_before_upstream_completion() {
-        let mut translator = LiveStreamTranslator::new("msg_1".into(), "grok-4.5".into());
-        let output = translator
-            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n")
-            .unwrap();
-        assert!(String::from_utf8(output).unwrap().contains("first"));
+    fn stream_omits_empty_reasoning_summary() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":1,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "output_index":1,"delta":"answer"
+                })
+            ),
+            format!(
+                "{}{}",
+                sse_event(
+                    "response.output_item.done",
+                    serde_json::json!({
+                        "output_index":1,"item":{"type":"message"}
+                    })
+                ),
+                sse_event(
+                    "response.completed",
+                    serde_json::json!({
+                        "response":{"id":"resp_1","usage":{}}
+                    })
+                )
+            ),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        assert!(!out.contains("\"type\":\"thinking\""));
+        assert!(!out.contains("\"type\":\"thinking_delta\""));
+        assert!(out.contains("event: message_stop"));
     }
 }

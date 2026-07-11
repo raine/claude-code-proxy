@@ -17,12 +17,12 @@ pub const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_cod
 pub const TIER_DENIED_HINT: &str = "\
 xAI returned 403 for this SuperGrok/X Premium+ OAuth session. \
 xAI may restrict OAuth API access by tier even when the in-app subscription is active. \
-Re-running `xai auth login` usually will not fix this. \
-Set CCP_XAI_API_KEY or XAI_API_KEY as a fallback, or check your plan at https://x.ai/grok.";
+Re-running `grok auth login` usually will not fix this. \
+Set CCP_GROK_API_KEY or XAI_API_KEY as a fallback, or check your plan at https://x.ai/grok.";
 
 pub fn issuer() -> String {
-    let raw = config::xai_oauth_issuer();
-    match pin_xai_https_origin(&raw, DEFAULT_ISSUER) {
+    let raw = config::grok_oauth_issuer();
+    match pin_grok_https_origin(&raw, DEFAULT_ISSUER) {
         Ok(url) => url,
         Err(reason) => {
             eprintln!("warning: ignoring xAI oauth issuer override ({reason}); using {DEFAULT_ISSUER}");
@@ -32,8 +32,8 @@ pub fn issuer() -> String {
 }
 
 pub fn api_base_url() -> String {
-    let raw = config::xai_base_url();
-    match pin_xai_https_origin(&raw, DEFAULT_API_BASE) {
+    let raw = config::grok_base_url();
+    match pin_grok_https_origin(&raw, DEFAULT_API_BASE) {
         Ok(url) => url.trim_end_matches('/').to_string(),
         Err(reason) => {
             eprintln!("warning: ignoring xAI base URL override ({reason}); using {DEFAULT_API_BASE}");
@@ -44,7 +44,7 @@ pub fn api_base_url() -> String {
 
 /// Pin OAuth/inference origins to HTTPS xAI hosts. On failure returns Err reason
 /// so callers can fall back to defaults (Hermes-style: never ship tokens off-host).
-pub fn pin_xai_https_origin(candidate: &str, fallback: &str) -> Result<String, String> {
+pub fn pin_grok_https_origin(candidate: &str, fallback: &str) -> Result<String, String> {
     let trimmed = candidate.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Ok(fallback.to_string());
@@ -68,14 +68,14 @@ mod tests {
     #[test]
     fn pin_accepts_api_x_ai() {
         assert_eq!(
-            pin_xai_https_origin("https://api.x.ai/v1/", DEFAULT_API_BASE).unwrap(),
+            pin_grok_https_origin("https://api.x.ai/v1/", DEFAULT_API_BASE).unwrap(),
             "https://api.x.ai/v1"
         );
     }
 
     #[test]
     fn pin_rejects_foreign_and_http() {
-        assert!(pin_xai_https_origin("http://api.x.ai/v1", DEFAULT_API_BASE).is_err());
-        assert!(pin_xai_https_origin("https://evil.example/v1", DEFAULT_API_BASE).is_err());
+        assert!(pin_grok_https_origin("http://api.x.ai/v1", DEFAULT_API_BASE).is_err());
+        assert!(pin_grok_https_origin("https://evil.example/v1", DEFAULT_API_BASE).is_err());
     }
 }

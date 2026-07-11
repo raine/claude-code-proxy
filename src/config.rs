@@ -9,7 +9,7 @@ use crate::paths;
 pub enum AliasProvider {
     Codex,
     Kimi,
-    Xai,
+    Grok,
 }
 
 impl AliasProvider {
@@ -17,7 +17,7 @@ impl AliasProvider {
         match self {
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
-            AliasProvider::Xai => "xai",
+            AliasProvider::Grok => "grok",
         }
     }
 }
@@ -40,7 +40,9 @@ struct FileConfig {
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
     pub cursor: Option<CursorConfig>,
-    pub xai: Option<XaiConfig>,
+    /// Accepts `"grok"` (preferred) or legacy `"xai"` config key.
+    #[serde(alias = "xai")]
+    pub grok: Option<GrokConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -85,7 +87,7 @@ struct KimiConfig {
 }
 
 #[derive(Deserialize, Clone)]
-struct XaiConfig {
+struct GrokConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
     #[serde(rename = "oauthIssuer")]
@@ -108,7 +110,7 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
-        "xai" => Some(AliasProvider::Xai),
+        "grok" => Some(AliasProvider::Grok),
         _ => None,
     }
 }
@@ -569,90 +571,102 @@ pub fn cursor_agent_bundle() -> Option<String> {
 // xAI SuperGrok config
 // ---------------------------------------------------------------------------
 
-pub fn xai_base_url() -> String {
+pub fn grok_base_url() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_XAI_BASE_URL") {
-        return raw.clone();
-    }
-    if let Some(raw) = env.get("XAI_BASE_URL") {
+    if let Some(raw) = env
+        .get("CCP_GROK_BASE_URL")
+        .or_else(|| env.get("CCP_XAI_BASE_URL"))
+        .or_else(|| env.get("XAI_BASE_URL"))
+    {
         return raw.clone();
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
-        && let Some(xai) = file.xai
-        && let Some(url) = xai.base_url
+        && let Some(cfg) = file.grok
+        && let Some(url) = cfg.base_url
     {
         return url;
     }
     "https://api.x.ai/v1".to_string()
 }
 
-pub fn xai_oauth_issuer() -> String {
+pub fn grok_oauth_issuer() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_XAI_OAUTH_ISSUER") {
+    if let Some(raw) = env
+        .get("CCP_GROK_OAUTH_ISSUER")
+        .or_else(|| env.get("CCP_XAI_OAUTH_ISSUER"))
+    {
         return raw.clone();
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
-        && let Some(xai) = file.xai
-        && let Some(issuer) = xai.oauth_issuer
+        && let Some(cfg) = file.grok
+        && let Some(issuer) = cfg.oauth_issuer
     {
         return issuer;
     }
     "https://auth.x.ai".to_string()
 }
 
-pub fn xai_effort() -> Option<String> {
+pub fn grok_effort() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_XAI_EFFORT") {
+    if let Some(raw) = env
+        .get("CCP_GROK_EFFORT")
+        .or_else(|| env.get("CCP_XAI_EFFORT"))
+    {
         return Some(raw.clone());
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
-        && let Some(xai) = file.xai
+        && let Some(cfg) = file.grok
     {
-        return xai.effort;
+        return cfg.effort;
     }
     None
 }
 
-pub fn xai_reasoning_summary() -> Option<String> {
+pub fn grok_reasoning_summary() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env
-        .get("CCP_XAI_REASONING_SUMMARY")
+        .get("CCP_GROK_REASONING_SUMMARY")
+        .or_else(|| env.get("CCP_XAI_REASONING_SUMMARY"))
         .filter(|raw| !raw.is_empty())
     {
         return Some(raw.clone());
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
-        && let Some(xai) = file.xai
-        && let Some(summary) = xai.reasoning_summary.filter(|raw| !raw.is_empty())
+        && let Some(cfg) = file.grok
+        && let Some(summary) = cfg.reasoning_summary.filter(|raw| !raw.is_empty())
     {
         return Some(summary);
     }
     None
 }
 
-pub fn xai_previous_response_id() -> bool {
+pub fn grok_previous_response_id() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_XAI_PREVIOUS_RESPONSE_ID") {
+    if let Some(raw) = env
+        .get("CCP_GROK_PREVIOUS_RESPONSE_ID")
+        .or_else(|| env.get("CCP_XAI_PREVIOUS_RESPONSE_ID"))
+    {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
-        && let Some(xai) = file.xai
-        && let Some(val) = xai.previous_response_id
+        && let Some(cfg) = file.grok
+        && let Some(val) = cfg.previous_response_id
     {
         return val;
     }
     true
 }
 
-pub fn xai_api_key() -> Option<String> {
+pub fn grok_api_key() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env
-        .get("CCP_XAI_API_KEY")
+        .get("CCP_GROK_API_KEY")
+        .or_else(|| env.get("CCP_XAI_API_KEY"))
         .or_else(|| env.get("XAI_API_KEY"))
         .filter(|raw| !raw.trim().is_empty())
     {
