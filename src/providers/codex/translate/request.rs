@@ -838,7 +838,45 @@ fn unsupported_tool_result_block_to_string(block: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        _lock: MutexGuard<'static, ()>,
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                _lock: lock,
+                key,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     fn opts() -> TranslateOptions {
         TranslateOptions {
@@ -1003,6 +1041,19 @@ mod tests {
             "model": "gpt-5.5",
             "messages": [{"role":"user", "content":"hello"}],
             "output_config": {"effort": "max"}
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn translate_effort_override_max_maps_to_max() {
+        let _env = EnvVarGuard::set("CCP_CODEX_EFFORT", "max");
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "low"}
         }))
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
