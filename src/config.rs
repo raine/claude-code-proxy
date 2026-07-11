@@ -9,6 +9,7 @@ use crate::paths;
 pub enum AliasProvider {
     Codex,
     Kimi,
+    Xai,
 }
 
 impl AliasProvider {
@@ -16,6 +17,7 @@ impl AliasProvider {
         match self {
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
+            AliasProvider::Xai => "xai",
         }
     }
 }
@@ -38,6 +40,7 @@ struct FileConfig {
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
     pub cursor: Option<CursorConfig>,
+    pub xai: Option<XaiConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -81,6 +84,20 @@ struct KimiConfig {
     pub base_url: Option<String>,
 }
 
+#[derive(Deserialize, Clone)]
+struct XaiConfig {
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "oauthIssuer")]
+    pub oauth_issuer: Option<String>,
+    #[serde(rename = "reasoningSummary")]
+    pub reasoning_summary: Option<String>,
+    #[serde(rename = "effort")]
+    pub effort: Option<String>,
+    #[serde(rename = "previousResponseId")]
+    pub previous_response_id: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct FileLog {
     pub verbose: Option<bool>,
@@ -91,6 +108,7 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
+        "xai" => Some(AliasProvider::Xai),
         _ => None,
     }
 }
@@ -511,6 +529,102 @@ pub fn cursor_agent_bundle() -> Option<String> {
         && let Some(bundle) = cursor.agent_bundle
     {
         return Some(bundle);
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// xAI SuperGrok config
+// ---------------------------------------------------------------------------
+
+pub fn xai_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_XAI_BASE_URL") {
+        return raw.clone();
+    }
+    if let Some(raw) = env.get("XAI_BASE_URL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(xai) = file.xai
+        && let Some(url) = xai.base_url
+    {
+        return url;
+    }
+    "https://api.x.ai/v1".to_string()
+}
+
+pub fn xai_oauth_issuer() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_XAI_OAUTH_ISSUER") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(xai) = file.xai
+        && let Some(issuer) = xai.oauth_issuer
+    {
+        return issuer;
+    }
+    "https://auth.x.ai".to_string()
+}
+
+pub fn xai_effort() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_XAI_EFFORT") {
+        return Some(raw.clone());
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(xai) = file.xai
+    {
+        return xai.effort;
+    }
+    None
+}
+
+pub fn xai_reasoning_summary() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env
+        .get("CCP_XAI_REASONING_SUMMARY")
+        .filter(|raw| !raw.is_empty())
+    {
+        return Some(raw.clone());
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(xai) = file.xai
+        && let Some(summary) = xai.reasoning_summary.filter(|raw| !raw.is_empty())
+    {
+        return Some(summary);
+    }
+    None
+}
+
+pub fn xai_previous_response_id() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_XAI_PREVIOUS_RESPONSE_ID") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(xai) = file.xai
+        && let Some(val) = xai.previous_response_id
+    {
+        return val;
+    }
+    true
+}
+
+pub fn xai_api_key() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env
+        .get("CCP_XAI_API_KEY")
+        .or_else(|| env.get("XAI_API_KEY"))
+        .filter(|raw| !raw.trim().is_empty())
+    {
+        return Some(raw.clone());
     }
     None
 }
