@@ -51,6 +51,8 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
+pub(crate) const GLM_MODELS: &[&str] = &["glm-4.7", "glm-5.2"];
+
 pub struct Registry {
     alias_provider: AliasProvider,
     models: BTreeMap<String, Vec<String>>,
@@ -73,6 +75,10 @@ impl Registry {
                 .map(|model| (*model).to_string())
                 .collect(),
         );
+        models.insert(
+            "glm".into(),
+            GLM_MODELS.iter().map(|m| (*m).to_string()).collect(),
+        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -81,6 +87,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "glm" => Arc::new(crate::providers::glm::GlmProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -373,5 +380,18 @@ mod tests {
                 .name(),
             "cursor"
         );
+    }
+
+    #[test]
+    fn glm_model_routes_to_glm_provider() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in ["glm-4.7", "glm-5.2"] {
+            let p = registry.provider_for_model(model, None);
+            assert!(p.is_some(), "{model} should route to a provider");
+            assert_eq!(p.expect("provider").name(), "glm");
+        }
+        // The [1m] compaction hint is stripped before routing.
+        let p = registry.provider_for_model("glm-5.2[1m]", None);
+        assert_eq!(p.expect("provider").name(), "glm");
     }
 }
