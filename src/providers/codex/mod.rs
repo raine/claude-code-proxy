@@ -40,6 +40,7 @@ use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{TranslateOptions, translate_request};
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
+const CODEX_CONTEXT_WINDOW_TOKENS: u64 = 372_000;
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
 // ---------------------------------------------------------------------------
@@ -121,6 +122,7 @@ impl Provider for CodexProvider {
                 );
             }
         };
+        let estimated_input_tokens = count_translated_tokens(&translated);
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
@@ -144,6 +146,7 @@ impl Provider for CodexProvider {
                 ctx,
                 stream_request,
                 continuation,
+                estimated_input_tokens,
             )
             .await;
         }
@@ -155,7 +158,7 @@ impl Provider for CodexProvider {
             Ok(r) => r,
             Err(e) => {
                 clear_continuation(ctx.session_id.as_deref());
-                return map_codex_error_to_response(&e);
+                return map_codex_error_to_response(&e, estimated_input_tokens);
             }
         };
 
@@ -169,9 +172,10 @@ impl Provider for CodexProvider {
                 Ok(b) => b,
                 Err(e) => {
                     clear_continuation(ctx.session_id.as_deref());
-                    return map_codex_failure_to_response(&format!(
-                        "Stream translation error: {e}"
-                    ));
+                    return map_codex_failure_to_response(
+                        &format!("Stream translation error: {e}"),
+                        estimated_input_tokens,
+                    );
                 }
             };
             if let Some(monitor) = ctx.monitor.as_ref() {
@@ -221,7 +225,10 @@ impl Provider for CodexProvider {
                 }
                 Err(e) => {
                     clear_continuation(ctx.session_id.as_deref());
-                    map_codex_failure_to_response(&format!("Accumulation error: {e}"))
+                    map_codex_failure_to_response(
+                        &format!("Accumulation error: {e}"),
+                        estimated_input_tokens,
+                    )
                 }
             }
         }
@@ -297,6 +304,7 @@ async fn live_stream_response(
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
+    estimated_input_tokens: u64,
 ) -> Response {
     let model = model.to_string();
     let mut attempt = 0_u32;
@@ -308,6 +316,10 @@ async fn live_stream_response(
             .await
         {
             Ok(events) => events,
+            Err(err) if is_codex_rate_limit_error(&err) => {
+                clear_continuation(ctx.session_id.as_deref());
+                return map_codex_error_to_response(&err, estimated_input_tokens);
+            }
             Err(err) if retryable_live_start_codex_error(&err) => {
                 if retry_with_full_context_for_live_error(&err)
                     && drop_live_continuation_for_retry(&mut continuation, &ctx)
@@ -317,12 +329,12 @@ async fn live_stream_response(
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     clear_continuation(ctx.session_id.as_deref());
-                    return map_codex_error_to_response(&err);
+                    return map_codex_error_to_response(&err, estimated_input_tokens);
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
                     clear_continuation(ctx.session_id.as_deref());
-                    return map_codex_error_to_response(&err);
+                    return map_codex_error_to_response(&err, estimated_input_tokens);
                 }
                 attempt += 1;
                 sleep(delay.wait_ms).await;
@@ -330,7 +342,7 @@ async fn live_stream_response(
             }
             Err(err) => {
                 clear_continuation(ctx.session_id.as_deref());
-                return map_codex_error_to_response(&err);
+                return map_codex_error_to_response(&err, estimated_input_tokens);
             }
         };
 
@@ -340,6 +352,7 @@ async fn live_stream_response(
             &model,
             ctx.clone(),
             request_body.clone(),
+            estimated_input_tokens,
         )
         .await
         {
@@ -355,12 +368,20 @@ async fn live_stream_response(
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     clear_continuation(ctx.session_id.as_deref());
-                    return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
+                    return map_codex_failure_with_retry_to_response(
+                        &message,
+                        retry_after.as_deref(),
+                        estimated_input_tokens,
+                    );
                 }
                 let delay = compute_backoff_delay(attempt, retry_after.as_deref());
                 if delay.exceeds_budget {
                     clear_continuation(ctx.session_id.as_deref());
-                    return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
+                    return map_codex_failure_with_retry_to_response(
+                        &message,
+                        retry_after.as_deref(),
+                        estimated_input_tokens,
+                    );
                 }
                 attempt += 1;
                 sleep(delay.wait_ms).await;
@@ -375,6 +396,7 @@ async fn live_stream_response_once(
     model: &str,
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
+    estimated_input_tokens: u64,
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
@@ -383,6 +405,13 @@ async fn live_stream_response_once(
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
+                if is_codex_rate_limit_error(&err) {
+                    clear_continuation(ctx.session_id.as_deref());
+                    return LiveStreamStart::Response(map_codex_error_to_response(
+                        &err,
+                        estimated_input_tokens,
+                    ));
+                }
                 if retryable_live_start_codex_error(&err) {
                     let full_context = retry_with_full_context_for_live_error(&err);
                     return LiveStreamStart::Retry {
@@ -392,7 +421,10 @@ async fn live_stream_response_once(
                     };
                 }
                 clear_continuation(ctx.session_id.as_deref());
-                return LiveStreamStart::Response(map_codex_error_to_response(&err));
+                return LiveStreamStart::Response(map_codex_error_to_response(
+                    &err,
+                    estimated_input_tokens,
+                ));
             }
         };
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
@@ -400,6 +432,15 @@ async fn live_stream_response_once(
         {
             Ok(result) => result,
             Err(message) => {
+                if is_live_rate_limit_payload(&payload, &message) {
+                    clear_continuation(ctx.session_id.as_deref());
+                    let retry_after = retry_after_from_live_payload(&payload);
+                    return LiveStreamStart::Response(map_codex_failure_with_retry_to_response(
+                        &message,
+                        retry_after.as_deref(),
+                        estimated_input_tokens,
+                    ));
+                }
                 if retryable_live_start_payload(&payload, &message) {
                     return LiveStreamStart::Retry {
                         message,
@@ -408,7 +449,10 @@ async fn live_stream_response_once(
                     };
                 }
                 clear_continuation(ctx.session_id.as_deref());
-                return LiveStreamStart::Response(map_codex_failure_to_response(&message));
+                return LiveStreamStart::Response(map_codex_failure_to_response(
+                    &message,
+                    estimated_input_tokens,
+                ));
             }
         };
         if !chunk.is_empty() {
@@ -618,6 +662,10 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
 }
 
+fn is_codex_rate_limit_error(err: &client::CodexError) -> bool {
+    err.status == 429 || is_rate_limit_message(codex_error_message(err))
+}
+
 fn retry_with_full_context_for_live_error(err: &client::CodexError) -> bool {
     matches!(
         err.detail.as_deref(),
@@ -701,6 +749,61 @@ fn retryable_live_start_payload(payload: &serde_json::Value, message: &str) -> b
     code == Some("overloaded_error")
         || err_type == Some("overloaded_error")
         || retryable_live_message(message)
+}
+
+fn is_live_rate_limit_payload(payload: &serde_json::Value, message: &str) -> bool {
+    if payload.get("type").and_then(|v| v.as_str()) == Some("codex.rate_limits")
+        && payload
+            .get("rate_limits")
+            .and_then(|r| r.get("limit_reached"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    {
+        return true;
+    }
+
+    let status = payload
+        .get("status")
+        .or_else(|| payload.get("status_code"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            payload
+                .get("error")
+                .and_then(|e| e.get("status"))
+                .and_then(|v| v.as_u64())
+        })
+        .or_else(|| {
+            payload
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("status"))
+                .and_then(|v| v.as_u64())
+        });
+    if status == Some(429) {
+        return true;
+    }
+
+    let classification = payload
+        .get("error")
+        .and_then(live_payload_error_classification)
+        .or_else(|| {
+            payload
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(live_payload_error_classification)
+        });
+
+    matches!(
+        classification,
+        Some("rate_limit_error" | "rate_limit_exceeded")
+    ) || is_rate_limit_message(message)
+}
+
+fn live_payload_error_classification(error: &serde_json::Value) -> Option<&str> {
+    error
+        .get("code")
+        .and_then(|v| v.as_str())
+        .or_else(|| error.get("type").and_then(|v| v.as_str()))
 }
 
 fn retry_after_from_live_payload(payload: &serde_json::Value) -> Option<String> {
@@ -790,10 +893,10 @@ fn update_continuation_from_upstream(
 // Error mapping
 // ---------------------------------------------------------------------------
 
-fn map_codex_error_to_response(err: &client::CodexError) -> Response {
+fn map_codex_error_to_response(err: &client::CodexError, estimated_input_tokens: u64) -> Response {
     let message = codex_error_message(err);
     if is_context_window_overflow(message) {
-        return map_codex_failure_to_response(message);
+        return map_codex_failure_to_response(message, estimated_input_tokens);
     }
 
     match err.status {
@@ -802,26 +905,61 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             "authentication_error",
             err.detail.as_deref().unwrap_or("Authentication failed"),
         ),
-        429 => {
-            let retry_after = err.retry_after.as_deref().unwrap_or("5");
-            let resp = json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                &err.message,
-            );
-            let headers = [(http::header::RETRY_AFTER, retry_after)];
-            (headers, resp).into_response()
-        }
+        429 => map_codex_rate_limit_to_response(
+            &err.message,
+            err.retry_after.as_deref(),
+            estimated_input_tokens,
+        ),
+        _ if is_rate_limit_message(message) => map_codex_rate_limit_to_response(
+            message,
+            err.retry_after.as_deref(),
+            estimated_input_tokens,
+        ),
         _ => json_error(StatusCode::BAD_GATEWAY, "api_error", message),
     }
 }
 
-fn map_codex_failure_to_response(message: &str) -> Response {
+fn map_codex_failure_to_response(message: &str, estimated_input_tokens: u64) -> Response {
+    map_codex_failure_with_retry_to_response(message, None, estimated_input_tokens)
+}
+
+fn map_codex_failure_with_retry_to_response(
+    message: &str,
+    retry_after: Option<&str>,
+    estimated_input_tokens: u64,
+) -> Response {
     if is_context_window_overflow(message) {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
+    } else if is_rate_limit_message(message) {
+        map_codex_rate_limit_to_response(message, retry_after, estimated_input_tokens)
     } else {
         json_error(StatusCode::BAD_GATEWAY, "api_error", message)
     }
+}
+
+fn map_codex_rate_limit_to_response(
+    message: &str,
+    retry_after: Option<&str>,
+    estimated_input_tokens: u64,
+) -> Response {
+    if estimated_input_tokens >= CODEX_CONTEXT_WINDOW_TOKENS {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            format!(
+                "Estimated input ({estimated_input_tokens} tokens) exceeds the Codex context window ({CODEX_CONTEXT_WINDOW_TOKENS} tokens); upstream reported: {message}"
+            ),
+        );
+    }
+
+    let retry_after = retry_after.unwrap_or("5");
+    let response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message);
+    let headers = [(http::header::RETRY_AFTER, retry_after)];
+    (headers, response).into_response()
+}
+
+fn is_rate_limit_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("rate limit")
 }
 
 fn is_context_window_overflow(message: &str) -> bool {
@@ -1085,7 +1223,7 @@ mod tests {
             origin: client::CodexErrorOrigin::WebSocket,
         };
 
-        let response = map_codex_error_to_response(&err);
+        let response = map_codex_error_to_response(&err, 100);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1095,6 +1233,52 @@ mod tests {
         assert_eq!(
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_below_context_window_returns_429_with_retry_after() {
+        let response = map_codex_failure_with_retry_to_response(
+            "rate limit reached",
+            Some("30"),
+            CODEX_CONTEXT_WINDOW_TOKENS - 1,
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("30")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "rate limit reached");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_at_context_window_returns_413_for_compaction() {
+        let response = map_codex_failure_with_retry_to_response(
+            "rate limit reached",
+            Some("30"),
+            CODEX_CONTEXT_WINDOW_TOKENS,
+        );
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(response.headers().get(http::header::RETRY_AFTER).is_none());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("372000"))
         );
     }
 
