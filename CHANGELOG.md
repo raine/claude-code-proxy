@@ -1,5 +1,9 @@
 # Changelog
 
+- Forward Claude Code's `max` effort as Codex `reasoning.effort: "max"` so
+  GPT-5.6 can use its highest supported reasoning level instead of silently
+  receiving `xhigh`.
+
 ## v0.1.10 (2026-07-10)
 
 - Claude Code requests using Opus 4.8, Sonnet 5, and Fable 5 model names can

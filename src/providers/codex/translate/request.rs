@@ -23,6 +23,7 @@ pub enum Effort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl std::fmt::Display for Effort {
@@ -33,6 +34,7 @@ impl std::fmt::Display for Effort {
             Effort::Medium => write!(f, "medium"),
             Effort::High => write!(f, "high"),
             Effort::Xhigh => write!(f, "xhigh"),
+            Effort::Max => write!(f, "max"),
         }
     }
 }
@@ -205,7 +207,7 @@ pub struct TranslateOptions {
 
 fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     match effort {
-        Some("max") => Some(Effort::Xhigh),
+        Some("max") => Some(Effort::Max),
         Some("xhigh") => Some(Effort::Xhigh),
         Some("low") => Some(Effort::Low),
         Some("medium") => Some(Effort::Medium),
@@ -217,13 +219,14 @@ fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
 fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
     let override_effort = config::codex_effort();
     if let Some(ref val) = override_effort {
-        let valid = ["none", "low", "medium", "high", "xhigh"];
+        let valid = ["none", "low", "medium", "high", "xhigh", "max"];
         if !valid.contains(&val.as_str()) {
             anyhow::bail!(
-                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh"
+                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
             );
         }
         return Ok(Some(match val.as_str() {
+            "max" => Effort::Max,
             "xhigh" => Effort::Xhigh,
             "high" => Effort::High,
             "medium" => Effort::Medium,
@@ -995,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_effort_max_maps_to_xhigh() {
+    fn translate_effort_max_maps_to_max() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
             "messages": [{"role":"user", "content":"hello"}],
@@ -1003,7 +1006,7 @@ mod tests {
         }))
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
-        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Xhigh)));
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
     }
 
     #[test]
