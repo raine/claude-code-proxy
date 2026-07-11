@@ -245,6 +245,53 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
     addr_str
 }
 
+async fn spawn_websocket_partial_close_then_success_upstream(
+    attempts: Arc<Mutex<usize>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        for attempt in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            if let Ok(mut count) = attempts.lock() {
+                *count += 1;
+            }
+
+            if attempt == 0 {
+                let partial_events = [
+                    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_discard"}}"#,
+                    r#"{"type":"response.output_text.delta","output_index":0,"delta":"discard me"}"#,
+                ];
+                for event in &partial_events {
+                    let _ = ws.send(Message::Text(event.to_string())).await;
+                }
+                drop(ws);
+                continue;
+            }
+
+            let complete_events = [
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_keep"}}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"keep me"}"#,
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_keep","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+            ];
+            for event in &complete_events {
+                let _ = ws.send(Message::Text(event.to_string())).await;
+            }
+        }
+    });
+
+    addr_str
+}
+
 async fn spawn_websocket_error_upstream(message: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -833,6 +880,42 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert_eq!(sent["model"], "gpt-5.5");
     assert!(sent.get("max_output_tokens").is_none());
     assert!(sent.get("stream").is_none());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_auto_buffers_failed_attempt_before_downstream_stream() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let attempts = Arc::new(Mutex::new(0usize));
+    let upstream = spawn_websocket_partial_close_then_success_upstream(attempts.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+    let response = tokio::time::timeout(
+        Duration::from_secs(8),
+        call_messages_body(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        })),
+    )
+    .await
+    .expect("buffered Auto request timed out");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(*attempts.lock().unwrap(), 2);
+    assert!(body.contains("keep me"));
+    assert!(!body.contains("discard me"));
 }
 
 #[allow(clippy::await_holding_lock)]

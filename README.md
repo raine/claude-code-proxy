@@ -513,6 +513,13 @@ Sign in with your **ChatGPT Plus/Pro account**, not an OpenAI API account. The
 token file includes the extracted `chatgpt_account_id` so the proxy can set the
 `ChatGPT-Account-Id` header on every upstream call.
 
+When no proxy-owned credential exists, the proxy can bootstrap from the native
+Codex CLI's `~/.codex/auth.json`. Treat that as a migration convenience, not a
+long-term shared credential: OAuth refresh tokens can rotate, so two concurrent
+writers can strand one another. If native Codex and this proxy run on the same
+machine, complete `codex auth login` or `codex auth device` once so the proxy has
+its own OAuth session.
+
 #### `codex auth device`
 
 Same OAuth flow, but for headless machines. Prints a short user code and a URL;
@@ -728,6 +735,16 @@ Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
 compatibility, or `CCP_CODEX_TRANSPORT=auto` to try WebSocket with HTTP fallback
 only when setup fails before a request is sent upstream.
+
+`auto` also acts as a completion-gated reliability mode: it buffers a complete
+WebSocket response before sending Anthropic events to Claude Code and safely
+retries statusless transport failures up to five times with jittered exponential
+backoff while nothing has reached the client. Retry and exhaustion events are
+written as structured `buffered_transport_retry*` log records. This prevents
+duplicate tool calls after a partial upstream stream, at the cost of delaying
+visible reasoning, text, and tool events until the Codex response finishes. Use
+`auto` when unattended completion matters more than live token streaming.
+
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code
 session id, reuses a session WebSocket while it remains open, and sends

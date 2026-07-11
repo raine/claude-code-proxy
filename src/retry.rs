@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use rand::Rng;
+
 pub const RETRY_INITIAL_DELAY_MS: u64 = 2000;
 pub const RETRY_MAX_DELAY_MS: u64 = 30_000;
 pub const RETRY_BACKOFF_FACTOR: u64 = 2;
@@ -31,8 +33,10 @@ pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> Backoff
     if exp > RETRY_MAX_DELAY_MS {
         exp = RETRY_MAX_DELAY_MS;
     }
-    let jitter = exp / 2;
-    let wait_ms = (exp / 2) + (jitter / 2);
+    // Concurrent agents should not wake and retry in lockstep. Pick uniformly
+    // from the latter half of the exponential window while preserving the
+    // existing lower and upper bounds.
+    let wait_ms = rand::thread_rng().gen_range((exp / 2)..=exp);
     BackoffOutcome {
         wait_ms,
         exceeds_budget: false,

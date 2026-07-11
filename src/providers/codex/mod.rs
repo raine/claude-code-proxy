@@ -46,7 +46,9 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // Provider
 // ---------------------------------------------------------------------------
 
-pub struct CodexProvider;
+pub struct CodexProvider {
+    client: Arc<CodexHttpClient>,
+}
 
 impl Default for CodexProvider {
     fn default() -> Self {
@@ -56,7 +58,9 @@ impl Default for CodexProvider {
 
 impl CodexProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            client: Arc::new(CodexHttpClient::new()),
+        }
     }
 }
 
@@ -131,7 +135,7 @@ impl Provider for CodexProvider {
         );
 
         // Post to upstream with continuation
-        let client = Arc::new(CodexHttpClient::new());
+        let client = self.client.clone();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -817,6 +821,22 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             let headers = [(http::header::RETRY_AFTER, retry_after)];
             (headers, resp).into_response()
         }
+        status @ (500 | 502 | 503 | 504 | 529) => {
+            let response = json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                if status == 529 {
+                    "overloaded_error"
+                } else {
+                    "api_error"
+                },
+                codex_error_message(err),
+            );
+            if let Some(retry_after) = err.retry_after.as_deref() {
+                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+            } else {
+                response
+            }
+        }
         _ => json_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -1093,6 +1113,32 @@ mod tests {
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_retryable_status_is_preserved() {
+        let err = client::CodexError {
+            status: 503,
+            message: "Upstream unavailable after buffered retries".to_string(),
+            detail: None,
+            retry_after: Some("7".to_string()),
+            origin: client::CodexErrorOrigin::Http,
+        };
+
+        let response = map_codex_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     #[test]
