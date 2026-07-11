@@ -1,183 +1,361 @@
+//! Browser PKCE login — adapted from upstream `grok` OAuth login
+//! (OIDC discovery, endpoint validation, open-browser, ephemeral callback).
+//! Still returns this crate's `jwt::TokenResponse` so manager/device/token_store
+//! stay unchanged.
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::constants::{OAUTH_CALLBACK_PATH, OAUTH_PORT, issuer};
+use serde::Deserialize;
+use url::Url;
+
+use super::constants::CLIENT_ID;
 use super::jwt::TokenResponse;
-use super::pkce::{
-    PkceCodes, build_authorize_url, exchange_code_for_tokens, generate_pkce, generate_state,
-};
+use super::pkce::{PkceCodes, generate_pkce, generate_state};
 
-const BROWSER_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Canonical SuperGrok OIDC issuer (same as upstream Grok login).
+pub const CANONICAL_ISSUER: &str = "https://auth.x.ai";
 
-pub struct BrowserLoginConfig {
-    pub issuer: String,
-    pub port: u16,
-    pub timeout: Duration,
+/// Broader scopes from upstream Grok login (includes conversations read/write).
+const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_METADATA_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct Discovery {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    response_types_supported: Vec<String>,
+    grant_types_supported: Vec<String>,
+    code_challenge_methods_supported: Vec<String>,
+    token_endpoint_auth_methods_supported: Vec<String>,
 }
 
-impl BrowserLoginConfig {
-    pub fn new(issuer: impl Into<String>) -> Self {
-        Self {
-            issuer: issuer.into(),
-            port: OAUTH_PORT,
-            timeout: BROWSER_LOGIN_TIMEOUT,
-        }
-    }
-
-    fn redirect_uri(&self, bound_port: u16) -> String {
-        format!("http://127.0.0.1:{bound_port}{OAUTH_CALLBACK_PATH}")
-    }
-}
-
-fn parse_query(query: &str) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        params.insert(key.into_owned(), value.into_owned());
-    }
-    params
-}
-
-fn extract_request_path_and_query(stream: &mut TcpStream) -> Option<(String, String)> {
-    let mut buf = [0; 4096];
-    let n = stream.read(&mut buf).ok()?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let _method = parts.next()?;
-    let path_and_query = parts.next()?;
-    let mut split = path_and_query.splitn(2, '?');
-    let path = split.next().unwrap_or("").to_string();
-    let query = split.next().unwrap_or("").to_string();
-    Some((path, query))
-}
-
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
-    let status_line = match status {
-        200 => "200 OK",
-        400 => "400 Bad Request",
-        404 => "404 Not Found",
-        500 => "500 Internal Server Error",
-        _ => "500 Internal Server Error",
-    };
-    let response = format!(
-        "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+/// Wire token payload used only inside this login flow before mapping to jwt::TokenResponse.
+#[derive(Deserialize)]
+struct WireTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: u64,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
 }
 
 pub fn run_browser_login() -> Result<TokenResponse, anyhow::Error> {
-    let config = BrowserLoginConfig::new(issuer());
-    run_browser_login_with_config(&config)
-}
-
-pub fn run_browser_login_with_config(
-    config: &BrowserLoginConfig,
-) -> Result<TokenResponse, anyhow::Error> {
+    let client = http_client()?;
+    let discovery = discover(&client)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let pkce = generate_pkce();
     let state = generate_state();
-
-    // Prefer canonical port; fall back to an ephemeral port if busy.
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", config.port)) {
-        Ok(l) => l,
-        Err(_) => TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| anyhow::anyhow!("Failed to bind OAuth callback listener: {e}"))?,
-    };
-    let bound_port = listener
-        .local_addr()
-        .map_err(|e| anyhow::anyhow!("Failed to read bound port: {e}"))?
-        .port();
-    let redirect_uri = config.redirect_uri(bound_port);
-    let auth_url = build_authorize_url(&config.issuer, &redirect_uri, &pkce, &state)?;
-
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| anyhow::anyhow!("Failed to set non-blocking: {e}"))?;
+    let auth_url = authorize_url(&discovery, &redirect_uri, &pkce, &state)?;
 
     println!("Open this URL in your browser to authorize:\n\n  {auth_url}\n");
-
-    let deadline = std::time::Instant::now() + config.timeout;
-    loop {
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("OAuth timeout");
-        }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                return handle_callback(
-                    &mut stream,
-                    &config.issuer,
-                    &redirect_uri,
-                    &pkce,
-                    &state,
-                );
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => anyhow::bail!("Server error: {e}"),
-        }
+    open_browser(&auth_url);
+    let code = wait_for_callback(&listener, &state, LOGIN_TIMEOUT)?;
+    let wire = exchange_code(&client, &discovery, &code, &pkce, &redirect_uri)?;
+    validate_wire_tokens(&wire)?;
+    if wire
+        .refresh_token
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        anyhow::bail!("Grok login did not grant an offline session");
     }
+
+    Ok(TokenResponse {
+        access_token: wire.access_token,
+        refresh_token: wire.refresh_token,
+        expires_in: Some(wire.expires_in),
+        id_token: wire.id_token,
+        scope: wire.scope,
+        token_type: wire.token_type,
+    })
 }
 
-fn handle_callback(
-    stream: &mut TcpStream,
-    issuer: &str,
+fn http_client() -> anyhow::Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()?)
+}
+
+fn discover(client: &reqwest::blocking::Client) -> anyhow::Result<Discovery> {
+    let url = format!("{CANONICAL_ISSUER}/.well-known/openid-configuration");
+    let response = client.get(url).send()?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|size| size as usize > MAX_METADATA_BYTES)
+    {
+        anyhow::bail!("Grok OIDC metadata exceeds the size limit");
+    }
+    let bytes = response.bytes()?;
+    if bytes.len() > MAX_METADATA_BYTES {
+        anyhow::bail!("Grok OIDC metadata exceeds the size limit");
+    }
+    let discovery: Discovery = serde_json::from_slice(&bytes)?;
+    validate_discovery(&discovery)?;
+    Ok(discovery)
+}
+
+fn validate_discovery(discovery: &Discovery) -> anyhow::Result<()> {
+    if discovery.issuer != CANONICAL_ISSUER {
+        anyhow::bail!("OIDC discovery issuer mismatch");
+    }
+    let issuer = Url::parse(CANONICAL_ISSUER)?;
+    for endpoint in [&discovery.authorization_endpoint, &discovery.token_endpoint] {
+        let endpoint = Url::parse(endpoint)?;
+        if endpoint.scheme() != "https" || endpoint.origin() != issuer.origin() {
+            anyhow::bail!("OIDC endpoint is outside the canonical issuer");
+        }
+    }
+    if !discovery
+        .response_types_supported
+        .iter()
+        .any(|v| v == "code")
+        || !discovery
+            .grant_types_supported
+            .iter()
+            .any(|v| v == "authorization_code")
+        || !discovery
+            .grant_types_supported
+            .iter()
+            .any(|v| v == "refresh_token")
+        || !discovery
+            .code_challenge_methods_supported
+            .iter()
+            .any(|v| v == "S256")
+        || !discovery
+            .token_endpoint_auth_methods_supported
+            .iter()
+            .any(|v| v == "none")
+    {
+        anyhow::bail!("Grok OIDC provider lacks required OAuth capabilities");
+    }
+    Ok(())
+}
+
+fn authorize_url(
+    discovery: &Discovery,
     redirect_uri: &str,
     pkce: &PkceCodes,
     state: &str,
-) -> Result<TokenResponse, anyhow::Error> {
+) -> anyhow::Result<String> {
+    let mut url = Url::parse(&discovery.authorization_endpoint)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", SCOPES)
+        .append_pair("code_challenge", &pkce.challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state);
+    Ok(url.into())
+}
+
+fn exchange_code(
+    client: &reqwest::blocking::Client,
+    discovery: &Discovery,
+    code: &str,
+    pkce: &PkceCodes,
+    redirect_uri: &str,
+) -> anyhow::Result<WireTokenResponse> {
+    let response = client
+        .post(&discovery.token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", CLIENT_ID),
+            ("code", code),
+            ("code_verifier", pkce.verifier.as_str()),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "Grok token exchange failed with status {}",
+            response.status()
+        );
+    }
+    Ok(response.json()?)
+}
+
+fn validate_wire_tokens(tokens: &WireTokenResponse) -> anyhow::Result<()> {
+    if tokens.access_token.is_empty()
+        || tokens.expires_in == 0
+        || tokens
+            .token_type
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case("bearer"))
+    {
+        anyhow::bail!("Grok token response is invalid");
+    }
+    Ok(())
+}
+
+fn wait_for_callback(
+    listener: &TcpListener,
+    state: &str,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("Grok OAuth login timed out");
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => match callback(&mut stream, state) {
+                Callback::Code(code) => return Ok(code),
+                Callback::Terminal(error) => anyhow::bail!(error),
+                Callback::Ignore => {}
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+enum Callback {
+    Code(String),
+    Terminal(String),
+    Ignore,
+}
+
+fn callback(stream: &mut TcpStream, expected_state: &str) -> Callback {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-
-    let (path, query) = match extract_request_path_and_query(stream) {
-        Some(pair) => pair,
-        None => {
-            write_response(stream, 400, "text/plain", "Bad request");
-            anyhow::bail!("Bad request");
-        }
+    let mut buffer = [0_u8; 8192];
+    let Ok(length) = stream.read(&mut buffer) else {
+        return Callback::Ignore;
     };
-
-    if path != OAUTH_CALLBACK_PATH {
-        write_response(stream, 404, "text/plain", "Not found");
-        anyhow::bail!("Not found");
-    }
-
-    let params = parse_query(&query);
-    if let Some(error) = params.get("error") {
-        write_response(stream, 400, "text/plain", &format!("Auth failed: {error}"));
-        anyhow::bail!("{error}");
-    }
-
-    let code = match params.get("code") {
-        Some(c) => c.clone(),
-        None => {
-            write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
-            anyhow::bail!("Invalid callback");
-        }
+    let request = String::from_utf8_lossy(&buffer[..length]);
+    let Some(target) = request.lines().next().and_then(|line| {
+        let mut parts = line.split_whitespace();
+        (parts.next() == Some("GET"))
+            .then(|| parts.next())
+            .flatten()
+    }) else {
+        return Callback::Ignore;
     };
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+        return Callback::Ignore;
+    };
+    if url.path() != "/callback" {
+        respond(stream, "404 Not Found", "Not found");
+        return Callback::Ignore;
+    }
+    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if params.contains_key("error") {
+        respond(stream, "400 Bad Request", "Authorization failed");
+        return Callback::Terminal("Grok authorization was denied".into());
+    }
+    let valid_state = params
+        .get("state")
+        .is_some_and(|value| constant_time_eq(value, expected_state));
+    let code = params.get("code").filter(|value| !value.is_empty());
+    if !valid_state || code.is_none() {
+        respond(stream, "400 Bad Request", "Invalid authorization callback");
+        return Callback::Terminal("Grok authorization callback is invalid".into());
+    }
+    respond(
+        stream,
+        "200 OK",
+        "Authorization received. Return to the terminal.",
+    );
+    Callback::Code(code.unwrap().clone())
+}
 
-    let received_state = params.get("state").cloned().unwrap_or_default();
-    if received_state != state {
-        write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
-        anyhow::bail!("Invalid callback: state mismatch");
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let command = ("open", vec![url]);
+    #[cfg(target_os = "linux")]
+    let command = ("xdg-open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let command = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let _ = std::process::Command::new(command.0)
+            .args(command.1)
+            .spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata() -> Discovery {
+        Discovery {
+            issuer: CANONICAL_ISSUER.into(),
+            authorization_endpoint: "https://auth.x.ai/oauth2/authorize".into(),
+            token_endpoint: "https://auth.x.ai/oauth2/token".into(),
+            response_types_supported: vec!["code".into()],
+            grant_types_supported: vec!["authorization_code".into(), "refresh_token".into()],
+            code_challenge_methods_supported: vec!["S256".into()],
+            token_endpoint_auth_methods_supported: vec!["none".into()],
+        }
     }
 
-    match exchange_code_for_tokens(issuer, &code, pkce, redirect_uri) {
-        Ok(tokens) => {
-            write_response(
-                stream,
-                200,
-                "text/html",
-                "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>",
-            );
-            Ok(tokens)
-        }
-        Err(e) => {
-            write_response(stream, 500, "text/plain", &e.to_string());
-            Err(e)
-        }
+    #[test]
+    fn authorization_url_has_exact_public_client_contract() {
+        let url = authorize_url(
+            &metadata(),
+            "http://127.0.0.1:1234/callback",
+            &generate_pkce(),
+            "state",
+        )
+        .unwrap();
+        let url = Url::parse(&url).unwrap();
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params.get("client_id").unwrap(), CLIENT_ID);
+        assert_eq!(params.get("scope").unwrap(), SCOPES);
+        assert_eq!(
+            params.get("redirect_uri").unwrap(),
+            "http://127.0.0.1:1234/callback"
+        );
+        assert!(!params.contains_key("client_secret"));
+    }
+
+    #[test]
+    fn discovery_rejects_cross_origin_endpoint() {
+        let mut value = metadata();
+        value.token_endpoint = "https://example.com/token".into();
+        assert!(validate_discovery(&value).is_err());
+    }
+
+    #[test]
+    fn callback_validates_state_and_path() {
+        assert!(constant_time_eq("state", "state"));
+        assert!(!constant_time_eq("state", "other"));
     }
 }

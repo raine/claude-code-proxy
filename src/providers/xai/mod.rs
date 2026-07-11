@@ -324,7 +324,9 @@ pub(crate) struct XaiCli;
 
 impl CliHandlers for XaiCli {
     fn login(&self) -> Result<(), anyhow::Error> {
-        println!("xAI SuperGrok OAuth (browser PKCE). For headless hosts use: xai auth device");
+        println!(
+            "xAI SuperGrok OAuth (browser PKCE via OIDC discovery). For headless hosts use: xai auth device"
+        );
         let tokens = run_browser_login()?;
         persist_and_print(&tokens)
     }
