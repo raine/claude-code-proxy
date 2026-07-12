@@ -496,7 +496,7 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 filters.allowed_domains.is_some() || filters.blocked_domains.is_some();
             out.push(ResponsesTool::WebSearch(ResponsesWebSearchTool {
                 kind: "web_search".to_string(),
-                external_web_access: false,
+                external_web_access: true,
                 search_content_types: vec!["text".to_string(), "image".to_string()],
                 filters: if has_filters { Some(filters) } else { None },
             }));
