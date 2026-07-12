@@ -35,7 +35,7 @@ use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, resolve_model_request, uses_responses_lite,
+    assert_allowed_model, full_lane_web_search_model, resolve_model_request, uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{TranslateOptions, has_hosted_web_search, translate_request};
@@ -93,7 +93,7 @@ impl Provider for CodexProvider {
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
 
-        let resolved = resolve_model_request(model);
+        let mut resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -104,6 +104,7 @@ impl Provider for CodexProvider {
                 ),
             );
         }
+        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -114,8 +115,7 @@ impl Provider for CodexProvider {
                 session_id: ctx.session_id.clone(),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
-                use_responses_lite: uses_responses_lite(&resolved.model)
-                    && !has_hosted_web_search(&body),
+                use_responses_lite,
             },
         ) {
             Ok(t) => t,
@@ -241,7 +241,7 @@ impl Provider for CodexProvider {
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
-        let resolved = resolve_model_request(model);
+        let mut resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -252,6 +252,7 @@ impl Provider for CodexProvider {
                 ),
             );
         }
+        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -262,8 +263,7 @@ impl Provider for CodexProvider {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
-                use_responses_lite: uses_responses_lite(&resolved.model)
-                    && !has_hosted_web_search(&body),
+                use_responses_lite,
             },
         ) {
             Ok(t) => t,
@@ -288,6 +288,18 @@ impl Provider for CodexProvider {
         )
             .into_response()
     }
+}
+
+/// Picks the upstream model and lane for a request. Hosted web_search must
+/// run on the full Responses API (the lite lane rejects hosted tools), and
+/// lite-only models like gpt-5.6-luna don't exist there, so such requests
+/// are upgraded to a full-lane model. Returns whether to use the lite lane.
+fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+    if has_hosted_web_search(body) {
+        *model = full_lane_web_search_model(model).to_string();
+        return false;
+    }
+    uses_responses_lite(model)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -912,6 +924,50 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role":"user", "content":"find it"}],
+            "tools": tools
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn web_search_requests_leave_lite_lane_and_upgrade_luna() {
+        let body = request_with_tools(serde_json::json!([
+            {"type":"web_search_20250305", "name":"web_search"}
+        ]));
+        for (resolved, expected) in [
+            ("gpt-5.6-luna", "gpt-5.6-sol"),
+            ("gpt-5.6-sol", "gpt-5.6-sol"),
+            ("gpt-5.6-terra", "gpt-5.6-terra"),
+            ("gpt-5.4", "gpt-5.4"),
+        ] {
+            let mut model = resolved.to_string();
+            let lite = apply_model_lane_for_request(&mut model, &body);
+            assert!(!lite, "{resolved} with web_search must use the full lane");
+            assert_eq!(model, expected);
+        }
+    }
+
+    #[test]
+    fn requests_without_web_search_keep_model_and_lite_lane() {
+        let body = request_with_tools(serde_json::json!([
+            {"name":"Bash", "input_schema":{}}
+        ]));
+        for (resolved, lite_expected) in [
+            ("gpt-5.6-luna", true),
+            ("gpt-5.6-sol", true),
+            ("gpt-5.4", false),
+        ] {
+            let mut model = resolved.to_string();
+            let lite = apply_model_lane_for_request(&mut model, &body);
+            assert_eq!(model, resolved, "model must not change without web_search");
+            assert_eq!(lite, lite_expected);
+        }
+    }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK

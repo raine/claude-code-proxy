@@ -112,6 +112,18 @@ pub fn uses_responses_lite(model: &str) -> bool {
     matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
 }
 
+/// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
+/// Responses API resolves it to a `-free` variant and returns 404 (Model not
+/// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
+/// full lane, so luna is upgraded to its nearest full-lane sibling.
+pub fn full_lane_web_search_model(model: &str) -> &str {
+    if model == "gpt-5.6-luna" {
+        "gpt-5.6-sol"
+    } else {
+        model
+    }
+}
+
 pub fn is_valid_model_for_codex(model: &str) -> bool {
     if ALLOWED_MODELS.contains(&model) {
         return true;
@@ -131,6 +143,14 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn web_search_upgrades_luna_to_full_lane_sibling() {
+        assert_eq!(full_lane_web_search_model("gpt-5.6-luna"), "gpt-5.6-sol");
+        assert_eq!(full_lane_web_search_model("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(full_lane_web_search_model("gpt-5.6-terra"), "gpt-5.6-terra");
+        assert_eq!(full_lane_web_search_model("gpt-5.4"), "gpt-5.4");
     }
 
     #[test]
