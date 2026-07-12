@@ -37,7 +37,7 @@ use self::translate::model_allowlist::{
     assert_allowed_model, resolve_model_request, uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
-use self::translate::request::{TranslateOptions, translate_request};
+use self::translate::request::{TranslateOptions, has_hosted_web_search, translate_request};
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 use self::translate::stream::translate_stream_bytes_with_traffic;
@@ -109,7 +109,8 @@ impl Provider for CodexProvider {
                 session_id: ctx.session_id.clone(),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
-                use_responses_lite: uses_responses_lite(&resolved.model),
+                use_responses_lite: uses_responses_lite(&resolved.model)
+                    && !has_hosted_web_search(&body),
             },
         ) {
             Ok(t) => t,
@@ -256,7 +257,8 @@ impl Provider for CodexProvider {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
-                use_responses_lite: uses_responses_lite(&resolved.model),
+                use_responses_lite: uses_responses_lite(&resolved.model)
+                    && !has_hosted_web_search(&body),
             },
         ) {
             Ok(t) => t,
