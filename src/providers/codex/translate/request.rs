@@ -182,16 +182,6 @@ pub struct ResponsesWebSearchTool {
     pub kind: String,
     pub external_web_access: bool,
     pub search_content_types: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filters: Option<ResponsesWebSearchFilters>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponsesWebSearchFilters {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_domains: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked_domains: Option<Vec<String>>,
 }
 
 pub struct TranslateOptions {
@@ -307,11 +297,60 @@ pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
         })
 }
 
+/// The Codex backend accepts the `filters` object on `web_search` but returns
+/// zero results for every query while it is present, so allowed/blocked
+/// domains can't be forwarded as-is. `site:` / `-site:` query operators do
+/// work, so filters are emulated by instructing the model to scope its
+/// queries with them.
+fn web_search_domain_instructions(req: &MessagesRequest) -> Option<String> {
+    let tools = req.extra.get("tools")?.as_array()?;
+    let tool = tools
+        .iter()
+        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305"))?;
+    let domains = |key: &str| -> Vec<String> {
+        tool.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let allowed = domains("allowed_domains");
+    let blocked = domains("blocked_domains");
+    if allowed.is_empty() && blocked.is_empty() {
+        return None;
+    }
+    let mut out = String::from("Domain filters are in effect for web_search.");
+    if !allowed.is_empty() {
+        out.push_str(&format!(
+            " Only results from these domains may be used: {}. Scope every web_search query to them with site: operators (e.g. \"site:{}\") and discard results from any other domain.",
+            allowed.join(", "),
+            allowed[0],
+        ));
+    }
+    if !blocked.is_empty() {
+        out.push_str(&format!(
+            " Never use or cite results from these domains: {}. Exclude them from every web_search query with -site: operators (e.g. \"-site:{}\") and discard any results from them.",
+            blocked.join(", "),
+            blocked[0],
+        ));
+    }
+    Some(out)
+}
+
 pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    let instructions = flatten_system_text(req.extra.get("system"));
+    let mut instructions = flatten_system_text(req.extra.get("system"));
+    if let Some(domain_instructions) = web_search_domain_instructions(req) {
+        instructions = Some(match instructions {
+            Some(text) => format!("{text}\n\n{domain_instructions}"),
+            None => domain_instructions,
+        });
+    }
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
@@ -469,33 +508,14 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
             .and_then(|v| v.as_str())
             .unwrap_or("function");
         if tool_type == "web_search_20250305" {
-            let mut filters = ResponsesWebSearchFilters {
-                allowed_domains: None,
-                blocked_domains: None,
-            };
-            let allowed = tool.get("allowed_domains").and_then(|v| v.as_array());
-            if allowed.is_some_and(|a| !a.is_empty()) {
-                filters.allowed_domains = allowed.map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
-            }
-            let blocked = tool.get("blocked_domains").and_then(|v| v.as_array());
-            if blocked.is_some_and(|a| !a.is_empty()) {
-                filters.blocked_domains = blocked.map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
-            }
-            let has_filters =
-                filters.allowed_domains.is_some() || filters.blocked_domains.is_some();
+            // The Codex backend returns zero results whenever a `filters`
+            // object is present on `web_search`, so domain filters are
+            // enforced through query instructions instead (see
+            // web_search_domain_instructions).
             out.push(ResponsesTool::WebSearch(ResponsesWebSearchTool {
                 kind: "web_search".to_string(),
-                external_web_access: false,
+                external_web_access: true,
                 search_content_types: vec!["text".to_string(), "image".to_string()],
-                filters: if has_filters { Some(filters) } else { None },
             }));
         } else {
             let name = tool
@@ -909,6 +929,65 @@ mod tests {
             out.tool_choice,
             Some(ResponsesToolChoice::WebSearch { .. })
         ));
+        let tool = serde_json::to_value(out.tools.as_ref().unwrap()[0].clone()).unwrap();
+        assert_eq!(tool.get("external_web_access"), Some(&json!(true)));
+        assert!(tool.get("filters").is_none());
+        let instructions = out.instructions.unwrap();
+        assert!(instructions.contains("example.com"));
+        assert!(instructions.contains("site:example.com"));
+    }
+
+    #[test]
+    fn web_search_lists_all_allowed_and_blocked_domains() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"find it"}],
+            "tools": [{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["a.example", "b.example"],
+                "blocked_domains":["c.example", "d.example"]
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let instructions = out.instructions.unwrap();
+        for domain in ["a.example", "b.example", "c.example", "d.example"] {
+            assert!(instructions.contains(domain), "missing {domain}");
+        }
+        assert!(instructions.contains("site:a.example"));
+        assert!(instructions.contains("-site:c.example"));
+    }
+
+    #[test]
+    fn web_search_without_domains_adds_no_filter_instructions() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"find it"}],
+            "tools": [{"type":"web_search_20250305", "name":"web_search"}]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(out.instructions.is_none());
+    }
+
+    #[test]
+    fn web_search_blocked_domains_add_exclusion_instructions() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"find it"}],
+            "system": "Be brief.",
+            "tools": [{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "blocked_domains":["spam.example"]
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let instructions = out.instructions.unwrap();
+        assert!(instructions.starts_with("Be brief."));
+        assert!(instructions.contains("-site:spam.example"));
     }
 
     #[test]

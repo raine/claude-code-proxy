@@ -304,7 +304,11 @@ so simple prompts can emit no thinking block. Set `codex.reasoningSummary` /
 keeping `reasoning.effort` and encrypted continuation content.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
-Responses `web_search` tool, including non-empty domain filters. Codex hosted
+Responses `web_search` tool with `external_web_access` enabled. Domain filters
+are not forwarded as the Responses `filters` parameter — the Codex backend
+returns zero results whenever it is present — and are instead enforced through
+injected instructions that scope queries with `site:` / `-site:` operators.
+Codex hosted
 search calls are emitted back to Claude Code as Anthropic `server_tool_use` and
 `web_search_tool_result` blocks with `usage.server_tool_use.web_search_requests`
 so Claude Code can account for completed searches.
