@@ -492,13 +492,16 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                         .collect()
                 });
             }
-            let has_filters =
-                filters.allowed_domains.is_some() || filters.blocked_domains.is_some();
+            // The Codex backend zeroes out results when domain filters are
+            // present (allowed_domains=[github.com] -> 0 results for queries
+            // that hit the domain unfiltered), so don't forward them; the
+            // model filters from titles/URLs instead.
+            let _ = &filters;
             out.push(ResponsesTool::WebSearch(ResponsesWebSearchTool {
                 kind: "web_search".to_string(),
                 external_web_access: true,
                 search_content_types: vec!["text".to_string(), "image".to_string()],
-                filters: if has_filters { Some(filters) } else { None },
+                filters: None,
             }));
         } else {
             let name = tool
