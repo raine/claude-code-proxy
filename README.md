@@ -69,10 +69,14 @@ it in any browser, confirm the code, and the CLI polls until done.
 
 ```sh
 claude-code-proxy grok auth login      # browser OAuth (PKCE)
+# or, on a headless machine:
+claude-code-proxy grok auth device     # device-code flow (prints URL + code)
 ```
 
 Sign in with your **grok.com account**. The proxy stores and refreshes its own
-OAuth session and does not use the official Grok CLI credential file.
+OAuth session and does not use the official Grok CLI credential file. On a
+headless host, `grok auth device` prints a verification URL and code to enter on
+any other device, then polls until authorization completes.
 
 **Cursor Agent:**
 
@@ -366,14 +370,17 @@ search X use Grok's hosted `x_search` tool, with citations and search usage
 reported in Claude Code.
 
 Authentication uses browser OAuth with S256 PKCE through `auth.x.ai` and an
-ephemeral loopback callback. The proxy stores its own access and refresh tokens,
+ephemeral loopback callback. Headless hosts can use the OAuth device-code flow
+(`grok auth device`) instead, which prints a verification URL and user code and
+polls the same issuer. The proxy stores its own access and refresh tokens,
 refreshes them five minutes before expiry, and does not use `~/.grok/auth.json`.
 
-| Command            | What it does                        |
-| ------------------ | ----------------------------------- |
-| `grok auth login`  | Browser OAuth with a local callback |
-| `grok auth status` | Show token expiry and storage path  |
-| `grok auth logout` | Delete proxy-owned credentials      |
+| Command            | What it does                          |
+| ------------------ | ------------------------------------- |
+| `grok auth login`  | Browser OAuth with a local callback   |
+| `grok auth device` | Device-code OAuth for headless hosts  |
+| `grok auth status` | Show token expiry and storage path    |
+| `grok auth logout` | Delete proxy-owned credentials        |
 
 ### Cursor Agent
 

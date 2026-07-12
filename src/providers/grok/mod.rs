@@ -464,7 +464,10 @@ impl CliHandlers for GrokCli {
         Ok(())
     }
     fn device(&self) -> anyhow::Result<()> {
-        anyhow::bail!("Grok device login is unavailable; use grok auth login")
+        let store = file_store();
+        auth::device::device_login(&store)?;
+        println!("Grok authentication saved in {}", store.auth_path());
+        Ok(())
     }
     fn status(&self) -> anyhow::Result<()> {
         let store = file_store();

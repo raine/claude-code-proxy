@@ -12,7 +12,7 @@ use crate::auth::AuthStorage;
 
 pub const CANONICAL_ISSUER: &str = "https://auth.x.ai";
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
-const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+pub(super) const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_METADATA_BYTES: usize = 256 * 1024;
 
