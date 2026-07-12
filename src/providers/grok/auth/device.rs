@@ -9,8 +9,8 @@ use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 
 const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const DEVICE_POLL_SAFETY_MARGIN_MS: u64 = 500;
-const SLOW_DOWN_BACKOFF_MS: u64 = 2000;
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 const MAX_DEVICE_POLL_WAIT: Duration = Duration::from_secs(600);
 
 #[derive(Deserialize)]
@@ -42,9 +42,43 @@ enum DevicePoll {
     SlowDown,
 }
 
+trait DeviceRuntime {
+    fn monotonic_now(&self) -> Instant;
+    fn unix_time_ms(&self) -> u64;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemRuntime;
+
+impl DeviceRuntime for SystemRuntime {
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn unix_time_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
 pub fn device_login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::Result<()> {
     let client = client()?;
-    let tokens = run_device_flow(&client, CANONICAL_ISSUER)?;
+    device_login_inner(store, &client, CANONICAL_ISSUER, &SystemRuntime)
+}
+
+fn device_login_inner<S: AuthStorage<StoredAuth>>(
+    store: &GrokTokenStore<S>,
+    client: &reqwest::blocking::Client,
+    issuer: &str,
+    runtime: &dyn DeviceRuntime,
+) -> anyhow::Result<()> {
+    let tokens = run_device_flow_inner(client, issuer, runtime)?;
     let refresh = tokens
         .refresh_token
         .as_ref()
@@ -54,7 +88,9 @@ pub fn device_login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> an
     store.save_auth(StoredAuth {
         access: tokens.access_token,
         refresh,
-        expires_at_ms: now_ms().saturating_add(tokens.expires_in.saturating_mul(1000)),
+        expires_at_ms: runtime
+            .unix_time_ms()
+            .saturating_add(tokens.expires_in.saturating_mul(1000)),
         issuer: CANONICAL_ISSUER.into(),
         client_id: CLIENT_ID.into(),
     })?;
@@ -68,17 +104,10 @@ fn client() -> anyhow::Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-fn run_device_flow(
-    client: &reqwest::blocking::Client,
-    issuer: &str,
-) -> anyhow::Result<TokenResponse> {
-    run_device_flow_inner(client, issuer, &|dur| std::thread::sleep(dur))
-}
-
 fn run_device_flow_inner(
     client: &reqwest::blocking::Client,
     issuer: &str,
-    sleep: &dyn Fn(Duration),
+    runtime: &dyn DeviceRuntime,
 ) -> anyhow::Result<TokenResponse> {
     let auth = request_device_code(client, issuer)?;
     let visit = auth
@@ -91,26 +120,38 @@ fn run_device_flow_inner(
         auth.user_code
     );
 
-    let interval = Duration::from_millis(
-        auth.interval.unwrap_or(5).max(1) * 1000 + DEVICE_POLL_SAFETY_MARGIN_MS,
-    );
+    let mut interval = auth
+        .interval
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_POLL_INTERVAL);
     let max_wait = auth
         .expires_in
-        .map(|secs| Duration::from_secs(secs.max(30)))
+        .map(Duration::from_secs)
         .unwrap_or(MAX_DEVICE_POLL_WAIT);
-    let deadline = Instant::now() + max_wait;
+    let deadline = runtime
+        .monotonic_now()
+        .checked_add(max_wait)
+        .ok_or_else(|| anyhow::anyhow!("Grok device code lifetime is too large"))?;
 
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(runtime.monotonic_now());
+        if remaining.is_zero() {
             anyhow::bail!("Grok device login timed out after {}s", max_wait.as_secs());
         }
+        runtime.sleep(interval.min(remaining));
+        if runtime.monotonic_now() >= deadline {
+            anyhow::bail!("Grok device login timed out after {}s", max_wait.as_secs());
+        }
+
         match poll_token(client, issuer, &auth.device_code)? {
             DevicePoll::Tokens(tokens) => {
                 validate_tokens(&tokens)?;
                 return Ok(tokens);
             }
-            DevicePoll::Pending => sleep(interval),
-            DevicePoll::SlowDown => sleep(interval + Duration::from_millis(SLOW_DOWN_BACKOFF_MS)),
+            DevicePoll::Pending => {}
+            DevicePoll::SlowDown => {
+                interval = interval.saturating_add(SLOW_DOWN_INCREMENT);
+            }
         }
     }
 }
@@ -171,20 +212,47 @@ fn validate_tokens(tokens: &TokenResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::InMemoryAuthStore;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
     use std::thread;
+
+    const TEST_UNIX_TIME_MS: u64 = 1_700_000_000_000;
+
+    struct TestRuntime {
+        start: Instant,
+        elapsed: Mutex<Duration>,
+        sleeps: Mutex<Vec<Duration>>,
+    }
+
+    impl Default for TestRuntime {
+        fn default() -> Self {
+            Self {
+                start: Instant::now(),
+                elapsed: Mutex::new(Duration::ZERO),
+                sleeps: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DeviceRuntime for TestRuntime {
+        fn monotonic_now(&self) -> Instant {
+            self.start + *self.elapsed.lock().unwrap()
+        }
+
+        fn unix_time_ms(&self) -> u64 {
+            TEST_UNIX_TIME_MS
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+            *self.elapsed.lock().unwrap() += duration;
+        }
+    }
 
     /// Minimal mock issuer: one response for `/oauth2/device/code`, then a queued
     /// sequence of `(status, body)` responses for `/oauth2/token`.
@@ -234,10 +302,6 @@ mod tests {
             .unwrap()
     }
 
-    fn no_sleep() -> impl Fn(Duration) {
-        |_| {}
-    }
-
     #[test]
     fn device_flow_returns_tokens_after_pending() {
         let issuer = spawn_issuer(
@@ -252,7 +316,8 @@ mod tests {
                 ),
             ],
         );
-        let tokens = run_device_flow_inner(&test_client(), &issuer, &no_sleep()).unwrap();
+        let tokens =
+            run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap();
         assert_eq!(tokens.access_token, "access-1");
         assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-1"));
     }
@@ -263,7 +328,8 @@ mod tests {
             r#"{"device_code":"dev-2","user_code":"AAAA-0000","interval":0}"#,
             vec![(400, r#"{"error":"access_denied"}"#.into())],
         );
-        let error = run_device_flow_inner(&test_client(), &issuer, &no_sleep()).unwrap_err();
+        let error =
+            run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap_err();
         assert!(error.to_string().contains("access_denied"));
     }
 
@@ -271,8 +337,52 @@ mod tests {
     fn device_flow_reports_init_failure() {
         let issuer = spawn_issuer(r#"{"error":"invalid_client"}"#, vec![]);
         // device/code returns 200 with a body missing required fields -> parse error.
-        let error = run_device_flow_inner(&test_client(), &issuer, &no_sleep()).unwrap_err();
+        let error =
+            run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap_err();
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn device_flow_waits_before_polling_and_persists_slow_down() {
+        let issuer = spawn_issuer(
+            r#"{"device_code":"dev-4","user_code":"CCCC-2222","interval":2}"#,
+            vec![
+                (400, r#"{"error":"authorization_pending"}"#.into()),
+                (400, r#"{"error":"slow_down"}"#.into()),
+                (400, r#"{"error":"authorization_pending"}"#.into()),
+                (
+                    200,
+                    r#"{"access_token":"access-4","refresh_token":"refresh-4","expires_in":3600,"token_type":"Bearer"}"#
+                        .into(),
+                ),
+            ],
+        );
+        let runtime = TestRuntime::default();
+        run_device_flow_inner(&test_client(), &issuer, &runtime).unwrap();
+        assert_eq!(
+            *runtime.sleeps.lock().unwrap(),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(7),
+                Duration::from_secs(7),
+            ]
+        );
+    }
+
+    #[test]
+    fn device_flow_respects_short_expiration() {
+        let issuer = spawn_issuer(
+            r#"{"device_code":"dev-5","user_code":"DDDD-3333","interval":5,"expires_in":2}"#,
+            vec![(200, r#"{}"#.into())],
+        );
+        let runtime = TestRuntime::default();
+        let error = run_device_flow_inner(&test_client(), &issuer, &runtime).unwrap_err();
+        assert!(error.to_string().contains("timed out after 2s"));
+        assert_eq!(
+            *runtime.sleeps.lock().unwrap(),
+            vec![Duration::from_secs(2)]
+        );
     }
 
     #[test]
@@ -286,20 +396,13 @@ mod tests {
             )],
         );
         let store = GrokTokenStore::new(InMemoryAuthStore::<StoredAuth>::default());
-        let tokens = run_device_flow_inner(&test_client(), &issuer, &no_sleep()).unwrap();
-        let refresh = tokens.refresh_token.clone().unwrap();
-        store
-            .save_auth(StoredAuth {
-                access: tokens.access_token,
-                refresh,
-                expires_at_ms: now_ms() + tokens.expires_in * 1000,
-                issuer: CANONICAL_ISSUER.into(),
-                client_id: CLIENT_ID.into(),
-            })
-            .unwrap();
+        let runtime = TestRuntime::default();
+        device_login_inner(&store, &test_client(), &issuer, &runtime).unwrap();
         let saved = store.load_auth().unwrap().unwrap();
         assert_eq!(saved.access, "access-3");
         assert_eq!(saved.refresh, "refresh-3");
+        assert_eq!(saved.expires_at_ms, TEST_UNIX_TIME_MS + 3_600_000);
         assert_eq!(saved.issuer, CANONICAL_ISSUER);
+        assert_eq!(saved.client_id, CLIENT_ID);
     }
 }
