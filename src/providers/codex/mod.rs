@@ -660,10 +660,11 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
+        return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
+    }
     matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
-        || (err.status == 0
-            && (err.detail.as_deref() == Some("websocket_pre_request")
-                || retryable_live_message(codex_error_message(err))))
+        || (err.status == 0 && retryable_live_message(codex_error_message(err)))
 }
 
 fn retry_with_full_context_for_live_error(err: &client::CodexError) -> bool {
@@ -1069,13 +1070,13 @@ mod tests {
     }
 
     #[test]
-    fn live_start_statusless_websocket_pre_request_error_is_retryable() {
+    fn live_start_statusless_websocket_handshake_error_is_retryable() {
         let err = client::CodexError {
             status: 0,
             message: "WebSocket connect timeout after 15000ms".to_string(),
-            detail: Some("websocket_pre_request".to_string()),
+            detail: None,
             retry_after: None,
-            origin: client::CodexErrorOrigin::WebSocket,
+            origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
 
         assert!(retryable_live_start_codex_error(&err));

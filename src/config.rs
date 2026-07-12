@@ -504,7 +504,7 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::Auto
+    CodexTransport::WebSocket
 }
 
 // ---------------------------------------------------------------------------
@@ -601,11 +601,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_auto() {
+    fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         let result = codex_transport();
-        assert_eq!(result, CodexTransport::Auto);
+        assert_eq!(result, CodexTransport::WebSocket);
     }
 
     #[test]
@@ -629,23 +629,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_auto() {
+    fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
-        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]
-    fn codex_transport_empty_env_falls_back_to_auto() {
+    fn codex_transport_empty_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
-        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]

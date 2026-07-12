@@ -713,7 +713,7 @@ Windows, and at
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `auto`                                            | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                                                                         |
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
@@ -731,10 +731,10 @@ A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
 
-Codex tries the WebSocket Responses transport by default and falls back to HTTP
-SSE when the WebSocket handshake fails before a request is sent upstream. Set
-`CCP_CODEX_TRANSPORT=http` to force HTTP for debugging or compatibility, or
-`CCP_CODEX_TRANSPORT=websocket` to require WebSocket without fallback.
+Codex uses the WebSocket Responses transport by default. Set
+`CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
+compatibility, or `CCP_CODEX_TRANSPORT=auto` to try WebSocket with HTTP fallback
+only when setup fails before a request is sent upstream.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code
 session id, reuses a session WebSocket while it remains open, and sends
