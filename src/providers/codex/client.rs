@@ -1467,7 +1467,7 @@ mod tests {
     fn status_error_preserves_buffered_websocket_event_message() {
         let error = codex_status_error(
             CodexResponse {
-                body: br#"data: {"type":"error","error":{"status":400,"message":"bad request"}}\n\n"#
+                body: b"data: {\"type\":\"error\",\"error\":{\"status\":400,\"message\":\"bad request\"}}\n\n"
                     .to_vec(),
                 status: 400,
                 headers: Vec::new(),
