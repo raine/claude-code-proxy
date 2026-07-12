@@ -117,6 +117,18 @@ upstream for each request is chosen from `ANTHROPIC_MODEL`. When stdout is a
 terminal, `serve` opens a monitor TUI with sessions, active requests, recent
 requests, and error events. Use `--no-monitor` for plain terminal output.
 
+Installed via Homebrew, the proxy can also run as a background service that
+starts at login and restarts if it exits:
+
+```sh
+brew services start claude-code-proxy
+```
+
+Service output goes to `~/.local/state/claude-code-proxy/service.log`,
+alongside the proxy's own `proxy.log`. Provider logins are still a one-time
+interactive step (e.g. `claude-code-proxy codex auth login`); the service
+serves 401s until a token is stored.
+
 ### 4. Point Claude Code at it
 
 `ANTHROPIC_MODEL` selects the provider:
