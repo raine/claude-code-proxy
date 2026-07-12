@@ -266,7 +266,7 @@ pub async fn codex_websocket_request(
         message: e.message,
         detail: None,
         retry_after: None,
-        origin: CodexErrorOrigin::WebSocket,
+        origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let body_json = serde_json::to_string(body_value).unwrap_or_default();
     if let Some(tc) = traffic {
@@ -678,31 +678,36 @@ async fn connect_with_timeout(
         .map_err(|_| CodexError {
             status: 0,
             message: format!("WebSocket connect timeout after {connect_timeout_ms}ms"),
-            detail: Some("websocket_pre_request".to_string()),
+            detail: None,
             retry_after: None,
-            origin: CodexErrorOrigin::WebSocket,
+            origin: CodexErrorOrigin::WebSocketHandshake,
         })?
         .map_err(|e| {
-            let (status, retry_after) = match &e {
-                tungstenite::Error::Http(response) => (
-                    Some(response.status().as_u16()),
-                    response
-                        .headers()
-                        .get(http::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_string),
-                ),
-                _ => (None, None),
+            let (status, retry_after, detail) = match &e {
+                tungstenite::Error::Http(response) => {
+                    let detail = response
+                        .body()
+                        .as_ref()
+                        .and_then(|body| String::from_utf8(body.clone()).ok())
+                        .filter(|body| !body.trim().is_empty());
+                    (
+                        Some(response.status().as_u16()),
+                        response
+                            .headers()
+                            .get(http::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                        detail,
+                    )
+                }
+                _ => (None, None, None),
             };
             CodexError {
                 status: status.unwrap_or(0),
                 message: format!("WebSocket connect error: {e}"),
-                detail: match status {
-                    Some(401 | 403) => None,
-                    _ => Some("websocket_pre_request".to_string()),
-                },
+                detail,
                 retry_after,
-                origin: CodexErrorOrigin::WebSocket,
+                origin: CodexErrorOrigin::WebSocketHandshake,
             }
         })
 }
@@ -1269,7 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_connect_401_is_statusful_auth_error() {
+    async fn websocket_connect_401_is_pre_request_handshake_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1280,7 +1285,7 @@ mod tests {
             let mut buf = [0_u8; 2048];
             let _ = socket.read(&mut buf).await;
             socket
-                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\n\r\npolicy denied")
                 .await
                 .unwrap();
         });
@@ -1297,8 +1302,8 @@ mod tests {
         };
 
         assert_eq!(err.status, 401);
-        assert_eq!(err.detail, None);
-        assert_eq!(err.origin, CodexErrorOrigin::WebSocket);
+        assert_eq!(err.detail.as_deref(), Some("policy denied"));
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
     }
 
     #[tokio::test]
@@ -1332,9 +1337,9 @@ mod tests {
         };
 
         assert_eq!(err.status, 502);
-        assert_eq!(err.detail.as_deref(), Some("websocket_pre_request"));
+        assert_eq!(err.detail, None);
         assert_eq!(err.retry_after.as_deref(), Some("3"));
-        assert_eq!(err.origin, CodexErrorOrigin::WebSocket);
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
     }
 
     #[tokio::test]

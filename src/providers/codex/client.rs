@@ -30,6 +30,7 @@ pub struct CodexError {
 pub enum CodexErrorOrigin {
     Http,
     WebSocket,
+    WebSocketHandshake,
     Auth,
     BufferedHttp,
     BufferedWebSocket,
@@ -371,10 +372,7 @@ impl CodexHttpClient {
 
                     match ws_result {
                         Ok(response) => Ok(response),
-                        Err(err)
-                            if err.status == 0
-                                && err.detail.as_deref() == Some("websocket_pre_request") =>
-                        {
+                        Err(err) if should_fallback_to_http(&err) => {
                             // Fall back to HTTP only if WebSocket failed before sending
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
@@ -397,7 +395,7 @@ impl CodexHttpClient {
                 }
             };
 
-            if should_refresh_after_unauthorized(&result, auth_refresh_attempted) {
+            if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
                 auth_refresh_attempted = true;
                 match self.auth_manager.force_refresh(&auth.access).await {
                     Ok(new_auth) => {
@@ -1086,6 +1084,7 @@ fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
     match origin {
         CodexErrorOrigin::Http => "http",
         CodexErrorOrigin::WebSocket => "websocket",
+        CodexErrorOrigin::WebSocketHandshake => "websocket_handshake",
         CodexErrorOrigin::Auth => "auth",
         CodexErrorOrigin::BufferedHttp => "buffered_http",
         CodexErrorOrigin::BufferedWebSocket => "buffered_websocket",
@@ -1138,6 +1137,9 @@ fn log_buffered_retry_exhausted(
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
+    if err.origin == CodexErrorOrigin::WebSocketHandshake {
+        return err.status == 0 || should_retry_codex_status(err.status);
+    }
     if err.detail.as_deref() == Some("websocket_pre_request") {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
@@ -1170,14 +1172,23 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 fn should_refresh_after_unauthorized(
     result: &Result<CodexResponse, CodexError>,
     auth_refresh_attempted: bool,
+    transport: crate::config::CodexTransport,
 ) -> bool {
     if auth_refresh_attempted {
         return false;
     }
     match result {
         Ok(response) => response.status == 401,
-        Err(err) => err.status == 401,
+        Err(err) => {
+            err.status == 401
+                && (err.origin != CodexErrorOrigin::WebSocketHandshake
+                    || transport == crate::config::CodexTransport::WebSocket)
+        }
     }
+}
+
+fn should_fallback_to_http(err: &CodexError) -> bool {
+    err.origin == CodexErrorOrigin::WebSocketHandshake
 }
 
 fn should_retry_without_continuation(
@@ -1321,6 +1332,52 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"data: keep\n\n");
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_to_http_after_statusful_websocket_handshake_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut websocket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = websocket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
+            websocket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 13\r\nconnection: close\r\n\r\npolicy denied",
+                )
+                .await
+                .unwrap();
+            drop(websocket);
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let read = http.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+            let body = b"data: keep\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            http.write_all(response.as_bytes()).await.unwrap();
+            http.write_all(body).await.unwrap();
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"data: keep\n\n");
     }
@@ -1745,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_retry_check_covers_http_and_websocket_results() {
+    fn unauthorized_retry_distinguishes_auto_and_strict_websocket_handshakes() {
         let http_unauthorized = Ok(CodexResponse {
             body: Vec::new(),
             status: 401,
@@ -1765,14 +1822,49 @@ mod tests {
             retry_after: None,
             origin: CodexErrorOrigin::WebSocket,
         });
+        let rejected_handshake = Err(CodexError {
+            status: 401,
+            message: "WebSocket connect error".to_string(),
+            detail: Some("policy denied".to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        });
+        let rejected_handshake_err = match &rejected_handshake {
+            Err(error) => error,
+            Ok(_) => panic!("expected rejected handshake"),
+        };
 
-        assert!(should_refresh_after_unauthorized(&http_unauthorized, false));
+        assert!(should_refresh_after_unauthorized(
+            &http_unauthorized,
+            false,
+            crate::config::CodexTransport::Auto
+        ));
         assert!(should_refresh_after_unauthorized(
             &websocket_unauthorized,
-            false
+            false,
+            crate::config::CodexTransport::Auto
         ));
-        assert!(!should_refresh_after_unauthorized(&forbidden, false));
-        assert!(!should_refresh_after_unauthorized(&http_unauthorized, true));
+        assert!(!should_refresh_after_unauthorized(
+            &forbidden,
+            false,
+            crate::config::CodexTransport::Auto
+        ));
+        assert!(!should_refresh_after_unauthorized(
+            &rejected_handshake,
+            false,
+            crate::config::CodexTransport::Auto
+        ));
+        assert!(should_refresh_after_unauthorized(
+            &rejected_handshake,
+            false,
+            crate::config::CodexTransport::WebSocket
+        ));
+        assert!(!should_refresh_after_unauthorized(
+            &http_unauthorized,
+            true,
+            crate::config::CodexTransport::Auto
+        ));
+        assert!(should_fallback_to_http(rejected_handshake_err));
     }
 
     #[test]
