@@ -1047,7 +1047,23 @@ fn codex_status_error(
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
         .map(|(_, value)| value.clone());
-    let message = serde_json::from_slice::<serde_json::Value>(&response.body)
+    let message = codex_status_error_message(&response.body).unwrap_or_else(|| {
+        format!(
+            "Upstream Codex request failed with status {}",
+            response.status
+        )
+    });
+    CodexError {
+        status: response.status,
+        message: message.clone(),
+        detail: Some(message),
+        retry_after,
+        origin: buffered_origin(transport),
+    }
+}
+
+fn codex_status_error_message(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
             value
@@ -1057,19 +1073,12 @@ fn codex_status_error(
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| {
-            format!(
-                "Upstream Codex request failed with status {}",
-                response.status
-            )
-        });
-    CodexError {
-        status: response.status,
-        message: message.clone(),
-        detail: Some(message),
-        retry_after,
-        origin: buffered_origin(transport),
-    }
+        .or_else(|| {
+            parse_sse_events(body).into_iter().find_map(|event| {
+                let payload = serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
+                super::events::classify_event_failure(&payload).map(|failure| failure.message)
+            })
+        })
 }
 
 fn buffered_origin(transport: crate::config::CodexTransport) -> CodexErrorOrigin {
@@ -1395,6 +1404,23 @@ mod tests {
         assert_eq!(error.status, 404);
         assert_eq!(error.detail.as_deref(), Some("Model not found gpt-test"));
         assert_eq!(error.origin, CodexErrorOrigin::BufferedHttp);
+    }
+
+    #[test]
+    fn status_error_preserves_buffered_websocket_event_message() {
+        let error = codex_status_error(
+            CodexResponse {
+                body: br#"data: {"type":"error","error":{"status":400,"message":"bad request"}}\n\n"#
+                    .to_vec(),
+                status: 400,
+                headers: Vec::new(),
+            },
+            crate::config::CodexTransport::WebSocket,
+        );
+
+        assert_eq!(error.status, 400);
+        assert_eq!(error.detail.as_deref(), Some("bad request"));
+        assert_eq!(error.origin, CodexErrorOrigin::BufferedWebSocket);
     }
 
     #[tokio::test]
