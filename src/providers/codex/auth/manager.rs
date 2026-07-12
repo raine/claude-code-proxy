@@ -27,22 +27,42 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 
     pub fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
-        let cached = {
-            let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-            guard.clone()
-        };
-        let stored = match cached {
-            Some(ref auth) => auth.clone(),
-            None => {
-                let loaded = self.store.load_auth()?;
-                match loaded {
-                    Some(auth) => {
-                        let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let stored = if self.store.reload_each_request() {
+            let loaded = self.store.load_auth()?;
+            match loaded {
+                Some(auth) => {
+                    let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if guard.as_ref() != Some(&auth) {
                         *guard = Some(auth.clone());
-                        auth
                     }
-                    None => {
-                        anyhow::bail!("Not authenticated. Run: claude-code-proxy codex auth login");
+                    auth
+                }
+                None => {
+                    self.reset_cache();
+                    anyhow::bail!("Not authenticated. Run: claude-code-proxy codex auth login");
+                }
+            }
+        } else {
+            let cached = {
+                let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                guard.clone()
+            };
+            match cached {
+                Some(ref auth) => auth.clone(),
+                None => {
+                    let loaded = self.store.load_auth()?;
+                    match loaded {
+                        Some(auth) => {
+                            let mut guard =
+                                self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                            *guard = Some(auth.clone());
+                            auth
+                        }
+                        None => {
+                            anyhow::bail!(
+                                "Not authenticated. Run: claude-code-proxy codex auth login"
+                            );
+                        }
                     }
                 }
             }
@@ -196,5 +216,61 @@ mod tests {
                 .to_string()
                 .contains("Not authenticated")
         );
+    }
+
+    #[test]
+    fn reloading_store_observes_profile_swap_on_next_request() {
+        let store = CodexTokenStore::new_reloading(InMemoryAuthStore::new());
+        store
+            .save_auth(StoredAuth {
+                access: "first_access".into(),
+                refresh: String::new(),
+                expires: 9999999999999,
+                account_id: Some("acct_1".into()),
+            })
+            .unwrap();
+        let manager = CodexAuthManager::new(store);
+
+        assert_eq!(manager.get_auth().unwrap().access, "first_access");
+        manager
+            .store
+            .save_auth(StoredAuth {
+                access: "second_access".into(),
+                refresh: String::new(),
+                expires: 9999999999999,
+                account_id: Some("acct_2".into()),
+            })
+            .unwrap();
+
+        let swapped = manager.get_auth().unwrap();
+        assert_eq!(swapped.access, "second_access");
+        assert_eq!(swapped.account_id.as_deref(), Some("acct_2"));
+    }
+
+    #[test]
+    fn normal_store_keeps_cached_auth() {
+        let store = test_store();
+        store
+            .save_auth(StoredAuth {
+                access: "first_access".into(),
+                refresh: "first_refresh".into(),
+                expires: 9999999999999,
+                account_id: Some("acct_1".into()),
+            })
+            .unwrap();
+        let manager = CodexAuthManager::new(store);
+
+        assert_eq!(manager.get_auth().unwrap().access, "first_access");
+        manager
+            .store
+            .save_auth(StoredAuth {
+                access: "second_access".into(),
+                refresh: "second_refresh".into(),
+                expires: 9999999999999,
+                account_id: Some("acct_2".into()),
+            })
+            .unwrap();
+
+        assert_eq!(manager.get_auth().unwrap().access, "first_access");
     }
 }

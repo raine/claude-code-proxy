@@ -25,6 +25,7 @@ pub struct StoredAuth {
 pub struct CodexTokenStore<S: AuthStorage<StoredAuth>> {
     store: S,
     codex_cli_fallback: bool,
+    reload_each_request: bool,
 }
 
 impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
@@ -32,6 +33,7 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
         Self {
             store,
             codex_cli_fallback: false,
+            reload_each_request: false,
         }
     }
 
@@ -39,6 +41,15 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
         Self {
             store,
             codex_cli_fallback: true,
+            reload_each_request: false,
+        }
+    }
+
+    pub fn new_reloading(store: S) -> Self {
+        Self {
+            store,
+            codex_cli_fallback: false,
+            reload_each_request: true,
         }
     }
 
@@ -74,6 +85,10 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
     pub fn auth_path(&self) -> String {
         self.store.path()
     }
+
+    pub fn reload_each_request(&self) -> bool {
+        self.reload_each_request
+    }
 }
 
 pub type DefaultCodexAuthStore = KeychainFileAuthStore<StoredAuth, SystemKeychain>;
@@ -92,7 +107,7 @@ pub fn file_store() -> CodexTokenStore<DefaultCodexAuthStore> {
     if std::env::var_os("CCP_CONFIG_DIR").is_none() {
         CodexTokenStore::new_with_codex_cli_fallback(store)
     } else {
-        CodexTokenStore::new(store)
+        CodexTokenStore::new_reloading(store)
     }
 }
 

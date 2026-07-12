@@ -271,6 +271,30 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
     addr_str
 }
 
+async fn spawn_websocket_rate_limit_upstream(retry_after_seconds: u64) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let _ = ws.next().await;
+            let event = json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "limit_reached": true,
+                    "primary": {"reset_after_seconds": retry_after_seconds}
+                }
+            });
+            let _ = ws.send(Message::Text(event.to_string())).await;
+        }
+    });
+
+    addr_str
+}
+
 async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -655,6 +679,42 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_context_window_error_requests_compaction() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_http_upstream(|_body: Value| {
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"input exceeds context window\"}}}\n\n"
+            .as_bytes()
+            .to_vec()
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages("gpt-5.5").await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "request_too_large");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("input exceeds context window")),
+        "response body: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
@@ -887,7 +947,7 @@ async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn smoke_codex_websocket_stream_returns_json_for_early_error() {
+async fn smoke_codex_websocket_context_window_error_requests_compaction() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -913,12 +973,88 @@ async fn smoke_codex_websocket_stream_returns_json_for_early_error() {
 
     assert_eq!(
         status,
-        StatusCode::BAD_GATEWAY,
+        StatusCode::PAYLOAD_TOO_LARGE,
         "response body: {}",
         String::from_utf8_lossy(&body)
     );
     let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "request_too_large");
     assert_eq!(value["error"]["message"], "input exceeds context window");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_rate_limit_returns_429_with_retry_after() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let upstream = spawn_websocket_rate_limit_upstream(30).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"]["type"], "rate_limit_error");
+    assert_eq!(value["error"]["message"], "rate limit reached");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_oversized_rate_limit_requests_compaction() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let upstream = spawn_websocket_rate_limit_upstream(30).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":".".repeat(372_100)}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(response.headers().get(http::header::RETRY_AFTER).is_none());
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"]["type"], "request_too_large");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("372000"))
+    );
 }
 
 #[allow(clippy::await_holding_lock)]
