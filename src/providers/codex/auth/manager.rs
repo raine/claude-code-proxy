@@ -9,6 +9,14 @@ use crate::auth::AuthStorage;
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
     cached: Arc<Mutex<Option<StoredAuth>>>,
+    // Serializes token refreshes (single-flight). The `cached` mutex only
+    // guards cache reads/writes; without this lock, N concurrent requests
+    // hitting the expiry margin each POST /oauth/token with the SAME
+    // (single-use, rotating) refresh token — the first rotates it, the rest
+    // get 401 and used to clear_auth(), destroying the winner's fresh tokens.
+    // Observed in production as minutes-long all-requests-401 windows during
+    // agent fan-outs at token-expiry boundaries.
+    refresh_flight: Arc<Mutex<()>>,
 }
 
 impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
@@ -16,6 +24,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         Self {
             store,
             cached: Arc::new(Mutex::new(None)),
+            refresh_flight: Arc::new(Mutex::new(())),
         }
     }
 
@@ -71,6 +80,29 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 
     fn refresh_now(&self, current: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
+        // Single-flight: hold the flight lock for the whole refresh. Racing
+        // callers block here, then discover the winner's tokens on re-check
+        // below and return without touching the token endpoint.
+        let _flight = self
+            .refresh_flight
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Re-check under the lock: a concurrent flight (or another process
+        // sharing the store) may have refreshed while we waited. The store is
+        // the persisted truth; prefer it over both `current` and the cache.
+        let current = match self.store.load_auth()? {
+            Some(latest) => {
+                if latest.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+                    let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    *guard = Some(latest.clone());
+                    return Ok(latest);
+                }
+                latest
+            }
+            None => current.clone(),
+        };
+
         if current.refresh.is_empty() {
             anyhow::bail!("No refresh token stored; re-authenticate");
         }
@@ -90,6 +122,17 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
+            // Before destroying auth state: if the store's refresh token has
+            // rotated since we read `current`, a concurrent writer (e.g.
+            // another process sharing the Keychain entry) beat us — its
+            // tokens are good; return them instead of clobbering the store.
+            if let Ok(Some(latest)) = self.store.load_auth() {
+                if latest.refresh != current.refresh && latest.expires > Self::now_ms() {
+                    let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    *guard = Some(latest.clone());
+                    return Ok(latest);
+                }
+            }
             {
                 let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
                 *guard = None;
@@ -196,5 +239,61 @@ mod tests {
                 .to_string()
                 .contains("Not authenticated")
         );
+    }
+
+    #[test]
+    fn refresh_recheck_returns_concurrently_rotated_tokens_without_network() {
+        // Cache holds an EXPIRED token; the store already holds a FRESH one
+        // (as after a concurrent flight or another process refreshed). The
+        // re-check under the flight lock must return the store's tokens and
+        // never reach the token endpoint (no HTTP mock exists here — reaching
+        // the network would fail the test with a refresh error).
+        let store = test_store();
+        let fresh = StoredAuth {
+            access: "rotated_access".into(),
+            refresh: "rotated_refresh".into(),
+            expires: 9_999_999_999_999,
+            account_id: Some("acct_1".into()),
+        };
+        store.save_auth(fresh.clone()).unwrap();
+        let manager = CodexAuthManager::new(store);
+        manager.set_cached(StoredAuth {
+            access: "stale_access".into(),
+            refresh: "stale_refresh".into(),
+            expires: 0, // expired -> get_auth enters refresh_now
+            account_id: Some("acct_1".into()),
+        });
+        let result = manager.get_auth().unwrap();
+        assert_eq!(result.access, "rotated_access");
+        assert_eq!(result.refresh, "rotated_refresh");
+    }
+
+    #[test]
+    fn concurrent_get_auth_single_flights_to_rotated_tokens() {
+        use std::sync::Arc as StdArc;
+        let store = test_store();
+        store
+            .save_auth(StoredAuth {
+                access: "rotated_access".into(),
+                refresh: "rotated_refresh".into(),
+                expires: 9_999_999_999_999,
+                account_id: None,
+            })
+            .unwrap();
+        let manager = StdArc::new(CodexAuthManager::new(store));
+        manager.set_cached(StoredAuth {
+            access: "stale".into(),
+            refresh: "stale".into(),
+            expires: 0,
+            account_id: None,
+        });
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = StdArc::clone(&manager);
+            handles.push(std::thread::spawn(move || m.get_auth().unwrap().access));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), "rotated_access");
+        }
     }
 }
