@@ -290,9 +290,12 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("tool must be an object"))?;
         for key in obj.keys() {
-            if !["name", "description", "input_schema"].contains(&key.as_str()) {
+            if !["name", "description", "input_schema", "cache_control"].contains(&key.as_str()) {
                 anyhow::bail!("unsupported tool field: {key}");
             }
+        }
+        if !valid_cache_control(obj.get("cache_control")) {
+            anyhow::bail!("unsupported tool cache_control");
         }
         let name = obj
             .get("name")
@@ -412,10 +415,9 @@ fn parse_message(
             ("assistant", "web_search_tool_result" | "x_search_tool_result")
             | ("user", "web_search_tool_result" | "x_search_tool_result") => {}
             ("assistant", "tool_use") => {
-                if object
-                    .keys()
-                    .any(|key| !["type", "id", "name", "input"].contains(&key.as_str()))
-                    || object.len() != 4
+                if object.keys().any(|key| {
+                    !["type", "id", "name", "input", "cache_control"].contains(&key.as_str())
+                }) || !valid_cache_control(object.get("cache_control"))
                 {
                     anyhow::bail!("unsupported tool_use field");
                 }
@@ -481,13 +483,13 @@ fn parse_message(
                             let part = part.as_object().ok_or_else(|| {
                                 anyhow::anyhow!("tool result child must be an object")
                             })?;
-                            if part.len() != 2
-                                || part.get("type").and_then(Value::as_str) != Some("text")
-                                || part
-                                    .keys()
-                                    .any(|key| !["type", "text"].contains(&key.as_str()))
+                            if part.get("type").and_then(Value::as_str) != Some("text")
+                                || part.keys().any(|key| {
+                                    !["type", "text", "cache_control"].contains(&key.as_str())
+                                })
+                                || !valid_cache_control(part.get("cache_control"))
                             {
-                                anyhow::bail!("tool result supports exact text children only");
+                                anyhow::bail!("tool result supports text children only");
                             }
                             part.get("text")
                                 .and_then(Value::as_str)
@@ -750,5 +752,69 @@ mod tests {
             {"type":"tool_result","tool_use_id":"call_1","content":"second"}
         ]));
         assert!(translate_request(&request, "grok-4.5".into()).is_err());
+    }
+
+    #[test]
+    fn grok_translation_accepts_tool_cache_control_without_forwarding_it() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{
+                "name":"lookup",
+                "description":"Look things up",
+                "input_schema":{"type":"object"},
+                "cache_control":{"type":"ephemeral"}
+            }]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(
+            translated["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "lookup" })
+        );
+        assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_rejects_invalid_tool_cache_control() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{
+                "name":"lookup",
+                "input_schema":{"type":"object"},
+                "cache_control":{"type":"persistent"}
+            }]
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+    }
+
+    #[test]
+    fn grok_translation_accepts_cache_control_on_tool_use_and_tool_result() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"a"},"cache_control":{"type":"ephemeral","ttl":"1h"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":[
+                        {"type":"text","text":"result","cache_control":{"type":"ephemeral"}}
+                    ]}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][0]["type"], "function_call");
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert_eq!(translated["input"][1]["output"], "result");
+        assert!(!translated.to_string().contains("cache_control"));
     }
 }
