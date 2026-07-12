@@ -9,9 +9,13 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
+    /// Sign in using browser-based authentication
     Login,
+    /// Sign in using a device code
     Device,
+    /// Show the current authentication status
     Status,
+    /// Delete stored authentication credentials
     Logout,
 }
 
