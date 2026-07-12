@@ -293,6 +293,20 @@ pub fn normalize_strict_json_schema(schema: &Value) -> Value {
     }
 }
 
+/// Hosted tools (web_search) are rejected by the Responses Lite lane, which
+/// only supports function and custom tools. Requests carrying them must use
+/// the full Responses API.
+pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
+    req.extra
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305"))
+        })
+}
+
 pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
@@ -365,6 +379,21 @@ pub fn translate_request(
         && !tools.is_empty()
     {
         out.tools = Some(tools);
+    }
+
+    // Never force a web_search tool_choice the request didn't register —
+    // upstream 502s instead of ignoring it.
+    if matches!(
+        out.tool_choice,
+        Some(ResponsesToolChoice::WebSearch { .. })
+    ) {
+        let has_web_search = out
+            .tools
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|tool| matches!(tool, ResponsesTool::WebSearch(_))));
+        if !has_web_search {
+            out.tool_choice = Some(ResponsesToolChoice::Auto);
+        }
     }
 
     if let Some(sid) = opts.session_id {
@@ -879,6 +908,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.prompt_cache_key.as_deref(), Some("s"));
+        assert!(matches!(
+            out.tool_choice,
+            Some(ResponsesToolChoice::WebSearch { .. })
+        ));
+    }
+
+    #[test]
+    fn has_hosted_web_search_detects_web_search_tool() {
+        let with: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"find it"}],
+            "tools": [
+                {"name":"Bash", "input_schema":{}},
+                {"type":"web_search_20250305", "name":"web_search"}
+            ]
+        }))
+        .unwrap();
+        assert!(has_hosted_web_search(&with));
+
+        let without: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"run it"}],
+            "tools": [{"name":"Bash", "input_schema":{}}]
+        }))
+        .unwrap();
+        assert!(!has_hosted_web_search(&without));
+    }
+
+    #[test]
+    fn responses_lite_downgrades_unregistered_web_search_tool_choice() {
+        // On the lite lane tools travel in the AdditionalTools developer
+        // prefix, so a top-level web_search tool_choice would reference a
+        // tool upstream doesn't know about and 502.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"find it"}],
+            "tools": [{
+                "type":"web_search_20250305",
+                "name":"web_search"
+            }],
+            "tool_choice": {"type":"tool", "name":"web_search"}
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        assert!(out.tools.is_none());
+        assert!(matches!(out.tool_choice, Some(ResponsesToolChoice::Auto)));
+    }
+
+    #[test]
+    fn full_lane_keeps_web_search_tool_choice_registered() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"find it"}],
+            "tools": [{
+                "type":"web_search_20250305",
+                "name":"web_search"
+            }],
+            "tool_choice": {"type":"tool", "name":"web_search"}
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            out.tools
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|tool| matches!(tool, ResponsesTool::WebSearch(_))))
+        );
         assert!(matches!(
             out.tool_choice,
             Some(ResponsesToolChoice::WebSearch { .. })
