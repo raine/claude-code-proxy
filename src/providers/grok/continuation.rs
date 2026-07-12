@@ -323,7 +323,6 @@ mod tests {
     fn continuation_behaviors() {
         // All tests run in sequence to avoid global state interference
 
-        // disabled_when_not_enabled
         clear_all_continuations_for_tests();
         let input = vec![ResponsesInputItem::Message {
             role: "user".to_string(),
@@ -338,7 +337,6 @@ mod tests {
         assert_eq!(result.disabled_reason, Some("disabled".to_string()));
         assert_eq!(result.input_delta_count, 1);
 
-        // missing_session
         clear_all_continuations_for_tests();
         let input = vec![ResponsesInputItem::Message {
             role: "user".to_string(),
@@ -352,7 +350,6 @@ mod tests {
         let result = continuation_candidate(None, &req, true);
         assert_eq!(result.disabled_reason, Some("missing_session".to_string()));
 
-        // uses_previous_response_id_for_append_only
         clear_all_continuations_for_tests();
         let input = vec![ResponsesInputItem::Message {
             role: "user".to_string(),
@@ -388,7 +385,6 @@ mod tests {
         assert_eq!(result.previous_response_id, Some("resp_1".to_string()));
         assert_eq!(result.input_delta_count, 1);
 
-        // clears_state_when_prompt_signature_changes
         clear_all_continuations_for_tests();
         let input = vec![ResponsesInputItem::Message {
             role: "user".to_string(),
@@ -406,7 +402,6 @@ mod tests {
         assert_eq!(result.disabled_reason, Some("prompt_changed".to_string()));
         assert!(!has_continuation_for_tests("s1"));
 
-        // clears_state_when_missing_response_id
         clear_all_continuations_for_tests();
         let input = vec![ResponsesInputItem::Message {
             role: "user".to_string(),

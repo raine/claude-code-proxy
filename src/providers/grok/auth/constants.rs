@@ -4,15 +4,15 @@ pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 pub const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 pub const DEFAULT_ISSUER: &str = "https://auth.x.ai";
 pub const DEFAULT_API_BASE: &str = "https://api.x.ai/v1";
-/// Canonical loopback port used by OpenCode / Kilo / ecosystem for xAI PKCE.
+/// Canonical loopback port for xAI PKCE.
 pub const OAUTH_PORT: u16 = 56121;
 pub const OAUTH_CALLBACK_PATH: &str = "/callback";
-/// Refresh up to 1h early (access tokens ~6h on SuperGrok flows; same policy as Hermes).
+/// Refresh up to one hour before expiry.
 pub const REFRESH_MARGIN_MS: u64 = 60 * 60 * 1000;
 pub const DEVICE_POLL_SAFETY_MARGIN_MS: u64 = 500;
 pub const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Shared copy for SuperGrok OAuth tier gating (refresh or inference HTTP 403).
+/// Guidance for SuperGrok OAuth tier gating on HTTP 403.
 /// Re-login usually will not fix this; API key is the escape hatch.
 pub const TIER_DENIED_HINT: &str = "\
 xAI returned 403 for this SuperGrok/X Premium+ OAuth session. \
@@ -25,7 +25,9 @@ pub fn issuer() -> String {
     match pin_grok_https_origin(&raw, DEFAULT_ISSUER) {
         Ok(url) => url,
         Err(reason) => {
-            eprintln!("warning: ignoring xAI oauth issuer override ({reason}); using {DEFAULT_ISSUER}");
+            eprintln!(
+                "warning: ignoring xAI oauth issuer override ({reason}); using {DEFAULT_ISSUER}"
+            );
             DEFAULT_ISSUER.to_string()
         }
     }
@@ -36,14 +38,15 @@ pub fn api_base_url() -> String {
     match pin_grok_https_origin(&raw, DEFAULT_API_BASE) {
         Ok(url) => url.trim_end_matches('/').to_string(),
         Err(reason) => {
-            eprintln!("warning: ignoring xAI base URL override ({reason}); using {DEFAULT_API_BASE}");
+            eprintln!(
+                "warning: ignoring xAI base URL override ({reason}); using {DEFAULT_API_BASE}"
+            );
             DEFAULT_API_BASE.to_string()
         }
     }
 }
 
-/// Pin OAuth/inference origins to HTTPS xAI hosts. On failure returns Err reason
-/// so callers can fall back to defaults (Hermes-style: never ship tokens off-host).
+/// Pin OAuth and inference origins to HTTPS xAI hosts.
 pub fn pin_grok_https_origin(candidate: &str, fallback: &str) -> Result<String, String> {
     let trimmed = candidate.trim().trim_end_matches('/');
     if trimmed.is_empty() {

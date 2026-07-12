@@ -1,7 +1,4 @@
-//! Browser PKCE login — adapted from upstream `grok` OAuth login
-//! (OIDC discovery, endpoint validation, open-browser, ephemeral callback).
-//! Still returns this crate's `jwt::TokenResponse` so manager/device/token_store
-//! stay unchanged.
+//! Browser PKCE login with OIDC discovery and an ephemeral loopback callback.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -15,10 +12,10 @@ use super::constants::CLIENT_ID;
 use super::jwt::TokenResponse;
 use super::pkce::{PkceCodes, generate_pkce, generate_state};
 
-/// Canonical SuperGrok OIDC issuer (same as upstream Grok login).
+/// Canonical SuperGrok OIDC issuer.
 pub const CANONICAL_ISSUER: &str = "https://auth.x.ai";
 
-/// Broader scopes from upstream Grok login (includes conversations read/write).
+/// OAuth scopes, including conversation access.
 const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_METADATA_BYTES: usize = 256 * 1024;

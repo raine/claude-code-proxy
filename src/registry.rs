@@ -50,7 +50,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
 
-/// Explicit allowlist for SuperGrok OAuth (Hermes pins build + composer first).
+/// Explicit allowlist for SuperGrok OAuth.
 pub(crate) const GROK_MODELS: &[&str] = &[
     "grok-build-0.1",
     "grok-composer-2.5-fast",

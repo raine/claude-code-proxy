@@ -58,7 +58,7 @@ pub fn exchange_code_for_tokens(
     redirect_uri: &str,
 ) -> Result<TokenResponse, anyhow::Error> {
     let client = reqwest::blocking::Client::new();
-    // xAI expects code_challenge echoed on token exchange (Hermes/OpenCode).
+    // xAI expects the code challenge to be echoed during token exchange.
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),

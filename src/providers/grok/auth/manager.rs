@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::constants::{CLIENT_ID, REFRESH_MARGIN_MS, TIER_DENIED_HINT, issuer};
 use super::jwt::{TokenResponse, expires_at_ms, refresh_token_from, validate_token_response};
-use super::token_store::{StoredAuth, GrokTokenStore};
+use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 
 pub struct GrokAuthManager<S: AuthStorage<StoredAuth>> {
@@ -94,7 +94,7 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         let status = resp.status().as_u16();
         let body_text = resp.text().unwrap_or_default();
 
-        // Tier / entitlement gate: keep tokens. Re-login will not help (Hermes #26847).
+        // Keep tokens on tier denial because re-authentication cannot change entitlement.
         if status == 403 {
             anyhow::bail!("{TIER_DENIED_HINT}");
         }

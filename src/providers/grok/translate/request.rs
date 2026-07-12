@@ -201,10 +201,6 @@ pub struct TranslateOptions {
     pub use_responses_lite: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Translation entry point
-// ---------------------------------------------------------------------------
-
 fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     match effort {
         Some("max") => Some(Effort::Max),
@@ -286,6 +282,10 @@ pub fn normalize_strict_json_schema(schema: &Value) -> Value {
         _ => schema.clone(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Translation entry point
+// ---------------------------------------------------------------------------
 
 pub fn translate_request(
     req: &MessagesRequest,

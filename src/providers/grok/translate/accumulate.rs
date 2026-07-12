@@ -401,11 +401,8 @@ mod tests {
         let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
         let content = response["content"].as_array().unwrap();
         assert!(content.len() >= 3);
-        // First should be server_tool_use
         assert_eq!(content[0]["type"], "server_tool_use");
-        // Second should be web_search_tool_result
         assert_eq!(content[1]["type"], "web_search_tool_result");
-        // Third should be text
         assert_eq!(content[2]["type"], "text");
     }
 

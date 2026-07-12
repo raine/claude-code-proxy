@@ -22,9 +22,7 @@ use self::auth::device::run_device_login;
 use self::auth::manager::GrokAuthManager;
 use self::auth::token_store::file_store;
 use self::client::GrokHttpClient;
-use self::continuation::{
-    clear_continuation, continuation_candidate, record_continuation,
-};
+use self::continuation::{clear_continuation, continuation_candidate, record_continuation};
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::model_allowlist::{assert_allowed_model, resolve_model};
@@ -349,7 +347,10 @@ impl CliHandlers for GrokCli {
                 }
                 let remaining = auth.expires.saturating_sub(now_ms()) as i64 / 1000;
                 println!("Access token expires in {remaining}s");
-                println!("API base: {}", crate::providers::grok::auth::constants::api_base_url());
+                println!(
+                    "API base: {}",
+                    crate::providers::grok::auth::constants::api_base_url()
+                );
                 if api_key {
                     println!("API key fallback: configured (used if OAuth returns 403)");
                 }
@@ -359,7 +360,10 @@ impl CliHandlers for GrokCli {
                 if api_key {
                     println!("Authenticated: false (OAuth)");
                     println!("API key fallback: configured");
-                    println!("API base: {}", crate::providers::grok::auth::constants::api_base_url());
+                    println!(
+                        "API base: {}",
+                        crate::providers::grok::auth::constants::api_base_url()
+                    );
                     return Ok(());
                 }
                 anyhow::bail!("Not authenticated");

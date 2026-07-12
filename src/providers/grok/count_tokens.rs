@@ -2,32 +2,27 @@ use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesTool,
 };
 
-/// Approximate token counter for Codex translated requests.
+/// Approximate token counter for Grok translated requests.
 /// Uses a simple monotonic estimator that satisfies Claude Code's
 /// compaction logic (needs approximate, not exact counts).
 pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
     let mut total = 0u64;
 
-    // Instructions
     if let Some(ref instructions) = translated.instructions {
         total += approx_token_count(instructions);
     }
 
-    // Input items
     for item in &translated.input {
         total += count_input_item_tokens(item);
     }
 
-    // Tools
     if let Some(ref tools) = translated.tools {
         total += count_tool_tokens(tools);
     }
 
-    // Overhead
     total += translated.input.len() as u64 * 4;
     total += translated.tools.as_ref().map_or(0, |t| t.len() as u64 * 4);
 
-    // Model name
     total += approx_token_count(&translated.model);
 
     total.max(1)
