@@ -567,6 +567,9 @@ impl CodexHttpClient {
                     );
                     return Err(codex_status_error(response, transport));
                 }
+                Ok(response) if !(200..300).contains(&response.status) => {
+                    return Err(codex_status_error(response, transport));
+                }
                 Ok(response) => return Ok(response),
                 Err(err) if should_retry_without_continuation(&err, active_continuation) => {
                     clear_continuation(ctx.session_id.as_deref());
@@ -1356,6 +1359,42 @@ mod tests {
         server.await.unwrap();
         assert_eq!(error.status, 503);
         assert_eq!(error.retry_after.as_deref(), Some("120"));
+    }
+
+    #[tokio::test]
+    async fn buffered_http_rejects_non_retryable_error_status_before_sse_parsing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = br#"{"error":{"message":"Model not found gpt-test"}}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let result = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await;
+        server.await.unwrap();
+        let error = match result {
+            Ok(_) => panic!("non-success HTTP status must not reach the SSE reducer"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, 404);
+        assert_eq!(error.detail.as_deref(), Some("Model not found gpt-test"));
+        assert_eq!(error.origin, CodexErrorOrigin::BufferedHttp);
     }
 
     #[tokio::test]
