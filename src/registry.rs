@@ -24,6 +24,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
 ];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
+pub const MERGE_PREFIXES: &[&str] = &["merge:"];
 
 const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor",
@@ -51,6 +52,15 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
+/// Prefixed catalog for the generic Anthropic-compatible upstream (Merge defaults).
+/// Anthropic models only for v1 — no Merge-hosted OpenAI/GPT ids.
+pub const MERGE_MODELS: &[&str] = &[
+    "merge:anthropic/claude-opus-4-8",
+    "merge:anthropic/fable-5",
+    "merge:anthropic/claude-sonnet-5",
+    "merge:anthropic/claude-haiku-4-5-20251001",
+];
+
 pub struct Registry {
     alias_provider: AliasProvider,
     models: BTreeMap<String, Vec<String>>,
@@ -73,6 +83,13 @@ impl Registry {
                 .map(|model| (*model).to_string())
                 .collect(),
         );
+        models.insert(
+            "merge".into(),
+            MERGE_MODELS
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect(),
+        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
@@ -81,6 +98,7 @@ impl Registry {
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
+                "merge" => Arc::new(crate::providers::merge::MergeProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -151,6 +169,9 @@ impl Registry {
         if is_cursor_model(&normalized) {
             return self.handlers.get("cursor").cloned();
         }
+        if is_merge_model(&normalized) {
+            return self.handlers.get("merge").cloned();
+        }
 
         for (name, models) in &self.models {
             if models.iter().any(|candidate| candidate == &normalized) {
@@ -194,6 +215,15 @@ pub fn is_cursor_model(model: &str) -> bool {
         .any(|prefix| model.starts_with(prefix))
 }
 
+pub fn is_merge_model(model: &str) -> bool {
+    if MERGE_MODELS.contains(&model) {
+        return true;
+    }
+    MERGE_PREFIXES
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
 struct PlaceholderProvider {
     name: &'static str,
     models: Vec<String>,
@@ -206,6 +236,7 @@ impl PlaceholderProvider {
             "kimi" => "kimi",
             "cursor" => "cursor",
             "grok" => "grok",
+            "merge" => "merge",
             _ => "codex",
         };
         Self { name, models }
@@ -228,6 +259,7 @@ impl Provider for PlaceholderProvider {
             "kimi" => &KIMI_CLI,
             "cursor" => &CURSOR_CLI,
             "grok" => &GROK_CLI,
+            "merge" => &MERGE_CLI,
             _ => &CODEX_CLI,
         }
     }
@@ -287,6 +319,7 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
+const MERGE_CLI: PlaceholderCli = PlaceholderCli { provider: "merge" };
 
 fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
@@ -372,6 +405,25 @@ mod tests {
                 .unwrap()
                 .name(),
             "cursor"
+        );
+    }
+
+    #[test]
+    fn merge_prefix_routes() {
+        let registry = Registry::new(AliasProvider::Codex);
+        assert_eq!(
+            registry
+                .provider_for_model("merge:anthropic/claude-sonnet-5", None)
+                .unwrap()
+                .name(),
+            "merge"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("merge:anthropic/fable-5", None)
+                .unwrap()
+                .name(),
+            "merge"
         );
     }
 }
