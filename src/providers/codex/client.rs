@@ -780,33 +780,43 @@ impl CodexHttpClient {
 
         let mut body_bytes = Vec::new();
         loop {
-            let chunk = tokio::time::timeout(
+            let chunk = match tokio::time::timeout(
                 Duration::from_millis(super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS),
                 resp.chunk(),
             )
             .await
-            .map_err(|_| CodexError {
-                status: 0,
-                message: format!(
-                    "Timed out waiting {}ms for the next Codex response body chunk",
-                    super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS
-                ),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                origin: CodexErrorOrigin::Http,
-            })?
-            .map_err(|e| CodexError {
-                status: 0,
-                message: format!("Transport error reading Codex response body: {e}"),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                origin: CodexErrorOrigin::Http,
-            })?;
+            {
+                Err(_) => {
+                    return Err(CodexError {
+                        status: 0,
+                        message: format!(
+                            "Timed out waiting {}ms for the next Codex response body chunk",
+                            super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS
+                        ),
+                        detail: Some("http_response_body".to_string()),
+                        retry_after: None,
+                        origin: CodexErrorOrigin::Http,
+                    });
+                }
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(e)) => {
+                    return Err(CodexError {
+                        status: 0,
+                        message: format!("Transport error reading Codex response body: {e}"),
+                        detail: Some("http_response_body".to_string()),
+                        retry_after: None,
+                        origin: CodexErrorOrigin::Http,
+                    });
+                }
+            };
 
             let Some(chunk) = chunk else {
                 break;
             };
             body_bytes.extend_from_slice(&chunk);
+            if has_terminal_event(&body_bytes) {
+                break;
+            }
         }
 
         if let Some(traffic) = ctx.traffic.as_deref() {
@@ -825,6 +835,21 @@ impl CodexHttpClient {
             headers,
         })
     }
+}
+
+fn has_terminal_event(body: &[u8]) -> bool {
+    parse_sse_events(body).into_iter().any(|event| {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+            return false;
+        };
+        super::is_codex_terminal_event(&payload)
+            || (payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits")
+                && payload
+                    .get("rate_limits")
+                    .and_then(|limits| limits.get("limit_reached"))
+                    .and_then(|value| value.as_bool())
+                    == Some(true))
+    })
 }
 
 fn write_codex_http_request_capture(
@@ -1478,6 +1503,113 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(body.contains("resp_http_ok"));
         assert!(!body.contains("discard me"));
+    }
+
+    #[tokio::test]
+    async fn buffered_http_stops_at_terminal_before_invalid_framing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].starts_with(b"POST "));
+
+            let body = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_complete\",\"usage\":{}}}\n\n";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len() + 128
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let client = buffered_test_client(format!("http://{addr}/responses"));
+        let response = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &buffered_test_context("http-complete-framing-error"),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .expect("complete response should survive invalid HTTP framing");
+        server.await.unwrap();
+
+        assert!(
+            String::from_utf8(response.body)
+                .unwrap()
+                .contains("resp_complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_http_preserves_terminal_rate_limit_before_invalid_framing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+
+            let body = b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":7}}}\n\n";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len() + 128
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let client = buffered_test_client(format!("http://{addr}/responses"));
+        let result = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &buffered_test_context("http-rate-limit-framing-error"),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await;
+        server.await.unwrap();
+
+        let Err(error) = result else {
+            panic!("terminal rate limit should fail fast");
+        };
+        assert_eq!(error.status, 429);
+        assert_eq!(error.retry_after.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn terminal_event_detection_matches_codex_lifecycle() {
+        for event_type in [
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "response.error",
+            "response.done",
+            "error",
+        ] {
+            let body = format!("data: {{\"type\":\"{event_type}\"}}\n\n");
+            assert!(has_terminal_event(body.as_bytes()), "{event_type}");
+        }
+
+        for body in [
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n"
+                .as_slice(),
+            b"data: {\"nested\":{\"type\":\"response.completed\"}}\n\n".as_slice(),
+            b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":false}}\n\n"
+                .as_slice(),
+            b"data: not-json\n\n".as_slice(),
+        ] {
+            assert!(!has_terminal_event(body));
+        }
+
+        let rate_limit =
+            b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true}}\n\n";
+        assert!(has_terminal_event(rate_limit));
     }
 
     #[tokio::test]
