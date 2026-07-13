@@ -18,10 +18,29 @@ async fn bind_error_names_address_and_port() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = occupied.local_addr().unwrap().port();
 
-    let err = bind_proxy_listener(port).await.unwrap_err().to_string();
+    let err = bind_proxy_listener("127.0.0.1", port)
+        .await
+        .unwrap_err()
+        .to_string();
 
     assert!(err.contains(&format!("127.0.0.1:{port}")));
     assert!(err.contains("failed to bind proxy listener"));
+}
+
+#[tokio::test]
+async fn configurable_bind_address_accepts_all_interfaces() {
+    let listener = bind_proxy_listener("0.0.0.0", 0).await.unwrap();
+    assert_eq!(listener.local_addr().unwrap().ip().to_string(), "0.0.0.0");
+}
+
+#[tokio::test]
+async fn invalid_bind_address_is_actionable() {
+    let err = bind_proxy_listener("not-an-ip", 18765)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid proxy bind address"));
+    assert!(err.contains("not-an-ip"));
 }
 
 #[tokio::test]

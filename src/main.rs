@@ -85,6 +85,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Serve { port, no_monitor } => {
+            let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -92,9 +93,10 @@ fn main() -> Result<()> {
                 .build()?;
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
-                    print_server_banner(effective_port, &registry);
+                    print_server_banner(&bind_address, effective_port, &registry);
                     runtime
                         .block_on(server::serve(ServerConfig {
+                            bind_address,
                             port: effective_port,
                             monitor: None,
                         }))
@@ -104,7 +106,8 @@ fn main() -> Result<()> {
                     let _stderr_guard = logging::suppress_stderr();
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                    let listener = runtime.block_on(server::bind_proxy_listener(effective_port))?;
+                    let listener = runtime
+                        .block_on(server::bind_proxy_listener(&bind_address, effective_port))?;
                     let server_monitor = monitor.clone();
                     let server_task = runtime.spawn(server::serve_listener(
                         listener,
@@ -229,8 +232,15 @@ fn compact_cursor_list(models: &[String]) -> String {
     out
 }
 
-fn print_server_banner(port: u16, registry: &Registry) {
-    println!("Proxy listening on http://127.0.0.1:{port}");
+fn listen_url(bind_address: &str, port: u16) -> String {
+    match bind_address.parse::<std::net::IpAddr>() {
+        Ok(ip) => format!("http://{}", std::net::SocketAddr::new(ip, port)),
+        Err(_) => format!("http://{bind_address}:{port}"),
+    }
+}
+
+fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
+    println!("Proxy listening on {}", listen_url(bind_address, port));
     println!("Logs: {}", paths::log_file().display());
     let cfg = paths::config_dir();
     if cfg.exists() {
@@ -268,5 +278,10 @@ mod tests {
     #[test]
     fn non_tty_stdout_selects_plain_mode() {
         assert_eq!(select_serve_mode(false, false), ServeMode::Plain);
+    }
+
+    #[test]
+    fn listen_url_brackets_ipv6_addresses() {
+        assert_eq!(listen_url("::1", 18765), "http://[::1]:18765");
     }
 }

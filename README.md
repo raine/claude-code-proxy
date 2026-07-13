@@ -109,13 +109,16 @@ claude-code-proxy cursor auth status
 ```sh
 claude-code-proxy serve                # listens on 127.0.0.1:18765
 PORT=11435 claude-code-proxy serve     # change the listen port
+CCP_BIND_ADDRESS=0.0.0.0 claude-code-proxy serve  # change the bind address
 claude-code-proxy serve --no-monitor   # plain logs instead of the monitor TUI
 ```
 
-Binds to `127.0.0.1` only. One `serve` process handles all providers — the
-upstream for each request is chosen from `ANTHROPIC_MODEL`. When stdout is a
-terminal, `serve` opens a monitor TUI with sessions, active requests, recent
+Binds to `127.0.0.1` by default. One `serve` process handles all providers —
+the upstream for each request is chosen from `ANTHROPIC_MODEL`. When stdout is
+a terminal, `serve` opens a monitor TUI with sessions, active requests, recent
 requests, and error events. Use `--no-monitor` for plain terminal output.
+The proxy does not authenticate incoming clients, so protect any non-loopback
+binding with a firewall or an authenticating reverse proxy.
 
 Installed via Homebrew, the proxy can also run as a background service that
 starts at login and restarts if it exits:
@@ -636,6 +639,7 @@ Windows, and at
 
 ```json
 {
+  "bindAddress": "127.0.0.1",
   "port": 18765,
   "aliasProvider": "codex",
   "codex": {
@@ -672,6 +676,7 @@ Windows, and at
 
 | Variable                         | Config key                 | Default                                           | Purpose                                                                                                                                                                           |
 | -------------------------------- | -------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CCP_BIND_ADDRESS`               | `bindAddress`              | `127.0.0.1`                                       | Proxy listen IP address; use `0.0.0.0` only when remote access is required and protected                                                                                          |
 | `PORT`                           | `port`                     | `18765`                                           | Proxy listen port                                                                                                                                                                 |
 | `CCP_CONFIG_DIR`                 | unset                      | platform config dir                               | Per-process config directory; Cursor auth uses it for file storage                                                                                                                |
 | `XDG_STATE_HOME`                 | —                          | `~/.local/state`                                  | Linux/macOS base dir for `proxy.log`                                                                                                                                              |

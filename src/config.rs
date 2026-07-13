@@ -22,6 +22,7 @@ impl AliasProvider {
 
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
+    pub bind_address: String,
     pub port: u16,
     pub alias_provider: AliasProvider,
     pub log_verbose: bool,
@@ -31,6 +32,8 @@ pub struct LoadedConfig {
 
 #[derive(Deserialize)]
 struct FileConfig {
+    #[serde(rename = "bindAddress")]
+    pub bind_address: Option<String>,
     pub port: Option<u16>,
     #[serde(rename = "aliasProvider")]
     pub alias_provider: Option<String>,
@@ -116,12 +119,19 @@ pub fn load_config() -> LoadedConfig {
     let env: HashMap<_, _> = std::env::vars().collect();
 
     let mut out = LoadedConfig {
+        bind_address: "127.0.0.1".to_string(),
         port: 18765,
         alias_provider: AliasProvider::Codex,
         log_verbose: false,
         log_stderr: false,
         config_dir: config_dir.clone(),
     };
+
+    if let Some(raw) = env.get("CCP_BIND_ADDRESS") {
+        out.bind_address = raw.clone();
+    } else if let Some(bind_address) = file.as_ref().and_then(|f| f.bind_address.clone()) {
+        out.bind_address = bind_address;
+    }
 
     if let Some(raw) = env.get("CCP_ALIAS_PROVIDER") {
         if let Some(alias) = parse_alias(raw) {
@@ -172,6 +182,10 @@ pub fn port() -> u16 {
     load_config().port
 }
 
+pub fn bind_address() -> String {
+    load_config().bind_address
+}
+
 pub fn alias_provider() -> AliasProvider {
     load_config().alias_provider
 }
@@ -188,6 +202,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     let file = read_file_config(&cfg.config_dir);
     let env: HashMap<_, _> = std::env::vars().collect();
     let mut out = Vec::new();
+    if env.contains_key("CCP_BIND_ADDRESS") {
+        out.push("bindAddress (env)".to_string());
+    }
     if env.contains_key("PORT") {
         out.push("port (env)".to_string());
     }
@@ -228,6 +245,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
     }
     if let Some(file_cfg) = file {
+        if let Some(bind_address) = file_cfg.bind_address {
+            out.push(format!("bindAddress: {bind_address}"));
+        }
         if let Some(p) = file_cfg.port {
             out.push(format!("port: {p}"));
         }
@@ -566,12 +586,40 @@ mod tests {
 
     fn clear_env() {
         unsafe {
+            std::env::remove_var("CCP_BIND_ADDRESS");
             std::env::remove_var("CCP_CODEX_TRANSPORT");
             std::env::remove_var("CCP_CONFIG_DIR");
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
         }
+    }
+
+    #[test]
+    fn bind_address_defaults_to_loopback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(load_config().bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn bind_address_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"bindAddress":"192.0.2.10"}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(load_config().bind_address, "192.0.2.10");
+        let _bind_env = EnvGuard::set("CCP_BIND_ADDRESS", "0.0.0.0");
+        assert_eq!(load_config().bind_address, "0.0.0.0");
     }
 
     struct EnvGuard {
