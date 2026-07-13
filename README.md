@@ -746,7 +746,9 @@ duplicate tool calls after a partial upstream stream, at the cost of delaying
 visible reasoning, text, and tool events until the Codex response finishes. Use
 `auto` when unattended completion matters more than live token streaming. A
 WebSocket transport failure keeps that proxy instance on HTTP for 60 seconds,
-and the complete buffered operation has a 150-second wall-clock limit.
+and the complete buffered operation has a 10-minute wall-clock limit. Incoming
+request bodies also have a 30-second read deadline so an abandoned upload cannot
+leave a proxy request wedged indefinitely.
 
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code

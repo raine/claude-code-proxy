@@ -15,7 +15,7 @@ use super::translate::request::ResponsesRequest;
 
 const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
-const BUFFERED_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+const BUFFERED_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const WEBSOCKET_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------

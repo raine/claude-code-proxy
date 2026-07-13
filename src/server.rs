@@ -23,7 +23,7 @@ use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -154,9 +154,14 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
+    let body_bytes = match tokio::time::timeout(
+        Duration::from_secs(30),
+        axum::body::to_bytes(req.into_body(), usize::MAX),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
             let response = json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -193,6 +198,31 @@ async fn dispatch_request(
                     .as_ref()
                     .map(|details| details.message.as_str())
                     .unwrap_or("Invalid JSON"),
+            );
+            return response;
+        }
+        Err(_) => {
+            let response = json_error(
+                StatusCode::REQUEST_TIMEOUT,
+                "api_error",
+                "Timed out reading request body",
+            );
+            log_request_completed(
+                &log,
+                RequestLogContext {
+                    req_id: &req_id,
+                    provider: None,
+                    model: None,
+                    count_tokens,
+                    status: response.status(),
+                    started_at,
+                },
+            );
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(response.status()),
+                "Timed out reading request body",
             );
             return response;
         }
