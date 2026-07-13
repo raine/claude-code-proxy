@@ -449,10 +449,11 @@ sequenceDiagram
 
 ### `serve`
 
-Starts the HTTP proxy and blocks. Binds to `127.0.0.1` only. When stdout is a
-terminal, `serve` opens a monitor TUI showing sessions, active requests, recent
-requests, token throughput, and error events. Use `--no-monitor` to run with
-plain terminal output.
+Starts the HTTP proxy and blocks. Binds to `127.0.0.1` by default. Set
+`CCP_BIND_ADDRESS` or the `bindAddress` config key to choose another IP address.
+When stdout is a terminal, `serve` opens a monitor TUI showing sessions, active
+requests, recent requests, token throughput, and error events. Use `--no-monitor`
+to run with plain terminal output.
 
 Logs are written to the platform state directory and rotated at 20 MiB. Set
 `CCP_LOG_STDERR=1` to mirror log lines to stderr while running without the

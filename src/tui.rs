@@ -102,6 +102,7 @@ const EVENTS_TABLE_HEADERS: [(&str, Alignment); 5] = [
 ];
 
 pub struct MonitorUiConfig<'a> {
+    pub listen_url: String,
     pub port: u16,
     pub registry: &'a Registry,
     pub shutdown: Option<oneshot::Sender<()>>,
@@ -114,7 +115,7 @@ pub fn run_monitor(
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = MonitorApp {
-        port: config.port,
+        listen_url: config.listen_url,
         setup_text: setup_text(config.port, config.registry),
         show_setup: false,
         show_help: false,
@@ -212,7 +213,7 @@ enum DetailView {
 }
 
 struct MonitorApp {
-    port: u16,
+    listen_url: String,
     setup_text: String,
     show_setup: bool,
     show_help: bool,
@@ -364,10 +365,7 @@ fn render_header(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default().fg(BG).bg(TEAL)),
-        Span::styled(
-            format!("http://127.0.0.1:{}", app.port),
-            Style::default().fg(BG).bg(TEAL),
-        ),
+        Span::styled(&app.listen_url, Style::default().fg(BG).bg(TEAL)),
         Span::styled("  uptime ", Style::default().fg(BG).bg(TEAL)),
         Span::styled(
             format_duration(uptime),
@@ -1540,9 +1538,32 @@ mod tests {
     }
 
     #[test]
+    fn header_renders_configured_listen_url() {
+        let app = MonitorApp {
+            listen_url: "http://[::]:18765".to_string(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            shutdown: None,
+        };
+        let state = MonitorHandle::default().snapshot();
+
+        let header = draw(100, 1, |frame| {
+            render_header(frame, frame.area(), &app, &state)
+        });
+
+        assert!(buffer_text(&header).contains("http://[::]:18765"));
+    }
+
+    #[test]
     fn clamp_selection_caps_to_available_sessions() {
         let mut app = MonitorApp {
-            port: 3000,
+            listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
@@ -1566,7 +1587,7 @@ mod tests {
     #[test]
     fn arrow_navigation_moves_between_focus_panes_at_edges() {
         let mut app = MonitorApp {
-            port: 3000,
+            listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
@@ -1590,7 +1611,7 @@ mod tests {
     #[test]
     fn vim_navigation_stays_within_focused_pane() {
         let mut app = MonitorApp {
-            port: 3000,
+            listen_url: "http://127.0.0.1:3000".to_string(),
             setup_text: String::new(),
             show_setup: false,
             show_help: false,

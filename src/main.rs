@@ -108,6 +108,9 @@ fn main() -> Result<()> {
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let listener = runtime
                         .block_on(server::bind_proxy_listener(&bind_address, effective_port))?;
+                    let local_addr = listener.local_addr()?;
+                    let monitor_listen_url =
+                        listen_url(&local_addr.ip().to_string(), local_addr.port());
                     let server_monitor = monitor.clone();
                     let server_task = runtime.spawn(server::serve_listener(
                         listener,
@@ -119,6 +122,7 @@ fn main() -> Result<()> {
                     let ui_result = tui::run_monitor(
                         monitor,
                         MonitorUiConfig {
+                            listen_url: monitor_listen_url,
                             port: effective_port,
                             registry: &registry,
                             shutdown: Some(shutdown_tx),
