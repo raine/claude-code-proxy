@@ -207,7 +207,7 @@ async fn dispatch_request(
         }
     };
 
-    let body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
+    let mut body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
         Ok(body) => body,
         Err(response) => {
             let status = response.status();
@@ -295,6 +295,7 @@ async fn dispatch_request(
     };
 
     let normalized_model = normalize_incoming_model(model);
+    body.model = Some(normalized_model.clone());
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
     } else {

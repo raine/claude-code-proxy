@@ -212,6 +212,26 @@ async fn count_tokens_routes_to_provider() {
 }
 
 #[tokio::test]
+async fn context_window_hint_is_removed_before_provider_dispatch() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"gpt-5.6-luna[1m]","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn unknown_routes_use_anthropic_not_found_error() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
