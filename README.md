@@ -734,16 +734,19 @@ affecting other keys.
 Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
 compatibility, or `CCP_CODEX_TRANSPORT=auto` to try WebSocket with HTTP fallback
-only when setup fails before a request is sent upstream.
+after any retryable WebSocket transport failure.
 
 `auto` also acts as a completion-gated reliability mode: it buffers a complete
 WebSocket response before sending Anthropic events to Claude Code and safely
-retries statusless transport failures up to five times with jittered exponential
+falls back from WebSocket to HTTP after a retryable WebSocket failure, then
+retries statusless transport failures up to three times with jittered exponential
 backoff while nothing has reached the client. Retry and exhaustion events are
 written as structured `buffered_transport_retry*` log records. This prevents
 duplicate tool calls after a partial upstream stream, at the cost of delaying
 visible reasoning, text, and tool events until the Codex response finishes. Use
-`auto` when unattended completion matters more than live token streaming.
+`auto` when unattended completion matters more than live token streaming. A
+WebSocket transport failure keeps that proxy instance on HTTP for 60 seconds,
+and the complete buffered operation has a 150-second wall-clock limit.
 
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
@@ -245,7 +246,7 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
     addr_str
 }
 
-async fn spawn_websocket_partial_close_then_success_upstream(
+async fn spawn_websocket_partial_close_then_http_success_upstream(
     attempts: Arc<Mutex<usize>>,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -253,40 +254,36 @@ async fn spawn_websocket_partial_close_then_success_upstream(
     let addr_str = format!("http://{addr}");
 
     tokio::spawn(async move {
-        for attempt in 0..2 {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
-                return;
-            };
-            let _ = ws.next().await;
-            if let Ok(mut count) = attempts.lock() {
-                *count += 1;
-            }
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            return;
+        };
+        let _ = ws.next().await;
+        *attempts.lock().unwrap() += 1;
+        let _ = ws
+            .send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"discard me"}"#.into(),
+            ))
+            .await;
+        drop(ws);
 
-            if attempt == 0 {
-                let partial_events = [
-                    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_discard"}}"#,
-                    r#"{"type":"response.output_text.delta","output_index":0,"delta":"discard me"}"#,
-                ];
-                for event in &partial_events {
-                    let _ = ws.send(Message::Text(event.to_string())).await;
-                }
-                drop(ws);
-                continue;
-            }
-
-            let complete_events = [
-                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_keep"}}"#,
-                r#"{"type":"response.output_text.delta","output_index":0,"delta":"keep me"}"#,
-                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
-                r#"{"type":"response.completed","response":{"id":"resp_keep","usage":{"input_tokens":5,"output_tokens":2}}}"#,
-            ];
-            for event in &complete_events {
-                let _ = ws.send(Message::Text(event.to_string())).await;
-            }
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = vec![0u8; 16 * 1024];
+        if stream.read(&mut request).await.unwrap_or(0) == 0 {
+            return;
         }
+        *attempts.lock().unwrap() += 1;
+        let body = b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_keep\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"keep me\"}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_keep\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(body).await;
     });
 
     addr_str
@@ -891,7 +888,7 @@ async fn smoke_codex_auto_buffers_failed_attempt_before_downstream_stream() {
     clear_codex_websocket_pool_for_tests();
 
     let attempts = Arc::new(Mutex::new(0usize));
-    let upstream = spawn_websocket_partial_close_then_success_upstream(attempts.clone()).await;
+    let upstream = spawn_websocket_partial_close_then_http_success_upstream(attempts.clone()).await;
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
