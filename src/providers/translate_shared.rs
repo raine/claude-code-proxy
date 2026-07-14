@@ -22,6 +22,7 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        signature: Option<String>,
     },
 }
 
@@ -202,7 +203,14 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Some(ContentBlock::Thinking { thinking })
+            let signature = value
+                .get("signature")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(ContentBlock::Thinking {
+                thinking,
+                signature,
+            })
         }
         _ => None,
     }

@@ -43,6 +43,7 @@ pub fn accumulate_response_with_traffic(
     enum BlockKind {
         Thinking {
             text: String,
+            signature: String,
         },
         Text {
             text: String,
@@ -69,14 +70,22 @@ pub fn accumulate_response_with_traffic(
                     index: *index,
                     kind: BlockKind::Thinking {
                         text: String::new(),
+                        signature: String::new(),
                     },
                 });
             }
             ReducerEvent::ThinkingDelta { index, text } => {
                 if let Some(block) = blocks.iter_mut().rev().find(|b| b.index == *index)
-                    && let BlockKind::Thinking { text: t } = &mut block.kind
+                    && let BlockKind::Thinking { text: t, .. } = &mut block.kind
                 {
                     t.push_str(text);
+                }
+            }
+            ReducerEvent::ThinkingSignature { index, signature } => {
+                if let Some(block) = blocks.iter_mut().rev().find(|b| b.index == *index)
+                    && let BlockKind::Thinking { signature: s, .. } = &mut block.kind
+                {
+                    *s = signature.clone();
                 }
             }
             ReducerEvent::TextStart { index } => {
@@ -177,14 +186,14 @@ pub fn accumulate_response_with_traffic(
 
     for block in &blocks {
         match &block.kind {
-            BlockKind::Thinking { text } => {
-                if !text.is_empty() {
+            BlockKind::Thinking { text, signature } => {
+                if !text.is_empty() || !signature.is_empty() {
                     indexed_content.push((
                         block.index,
                         serde_json::json!({
                             "type": "thinking",
                             "thinking": text,
-                            "signature": "",
+                            "signature": signature,
                         }),
                     ));
                 }
@@ -534,5 +543,41 @@ mod tests {
         let upstream = sse_event("error", json!({"error":{"message":"upstream failure"}}));
         let result = accumulate_response(upstream.as_bytes(), "msg_e", "model");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn accumulate_preserves_signature_without_visible_summary() {
+        let upstream = format!(
+            "{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_1"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
+        let content = response["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "");
+        assert!(
+            content[0]["signature"]
+                .as_str()
+                .unwrap()
+                .starts_with("ccp:codex:v1:")
+        );
     }
 }

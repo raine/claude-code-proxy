@@ -10,6 +10,7 @@ use crate::providers::translate_shared::{
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
+use super::reasoning_signature::decode_reasoning_signature;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -151,6 +152,12 @@ pub enum ResponsesInputItem {
         #[serde(default)]
         call_id: String,
         output: String,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        summary: Vec<Value>,
+        encrypted_content: String,
     },
 }
 
@@ -740,6 +747,19 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 call_id: id.clone(),
                                 name: name.clone(),
                                 arguments: args,
+                            });
+                        }
+                        ContentBlock::Thinking { signature, .. } => {
+                            let Some(replay) =
+                                signature.as_deref().and_then(decode_reasoning_signature)
+                            else {
+                                continue;
+                            };
+                            flush_text(&mut out, &mut text_parts);
+                            out.push(ResponsesInputItem::Reasoning {
+                                id: replay.id,
+                                summary: Vec::new(),
+                                encrypted_content: replay.encrypted_content,
                             });
                         }
                         _ => {}
@@ -1665,5 +1685,48 @@ mod tests {
         ] {
             assert!(keys.contains(*key), "missing key: {key}");
         }
+    }
+
+    #[test]
+    fn assistant_thinking_signature_replays_codex_reasoning_item() {
+        let replay = super::super::reasoning_signature::ReasoningReplay {
+            id: "rs_1".to_string(),
+            encrypted_content: "opaque".to_string(),
+        };
+        let signature =
+            super::super::reasoning_signature::encode_reasoning_signature(&replay).unwrap();
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"user","content":"start"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"visible summary","signature":signature},
+                    {"type":"text","text":"done"}
+                ]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let reasoning_index = out
+            .input
+            .iter()
+            .position(|item| matches!(item, ResponsesInputItem::Reasoning { .. }))
+            .unwrap();
+        let ResponsesInputItem::Reasoning {
+            id,
+            summary,
+            encrypted_content,
+        } = &out.input[reasoning_index]
+        else {
+            unreachable!();
+        };
+        assert_eq!(id, "rs_1");
+        assert!(summary.is_empty());
+        assert_eq!(encrypted_content, "opaque");
+        assert!(matches!(
+            out.input.get(reasoning_index + 1),
+            Some(ResponsesInputItem::Message { role, .. }) if role == "assistant"
+        ));
     }
 }

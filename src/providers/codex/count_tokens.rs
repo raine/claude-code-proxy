@@ -50,7 +50,20 @@ fn count_input_item_tokens(item: &ResponsesInputItem) -> u64 {
             name, arguments, ..
         } => approx_token_count(name) + approx_token_count(arguments),
         ResponsesInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
+        ResponsesInputItem::Reasoning {
+            encrypted_content, ..
+        } => approx_reasoning_token_count(encrypted_content),
     }
+}
+
+fn approx_reasoning_token_count(encoded_content: &str) -> u64 {
+    let model_visible_bytes = encoded_content
+        .len()
+        .saturating_mul(3)
+        .checked_div(4)
+        .unwrap_or(0)
+        .saturating_sub(650);
+    u64::try_from(model_visible_bytes.saturating_add(3) / 4).unwrap_or(u64::MAX)
 }
 
 fn count_content_part_tokens(part: &ResponsesContentPart) -> u64 {
@@ -162,5 +175,12 @@ mod tests {
         }))
         .unwrap();
         assert!(count_translated_tokens(&long) >= count_translated_tokens(&short));
+    }
+
+    #[test]
+    fn encrypted_reasoning_uses_codex_model_visible_size_estimate() {
+        let encoded_content = "A".repeat(4000);
+        assert_eq!(approx_reasoning_token_count(&encoded_content), 588);
+        assert_eq!(approx_reasoning_token_count("short"), 0);
     }
 }

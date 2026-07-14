@@ -100,6 +100,19 @@ fn emit_content_event(
             );
             true
         }
+        ReducerEvent::ThinkingSignature { index, signature } => {
+            emit(
+                out,
+                traffic,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "signature_delta", "signature": signature}
+                }),
+            );
+            true
+        }
         ReducerEvent::ThinkingStop { index } => {
             open_blocks.remove(index);
             emit(
@@ -221,6 +234,7 @@ fn is_content_event(event: &ReducerEvent) -> bool {
         event,
         ReducerEvent::ThinkingStart { .. }
             | ReducerEvent::ThinkingDelta { .. }
+            | ReducerEvent::ThinkingSignature { .. }
             | ReducerEvent::ThinkingStop { .. }
             | ReducerEvent::TextStart { .. }
             | ReducerEvent::TextDelta { .. }
@@ -686,5 +700,47 @@ mod tests {
         assert!(!out.contains("\"type\":\"thinking\""));
         assert!(!out.contains("\"type\":\"thinking_delta\""));
         assert!(out.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn stream_emits_signature_delta_before_thinking_stop() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
+                })
+            ),
+            sse_event(
+                "response.reasoning_summary_text.delta",
+                serde_json::json!({"output_index":0,"delta":"plan"})
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_1"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        let thinking_delta = out.find(r#""type":"thinking_delta""#).unwrap();
+        let signature_delta = out.find(r#""type":"signature_delta""#).unwrap();
+        let thinking_stop = out[signature_delta..]
+            .find("event: content_block_stop")
+            .map(|offset| signature_delta + offset)
+            .unwrap();
+        assert!(thinking_delta < signature_delta);
+        assert!(signature_delta < thinking_stop);
+        assert!(out.contains("ccp:codex:v1:"));
     }
 }

@@ -83,6 +83,7 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
         ResponsesInputItem::Message { .. } => Some("message".to_string()),
         ResponsesInputItem::FunctionCall { .. } => Some("function_call".to_string()),
         ResponsesInputItem::FunctionCallOutput { .. } => Some("function_call_output".to_string()),
+        ResponsesInputItem::Reasoning { .. } => Some("reasoning".to_string()),
     });
 
     let role_counts = count_items_by(&body.input, |item| match item {
@@ -108,6 +109,7 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                     ResponsesInputItem::FunctionCallOutput { .. } => {
                         ("function_call_output".to_string(), None)
                     }
+                    ResponsesInputItem::Reasoning { .. } => ("reasoning".to_string(), None),
                 };
                 let json_bytes_val =
                     json_bytes(Some(&serde_json::to_value(item).unwrap_or_default()));

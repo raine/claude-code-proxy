@@ -1,6 +1,7 @@
 use crate::anthropic::sse::parse_sse_events;
 
 use super::read_rewrite::sanitize_read_args;
+use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,10 @@ pub enum ReducerEvent {
     ThinkingDelta {
         index: usize,
         text: String,
+    },
+    ThinkingSignature {
+        index: usize,
+        signature: String,
     },
     ThinkingStop {
         index: usize,
@@ -143,6 +148,82 @@ enum BlockState {
     },
 }
 
+#[derive(Clone, Copy)]
+struct ActiveThinking {
+    output_index: usize,
+    anthropic_index: usize,
+}
+
+fn reasoning_input_item(replay: ReasoningReplay) -> ResponsesInputItem {
+    ResponsesInputItem::Reasoning {
+        id: replay.id,
+        summary: Vec::new(),
+        encrypted_content: replay.encrypted_content,
+    }
+}
+
+fn finalize_active_thinking(
+    active: ActiveThinking,
+    out: &mut Vec<ReducerEvent>,
+    reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
+    output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
+) {
+    if let Some(replay) = reasoning_by_output_index
+        .remove(&active.output_index)
+        .and_then(|pending| pending.replay())
+        && let Some(signature) = encode_reasoning_signature(&replay)
+    {
+        out.push(ReducerEvent::ThinkingSignature {
+            index: active.anthropic_index,
+            signature,
+        });
+        output_items_by_index.insert(active.output_index, reasoning_input_item(replay));
+    }
+    out.push(ReducerEvent::ThinkingStop {
+        index: active.anthropic_index,
+    });
+}
+
+fn close_thinking(
+    out: &mut Vec<ReducerEvent>,
+    active_thinking: &mut Option<ActiveThinking>,
+    reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
+    output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
+) {
+    if let Some(active) = active_thinking.take() {
+        finalize_active_thinking(
+            active,
+            out,
+            reasoning_by_output_index,
+            output_items_by_index,
+        );
+    }
+}
+
+fn emit_signature_only_reasoning(
+    output_index: usize,
+    anthropic_index: &mut usize,
+    out: &mut Vec<ReducerEvent>,
+    reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
+    output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
+) {
+    let Some(replay) = reasoning_by_output_index
+        .remove(&output_index)
+        .and_then(|pending| pending.replay())
+    else {
+        return;
+    };
+    let Some(signature) = encode_reasoning_signature(&replay) else {
+        return;
+    };
+    let index = *anthropic_index;
+    *anthropic_index += 1;
+    out.push(ReducerEvent::ThinkingStart { index });
+    out.push(ReducerEvent::ThinkingSignature { index, signature });
+    out.push(ReducerEvent::ThinkingStop { index });
+    output_items_by_index.insert(output_index, reasoning_input_item(replay));
+}
+
 pub fn finish_metadata_from_upstream(
     input: &[u8],
 ) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
@@ -172,8 +253,10 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         std::collections::BTreeMap::new();
     let mut item_id_to_output_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut reasoning_by_output_index: std::collections::HashMap<usize, PendingReasoning> =
+        std::collections::HashMap::new();
     let mut anthropic_index = 0usize;
-    let mut thinking_index: Option<usize> = None;
+    let mut active_thinking: Option<ActiveThinking> = None;
     let mut saw_tool_use = false;
     let mut final_usage: Option<CodexUsage> = None;
     let mut response_id: Option<String> = None;
@@ -223,12 +306,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     },
                 );
             }
-        }
-    }
-
-    fn close_thinking(out: &mut Vec<ReducerEvent>, thinking_index: &mut Option<usize>) {
-        if let Some(index) = thinking_index.take() {
-            out.push(ReducerEvent::ThinkingStop { index });
         }
     }
 
@@ -318,6 +395,10 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if item_type == "reasoning" {
+                reasoning_by_output_index
+                    .entry(output_index)
+                    .or_default()
+                    .capture(item);
                 continue;
             }
             if item_type == "web_search_call" {
@@ -326,7 +407,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             }
 
             if item_type == "message" {
-                close_thinking(&mut out, &mut thinking_index);
+                close_thinking(
+                    &mut out,
+                    &mut active_thinking,
+                    &mut reasoning_by_output_index,
+                    &mut output_items_by_index,
+                );
                 let idx = anthropic_index;
                 anthropic_index += 1;
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
@@ -344,7 +430,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             }
 
             if item_type == "function_call" {
-                close_thinking(&mut out, &mut thinking_index);
+                close_thinking(
+                    &mut out,
+                    &mut active_thinking,
+                    &mut reasoning_by_output_index,
+                    &mut output_items_by_index,
+                );
                 saw_tool_use = true;
                 let idx = anthropic_index;
                 anthropic_index += 1;
@@ -384,9 +475,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
 
         if t == "response.reasoning_summary_part.added" {
-            if let Some(index) = thinking_index {
+            let output_index = p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if let Some(active) =
+                active_thinking.filter(|active| active.output_index == output_index)
+            {
                 out.push(ReducerEvent::ThinkingDelta {
-                    index,
+                    index: active.anthropic_index,
                     text: "\n\n".to_string(),
                 });
             }
@@ -394,25 +488,42 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
 
         if t == "response.reasoning_summary_text.delta" {
+            let output_index = p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if delta.is_empty() {
                 continue;
             }
-            if thinking_index.is_none() {
+            if active_thinking.map(|active| active.output_index) != Some(output_index) {
+                close_thinking(
+                    &mut out,
+                    &mut active_thinking,
+                    &mut reasoning_by_output_index,
+                    &mut output_items_by_index,
+                );
                 let index = anthropic_index;
                 anthropic_index += 1;
-                thinking_index = Some(index);
+                active_thinking = Some(ActiveThinking {
+                    output_index,
+                    anthropic_index: index,
+                });
                 out.push(ReducerEvent::ThinkingStart { index });
             }
             out.push(ReducerEvent::ThinkingDelta {
-                index: thinking_index.unwrap(),
+                index: active_thinking
+                    .expect("thinking block was started")
+                    .anthropic_index,
                 text: delta.to_string(),
             });
             continue;
         }
 
         if t == "response.output_text.delta" {
-            close_thinking(&mut out, &mut thinking_index);
+            close_thinking(
+                &mut out,
+                &mut active_thinking,
+                &mut reasoning_by_output_index,
+                &mut output_items_by_index,
+            );
             let output_index = p
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -550,14 +661,39 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             if let Some(item_val) = item
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning")
             {
-                close_thinking(&mut out, &mut thinking_index);
+                reasoning_by_output_index
+                    .entry(output_index)
+                    .or_default()
+                    .capture(item_val);
+                let had_active_summary =
+                    active_thinking.is_some_and(|active| active.output_index == output_index);
+                close_thinking(
+                    &mut out,
+                    &mut active_thinking,
+                    &mut reasoning_by_output_index,
+                    &mut output_items_by_index,
+                );
+                if !had_active_summary {
+                    emit_signature_only_reasoning(
+                        output_index,
+                        &mut anthropic_index,
+                        &mut out,
+                        &mut reasoning_by_output_index,
+                        &mut output_items_by_index,
+                    );
+                }
                 continue;
             }
 
             if let Some(item_val) = item
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("web_search_call")
             {
-                close_thinking(&mut out, &mut thinking_index);
+                close_thinking(
+                    &mut out,
+                    &mut active_thinking,
+                    &mut reasoning_by_output_index,
+                    &mut output_items_by_index,
+                );
                 let idx = anthropic_index;
                 anthropic_index += 1;
                 let result_index = anthropic_index;
@@ -673,7 +809,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         });
     }
 
-    close_thinking(&mut out, &mut thinking_index);
+    close_thinking(
+        &mut out,
+        &mut active_thinking,
+        &mut reasoning_by_output_index,
+        &mut output_items_by_index,
+    );
 
     let stop_reason: StopReason = if incomplete {
         STOP_MAX_TOKENS
@@ -1575,5 +1716,64 @@ mod tests {
             })
             .collect();
         assert_eq!(deltas, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn reasoning_signature_precedes_stop_and_enters_continuation_transcript() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"}
+                })
+            ),
+            sse(
+                "response.reasoning_summary_text.delta",
+                json!({"output_index":0,"summary_index":0,"delta":"plan"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_1","summary":[]}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let signature_index = events
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::ThinkingSignature { .. }))
+            .unwrap();
+        let stop_index = events
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::ThinkingStop { .. }))
+            .unwrap();
+        assert!(signature_index < stop_index);
+
+        let ReducerEvent::ThinkingSignature { signature, .. } = &events[signature_index] else {
+            unreachable!();
+        };
+        let replay =
+            super::super::reasoning_signature::decode_reasoning_signature(signature).unwrap();
+        assert_eq!(replay.id, "rs_1");
+        assert_eq!(replay.encrypted_content, "opaque");
+
+        let ReducerEvent::Finish { output_items, .. } = events.last().unwrap() else {
+            panic!("expected Finish");
+        };
+        assert!(matches!(
+            output_items.as_slice(),
+            [ResponsesInputItem::Reasoning {
+                id,
+                encrypted_content,
+                ..
+            }] if id == "rs_1" && encrypted_content == "opaque"
+        ));
     }
 }

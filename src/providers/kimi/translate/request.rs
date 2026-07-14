@@ -433,7 +433,7 @@ fn push_assistant_message(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
                     text_parts.push(text.clone());
                 }
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 if !thinking.is_empty() {
                     thinking_parts.push(thinking.clone());
                 }
