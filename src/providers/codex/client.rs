@@ -350,6 +350,135 @@ pub struct CodexResponse {
     pub transport: ActualTransport,
 }
 
+pub type CodexHttpEventReceiver =
+    tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
+
+const MAX_HTTP_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct HttpSseDecoder {
+    frame: Vec<u8>,
+    line_start: usize,
+    skip_lf: bool,
+}
+
+struct DecodedHttpSseEvent {
+    event: Option<String>,
+    payload: Option<serde_json::Value>,
+}
+
+struct HttpEventStreamState {
+    resp: reqwest::Response,
+    started_at: Instant,
+    body_json: String,
+    auth: StoredAuth,
+    auth_refresh_attempted: bool,
+    use_responses_lite: bool,
+    retries: u32,
+}
+
+impl HttpSseDecoder {
+    fn push(&mut self, input: &[u8]) -> Result<Vec<DecodedHttpSseEvent>, CodexError> {
+        let mut events = Vec::new();
+        for &byte in input {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\n' => self.end_line(&mut events)?,
+                b'\r' => {
+                    self.end_line(&mut events)?;
+                    self.skip_lf = true;
+                }
+                _ => self.push_byte(byte)?,
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish(&self) -> Result<(), CodexError> {
+        if self.frame.is_empty() {
+            Ok(())
+        } else {
+            Err(http_sse_error(
+                "Codex SSE stream ended with an incomplete frame",
+            ))
+        }
+    }
+
+    fn push_byte(&mut self, byte: u8) -> Result<(), CodexError> {
+        if self.frame.len() >= MAX_HTTP_SSE_FRAME_BYTES {
+            return Err(http_sse_error("Codex SSE frame exceeds the size limit"));
+        }
+        self.frame.push(byte);
+        Ok(())
+    }
+
+    fn end_line(&mut self, events: &mut Vec<DecodedHttpSseEvent>) -> Result<(), CodexError> {
+        if self.frame.len() == self.line_start {
+            if !self.frame.is_empty()
+                && let Some(event) = decode_http_sse_frame(&self.frame)?
+            {
+                events.push(event);
+            }
+            self.frame.clear();
+            self.line_start = 0;
+            return Ok(());
+        }
+        self.push_byte(b'\n')?;
+        self.line_start = self.frame.len();
+        Ok(())
+    }
+}
+
+fn decode_http_sse_frame(frame: &[u8]) -> Result<Option<DecodedHttpSseEvent>, CodexError> {
+    let frame = std::str::from_utf8(frame)
+        .map_err(|_| http_sse_error("Codex SSE frame contains invalid UTF-8"))?;
+    let mut event = None;
+    let mut data = Vec::new();
+    for line in frame.lines() {
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event = Some(value.to_owned()),
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let data = data.join("\n");
+    if data == "[DONE]" {
+        return Ok(Some(DecodedHttpSseEvent {
+            event,
+            payload: None,
+        }));
+    }
+    let payload = serde_json::from_str(&data)
+        .map_err(|_| http_sse_error("Codex SSE frame contains invalid JSON"))?;
+    Ok(Some(DecodedHttpSseEvent {
+        event,
+        payload: Some(payload),
+    }))
+}
+
+fn http_sse_error(message: &str) -> CodexError {
+    CodexError {
+        status: 0,
+        message: message.to_string(),
+        detail: Some("http_response_sse".to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -947,6 +1076,436 @@ impl CodexHttpClient {
         }
     }
 
+    pub async fn stream_codex_http_events(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+    ) -> Result<CodexHttpEventReceiver, CodexError> {
+        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
+        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
+            status: 500,
+            message: "Failed to serialize request".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+        let mut auth_refresh_attempted = false;
+        let use_responses_lite = body.client_metadata.is_some();
+        let mut retries = 0_u32;
+        let (resp, started_at) = loop {
+            match self
+                .start_http_event_attempt(
+                    &mut auth,
+                    &body_json,
+                    ctx,
+                    use_responses_lite,
+                    &mut auth_refresh_attempted,
+                )
+                .await
+            {
+                Ok(attempt) => break attempt,
+                Err(error) if retryable_http_stream_error(&error) => {
+                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        return Err(error);
+                    }
+                    let delay = compute_backoff_delay(retries, error.retry_after.as_deref());
+                    if delay.exceeds_budget {
+                        return Err(error);
+                    }
+                    retries += 1;
+                    sleep(delay.wait_ms).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        Ok(self.spawn_http_event_stream(
+            HttpEventStreamState {
+                resp,
+                started_at,
+                body_json,
+                auth,
+                auth_refresh_attempted,
+                use_responses_lite,
+                retries,
+            },
+            ctx.clone(),
+        ))
+    }
+
+    async fn start_http_event_attempt(
+        &self,
+        auth: &mut StoredAuth,
+        body_json: &str,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+        auth_refresh_attempted: &mut bool,
+    ) -> Result<(reqwest::Response, Instant), CodexError> {
+        loop {
+            let (resp, started_at) = self
+                .start_post_http(auth, body_json, ctx, use_responses_lite)
+                .await?;
+
+            if resp.status().as_u16() == 401 && !*auth_refresh_attempted {
+                *auth_refresh_attempted = true;
+                *auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                let response = self.collect_http_response(resp, started_at, ctx).await?;
+                let mut error = codex_status_error(response);
+                error.origin = CodexErrorOrigin::Http;
+                return Err(error);
+            }
+
+            let status = resp.status().as_u16();
+            let headers = response_headers(&resp);
+            if let Some(traffic) = ctx.traffic.as_deref() {
+                write_upstream_response_headers_capture(
+                    traffic,
+                    status,
+                    started_at.elapsed(),
+                    &headers,
+                );
+            }
+            return Ok((resp, started_at));
+        }
+    }
+
+    pub async fn stream_codex_auto_events(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
+        let mut websocket = self
+            .stream_codex_websocket_events(body, ctx, continuation)
+            .await?;
+        let client = self.clone();
+        let body = body.clone();
+        let ctx = ctx.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            match websocket.recv().await {
+                Some(Err(err)) if should_fallback_to_http(&err) => {
+                    match client.stream_codex_http_events(&body, &ctx).await {
+                        Ok(http) => forward_codex_events(http, tx).await,
+                        Err(err) => {
+                            let _ = tx.send(Err(err)).await;
+                        }
+                    }
+                }
+                Some(item) => {
+                    if tx.send(item).await.is_ok() {
+                        forward_codex_events(websocket, tx).await;
+                    }
+                }
+                None => {
+                    let _ = tx
+                        .send(Err(CodexError {
+                            status: 0,
+                            message: "WebSocket connection closed before the first Codex event"
+                                .to_string(),
+                            detail: Some(
+                                super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string(),
+                            ),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        }))
+                        .await;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    fn spawn_http_event_stream(
+        self: &Arc<Self>,
+        state: HttpEventStreamState,
+        ctx: RequestContext,
+    ) -> CodexHttpEventReceiver {
+        let HttpEventStreamState {
+            mut resp,
+            mut started_at,
+            body_json,
+            mut auth,
+            mut auth_refresh_attempted,
+            use_responses_lite,
+            mut retries,
+        } = state;
+        let client = self.clone();
+        let body_idle_timeout_ms = self.body_idle_timeout_ms;
+        let req_id = ctx.req_id.clone();
+        let traffic = ctx.traffic.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let log = create_logger("codex");
+            let mut semantic_output_forwarded = false;
+
+            if tx
+                .send(Ok(serde_json::json!({
+                    "type": "keepalive",
+                    "_ccp_synthetic": true
+                })))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            'attempts: loop {
+                let mut decoder = HttpSseDecoder::default();
+                let mut body_bytes = 0_u64;
+                let mut body_chunks = 0_u64;
+                let mut event_count = 0_u64;
+                let mut pending_events = Vec::new();
+
+                let mut retry_error = 'read_attempt: loop {
+                    let chunk = tokio::select! {
+                        _ = tx.closed() => {
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_dropped",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                None,
+                            );
+                            return;
+                        }
+                        chunk = tokio::time::timeout(
+                            Duration::from_millis(body_idle_timeout_ms),
+                            resp.chunk(),
+                        ) => chunk
+                    };
+
+                    let chunk = match chunk {
+                        Ok(Ok(Some(chunk))) => chunk,
+                        Ok(Ok(None)) => {
+                            let error = match decoder.finish() {
+                                Ok(()) => http_sse_error(
+                                    "Codex SSE stream ended before a terminal response event",
+                                ),
+                                Err(error) => error,
+                            };
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_failed",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                Some(&error.message),
+                            );
+                            if !semantic_output_forwarded && retryable_http_stream_error(&error) {
+                                break 'read_attempt error;
+                            }
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                        Ok(Err(err)) => {
+                            let error = CodexError {
+                                status: 0,
+                                message: format!(
+                                    "Transport error reading Codex response body: {err}"
+                                ),
+                                detail: Some("http_response_body".to_string()),
+                                retry_after: None,
+                                origin: CodexErrorOrigin::Http,
+                            };
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_failed",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                Some(&error.message),
+                            );
+                            if !semantic_output_forwarded {
+                                break 'read_attempt error;
+                            }
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                        Err(_) => {
+                            let error = CodexError {
+                                status: 0,
+                                message: format!(
+                                    "Timed out waiting {body_idle_timeout_ms}ms for the next Codex response body chunk"
+                                ),
+                                detail: Some("http_response_body".to_string()),
+                                retry_after: None,
+                                origin: CodexErrorOrigin::Http,
+                            };
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_failed",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                Some(&error.message),
+                            );
+                            if !semantic_output_forwarded {
+                                break 'read_attempt error;
+                            }
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                    };
+
+                    body_bytes = body_bytes.saturating_add(chunk.len() as u64);
+                    body_chunks = body_chunks.saturating_add(1);
+                    let events = match decoder.push(&chunk) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_failed",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                Some(&error.message),
+                            );
+                            if !semantic_output_forwarded && retryable_http_stream_error(&error) {
+                                break 'read_attempt error;
+                            }
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                    };
+
+                    for event in events {
+                        let Some(payload) = event.payload else {
+                            continue;
+                        };
+                        event_count = event_count.saturating_add(1);
+                        if let Some(traffic) = traffic.as_deref() {
+                            write_codex_http_sse_event_capture(
+                                traffic,
+                                event.event.as_deref(),
+                                &payload,
+                            );
+                        }
+
+                        let failure = super::events::classify_event_failure(&payload);
+                        if !semantic_output_forwarded
+                            && let Some(failure) = failure.as_ref()
+                            && failure.retryable()
+                        {
+                            pending_events.clear();
+                            break 'read_attempt codex_event_failure_error(failure.clone());
+                        }
+
+                        let terminal = event_closes_http_stream(&payload);
+                        if !semantic_output_forwarded && failure.is_some() {
+                            pending_events.clear();
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        } else if !semantic_output_forwarded
+                            && http_event_starts_semantic_output(&payload)
+                        {
+                            semantic_output_forwarded = true;
+                            for pending in pending_events.drain(..) {
+                                if tx.send(Ok(pending)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        } else if semantic_output_forwarded || http_event_is_control(&payload) {
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        } else {
+                            pending_events.push(payload);
+                        }
+
+                        if terminal {
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_completed",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                None,
+                            );
+                            return;
+                        }
+                    }
+                };
+
+                loop {
+                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        let _ = tx.send(Err(retry_error)).await;
+                        return;
+                    }
+                    let delay = compute_backoff_delay(retries, retry_error.retry_after.as_deref());
+                    if delay.exceeds_budget {
+                        let _ = tx.send(Err(retry_error)).await;
+                        return;
+                    }
+                    retries += 1;
+                    tokio::select! {
+                        _ = tx.closed() => return,
+                        _ = sleep(delay.wait_ms) => {}
+                    }
+
+                    let next_attempt = tokio::select! {
+                        _ = tx.closed() => return,
+                        result = client.start_http_event_attempt(
+                            &mut auth,
+                            &body_json,
+                            &ctx,
+                            use_responses_lite,
+                            &mut auth_refresh_attempted,
+                        ) => result
+                    };
+                    match next_attempt {
+                        Ok((next_resp, next_started_at)) => {
+                            resp = next_resp;
+                            started_at = next_started_at;
+                            continue 'attempts;
+                        }
+                        Err(error) if retryable_http_stream_error(&error) => {
+                            retry_error = error;
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        rx
+    }
+
     async fn post_codex_with_transport(
         &self,
         body: &ResponsesRequest,
@@ -1485,6 +2044,19 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         use_responses_lite: bool,
     ) -> Result<CodexResponse, CodexError> {
+        let (resp, started_at) = self
+            .start_post_http(auth, body_json, ctx, use_responses_lite)
+            .await?;
+        self.collect_http_response(resp, started_at, ctx).await
+    }
+
+    async fn start_post_http(
+        &self,
+        auth: &StoredAuth,
+        body_json: &str,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+    ) -> Result<(reqwest::Response, Instant), CodexError> {
         let url = &self.base_url;
         let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
 
@@ -1503,7 +2075,7 @@ impl CodexHttpClient {
         let send_fut = req_builder.body(body_json.to_string()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
-        let mut resp = tokio::time::timeout(header_timeout_dur, send_fut)
+        let resp = tokio::time::timeout(header_timeout_dur, send_fut)
             .await
             .map_err(|_| CodexError {
                 status: 0,
@@ -1535,6 +2107,15 @@ impl CodexHttpClient {
                 }
             })?;
 
+        Ok((resp, started_at))
+    }
+
+    async fn collect_http_response(
+        &self,
+        mut resp: reqwest::Response,
+        started_at: Instant,
+        ctx: &RequestContext,
+    ) -> Result<CodexResponse, CodexError> {
         let status = resp.status().as_u16();
         let headers: Vec<(String, String)> = resp
             .headers()
@@ -1700,6 +2281,136 @@ impl CodexHttpClient {
     }
 }
 
+async fn forward_codex_events(
+    mut source: tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>,
+    tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
+) {
+    while let Some(item) = source.recv().await {
+        if tx.send(item).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
+    resp.headers()
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+fn event_closes_http_stream(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(|value| value.as_str()),
+        Some(
+            "response.completed"
+                | "response.incomplete"
+                | "response.done"
+                | "response.failed"
+                | "response.error"
+                | "error"
+        )
+    )
+}
+
+fn http_event_is_control(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(|value| value.as_str()),
+        Some(
+            "keepalive"
+                | "response.created"
+                | "response.in_progress"
+                | "codex.rate_limits"
+                | "response.web_search_call.in_progress"
+                | "response.web_search_call.searching"
+                | "response.web_search_call.completed"
+        )
+    )
+}
+
+fn http_event_starts_semantic_output(payload: &serde_json::Value) -> bool {
+    match payload.get("type").and_then(|value| value.as_str()) {
+        Some("response.output_item.added") => matches!(
+            payload
+                .pointer("/item/type")
+                .and_then(|value| value.as_str()),
+            Some("message" | "function_call")
+        ),
+        Some(
+            "response.reasoning_summary_text.delta"
+            | "response.output_text.delta"
+            | "response.function_call_arguments.delta",
+        ) => payload
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .is_some_and(|delta| !delta.is_empty()),
+        Some("response.output_item.done") => matches!(
+            payload
+                .pointer("/item/type")
+                .and_then(|value| value.as_str()),
+            Some("reasoning" | "message" | "function_call")
+        ),
+        Some("response.completed" | "response.incomplete" | "response.done") => true,
+        _ => false,
+    }
+}
+
+fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> CodexError {
+    CodexError {
+        status: failure.status,
+        message: failure.message.clone(),
+        detail: Some(failure.message),
+        retry_after: failure.retry_after,
+        origin: CodexErrorOrigin::Http,
+    }
+}
+
+fn retryable_http_stream_error(error: &CodexError) -> bool {
+    if should_retry_codex_status(error.status) || is_retryable_transport_error(error) {
+        return true;
+    }
+    if error.status != 0 {
+        return false;
+    }
+    if error.detail.as_deref() == Some("http_response_sse") {
+        return error.message != "Codex SSE frame exceeds the size limit";
+    }
+    let message = error.message.to_ascii_lowercase();
+    message.contains("ended before a terminal response event")
+        || message.contains("ended with an incomplete frame")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_http_stream_end(
+    log: &crate::logging::Logger,
+    message: &str,
+    req_id: &str,
+    started_at: Instant,
+    body_bytes: u64,
+    body_chunks: u64,
+    event_count: u64,
+    error: Option<&str>,
+) {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        ("transport".to_string(), serde_json::json!("http")),
+        ("bodyBytes".to_string(), serde_json::json!(body_bytes)),
+        ("bodyChunks".to_string(), serde_json::json!(body_chunks)),
+        ("eventCount".to_string(), serde_json::json!(event_count)),
+        (
+            "ms".to_string(),
+            serde_json::json!(started_at.elapsed().as_millis()),
+        ),
+    ]);
+    if let Some(error) = error {
+        fields.insert("error".to_string(), serde_json::json!(error));
+    }
+    match message {
+        "codex_http_stream_completed" => log.info(message, Some(fields)),
+        _ => log.warn(message, Some(fields)),
+    }
+}
+
 fn write_codex_http_request_capture(
     traffic: &TrafficCapture,
     url: &str,
@@ -1748,6 +2459,21 @@ fn write_upstream_response_capture(
     headers: &[(String, String)],
     body: &[u8],
 ) {
+    write_upstream_response_headers_capture(traffic, status, elapsed, headers);
+    if status >= 400 {
+        traffic.write_text("031-upstream-error-body", &String::from_utf8_lossy(body));
+    } else {
+        traffic.write_bytes("032-upstream-response-body.sse", body);
+        write_codex_sse_event_capture(traffic, body);
+    }
+}
+
+fn write_upstream_response_headers_capture(
+    traffic: &TrafficCapture,
+    status: u16,
+    elapsed: Duration,
+    headers: &[(String, String)],
+) {
     traffic.write_json(
         "030-upstream-response-headers",
         &serde_json::json!({
@@ -1756,12 +2482,22 @@ fn write_upstream_response_capture(
             "headers": headers_to_json_from_pairs(headers),
         }),
     );
-    if status >= 400 {
-        traffic.write_text("031-upstream-error-body", &String::from_utf8_lossy(body));
-    } else {
-        traffic.write_bytes("032-upstream-response-body.sse", body);
-        write_codex_sse_event_capture(traffic, body);
+}
+
+fn write_codex_http_sse_event_capture(
+    traffic: &TrafficCapture,
+    event: Option<&str>,
+    payload: &serde_json::Value,
+) {
+    let mut payload = payload.clone();
+    if let Some(event) = event
+        && let Some(object) = payload.as_object_mut()
+    {
+        object
+            .entry("_sse_event")
+            .or_insert_with(|| serde_json::json!(event));
     }
+    traffic.write_json_event("040-upstream-event", &payload);
 }
 
 fn write_codex_sse_event_capture(traffic: &TrafficCapture, body: &[u8]) {
@@ -2336,6 +3072,160 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         server.await.unwrap();
+    }
+
+    async fn write_http_chunk(stream: &mut tokio::net::TcpStream, body: &[u8]) {
+        stream
+            .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[test]
+    fn http_sse_decoder_handles_fragmented_crlf_and_done_marker() {
+        let mut decoder = HttpSseDecoder::default();
+        assert!(
+            decoder
+                .push(b"event: response.output_text.delta\r")
+                .unwrap()
+                .is_empty()
+        );
+        let events = decoder
+            .push(b"\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\r\n\r\n")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event.as_deref(),
+            Some("response.output_text.delta")
+        );
+        assert_eq!(
+            events[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("delta"))
+                .and_then(|value| value.as_str()),
+            Some("ok")
+        );
+
+        let done = decoder.push(b"data: [DONE]\n\n").unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].payload.is_none());
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn http_sse_size_limit_is_not_retryable() {
+        assert!(!retryable_http_stream_error(&http_sse_error(
+            "Codex SSE frame exceeds the size limit",
+        )));
+        assert!(retryable_http_stream_error(&http_sse_error(
+            "Codex SSE frame contains invalid JSON",
+        )));
+        assert!(retryable_http_stream_error(&http_sse_error(
+            "Codex SSE frame contains invalid UTF-8",
+        )));
+    }
+
+    #[tokio::test]
+    async fn http_stream_forwards_event_before_terminal_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            write_http_chunk(
+                &mut stream,
+                b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+            )
+            .await;
+            release_rx.await.unwrap();
+            write_http_chunk(
+                &mut stream,
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{}}}\n\n",
+            )
+            .await;
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let mut events = client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+            .unwrap();
+
+        let synthetic = events.recv().await.unwrap().unwrap();
+        assert_eq!(
+            synthetic.get("type").and_then(|value| value.as_str()),
+            Some("keepalive")
+        );
+        let first_upstream = tokio::time::timeout(Duration::from_millis(200), events.recv())
+            .await
+            .expect("first upstream event must arrive before the response completes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first_upstream.get("type").and_then(|value| value.as_str()),
+            Some("response.output_item.added")
+        );
+
+        release_tx.send(()).unwrap();
+        let terminal = events.recv().await.unwrap().unwrap();
+        assert_eq!(
+            terminal.get("type").and_then(|value| value.as_str()),
+            Some("response.completed")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_stream_bounds_initial_status_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut attempts = 0_u32;
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let mut request = [0_u8; 16 * 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                attempts += 1;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+            attempts
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let error = match client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+        {
+            Ok(_) => panic!("retryable status must exhaust with an error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, 503);
+        assert_eq!(
+            server.await.unwrap(),
+            MAX_BUFFERED_TRANSPORT_ATTEMPTS,
+            "initial status failures must share the HTTP stream retry budget"
+        );
     }
 
     #[tokio::test]

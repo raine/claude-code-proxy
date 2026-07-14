@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
@@ -59,6 +59,7 @@ use self::translate::request::{
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
+const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
 // ---------------------------------------------------------------------------
@@ -297,15 +298,46 @@ impl Provider for CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id;
+        let configured_transport = config::codex_transport();
+        let transport = configured_transport.as_str();
+        let upstream_started_at = Instant::now();
+        let log = create_logger("codex");
+        let req_id = ctx.req_id.clone();
+        log.info(
+            "codex_upstream_request_started",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), serde_json::json!(&req_id)),
+                ("transport".to_string(), serde_json::json!(transport)),
+                ("model".to_string(), serde_json::json!(&resolved.model)),
+                ("stream".to_string(), serde_json::json!(want_stream)),
+                (
+                    "responsesLite".to_string(),
+                    serde_json::json!(use_responses_lite),
+                ),
+                (
+                    "previousResponseIdEnabled".to_string(),
+                    serde_json::json!(previous_response_id_enabled),
+                ),
+                (
+                    "hasPreviousResponseId".to_string(),
+                    serde_json::json!(continuation.previous_response_id.is_some()),
+                ),
+                (
+                    "inputDeltaCount".to_string(),
+                    serde_json::json!(continuation.input_delta.as_ref().map(Vec::len)),
+                ),
+                ("turnId".to_string(), serde_json::json!(turn_id)),
+            ])),
+        );
 
         // Post to upstream with continuation
         let client = self.client.clone();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        if want_stream && matches!(config::codex_transport(), config::CodexTransport::WebSocket) {
+        if want_stream {
             let stream_request = translated.clone();
-            return live_stream_response(
+            let response = live_stream_response(
                 client,
                 message_id,
                 model,
@@ -316,8 +348,25 @@ impl Provider for CodexProvider {
                     compact_boundary,
                     attempt: compaction_attempt,
                 },
+                configured_transport,
             )
             .await;
+            log.info(
+                "codex_upstream_response_ready",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&req_id)),
+                    ("transport".to_string(), serde_json::json!(transport)),
+                    (
+                        "status".to_string(),
+                        serde_json::json!(response.status().as_u16()),
+                    ),
+                    (
+                        "ms".to_string(),
+                        serde_json::json!(upstream_started_at.elapsed().as_millis()),
+                    ),
+                ])),
+            );
+            return response;
         }
 
         let mut continuation = Some(continuation);
@@ -329,6 +378,23 @@ impl Provider for CodexProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    log.warn(
+                        "codex_upstream_request_failed",
+                        Some(serde_json::Map::from_iter([
+                            ("reqId".to_string(), serde_json::json!(&req_id)),
+                            ("transport".to_string(), serde_json::json!(transport)),
+                            ("status".to_string(), serde_json::json!(e.status)),
+                            (
+                                "origin".to_string(),
+                                serde_json::json!(format!("{:?}", e.origin)),
+                            ),
+                            ("error".to_string(), serde_json::json!(&e.message)),
+                            (
+                                "ms".to_string(),
+                                serde_json::json!(upstream_started_at.elapsed().as_millis()),
+                            ),
+                        ])),
+                    );
                     abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&e);
@@ -355,6 +421,22 @@ impl Provider for CodexProvider {
             attempt += 1;
             sleep(delay.wait_ms).await;
         };
+        log.info(
+            "codex_upstream_response_received",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), serde_json::json!(&req_id)),
+                ("transport".to_string(), serde_json::json!(transport)),
+                ("status".to_string(), serde_json::json!(upstream.status)),
+                (
+                    "bodyBytes".to_string(),
+                    serde_json::json!(upstream.body.len()),
+                ),
+                (
+                    "ms".to_string(),
+                    serde_json::json!(upstream_started_at.elapsed().as_millis()),
+                ),
+            ])),
+        );
 
         if want_stream {
             let estimated_input_tokens = count_translated_tokens(&translated);
@@ -539,6 +621,7 @@ struct LiveStreamCompaction {
     attempt: Option<CompactionAttempt>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response(
     client: Arc<CodexHttpClient>,
     message_id: String,
@@ -547,6 +630,7 @@ async fn live_stream_response(
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
     compaction: LiveStreamCompaction,
+    transport: config::CodexTransport,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -554,11 +638,27 @@ async fn live_stream_response(
     let mut continuation = Some(continuation);
 
     loop {
-        let upstream_events = match client
-            .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
-            .await
-        {
+        let upstream_events = match transport {
+            config::CodexTransport::Http => {
+                client.stream_codex_http_events(&request_body, &ctx).await
+            }
+            config::CodexTransport::WebSocket => {
+                client
+                    .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
+                    .await
+            }
+            config::CodexTransport::Auto => {
+                client
+                    .stream_codex_auto_events(&request_body, &ctx, continuation.as_ref())
+                    .await
+            }
+        };
+        let upstream_events = match upstream_events {
             Ok(events) => events,
+            Err(err) if err.origin == client::CodexErrorOrigin::Http => {
+                abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                return map_codex_error_to_response(&err);
+            }
             Err(err) if retryable_live_start_codex_error(&err) => {
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&err) {
@@ -597,6 +697,14 @@ async fn live_stream_response(
         {
             LiveStreamStart::Response(response) => return response,
             LiveStreamStart::Retry { error } => {
+                // The incremental HTTP reader performs its own bounded
+                // pre-semantic retries so it can stop immediately when the
+                // consumer disappears. Do not multiply that exhausted retry
+                // loop by the provider-level WebSocket retry policy.
+                if error.origin == client::CodexErrorOrigin::Http {
+                    abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
+                    return map_codex_error_to_response(&error);
+                }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&error) {
                     attempt += 1;
@@ -846,7 +954,31 @@ fn remaining_live_stream_response(
             abort_request_state(ctx.session_id.as_deref(), turn_id, compaction.attempt);
             return;
         }
-        while let Some(item) = upstream_events.recv().await {
+        let mut heartbeat = tokio::time::interval(LIVE_STREAM_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            let item = tokio::select! {
+                _ = tx.closed() => {
+                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    return;
+                }
+                item = upstream_events.recv() => item,
+                _ = heartbeat.tick() => {
+                    let chunk = translator.ping_chunk(ctx.traffic.as_deref());
+                    if !chunk.is_empty() {
+                        record_live_stream_progress(&ctx, &chunk);
+                        if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                            abort_continuation(ctx.session_id.as_deref(), turn_id);
+                            return;
+                        }
+                    }
+                    continue;
+                }
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(payload) => {
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
@@ -929,7 +1061,7 @@ fn remaining_live_stream_response(
             return;
         }
         let chunk = translator.error_chunk(
-            "WebSocket connection closed before terminal Codex response event",
+            "Upstream event stream closed before terminal Codex response event",
             "api_error",
             ctx.traffic.as_deref(),
         );
@@ -1500,6 +1632,123 @@ mod tests {
         let state = monitor.snapshot();
         assert_eq!(state.active[0].input_tokens, Some(12));
         assert_eq!(state.active[0].output_tokens, Some(48));
+    }
+
+    #[tokio::test]
+    async fn live_stream_response_emits_downstream_frames_before_terminal_event() {
+        use http_body_util::BodyExt as _;
+
+        let body = request_with_tools(serde_json::json!([]));
+        let request_body = translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "incremental-http".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(Ok(serde_json::json!({"type": "keepalive"})))
+            .await
+            .unwrap();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_up"}
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "first"
+        })))
+        .await
+        .unwrap();
+
+        let response = match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            None,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error } => panic!("unexpected retry: {error}"),
+        };
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("initial downstream frame must be available immediately")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        assert!(first.contains("event: message_start"));
+        assert!(first.contains("event: ping"));
+        assert!(first.contains("event: content_block_start"));
+        assert!(first.contains("event: content_block_delta"));
+
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "second"
+        })))
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("text delta must arrive before the terminal event")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(
+            String::from_utf8(second.to_vec())
+                .unwrap()
+                .contains("event: content_block_delta")
+        );
+
+        for payload in [
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "incomplete_details": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }
+            }),
+        ] {
+            tx.send(Ok(payload)).await.unwrap();
+        }
+        drop(tx);
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
     }
 
     #[test]

@@ -117,8 +117,11 @@ impl LiveStreamTranslator {
                 if is_terminal_rate_limit_event(payload) {
                     return Err("rate limit reached".to_string());
                 }
+                self.emit_ping(traffic, &mut out);
             }
-            "keepalive" => {}
+            "keepalive" | "response.created" | "response.in_progress" => {
+                self.emit_ping(traffic, &mut out);
+            }
             "response.failed" | "response.error" | "error" => {
                 return Err(error_message(payload));
             }
@@ -179,6 +182,14 @@ impl LiveStreamTranslator {
 
     pub fn has_semantic_output(&self) -> bool {
         self.semantic_output_started
+    }
+
+    pub fn ping_chunk(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.finished {
+            self.emit_ping(traffic, &mut out);
+        }
+        out
     }
 
     pub fn finish_after_closed_completed_tool_call(
@@ -249,6 +260,11 @@ impl LiveStreamTranslator {
                 }
             }),
         );
+    }
+
+    fn emit_ping(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
+        self.ensure_message_start(traffic, out);
+        self.emit(traffic, out, "ping", &serde_json::json!({"type": "ping"}));
     }
 
     fn emit(
@@ -1542,6 +1558,23 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, "rate limit reached");
+    }
+
+    #[test]
+    fn progress_events_start_message_and_emit_pings() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let first = String::from_utf8(
+            translator
+                .accept(&json!({"type": "response.created"}), None)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.matches("event: message_start").count(), 1);
+        assert_eq!(first.matches("event: ping").count(), 1);
+
+        let second = String::from_utf8(translator.ping_chunk(None)).unwrap();
+        assert!(!second.contains("event: message_start"));
+        assert_eq!(second.matches("event: ping").count(), 1);
     }
 
     #[test]

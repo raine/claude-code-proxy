@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -193,6 +194,63 @@ where
     });
 
     addr_str
+}
+
+#[allow(clippy::await_holding_lock)]
+async fn assert_codex_http_presemantic_retry(first_response: Vec<u8>) {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_response = Arc::new(first_response);
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        let first_response = first_response.clone();
+        move |_body: Value| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                first_response.as_ref().clone()
+            } else {
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_retry\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_retry\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"retry succeeded\"}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("retried stream must finish")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stream body: {text}");
+    assert!(text.contains("retry succeeded"), "stream body: {text}");
+    assert!(!text.contains("event: error"), "stream body: {text}");
+    assert_eq!(text.matches("event: message_start").count(), 1);
+    assert_eq!(text.matches("event: message_stop").count(), 1);
 }
 
 /// Spawn a mock WebSocket server that accepts one connection, captures the
@@ -1489,6 +1547,364 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
     let downstream = traffic_json(&files, "050-downstream-event.json");
     assert!(downstream.get("event").is_some());
     assert!(downstream.get("data").is_some());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_stream_returns_before_upstream_completion() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = format!("http://{addr}");
+    let mock = axum::Router::new().fallback({
+        let release = release.clone();
+        move |_body: String| {
+            let release = release.clone();
+            async move {
+                let stream = futures_util::stream::unfold(0_u8, move |state| {
+                    let release = release.clone();
+                    async move {
+                        match state {
+                            0 => Some((
+                                Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                                    concat!(
+                                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"incremental ok\"}\n\n"
+                                    )
+                                    .as_bytes(),
+                                )),
+                                1,
+                            )),
+                            1 => {
+                                release.notified().await;
+                                Some((
+                                    Ok(bytes::Bytes::from_static(concat!(
+                                        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+                                    ).as_bytes())),
+                                    2,
+                                ))
+                            }
+                            _ => None,
+                        }
+                    }
+                });
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = tokio::time::timeout(
+        Duration::from_millis(500),
+        call_messages_body(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        })),
+    )
+    .await
+    .expect("CCP must return streaming headers before upstream completion");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
+        .await
+        .expect("initial Anthropic heartbeat must arrive before upstream completion")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let first = String::from_utf8(first.to_vec()).unwrap();
+    assert!(first.contains("event: message_start"));
+    assert!(first.contains("event: ping"));
+    assert!(first.contains("incremental ok"));
+
+    release.notify_one();
+    let rest = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let rest = String::from_utf8(rest.to_vec()).unwrap();
+    assert!(rest.contains("event: message_stop"), "stream body: {rest}");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_overload_after_control_events() {
+    assert_codex_http_presemantic_retry(
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"Our servers are currently overloaded. Please try again later.\",\"retry_after\":0}}}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_rate_limit_after_control_events() {
+    assert_codex_http_presemantic_retry(
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_limited\"}}\n\n",
+            "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_transient_failure_after_control_events() {
+    assert_codex_http_presemantic_retry(
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_transient\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"status\":503,\"message\":\"temporarily unavailable\",\"retry_after\":0}}}\n\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_presemantic_eof() {
+    assert_codex_http_presemantic_retry(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_truncated\"}}\n\n"
+            .as_bytes()
+            .to_vec(),
+    )
+    .await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_bounds_initial_status_retries() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = format!("http://{addr}");
+    let mock = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("retry-after", "0")
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_presemantic_invalid_json() {
+    assert_codex_http_presemantic_retry(b"data: not-json\n\n".to_vec()).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_retries_presemantic_invalid_utf8() {
+    assert_codex_http_presemantic_retry(b"data: \xff\n\n".to_vec()).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_does_not_retry_overload_after_semantic_output() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial output\"}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded after output\",\"retry_after\":0}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            } else {
+                panic!("semantic output must close the full-request retry window");
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("failed semantic stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
+    assert!(text.contains("partial output"), "stream body: {text}");
+    assert!(
+        text.contains("overloaded after output"),
+        "stream body: {text}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_stops_after_retry_limit() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_exhausted\"}}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded until retry limit\",\"retry_after\":0}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status().as_u16(), 529);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("exhausted stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "stream body: {text}");
+    assert!(
+        text.contains("overloaded until retry limit"),
+        "stream body: {text}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel\"}}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"cancel during retry backoff\",\"retry_after\":0.1}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            } else {
+                panic!("request cancellation must prevent another upstream attempt");
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let request = tokio::spawn(call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    })));
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first upstream attempt must start");
+    request.abort();
+    let _ = request.await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[allow(clippy::await_holding_lock)]
