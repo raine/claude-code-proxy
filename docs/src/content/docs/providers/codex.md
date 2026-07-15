@@ -35,7 +35,13 @@ Claude Code summary compaction requests are capped at low effort by default beca
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
-- Claude Code hosted web search maps to Codex `web_search`, including supported domain filters and forced tool choice.
+- Claude Code's forced `web_search_20250305` subrequest uses Codex's standalone
+  `/alpha/search` endpoint. It keeps the resolved model, omits search reasoning,
+  and preserves non-empty domain filters, so Luna searches do not require a Sol
+  Responses turn. Automatic hosted-search requests remain on the full Responses
+  API because the standalone endpoint cannot decide whether to invoke a tool.
+  Results map back to Anthropic `server_tool_use` and
+  `web_search_tool_result` blocks with search usage.
 - Top-level base64 user images map to `input_image`.
 - Supported base64 images nested in tool results also map to `input_image`.
 - Remote image URLs, malformed images, and unsupported tool-result image forms remain textual placeholders.

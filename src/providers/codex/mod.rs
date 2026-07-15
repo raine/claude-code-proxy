@@ -7,6 +7,7 @@ pub mod count_tokens;
 pub(crate) mod events;
 pub mod native;
 pub mod request_summary;
+pub mod search;
 pub mod translate;
 pub mod websocket;
 
@@ -17,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
@@ -121,6 +123,82 @@ impl Provider for CodexProvider {
                     "Model \"{model}\" resolves to unsupported model \"{}\"",
                     e.model
                 ),
+            );
+        }
+        if search::is_standalone_search_request(&body) {
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.model_resolved(&ctx.req_id, &resolved.model);
+            }
+            let (search_request, query) = match search::build_search_request(
+                &body,
+                &resolved.model,
+                ctx.session_id.as_deref(),
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        error.to_string(),
+                    );
+                }
+            };
+            let log = create_logger("codex");
+            let started_at = Instant::now();
+            log.info(
+                "codex_standalone_search_started",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    ("model".to_string(), serde_json::json!(&resolved.model)),
+                    ("stream".to_string(), serde_json::json!(want_stream)),
+                ])),
+            );
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.upstream_started(&ctx.req_id);
+            }
+            let search_response = match self.client.post_search(&search_request, &ctx).await {
+                Ok(response) => response,
+                Err(error) => {
+                    log.warn(
+                        "codex_standalone_search_failed",
+                        Some(serde_json::Map::from_iter([
+                            ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                            ("model".to_string(), serde_json::json!(&resolved.model)),
+                            ("status".to_string(), serde_json::json!(error.status)),
+                            (
+                                "ms".to_string(),
+                                serde_json::json!(started_at.elapsed().as_millis()),
+                            ),
+                        ])),
+                    );
+                    return map_codex_error_to_response(&error);
+                }
+            };
+            log.info(
+                "codex_standalone_search_completed",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    ("model".to_string(), serde_json::json!(&resolved.model)),
+                    (
+                        "resultCount".to_string(),
+                        serde_json::json!(search_response.results.as_ref().map(Vec::len)),
+                    ),
+                    (
+                        "ms".to_string(),
+                        serde_json::json!(started_at.elapsed().as_millis()),
+                    ),
+                ])),
+            );
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.usage_updated(&ctx.req_id, Some(0), Some(0));
+            }
+            return search::anthropic_search_response(
+                &search_response,
+                &query,
+                &message_id,
+                model,
+                want_stream,
+                ctx.traffic.as_deref(),
             );
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
