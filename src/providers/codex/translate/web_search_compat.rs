@@ -37,7 +37,7 @@ pub fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
     format!("srvtoolu_{suffix}")
 }
 
-pub(crate) fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
+fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
     let mut results: Vec<WebSearchResult> = Vec::new();
     let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -62,7 +62,7 @@ pub(crate) fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchR
     }
 
     // Match bare URLs
-    let re2 = regex_lite::Regex::new(r#"https?://[^\s<>()|"'\\]+"#).unwrap();
+    let re2 = regex_lite::Regex::new(r"https?://[^\s<>()|]+").unwrap();
     for cap in re2.captures_iter(text) {
         let raw_url = cap.get(0).map(|m| m.as_str()).unwrap_or("");
         let url = clean_url(raw_url);
@@ -123,9 +123,6 @@ fn clean_url(value: &str) -> String {
         || out.ends_with(':')
         || out.ends_with('!')
         || out.ends_with('?')
-        || out.ends_with('"')
-        || out.ends_with('\'')
-        || out.ends_with('\\')
     {
         out.pop();
     }
@@ -177,14 +174,6 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.url == "https://example.com"));
         assert!(results.iter().any(|r| r.url == "https://other.com/page"));
-    }
-
-    #[test]
-    fn extract_results_strips_escaped_quote_suffix() {
-        let text = r#"{\"url\":\"https://example.com/path\"}"#;
-        let results = extract_web_search_results_from_text(text);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].url, "https://example.com/path");
     }
 
     #[test]

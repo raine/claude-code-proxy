@@ -7,9 +7,11 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
-use super::translate::web_search_compat::extract_web_search_results_from_text;
+use super::count_tokens::approx_token_count;
 
 const SEARCH_OUTPUT_TOKEN_BUDGET: u64 = 2_500;
+const SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
+const SEARCH_USER_CONTEXT_MESSAGES: usize = 2;
 const CLAUDE_SEARCH_PROMPT_PREFIX: &str = "Perform a web search for the query:";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -119,12 +121,53 @@ pub fn build_search_request(
     ))
 }
 
+pub fn search_request_input_tokens(request: &SearchRequest) -> u64 {
+    let mut tokens = approx_token_count(&request.model);
+    tokens += request
+        .commands
+        .search_query
+        .iter()
+        .map(|query| approx_token_count(&query.q))
+        .sum::<u64>();
+    tokens += request.input.as_ref().map(value_text_tokens).unwrap_or(0);
+    if let Some(filters) = &request.settings.filters {
+        tokens += filters
+            .allowed_domains
+            .iter()
+            .flatten()
+            .chain(filters.blocked_domains.iter().flatten())
+            .map(|domain| approx_token_count(domain))
+            .sum::<u64>();
+    }
+    tokens.max(1)
+}
+
+pub fn search_response_output_tokens(response: &SearchResponse) -> u64 {
+    (approx_token_count(&response.output)
+        + response
+            .results
+            .as_ref()
+            .map(|results| results.iter().map(value_text_tokens).sum())
+            .unwrap_or(0))
+    .max(1)
+}
+
+fn value_text_tokens(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => approx_token_count(text),
+        Value::Array(values) => values.iter().map(value_text_tokens).sum(),
+        Value::Object(values) => values.values().map(value_text_tokens).sum(),
+        _ => 0,
+    }
+}
+
 pub fn anthropic_search_response(
     response: &SearchResponse,
     query: &str,
     message_id: &str,
     model: &str,
     stream: bool,
+    input_tokens: u64,
     traffic: Option<&TrafficCapture>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -132,9 +175,10 @@ pub fn anthropic_search_response(
     let tool_use_id = format!("srvtoolu_ws_{}", uuid::Uuid::new_v4().simple());
     let results = search_results(response);
     let content = response_content(response, query, &tool_use_id, &results);
+    let output_tokens = search_response_output_tokens(response);
     let usage = json!({
-        "input_tokens": 0,
-        "output_tokens": 0,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
         "server_tool_use": {"web_search_requests": 1}
@@ -172,7 +216,7 @@ pub fn anthropic_search_response(
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {"input_tokens": 0, "output_tokens": 0}
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0}
             }
         }),
     );
@@ -290,21 +334,79 @@ fn extract_search_query(req: &MessagesRequest) -> Option<String> {
 }
 
 fn search_input(req: &MessagesRequest) -> Option<Value> {
-    let items: Vec<Value> = req
+    let mut messages: Vec<(&str, String)> = req
         .messages
         .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
         .filter_map(|message| {
             let text = content_text(&message.content);
+            (!text.is_empty()).then_some((message.role.as_str(), text))
+        })
+        .collect();
+    let latest_user = messages.iter().rposition(|(role, _)| *role == "user")?;
+    messages.truncate(latest_user + 1);
+    let first_user = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, (role, _))| *role == "user")
+        .take(SEARCH_USER_CONTEXT_MESSAGES)
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(latest_user);
+    messages.drain(..first_user);
+
+    let mut assistant_budget = SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET;
+    let items: Vec<Value> = messages
+        .into_iter()
+        .filter_map(|(role, text)| {
+            let (content_type, text) = if role == "assistant" {
+                if assistant_budget == 0 {
+                    return None;
+                }
+                let text = truncate_to_approx_tokens(&text, assistant_budget);
+                assistant_budget = assistant_budget.saturating_sub(approx_token_count(&text));
+                ("output_text", text)
+            } else {
+                ("input_text", text)
+            };
             (!text.is_empty()).then(|| {
                 json!({
                     "type": "message",
-                    "role": message.role,
-                    "content": [{"type": "input_text", "text": text}]
+                    "role": role,
+                    "content": [{"type": content_type, "text": text}]
                 })
             })
         })
         .collect();
     (!items.is_empty()).then_some(Value::Array(items))
+}
+
+fn truncate_to_approx_tokens(text: &str, max_tokens: u64) -> String {
+    if approx_token_count(text) <= max_tokens {
+        return text.to_string();
+    }
+
+    let mut tokens = 0_u64;
+    let mut in_word = false;
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        let word_char = ch.is_alphanumeric() || ch == '-' || ch == '_';
+        let starts_token = if word_char {
+            !in_word
+        } else {
+            !ch.is_whitespace()
+        };
+        if starts_token {
+            if tokens == max_tokens {
+                break;
+            }
+            tokens += 1;
+        }
+        in_word = word_char;
+        end = index + ch.len_utf8();
+    }
+    text[..end].to_string()
 }
 
 fn content_text(content: &Value) -> String {
@@ -364,16 +466,6 @@ fn search_results(response: &SearchResponse) -> Vec<SearchResult> {
             title: title.to_string(),
             url: url.to_string(),
         });
-    }
-    if results.is_empty() {
-        for result in extract_web_search_results_from_text(&response.output) {
-            if seen.insert(result.url.clone()) {
-                results.push(SearchResult {
-                    title: result.title,
-                    url: result.url,
-                });
-            }
-        }
     }
     results
 }
@@ -491,6 +583,84 @@ mod tests {
     }
 
     #[test]
+    fn search_input_uses_role_specific_content_and_recent_context() {
+        let mut req = request();
+        req.messages = serde_json::from_value(json!([
+            {"role": "user", "content": "old user"},
+            {"role": "assistant", "content": "old assistant"},
+            {"role": "user", "content": "previous user"},
+            {"role": "assistant", "content": "previous assistant"},
+            {
+                "role": "user",
+                "content": "Perform a web search for the query: current query"
+            },
+            {"role": "assistant", "content": "content after latest user"}
+        ]))
+        .unwrap();
+
+        let (search, _) = build_search_request(&req, "gpt-5.6-luna", None).unwrap();
+        let input = search.input.unwrap();
+        let items = input.as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["content"][0]["text"], "previous user");
+        assert_eq!(items[0]["content"][0]["type"], "input_text");
+        assert_eq!(items[1]["content"][0]["text"], "previous assistant");
+        assert_eq!(items[1]["content"][0]["type"], "output_text");
+        assert_eq!(items[2]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn search_input_bounds_assistant_context() {
+        let mut req = request();
+        let long_assistant = (0..2_000)
+            .map(|index| format!("word{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        req.messages = serde_json::from_value(json!([
+            {"role": "user", "content": "previous user"},
+            {"role": "assistant", "content": long_assistant},
+            {
+                "role": "user",
+                "content": "Perform a web search for the query: current query"
+            }
+        ]))
+        .unwrap();
+
+        let (search, _) = build_search_request(&req, "gpt-5.6-luna", None).unwrap();
+        let assistant = search.input.unwrap()[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(approx_token_count(&assistant) <= SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET);
+        assert!(!assistant.contains("word1999"));
+    }
+
+    #[test]
+    fn missing_structured_results_does_not_infer_urls_from_output() {
+        let response = SearchResponse {
+            encrypted_output: None,
+            output: "Result from https://github.com with an embedded https://example.com link"
+                .to_string(),
+            results: None,
+        };
+
+        assert!(search_results(&response).is_empty());
+    }
+
+    #[test]
+    fn standalone_usage_estimates_are_nonzero() {
+        let (request, _) = build_search_request(&request(), "gpt-5.6-luna", None).unwrap();
+        let response = SearchResponse {
+            encrypted_output: None,
+            output: "search output".to_string(),
+            results: None,
+        };
+
+        assert!(search_request_input_tokens(&request) > 0);
+        assert!(search_response_output_tokens(&response) > 0);
+    }
+
+    #[test]
     fn streamed_response_matches_claude_server_tool_shape() {
         let response = SearchResponse {
             encrypted_output: Some("opaque".to_string()),
@@ -508,6 +678,7 @@ mod tests {
             "msg_test",
             "claude-haiku-4-5-20251001",
             true,
+            12,
             None,
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();

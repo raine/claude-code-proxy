@@ -189,8 +189,10 @@ impl Provider for CodexProvider {
                     ),
                 ])),
             );
+            let input_tokens = search::search_request_input_tokens(&search_request);
+            let output_tokens = search::search_response_output_tokens(&search_response);
             if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.usage_updated(&ctx.req_id, Some(0), Some(0));
+                monitor.usage_updated(&ctx.req_id, Some(input_tokens), Some(output_tokens));
             }
             return search::anthropic_search_response(
                 &search_response,
@@ -198,6 +200,7 @@ impl Provider for CodexProvider {
                 &message_id,
                 model,
                 want_stream,
+                input_tokens,
                 ctx.traffic.as_deref(),
             );
         }

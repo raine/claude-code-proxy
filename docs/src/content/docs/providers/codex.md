@@ -40,8 +40,9 @@ Claude Code summary compaction requests are capped at low effort by default beca
   and preserves non-empty domain filters, so Luna searches do not require a Sol
   Responses turn. Automatic hosted-search requests remain on the full Responses
   API because the standalone endpoint cannot decide whether to invoke a tool.
-  Results map back to Anthropic `server_tool_use` and
-  `web_search_tool_result` blocks with search usage.
+  Structured result DTOs map back to Anthropic `server_tool_use` and
+  `web_search_tool_result` blocks, while standalone text output remains text.
+  The proxy locally estimates input and output tokens and reports search usage.
 - Top-level base64 user images map to `input_image`.
 - Supported base64 images nested in tool results also map to `input_image`.
 - Remote image URLs, malformed images, and unsupported tool-result image forms remain textual placeholders.

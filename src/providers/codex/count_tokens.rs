@@ -116,7 +116,7 @@ fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
     total
 }
 
-fn approx_token_count(text: &str) -> u64 {
+pub(crate) fn approx_token_count(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
     }

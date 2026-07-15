@@ -507,20 +507,14 @@ impl CodexHttpClient {
                     .map(|(_, value)| value.as_str());
                 let delay = compute_backoff_delay(retries, retry_after);
                 if delay.exceeds_budget {
-                    return Err(codex_status_error(
-                        response,
-                        crate::config::CodexTransport::Http,
-                    ));
+                    return Err(codex_status_error(response));
                 }
                 retries += 1;
                 sleep(delay.wait_ms).await;
                 continue;
             }
             if !(200..300).contains(&response.status) {
-                return Err(codex_status_error(
-                    response,
-                    crate::config::CodexTransport::Http,
-                ));
+                return Err(codex_status_error(response));
             }
             return serde_json::from_slice(&response.body).map_err(|e| CodexError {
                 status: 502,
@@ -1272,6 +1266,7 @@ impl CodexHttpClient {
             body,
             status,
             headers,
+            transport: ActualTransport::Http,
         })
     }
 }
