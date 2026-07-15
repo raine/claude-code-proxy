@@ -1,6 +1,6 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, or **Cursor**.
+Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, **Cursor**, or **GLM** (z.ai).
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
@@ -89,6 +89,18 @@ Cursor authentication uses Cursor's browser login, but the proxy stores its own
 tokens. It does not read Cursor Agent's Keychain/auth.json. You can also set
 `CCP_CURSOR_AUTH_TOKEN` for the proxy process.
 
+**GLM (z.ai):**
+
+```sh
+claude-code-proxy glm auth login        # paste your z.ai API key (read from stdin)
+# or, non-interactively:
+export CCP_GLM_API_KEY=<your z.ai API key>
+```
+
+Get an API key from your [z.ai](https://z.ai) console. z.ai speaks the Anthropic
+Messages API natively, so the proxy forwards requests verbatim and pipes the
+Anthropic reply straight back (no format translation).
+
 On macOS credentials go to Keychain. On Windows they are written under
 `%APPDATA%\claude-code-proxy\<provider>\auth.json`; on Linux they are written
 under `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`
@@ -102,6 +114,7 @@ claude-code-proxy codex auth status
 claude-code-proxy kimi auth status
 claude-code-proxy grok auth status
 claude-code-proxy cursor auth status
+claude-code-proxy glm auth status
 ```
 
 ### 3. Start the proxy
@@ -150,6 +163,7 @@ serves 401s until a token is stored.
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
 - `grok-composer-2.5-fast`, `grok-4.5` → **grok**
 - `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
+- `glm-4.7`, `glm-5.2` → **glm**
 
 An unknown model returns a 400 listing the supported ids. There is no
 implicit default provider.
@@ -194,6 +208,15 @@ ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=cursor \
 ANTHROPIC_SMALL_FAST_MODEL=cursor \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  claude
+
+# GLM (z.ai)
+ANTHROPIC_BASE_URL=http://localhost:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=glm-5.2 \
+ANTHROPIC_SMALL_FAST_MODEL=glm-4.7 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -362,6 +385,33 @@ refreshes them five minutes before expiry, and does not use `~/.grok/auth.json`.
 | `grok auth status` | Show token expiry and storage path    |
 | `grok auth logout` | Delete proxy-owned credentials        |
 
+### GLM (z.ai)
+
+Upstream: `https://api.z.ai/api/anthropic` (Anthropic Messages API). z.ai is
+Anthropic-native, so the proxy forwards the request verbatim (after stripping the
+local `[1m]` compaction hint) and pipes the upstream Anthropic SSE/JSON reply
+back to Claude Code unchanged — there is no format translation.
+
+Supported proxy model ids:
+
+- `glm-4.7`
+- `glm-5.2`
+
+Unknown `glm-*` ids are not auto-routed; set `ANTHROPIC_MODEL` to one of the
+registered ids above. Append `[1m]` (for example `glm-5.2[1m]`) if you want
+Claude Code to use a larger local compaction threshold; the proxy strips it
+before calling z.ai.
+
+Auth (z.ai uses static API keys, not OAuth):
+
+| Command           | What it does                                |
+| ----------------- | ------------------------------------------- |
+| `glm auth login`  | Read a z.ai API key from stdin and store it |
+| `glm auth status` | Show whether the key is set (env or stored) |
+| `glm auth logout` | Delete the stored key                       |
+
+`CCP_GLM_API_KEY` (alias `GLM_API_KEY`) takes precedence over stored credentials.
+
 ### Cursor Agent
 
 Upstream: `https://api2.cursor.sh/agent.v1.AgentService/Run` (Cursor Agent's
@@ -455,6 +505,7 @@ sequenceDiagram
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management      |
 | `kimi  auth login` / `status` / `logout`            | Kimi OAuth management       |
 | `cursor auth login` / `status` / `logout`           | Cursor OAuth management     |
+| `glm auth login` / `status` / `logout`              | GLM API-key management      |
 
 ---
 
@@ -704,6 +755,9 @@ Windows, and at
     "clientVersion": "cli-2026.06.04-5fd875e",
     "agentBundle": "/path/to/cursor-agent/index.js"
   },
+  "glm": {
+    "baseUrl": "https://api.z.ai/api/anthropic"
+  },
   "log": {
     "stderr": false,
     "verbose": false
@@ -723,6 +777,8 @@ Windows, and at
 | `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
+| `CCP_GLM_BASE_URL`               | `glm.baseUrl`              | `https://api.z.ai/api/anthropic`                  | Override the GLM (z.ai) Anthropic endpoint                                                                                                                                        |
+| `CCP_GLM_API_KEY`                | —                          | unset                                             | z.ai API key (alias `GLM_API_KEY`); takes precedence over stored credentials                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-iterra`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
@@ -805,6 +861,12 @@ CCP_TRAFFIC_LOG=1`.
   `CCP_CONFIG_DIR` is set, Cursor tokens are written to `cursor/auth.json` under
   that directory, including on macOS.
   `CCP_CURSOR_AUTH_TOKEN` overrides local proxy-owned storage.
+- GLM API key — macOS stores it under Keychain service `claude-code-proxy.glm`
+  (the store falls back to a mode-0600 file when non-interactive Keychain writes
+  are unavailable). Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/glm/auth.json`; Windows
+  uses `%APPDATA%\claude-code-proxy\glm\auth.json`. `CCP_GLM_API_KEY` (alias
+  `GLM_API_KEY`) overrides local storage.
 
 ## Switching models and backends
 
@@ -1044,6 +1106,13 @@ supported shape.
   session continuation are implemented. Full Cursor workspace/tool callbacks are
   captured and documented under `history/`, but not yet implemented as Claude
   tool round-trips.
+- **GLM — buffered streaming:** z.ai returns Anthropic SSE natively, but the
+  proxy buffers the upstream response before forwarding it to Claude Code
+  (matching the Codex/Kimi providers), so tokens arrive in one batch rather than
+  streaming incrementally.
+- **GLM — pass-through only:** the provider forwards Anthropic requests verbatim;
+  it does not translate or drop Anthropic-specific fields, so anything z.ai does
+  not accept is surfaced as an upstream error.
 
 ## Development
 
