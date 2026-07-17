@@ -231,6 +231,9 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
             "tools",
             "tool_choice",
             "context_management",
+            // Claude Code >= 2.1 attaches request diagnostics; Grok has no
+            // equivalent, so it is accepted and dropped rather than forwarded.
+            "diagnostics",
             "metadata",
             "output_config",
             "thinking",
@@ -290,7 +293,17 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("tool must be an object"))?;
         for key in obj.keys() {
-            if !["name", "description", "input_schema", "cache_control"].contains(&key.as_str()) {
+            // `eager_input_streaming` is a Claude Code >= 2.1 streaming hint with no
+            // Grok equivalent; accept and drop it rather than reject the request.
+            if ![
+                "name",
+                "description",
+                "input_schema",
+                "cache_control",
+                "eager_input_streaming",
+            ]
+            .contains(&key.as_str())
+            {
                 anyhow::bail!("unsupported tool field: {key}");
             }
         }
@@ -477,12 +490,18 @@ fn parse_message(
                     .ok_or_else(|| anyhow::anyhow!("tool result content is required"))?;
                 let output = match value {
                     Value::String(text) => text.clone(),
-                    Value::Array(parts) => parts
-                        .iter()
-                        .map(|part| {
+                    Value::Array(parts) => {
+                        let mut texts = Vec::new();
+                        for part in parts {
                             let part = part.as_object().ok_or_else(|| {
                                 anyhow::anyhow!("tool result child must be an object")
                             })?;
+                            // Claude Code >= 2.1 can attach `tool_reference` children
+                            // alongside the textual output. They carry no text for the
+                            // model, and Grok has no equivalent, so drop them.
+                            if part.get("type").and_then(Value::as_str) == Some("tool_reference") {
+                                continue;
+                            }
                             if part.get("type").and_then(Value::as_str) != Some("text")
                                 || part.keys().any(|key| {
                                     !["type", "text", "cache_control"].contains(&key.as_str())
@@ -491,12 +510,14 @@ fn parse_message(
                             {
                                 anyhow::bail!("tool result supports text children only");
                             }
-                            part.get("text")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?
-                        .join(""),
+                            texts.push(
+                                part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                                    anyhow::anyhow!("tool result text is invalid")
+                                })?,
+                            );
+                        }
+                        texts.join("")
+                    }
                     _ => anyhow::bail!("tool result supports text only"),
                 };
                 out.push(GrokInputItem::FunctionCallOutput {
@@ -516,11 +537,19 @@ fn valid_cache_control(value: Option<&Value>) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    object.keys().all(|key| key == "type" || key == "ttl")
+    object
+        .keys()
+        .all(|key| key == "type" || key == "ttl" || key == "scope")
         && object.get("type").and_then(Value::as_str) == Some("ephemeral")
         && object
             .get("ttl")
             .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m") | Some("1h")))
+        // Claude Code >= 2.1 sends `scope: "global"` on cache_control. Grok does
+        // not support prompt caching, so cache_control is verified and dropped;
+        // accepting the scope key keeps those requests translatable.
+        && object
+            .get("scope")
+            .is_none_or(|scope| matches!(scope.as_str(), Some("global")))
 }
 
 fn flush_message(role: &str, content: &mut Vec<GrokContentPart>, out: &mut Vec<GrokInputItem>) {
@@ -666,6 +695,88 @@ mod tests {
         .unwrap();
         let translated = translate_request(&request, "grok-composer-2.5-fast".into()).unwrap();
         assert_eq!(translated.input.len(), 1);
+    }
+
+    #[test]
+    fn grok_translation_accepts_claude_code_diagnostics_without_forwarding_it() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "diagnostics":{"request_id":"abc"}
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(!translated.to_string().contains("diagnostics"));
+    }
+
+    #[test]
+    fn grok_translation_accepts_cache_control_scope_without_forwarding_it() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}}],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(
+            translated["instructions"]
+                .as_str()
+                .unwrap()
+                .starts_with("rules")
+        );
+        assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_rejects_unknown_cache_control_scope() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","scope":"session"}}]}]
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+    }
+
+    #[test]
+    fn grok_translation_accepts_claude_code_eager_input_streaming_without_forwarding_it() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{
+                "name":"lookup",
+                "description":"d",
+                "input_schema":{"type":"object"},
+                "eager_input_streaming":true
+            }]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(
+            translated["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "lookup" })
+        );
+        assert!(!translated.to_string().contains("eager_input_streaming"));
+    }
+
+    #[test]
+    fn grok_translation_drops_tool_reference_children_in_tool_results() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"ok"},
+                {"type":"tool_reference","name":"lookup"}
+            ]}
+        ]));
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let rendered = translated.to_string();
+        assert!(!rendered.contains("tool_reference"));
+        assert!(rendered.contains("ok"));
     }
 
     #[test]
