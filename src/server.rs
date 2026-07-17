@@ -1,5 +1,6 @@
 use crate::{
     anthropic::json_error,
+    compaction_route::{CompactionRoute, CompactionRouteConfig},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     project,
@@ -88,19 +89,91 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    let registry = Arc::new(Registry::with_default_alias());
+    let compaction_route = load_compaction_route_config(&registry);
+    let app = app_with_monitor_and_compaction_route(registry, monitor, compaction_route);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
 }
 
+fn load_compaction_route_config(registry: &Registry) -> Option<CompactionRouteConfig> {
+    let config = match CompactionRouteConfig::from_env() {
+        Ok(config) => config?,
+        Err(error) => {
+            create_logger("compaction_route").warn(
+                "compaction_route_disabled_invalid_config",
+                Some(Map::from_iter([(
+                    "error".to_string(),
+                    json!(error.to_string()),
+                )])),
+            );
+            return None;
+        }
+    };
+
+    validate_compaction_route_config(registry, config)
+}
+
+fn validate_compaction_route_config(
+    registry: &Registry,
+    config: CompactionRouteConfig,
+) -> Option<CompactionRouteConfig> {
+    if registry.provider_for_model(config.model(), None).is_none() {
+        create_logger("compaction_route").warn(
+            "compaction_route_disabled_unknown_model",
+            Some(Map::from_iter([(
+                "model".to_string(),
+                json!(config.model()),
+            )])),
+        );
+        return None;
+    }
+
+    Some(config)
+}
+
+#[cfg(test)]
+mod compaction_route_config_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_target_is_rejected_before_router_state_is_built() {
+        let registry = Registry::with_default_alias();
+        let config = CompactionRouteConfig::from_values(
+            Some("not-a-configured-model".to_string()),
+            Some("medium".to_string()),
+            Some("markers".to_string()),
+            Some("60".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(validate_compaction_route_config(&registry, config).is_none());
+    }
+}
+
 pub fn app(registry: Arc<Registry>) -> Router {
-    app_with_monitor(registry, None)
+    app_with_monitor_and_compaction_route(registry, None, None)
 }
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
-    let state = Arc::new(AppState { registry, monitor });
+    app_with_monitor_and_compaction_route(registry, monitor, None)
+}
+
+pub fn app_with_monitor_and_compaction_route(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    compaction_route: Option<CompactionRouteConfig>,
+) -> Router {
+    let compaction_route = compaction_route
+        .and_then(|config| validate_compaction_route_config(registry.as_ref(), config));
+    let state = Arc::new(AppState {
+        registry,
+        monitor,
+        compaction_route: compaction_route.map(CompactionRoute::new),
+    });
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handler_messages))
@@ -113,6 +186,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
 struct AppState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
+    compaction_route: Option<CompactionRoute>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -163,7 +237,6 @@ async fn dispatch_request(
         monitor.request_started(&req_id, session_id.clone(), None, endpoint);
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let now = current_millis();
     let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -247,6 +320,14 @@ async fn dispatch_request(
             return response;
         }
     };
+
+    let now = current_millis();
+    let compaction_routed = state
+        .compaction_route
+        .as_ref()
+        .is_some_and(|compaction_route| {
+            compaction_route.try_route(&mut body, session_id.as_deref(), &req_id, count_tokens, now)
+        });
 
     if let Some(project) = project::name_from_request(
         body.extra.get("system"),
@@ -382,6 +463,7 @@ async fn dispatch_request(
         provider.name(),
         &normalized_model,
         now,
+        !compaction_routed,
     );
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
