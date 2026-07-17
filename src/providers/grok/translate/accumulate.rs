@@ -80,6 +80,14 @@ pub fn accumulate_response_with_traffic(
                     ));
                 }
             }
+            ReducerEvent::ThinkingSignature(index, signature) => {
+                if let Some(block) = block_positions
+                    .get(&index)
+                    .and_then(|position| blocks.get_mut(*position))
+                {
+                    block["signature"] = Value::String(signature);
+                }
+            }
             ReducerEvent::TextStart(index) => {
                 block_positions.insert(index, blocks.len());
                 blocks.push(serde_json::json!({"type":"text","text":""}))

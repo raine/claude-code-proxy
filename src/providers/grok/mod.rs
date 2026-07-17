@@ -99,7 +99,16 @@ impl Provider for GrokProvider {
             monitor.model_resolved(&ctx.req_id, &resolved);
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match self.client.post(&translated, ctx.traffic.clone()).await {
+        let meta = client::GrokRequestMeta {
+            req_id: Some(ctx.req_id.clone()),
+            session_id: ctx.session_id.clone(),
+            session_seq: ctx.session_seq,
+        };
+        let upstream = match self
+            .client
+            .post(&translated, &meta, ctx.traffic.clone())
+            .await
+        {
             Ok(response) => response,
             Err(error) => return map_error(error),
         };

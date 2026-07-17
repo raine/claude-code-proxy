@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::reasoning_signature::decode_reasoning_signature;
 use crate::anthropic::schema::{Message, MessagesRequest};
 
 #[derive(Debug, Clone, Serialize)]
@@ -15,6 +16,8 @@ pub struct GrokResponsesRequest {
     pub tools: Option<Vec<GrokTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<GrokToolChoice>,
+    /// Omitted when false so the wire matches official CLI (store unset).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub store: bool,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,6 +40,15 @@ pub enum GrokInputItem {
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
+    /// Replay of a prior Responses reasoning item (encrypted blob + id).
+    /// Required for prefix/KV-cache hits on multi-turn reasoning models.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<Value>,
+        encrypted_content: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,42 +122,12 @@ pub fn translate_request(
     model: String,
 ) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
-    let mut instructions = parse_system(req.extra.get("system"))?;
-    let mut tools = parse_tools(req.extra.get("tools"))?;
-    let hosted_web_search = tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
-    let dedicated_x_search = tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
-    let x_search_intent = requests_x_search(req);
-    let force_x_search = dedicated_x_search || x_search_intent;
-    let force_web_search = !force_x_search && hosted_web_search && requests_web_search(req);
-    if force_x_search {
-        tools = Some(vec![GrokTool::hosted("x_search")]);
-    } else if force_web_search {
-        tools = Some(vec![GrokTool::hosted("web_search")]);
-    } else {
-        let tools = tools.get_or_insert_default();
-        if !tools.iter().any(|tool| tool.kind == "x_search") {
-            tools.push(GrokTool::hosted("x_search"));
-        }
-    }
-    if hosted_web_search {
-        append_guidance(
-            &mut instructions,
-            "For general web searches, use the hosted web_search tool. Do not use shell commands, HTTP clients, or local tools to search the web.",
-        );
-    }
-    append_guidance(
-        &mut instructions,
-        "For requests to search X or Twitter, use the hosted x_search tool. XSearch accepts a query and supports allowed_x_handles, excluded_x_handles, from_date, and to_date filters. Do not use Bash, curl, HTTP clients, or general web_search for X searches.",
-    );
-    let tool_choice = if force_x_search || force_web_search {
-        Some(GrokToolChoice::Required("required".into()))
-    } else {
-        parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
-    };
+    let instructions = parse_system(req.extra.get("system"))?;
+    // Map tools 1:1. Do not rewrite the tool list or append guidance based on
+    // latest-user-text intent — that mutates the request prefix every turn and
+    // busts Grok's server-side KV / prefix cache.
+    let tools = parse_tools(req.extra.get("tools"))?;
+    let tool_choice = parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?;
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
     for message in &req.messages {
@@ -161,67 +143,6 @@ pub fn translate_request(
         stream: true,
         max_output_tokens: req.max_tokens,
     })
-}
-
-fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
-    *instructions = Some(match instructions.take() {
-        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{guidance}"),
-        _ => guidance.into(),
-    });
-}
-
-fn latest_user_text(req: &MessagesRequest) -> Option<String> {
-    let message = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")?;
-    match &message.content {
-        Value::String(text) => Some(text.to_ascii_lowercase()),
-        Value::Array(blocks) => Some(
-            blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase(),
-        ),
-        _ => None,
-    }
-}
-
-fn requests_x_search(req: &MessagesRequest) -> bool {
-    let Some(text) = latest_user_text(req) else {
-        return false;
-    };
-    [
-        "search x for",
-        "search on x",
-        "search twitter",
-        "search tweets",
-        "x search",
-        "posts on x",
-        "posts from x",
-        "tweets about",
-        "twitter posts",
-    ]
-    .iter()
-    .any(|phrase| text.contains(phrase))
-}
-
-fn requests_web_search(req: &MessagesRequest) -> bool {
-    let Some(text) = latest_user_text(req) else {
-        return false;
-    };
-    [
-        "search online",
-        "search the web",
-        "web search",
-        "look up online",
-        "look up on the web",
-    ]
-    .iter()
-    .any(|phrase| text.contains(phrase))
 }
 
 fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
@@ -350,10 +271,26 @@ fn parse_tool_choice(
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tool_choice name is invalid"))?;
-            if !tools
-                .is_some_and(|items| items.iter().any(|tool| tool.name.as_deref() == Some(name)))
-            {
+            // Hosted tools have no `name` field; Claude "tool" choice for
+            // WebSearch/XSearch is not expressible as a function choice.
+            let is_function = tools
+                .is_some_and(|items| items.iter().any(|tool| tool.name.as_deref() == Some(name)));
+            let is_hosted = matches!(name, "WebSearch" | "web_search" | "XSearch" | "x_search")
+                && tools.is_some_and(|items| {
+                    items.iter().any(|tool| {
+                        matches!(
+                            (name, tool.kind.as_str()),
+                            ("WebSearch" | "web_search", "web_search")
+                                | ("XSearch" | "x_search", "x_search")
+                        )
+                    })
+                });
+            if !is_function && !is_hosted {
                 anyhow::bail!("tool_choice references an unknown tool");
+            }
+            if is_hosted {
+                // Responses API: force a tool to be used without naming a function.
+                return Ok(Some(GrokToolChoice::Required("required".into())));
             }
             Ok(Some(GrokToolChoice::Function {
                 r#type: "function".into(),
@@ -387,7 +324,22 @@ fn parse_message(
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("content block type is invalid"))?;
         match (message.role.as_str(), typ) {
-            (_, "thinking") | (_, "redacted_thinking") => {}
+            (_, "thinking") | (_, "redacted_thinking") => {
+                // Replay encrypted reasoning when Claude returns our signature;
+                // otherwise drop (foreign signatures / empty).
+                let signature = object
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .or_else(|| object.get("data").and_then(Value::as_str));
+                if let Some(replay) = signature.and_then(decode_reasoning_signature) {
+                    flush_message(&message.role, &mut content, out);
+                    out.push(GrokInputItem::Reasoning {
+                        id: replay.id,
+                        summary: Vec::new(),
+                        encrypted_content: replay.encrypted_content,
+                    });
+                }
+            }
             (_, "text") => {
                 if object
                     .keys()
@@ -411,6 +363,8 @@ fn parse_message(
                 if !matches!(name, Some("web_search" | "x_search")) {
                     anyhow::bail!("unsupported server tool use");
                 }
+                // Hosted tool history is not yet re-emitted as Responses items;
+                // accept and drop so multi-turn sessions after search still work.
             }
             ("assistant", "web_search_tool_result" | "x_search_tool_result")
             | ("user", "web_search_tool_result" | "x_search_tool_result") => {}
@@ -535,6 +489,10 @@ fn flush_message(role: &str, content: &mut Vec<GrokContentPart>, out: &mut Vec<G
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::grok::translate::reasoning_signature::{
+        ReasoningReplay, encode_reasoning_signature,
+    };
+
     #[test]
     fn grok_translation_replays_hosted_search_history() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
@@ -572,13 +530,16 @@ mod tests {
         })).unwrap();
         let value =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
-        assert!(value["instructions"].as_str().unwrap().starts_with("rules"));
+        assert_eq!(value["instructions"], "rules");
         assert_eq!(value["input"][1]["type"], "function_call");
         assert_eq!(value["input"][2]["type"], "function_call_output");
         assert_eq!(value["tool_choice"]["type"], "function");
+        // store:false is omitted from the wire (skip_serializing_if Not::not)
+        assert!(value.get("store").is_none());
     }
+
     #[test]
-    fn grok_translation_maps_claude_web_search_to_hosted_web_search() {
+    fn grok_translation_maps_claude_web_search_to_hosted_web_search_without_mutation() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"search online for the project"}],
@@ -595,17 +556,14 @@ mod tests {
             translated["tools"],
             serde_json::json!([{"type":"web_search"}])
         );
-        assert!(
-            translated["instructions"]
-                .as_str()
-                .unwrap()
-                .contains("use the hosted web_search tool")
-        );
-        assert_eq!(translated["tool_choice"], "required");
+        // No per-request guidance appended into instructions (prefix stability).
+        assert!(translated.get("instructions").is_none() || translated["instructions"].is_null());
+        // No forced tool_choice from user-text intent.
+        assert!(translated.get("tool_choice").is_none() || translated["tool_choice"].is_null());
     }
 
     #[test]
-    fn grok_translation_maps_x_intent_to_required_hosted_x_search() {
+    fn grok_translation_keeps_function_tools_when_user_mentions_x() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"Search X for recent posts mentioning claude-code-proxy"}],
@@ -617,16 +575,18 @@ mod tests {
         .unwrap();
         let translated =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
-        assert_eq!(
-            translated["tools"],
-            serde_json::json!([{"type":"x_search"}])
-        );
-        assert_eq!(translated["tool_choice"], "required");
-        assert!(!translated.to_string().contains("\"name\":\"Bash\""));
+        let tools = translated["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "Bash");
+        assert_eq!(tools[1]["type"], "web_search");
+        // No auto-injected x_search and no forced required choice.
+        assert!(!translated.to_string().contains("\"type\":\"x_search\""));
+        assert!(translated.get("tool_choice").is_none() || translated["tool_choice"].is_null());
     }
 
     #[test]
-    fn grok_translation_maps_dedicated_xsearch_with_domain_schema() {
+    fn grok_translation_maps_dedicated_xsearch() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"find relevant posts"}],
@@ -653,7 +613,53 @@ mod tests {
             translated["tools"],
             serde_json::json!([{"type":"x_search"}])
         );
-        assert_eq!(translated["tool_choice"], "required");
+    }
+
+    #[test]
+    fn grok_translation_replays_reasoning_from_signature() {
+        let signature = encode_reasoning_signature(&ReasoningReplay {
+            id: "rs_1".into(),
+            encrypted_content: "opaque-blob".into(),
+        })
+        .unwrap();
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"plan","signature":signature},
+                    {"type":"text","text":"hello"}
+                ]},
+                {"role":"user","content":"again"}
+            ]
+        }))
+        .unwrap();
+        let value =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(value["input"][1]["type"], "reasoning");
+        assert_eq!(value["input"][1]["id"], "rs_1");
+        assert_eq!(value["input"][1]["encrypted_content"], "opaque-blob");
+        assert_eq!(value["input"][2]["type"], "message");
+        assert_eq!(value["input"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn grok_translation_drops_thinking_without_grok_signature() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"plan","signature":"foreign"},
+                    {"type":"text","text":"hello"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let value =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["type"], "message");
+        assert!(!value.to_string().contains("reasoning"));
     }
 
     #[test]

@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::reasoning_signature::{
+    PendingReasoning, encode_reasoning_signature,
+};
 use super::stream::SseDecoder;
 
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -11,6 +14,8 @@ const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
 pub enum ReducerEvent {
     ThinkingStart(usize),
     ThinkingDelta(usize, String),
+    /// Opaque signature so Claude can round-trip encrypted reasoning next turn.
+    ThinkingSignature(usize, String),
     ThinkingStop(usize),
     TextStart(usize),
     TextDelta(usize, String),
@@ -38,12 +43,15 @@ pub enum ReducerEvent {
 #[derive(Default)]
 pub struct Reducer {
     next_index: usize,
-    active: Option<(String, usize)>,
+    /// Active content channel: ("thinking"|"text", anthropic_index, optional output_index)
+    active: Option<(String, usize, Option<usize>)>,
     calls: HashMap<String, (usize, String)>,
     item_calls: HashMap<String, String>,
     tool_args: HashMap<String, String>,
     completed_arguments: HashMap<String, bool>,
     hosted_calls: HashMap<String, (String, String)>,
+    /// Pending reasoning items keyed by Responses output_index.
+    reasoning_by_output_index: HashMap<usize, PendingReasoning>,
     web_search_requests: u64,
     x_search_requests: u64,
     saw_tool: bool,
@@ -64,14 +72,17 @@ impl Reducer {
             "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done"
             | "response.content_part.added" => Ok(vec![]),
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => self
-                .delta(
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let output_index = value.get("output_index").and_then(Value::as_u64).map(|v| v as usize);
+                self.delta(
                     "thinking",
                     value
                         .get("delta")
                         .and_then(Value::as_str)
                         .ok_or_else(|| anyhow::anyhow!("reasoning delta is invalid"))?,
-                ),
+                    output_index,
+                )
+            }
             "response.custom_tool_call_input.delta" => {
                 let id = value
                     .get("item_id")
@@ -96,7 +107,7 @@ impl Reducer {
             | "response.web_search_call.searching"
             | "response.web_search_call.completed" => Ok(vec![]),
             "response.output_text.annotation.added" => {
-                let Some((kind, index)) = self.active.as_ref() else {
+                let Some((kind, index, _)) = self.active.as_ref() else {
                     return Ok(vec![]);
                 };
                 let Some(annotation) = value.get("annotation") else {
@@ -116,12 +127,26 @@ impl Reducer {
                     .get("delta")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("text delta is invalid"))?,
+                value.get("output_index").and_then(Value::as_u64).map(|v| v as usize),
             ),
             "response.output_item.added" => {
                 let item = value
                     .get("item")
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("output item is invalid"))?;
+                if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                    let output_index = value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize)
+                        .unwrap_or(0);
+                    let pending = self
+                        .reasoning_by_output_index
+                        .entry(output_index)
+                        .or_default();
+                    pending.capture(&Value::Object(item.clone()));
+                    return Ok(vec![]);
+                }
                 if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
                     let id = item
                         .get("id")
@@ -239,9 +264,9 @@ impl Reducer {
                 Ok(output)
             }
             "response.output_text.done" => self.close_kind("text"),
-            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
-                self.close_kind("thinking")
-            }
+            // Keep thinking open until `response.output_item.done` for the reasoning
+            // item so we can attach `encrypted_content` to the signature.
+            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => Ok(vec![]),
             "response.content_part.done" => Ok(vec![]),
             "response.output_item.done" => {
                 let item = value
@@ -249,6 +274,52 @@ impl Reducer {
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("completed output item is invalid"))?;
                 match item.get("type").and_then(Value::as_str) {
+                    Some("reasoning") => {
+                        let output_index = value
+                            .get("output_index")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as usize)
+                            .unwrap_or(0);
+                        let pending = self
+                            .reasoning_by_output_index
+                            .entry(output_index)
+                            .or_default();
+                        pending.capture(&Value::Object(item.clone()));
+                        // Close open thinking for this reasoning item (with signature),
+                        // or emit a signature-only block when no text deltas arrived.
+                        let thinking_open = self
+                            .active
+                            .as_ref()
+                            .is_some_and(|(kind, _, stored)| {
+                                kind == "thinking"
+                                    && (*stored == Some(output_index) || stored.is_none())
+                            });
+                        if thinking_open {
+                            // Ensure the active channel is linked to this output_index
+                            // so close_active finds the encrypted blob.
+                            if let Some((_, _, stored)) = self.active.as_mut() {
+                                *stored = Some(output_index);
+                            }
+                            return self.close_kind("thinking");
+                        }
+                        let Some(replay) = self
+                            .reasoning_by_output_index
+                            .remove(&output_index)
+                            .and_then(|pending| pending.replay())
+                        else {
+                            return Ok(vec![]);
+                        };
+                        let Some(signature) = encode_reasoning_signature(&replay) else {
+                            return Ok(vec![]);
+                        };
+                        let index = self.next_index;
+                        self.next_index += 1;
+                        Ok(vec![
+                            ReducerEvent::ThinkingStart(index),
+                            ReducerEvent::ThinkingSignature(index, signature),
+                            ReducerEvent::ThinkingStop(index),
+                        ])
+                    }
                     Some("web_search_call") => {
                         let id = item
                             .get("id")
@@ -366,22 +437,32 @@ impl Reducer {
             _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
         }
     }
-    fn delta(&mut self, kind: &str, delta: &str) -> anyhow::Result<Vec<ReducerEvent>> {
+    fn delta(
+        &mut self,
+        kind: &str,
+        delta: &str,
+        output_index: Option<usize>,
+    ) -> anyhow::Result<Vec<ReducerEvent>> {
         let mut out = Vec::new();
         if self
             .active
             .as_ref()
-            .is_none_or(|(active, _)| active != kind)
+            .is_none_or(|(active, _, _)| active != kind)
         {
             out.extend(self.close_active()?);
             let index = self.next_index;
             self.next_index += 1;
-            self.active = Some((kind.into(), index));
+            self.active = Some((kind.into(), index, output_index));
             out.push(if kind == "thinking" {
                 ReducerEvent::ThinkingStart(index)
             } else {
                 ReducerEvent::TextStart(index)
             });
+        } else if let Some((_, _, stored)) = self.active.as_mut()
+            && stored.is_none()
+            && let Some(output_index) = output_index
+        {
+            *stored = Some(output_index);
         }
         let index = self.active.as_ref().unwrap().1;
         out.push(if kind == "thinking" {
@@ -393,8 +474,31 @@ impl Reducer {
     }
     fn close_active(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
         Ok(match self.active.take() {
-            Some((kind, index)) if kind == "thinking" => vec![ReducerEvent::ThinkingStop(index)],
-            Some((_, index)) => vec![ReducerEvent::TextStop(index)],
+            Some((kind, index, output_index)) if kind == "thinking" => {
+                let mut out = Vec::new();
+                let replay = output_index
+                    .and_then(|output_index| self.reasoning_by_output_index.remove(&output_index))
+                    .and_then(|pending| pending.replay())
+                    .or_else(|| {
+                        // Fallback when stream deltas omit output_index: take the only pending blob.
+                        if self.reasoning_by_output_index.len() == 1 {
+                            self.reasoning_by_output_index
+                                .drain()
+                                .next()
+                                .and_then(|(_, pending)| pending.replay())
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(replay) = replay
+                    && let Some(signature) = encode_reasoning_signature(&replay)
+                {
+                    out.push(ReducerEvent::ThinkingSignature(index, signature));
+                }
+                out.push(ReducerEvent::ThinkingStop(index));
+                out
+            }
+            Some((_, index, _)) => vec![ReducerEvent::TextStop(index)],
             None => vec![],
         })
     }
@@ -402,7 +506,7 @@ impl Reducer {
         if self
             .active
             .as_ref()
-            .is_some_and(|(active, _)| active == kind)
+            .is_some_and(|(active, _, _)| active == kind)
         {
             self.close_active()
         } else {
@@ -464,6 +568,38 @@ mod tests {
             ReducerEvent::ThinkingDelta(0, delta) if delta == "think"
         ));
         assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
+    }
+
+    #[test]
+    fn grok_reducer_emits_reasoning_signature_for_round_trip() {
+        let input = concat!(
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
+            "\n\n",
+            r#"data: {"type":"response.reasoning_text.delta","output_index":0,"delta":"think"}"#,
+            "\n\n",
+            r#"data: {"type":"response.reasoning_text.done","output_index":0}"#,
+            "\n\n",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}"#,
+            "\n\n",
+            r#"data: {"type":"response.output_text.delta","delta":"answer"}"#,
+            "\n\n",
+            r#"data: {"type":"response.output_text.done"}"#,
+            "\n\n",
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}"#,
+            "\n\n",
+        );
+        let events = reduce_upstream_bytes(input.as_bytes()).unwrap();
+        let signature = events.iter().find_map(|event| match event {
+            ReducerEvent::ThinkingSignature(0, signature) => Some(signature.as_str()),
+            _ => None,
+        });
+        assert!(signature.is_some_and(|s| s.starts_with("ccp:grok:v1:")));
+        let decoded = super::super::reasoning_signature::decode_reasoning_signature(
+            signature.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.id, "rs_1");
+        assert_eq!(decoded.encrypted_content, "opaque");
     }
 
     #[test]

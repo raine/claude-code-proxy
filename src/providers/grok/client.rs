@@ -12,6 +12,14 @@ use crate::traffic::TrafficCapture;
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Per-request routing / affinity headers for Grok (matches official CLI).
+#[derive(Debug, Clone, Default)]
+pub struct GrokRequestMeta {
+    pub req_id: Option<String>,
+    pub session_id: Option<String>,
+    pub session_seq: Option<u64>,
+}
+
 pub struct GrokClient {
     client: Arc<reqwest::Client>,
     auth: Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
@@ -65,11 +73,19 @@ impl GrokResponse {
 
 impl GrokClient {
     pub fn new(base_url: String, client_version: String) -> anyhow::Result<Self> {
+        // No whole-request `.timeout(...)`: long multi-turn / tool streams routinely
+        // exceed 120s. Liveness is left to TCP/H2 keepalive + upstream idle behaviour
+        // (mirrors grok-build's sampling client).
         let client = Arc::new(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(120))
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_nodelay(true)
+                .http2_keep_alive_interval(Duration::from_secs(15))
+                .http2_keep_alive_timeout(Duration::from_secs(5))
+                .http2_keep_alive_while_idle(true)
                 .build()?,
         );
         let auth = Arc::new(GrokAuthManager::new(file_store())?);
@@ -98,6 +114,7 @@ impl GrokClient {
     pub async fn post(
         &self,
         body: &GrokResponsesRequest,
+        meta: &GrokRequestMeta,
         traffic: Option<Arc<TrafficCapture>>,
     ) -> Result<GrokResponse, GrokError> {
         if let Some(capture) = traffic.as_ref() {
@@ -105,7 +122,14 @@ impl GrokClient {
             capture.write_json("020-upstream-request", &body_value);
             capture.write_json("021-upstream-request-metadata", &serde_json::json!({
                 "method": "POST", "url": safe_url(&self.url), "provider": "grok", "transport": "http",
-                "headers": {"accept":"text/event-stream", "content-type":"application/json", "authorization":"[redacted]", "x-xai-token-auth":"[redacted]"},
+                "headers": {
+                    "accept":"text/event-stream",
+                    "content-type":"application/json",
+                    "authorization":"[redacted]",
+                    "x-xai-token-auth":"[redacted]",
+                    "x-grok-session-id": meta.session_id.as_deref().unwrap_or(""),
+                    "x-grok-req-id": meta.req_id.as_deref().unwrap_or(""),
+                },
                 "body_bytes": serde_json::to_vec(body).map(|v| v.len()).unwrap_or(0),
             }));
         }
@@ -117,7 +141,7 @@ impl GrokClient {
             }
         };
         let response = self
-            .attempt(&auth.access, body, 1, traffic.as_deref())
+            .attempt(&auth.access, body, meta, 1, traffic.as_deref())
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             let refreshed = self
@@ -129,7 +153,7 @@ impl GrokClient {
                     auth_error(error)
                 })?;
             let replay = self
-                .attempt(&refreshed.access, body, 2, traffic.as_deref())
+                .attempt(&refreshed.access, body, meta, 2, traffic.as_deref())
                 .await?;
             if replay.status() == StatusCode::UNAUTHORIZED {
                 capture_failure(traffic.as_deref(), "auth", "unauthorized", 2);
@@ -157,30 +181,42 @@ impl GrokClient {
         &self,
         access: &str,
         body: &GrokResponsesRequest,
+        meta: &GrokRequestMeta,
         attempt: u8,
         traffic: Option<&TrafficCapture>,
     ) -> Result<reqwest::Response, GrokError> {
         let started = Instant::now();
-        let response = self
+        let mut builder = self
             .client
             .post(&self.url)
             .header("accept", "text/event-stream")
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {access}"))
             .header("x-xai-token-auth", "xai-grok-cli")
-            .header("x-grok-client-identifier", "grok-shell")
+            .header("x-grok-client-identifier", "claude-code-proxy")
             .header("x-grok-client-version", &self.client_version)
-            .json(body)
-            .send()
-            .await
-            .map_err(|_| {
-                capture_failure(traffic, "transport", "transport", attempt);
-                GrokError {
-                    status: StatusCode::BAD_GATEWAY,
-                    retry_after: None,
-                    message: "Grok upstream request failed".into(),
-                }
-            })?;
+            .header("x-grok-agent-id", "claude-code-proxy");
+
+        if let Some(req_id) = meta.req_id.as_deref().filter(|v| !v.is_empty()) {
+            builder = builder.header("x-grok-req-id", req_id);
+        }
+        if let Some(session_id) = meta.session_id.as_deref().filter(|v| !v.is_empty()) {
+            builder = builder
+                .header("x-grok-session-id", session_id)
+                .header("x-grok-conv-id", session_id);
+        }
+        if let Some(seq) = meta.session_seq {
+            builder = builder.header("x-grok-turn-idx", seq.to_string());
+        }
+
+        let response = builder.json(body).send().await.map_err(|_| {
+            capture_failure(traffic, "transport", "transport", attempt);
+            GrokError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "Grok upstream request failed".into(),
+            }
+        })?;
         let status = response.status();
         if let Some(capture) = traffic {
             capture.write_json("022-upstream-attempt", &serde_json::json!({"attempt":attempt,"status":status.as_u16(),"elapsed_ms":started.elapsed().as_millis(),"headers":safe_headers(response.headers())}));

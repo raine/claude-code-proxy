@@ -49,6 +49,11 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
             name, arguments, ..
         } => approx_token_count(name) + approx_token_count(arguments),
         GrokInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
+        GrokInputItem::Reasoning {
+            id,
+            encrypted_content,
+            ..
+        } => approx_token_count(id) + approx_token_count(encrypted_content),
     }
 }
 

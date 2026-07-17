@@ -150,6 +150,7 @@ impl StreamTranslator {
                 && matches!(
                     event,
                     ReducerEvent::ThinkingStart(_)
+                        | ReducerEvent::ThinkingSignature(_, _)
                         | ReducerEvent::TextStart(_)
                         | ReducerEvent::ToolStart(_, _, _)
                         | ReducerEvent::HostedSearch { .. }
@@ -213,6 +214,11 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent) {
             out,
             "content_block_delta",
             serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":t}}),
+        ),
+        ReducerEvent::ThinkingSignature(i, signature) => emit(
+            out,
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"signature_delta","signature":signature}}),
         ),
         ReducerEvent::ThinkingStop(i) | ReducerEvent::TextStop(i) | ReducerEvent::ToolStop(i) => {
             emit(
