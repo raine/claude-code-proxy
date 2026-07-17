@@ -46,6 +46,12 @@ pub enum GrokContentPart {
     InputText { text: String },
     #[serde(rename = "output_text")]
     OutputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -438,6 +444,42 @@ fn parse_message(
                     GrokContentPart::InputText { text: text.into() }
                 });
             }
+            ("user", "image") => {
+                if object
+                    .keys()
+                    .any(|key| !["type", "source", "cache_control"].contains(&key.as_str()))
+                    || !valid_cache_control(object.get("cache_control"))
+                {
+                    anyhow::bail!("unsupported image block field");
+                }
+                let source = object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("image source must be an object"))?;
+                let image_url = match source.get("type").and_then(Value::as_str) {
+                    Some("base64") => {
+                        let media = source
+                            .get("media_type")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("image media_type is invalid"))?;
+                        let data = source
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("image data is invalid"))?;
+                        format!("data:{media};base64,{data}")
+                    }
+                    Some("url") => source
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("image url is invalid"))?
+                        .to_string(),
+                    _ => anyhow::bail!("unsupported image source"),
+                };
+                content.push(GrokContentPart::InputImage {
+                    image_url,
+                    detail: None,
+                });
+            }
             ("assistant", "server_tool_use") => {
                 let name = object.get("name").and_then(Value::as_str);
                 if !matches!(name, Some("web_search" | "x_search")) {
@@ -629,6 +671,48 @@ mod tests {
         assert_eq!(value["input"][2]["type"], "function_call_output");
         assert_eq!(value["tool_choice"]["type"], "function");
     }
+
+    #[test]
+    fn grok_translation_maps_base64_image_to_input_image() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},
+            {"type":"text","text":"describe it"}
+        ]));
+        let value =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let content = &value["input"][1]["content"];
+        assert_eq!(content[0]["type"], "input_image");
+        assert_eq!(content[0]["image_url"], "data:image/png;base64,aGVsbG8=");
+        assert_eq!(content[1]["type"], "input_text");
+    }
+
+    #[test]
+    fn grok_translation_maps_url_image_to_input_image() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"image","source":{"type":"url","url":"https://example.com/cat.png"}}
+        ]));
+        let value =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(value["input"][1]["content"][0]["type"], "input_image");
+        assert_eq!(
+            value["input"][1]["content"][0]["image_url"],
+            "https://example.com/cat.png"
+        );
+    }
+
+    #[test]
+    fn grok_translation_rejects_unknown_image_source_and_fields() {
+        let bad_source = request_with_blocks(serde_json::json!([
+            {"type":"image","source":{"type":"file","file_id":"f_1"}}
+        ]));
+        assert!(translate_request(&bad_source, "grok-4.5".into()).is_err());
+
+        let unknown_field = request_with_blocks(serde_json::json!([
+            {"type":"image","source":{"type":"url","url":"https://x/y.png"},"unknown":true}
+        ]));
+        assert!(translate_request(&unknown_field, "grok-4.5".into()).is_err());
+    }
+
     #[test]
     fn grok_translation_maps_claude_web_search_to_hosted_web_search() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({

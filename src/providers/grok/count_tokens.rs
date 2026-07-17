@@ -2,6 +2,8 @@ use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesReq
 
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_OVERHEAD_TOKENS: u64 = 4;
+// Rough per-image cost for token estimation; actual usage is billed by Grok.
+const IMAGE_TOKENS: u64 = 1024;
 
 pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
     let instructions = request
@@ -43,6 +45,7 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
                 GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
                     approx_token_count(text)
                 }
+                GrokContentPart::InputImage { .. } => IMAGE_TOKENS,
             })
             .sum(),
         GrokInputItem::FunctionCall {
