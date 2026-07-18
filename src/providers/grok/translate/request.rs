@@ -231,8 +231,6 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
             "tools",
             "tool_choice",
             "context_management",
-            // Claude Code >= 2.1 attaches request diagnostics; Grok has no
-            // equivalent, so it is accepted and dropped rather than forwarded.
             "diagnostics",
             "metadata",
             "output_config",
@@ -248,7 +246,24 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
             anyhow::bail!("unsupported Grok request field: {key}");
         }
     }
+    if !valid_diagnostics(req.extra.get("diagnostics")) {
+        anyhow::bail!("unsupported diagnostics");
+    }
     Ok(())
+}
+
+fn valid_diagnostics(value: Option<&Value>) -> bool {
+    let Some(value) = value else { return true };
+    let Some(object) = value.as_object() else {
+        return value.is_null();
+    };
+    object.keys().all(|key| key == "previous_message_id")
+        && object.get("previous_message_id").is_none_or(|id| {
+            id.is_null()
+                || id
+                    .as_str()
+                    .is_some_and(|previous_message_id| !previous_message_id.is_empty())
+        })
 }
 
 fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
@@ -293,8 +308,6 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("tool must be an object"))?;
         for key in obj.keys() {
-            // `eager_input_streaming` is a Claude Code >= 2.1 streaming hint with no
-            // Grok equivalent; accept and drop it rather than reject the request.
             if ![
                 "name",
                 "description",
@@ -309,6 +322,12 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
         }
         if !valid_cache_control(obj.get("cache_control")) {
             anyhow::bail!("unsupported tool cache_control");
+        }
+        if obj
+            .get("eager_input_streaming")
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            anyhow::bail!("tool eager_input_streaming must be boolean");
         }
         let name = obj
             .get("name")
@@ -496,10 +515,17 @@ fn parse_message(
                             let part = part.as_object().ok_or_else(|| {
                                 anyhow::anyhow!("tool result child must be an object")
                             })?;
-                            // Claude Code >= 2.1 can attach `tool_reference` children
-                            // alongside the textual output. They carry no text for the
-                            // model, and Grok has no equivalent, so drop them.
                             if part.get("type").and_then(Value::as_str) == Some("tool_reference") {
+                                if part.keys().any(|key| {
+                                    !["type", "tool_name", "cache_control"].contains(&key.as_str())
+                                }) || part
+                                    .get("tool_name")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(str::is_empty)
+                                    || !valid_cache_control(part.get("cache_control"))
+                                {
+                                    anyhow::bail!("unsupported tool_reference child");
+                                }
                                 continue;
                             }
                             if part.get("type").and_then(Value::as_str) != Some("text")
@@ -544,9 +570,6 @@ fn valid_cache_control(value: Option<&Value>) -> bool {
         && object
             .get("ttl")
             .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m") | Some("1h")))
-        // Claude Code >= 2.1 sends `scope: "global"` on cache_control. Grok does
-        // not support prompt caching, so cache_control is verified and dropped;
-        // accepting the scope key keeps those requests translatable.
         && object
             .get("scope")
             .is_none_or(|scope| matches!(scope.as_str(), Some("global")))
@@ -698,16 +721,34 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_accepts_claude_code_diagnostics_without_forwarding_it() {
+    fn grok_translation_accepts_cache_diagnostics_without_forwarding_it() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"hello"}],
-            "diagnostics":{"request_id":"abc"}
+            "diagnostics":{"previous_message_id":"msg_previous"}
         }))
         .unwrap();
         let translated =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
         assert!(!translated.to_string().contains("diagnostics"));
+    }
+
+    #[test]
+    fn grok_translation_rejects_malformed_cache_diagnostics() {
+        for diagnostics in [
+            serde_json::json!(true),
+            serde_json::json!({"previous_message_id": 1}),
+            serde_json::json!({"previous_message_id": ""}),
+            serde_json::json!({"previous_message_id": null, "unknown": true}),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":"hello"}],
+                "diagnostics": diagnostics
+            }))
+            .unwrap();
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
     }
 
     #[test]
@@ -765,11 +806,26 @@ mod tests {
     }
 
     #[test]
+    fn grok_translation_rejects_malformed_eager_input_streaming() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{
+                "name":"lookup",
+                "input_schema":{"type":"object"},
+                "eager_input_streaming":"true"
+            }]
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+    }
+
+    #[test]
     fn grok_translation_drops_tool_reference_children_in_tool_results() {
         let request = request_with_blocks(serde_json::json!([
             {"type":"tool_result","tool_use_id":"call_1","content":[
                 {"type":"text","text":"ok"},
-                {"type":"tool_reference","name":"lookup"}
+                {"type":"tool_reference","tool_name":"lookup"}
             ]}
         ]));
         let translated =
@@ -777,6 +833,21 @@ mod tests {
         let rendered = translated.to_string();
         assert!(!rendered.contains("tool_reference"));
         assert!(rendered.contains("ok"));
+    }
+
+    #[test]
+    fn grok_translation_rejects_malformed_tool_reference_children() {
+        for child in [
+            serde_json::json!({"type":"tool_reference","name":"lookup"}),
+            serde_json::json!({"type":"tool_reference","tool_name":""}),
+            serde_json::json!({"type":"tool_reference","tool_name":"lookup","unknown":true}),
+            serde_json::json!({"type":"tool_reference","tool_name":"lookup","cache_control":{"type":"persistent"}}),
+        ] {
+            let request = request_with_blocks(serde_json::json!([
+                {"type":"tool_result","tool_use_id":"call_1","content":[child]}
+            ]));
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
     }
 
     #[test]
