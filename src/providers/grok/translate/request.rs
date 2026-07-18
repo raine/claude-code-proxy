@@ -36,7 +36,17 @@ pub enum GrokInputItem {
         arguments: String,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: GrokFunctionCallOutput,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum GrokFunctionCallOutput {
+    Text(String),
+    Content(Vec<GrokContentPart>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -402,6 +412,62 @@ fn parse_tool_choice(
     }
 }
 
+fn parse_image(object: &serde_json::Map<String, Value>) -> anyhow::Result<GrokContentPart> {
+    if object
+        .keys()
+        .any(|key| !["type", "source", "cache_control"].contains(&key.as_str()))
+        || !valid_cache_control(object.get("cache_control"))
+    {
+        anyhow::bail!("unsupported image block field");
+    }
+    let source = object
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("image source must be an object"))?;
+    let image_url = match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            if source
+                .keys()
+                .any(|key| !["type", "media_type", "data"].contains(&key.as_str()))
+            {
+                anyhow::bail!("unsupported base64 image source field");
+            }
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("image media_type is invalid"))?;
+            if !matches!(media_type, "image/jpeg" | "image/png") {
+                anyhow::bail!("unsupported image media_type: {media_type}");
+            }
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|data| !data.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("image data is invalid"))?;
+            format!("data:{media_type};base64,{data}")
+        }
+        Some("url") => {
+            if source
+                .keys()
+                .any(|key| !["type", "url"].contains(&key.as_str()))
+            {
+                anyhow::bail!("unsupported URL image source field");
+            }
+            source
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("image url is invalid"))?
+                .to_string()
+        }
+        _ => anyhow::bail!("unsupported image source"),
+    };
+    Ok(GrokContentPart::InputImage {
+        image_url,
+        detail: None,
+    })
+}
+
 fn parse_message(
     message: &Message,
     out: &mut Vec<GrokInputItem>,
@@ -444,42 +510,7 @@ fn parse_message(
                     GrokContentPart::InputText { text: text.into() }
                 });
             }
-            ("user", "image") => {
-                if object
-                    .keys()
-                    .any(|key| !["type", "source", "cache_control"].contains(&key.as_str()))
-                    || !valid_cache_control(object.get("cache_control"))
-                {
-                    anyhow::bail!("unsupported image block field");
-                }
-                let source = object
-                    .get("source")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| anyhow::anyhow!("image source must be an object"))?;
-                let image_url = match source.get("type").and_then(Value::as_str) {
-                    Some("base64") => {
-                        let media = source
-                            .get("media_type")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| anyhow::anyhow!("image media_type is invalid"))?;
-                        let data = source
-                            .get("data")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| anyhow::anyhow!("image data is invalid"))?;
-                        format!("data:{media};base64,{data}")
-                    }
-                    Some("url") => source
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("image url is invalid"))?
-                        .to_string(),
-                    _ => anyhow::bail!("unsupported image source"),
-                };
-                content.push(GrokContentPart::InputImage {
-                    image_url,
-                    detail: None,
-                });
-            }
+            ("user", "image") => content.push(parse_image(object)?),
             ("assistant", "server_tool_use") => {
                 let name = object.get("name").and_then(Value::as_str);
                 if !matches!(name, Some("web_search" | "x_search")) {
@@ -550,43 +581,62 @@ fn parse_message(
                     .get("content")
                     .ok_or_else(|| anyhow::anyhow!("tool result content is required"))?;
                 let output = match value {
-                    Value::String(text) => text.clone(),
+                    Value::String(text) => GrokFunctionCallOutput::Text(text.clone()),
                     Value::Array(parts) => {
-                        let mut texts = Vec::new();
+                        let mut text = String::new();
+                        let mut content = Vec::new();
+                        let mut has_image = false;
                         for part in parts {
                             let part = part.as_object().ok_or_else(|| {
                                 anyhow::anyhow!("tool result child must be an object")
                             })?;
-                            if part.get("type").and_then(Value::as_str) == Some("tool_reference") {
-                                if part.keys().any(|key| {
-                                    !["type", "tool_name", "cache_control"].contains(&key.as_str())
-                                }) || part
-                                    .get("tool_name")
-                                    .and_then(Value::as_str)
-                                    .is_none_or(str::is_empty)
-                                    || !valid_cache_control(part.get("cache_control"))
-                                {
-                                    anyhow::bail!("unsupported tool_reference child");
+                            match part.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if part.keys().any(|key| {
+                                        !["type", "text", "cache_control"].contains(&key.as_str())
+                                    }) || !valid_cache_control(part.get("cache_control"))
+                                    {
+                                        anyhow::bail!("unsupported tool result text child");
+                                    }
+                                    let child_text =
+                                        part.get("text").and_then(Value::as_str).ok_or_else(
+                                            || anyhow::anyhow!("tool result text is invalid"),
+                                        )?;
+                                    text.push_str(child_text);
+                                    content.push(GrokContentPart::InputText {
+                                        text: child_text.into(),
+                                    });
                                 }
-                                continue;
+                                Some("image") => {
+                                    has_image = true;
+                                    content.push(parse_image(part)?);
+                                }
+                                Some("tool_reference") => {
+                                    if part.keys().any(|key| {
+                                        !["type", "tool_name", "cache_control"]
+                                            .contains(&key.as_str())
+                                    }) || part
+                                        .get("tool_name")
+                                        .and_then(Value::as_str)
+                                        .is_none_or(str::is_empty)
+                                        || !valid_cache_control(part.get("cache_control"))
+                                    {
+                                        anyhow::bail!("unsupported tool_reference child");
+                                    }
+                                    // tool_reference carries no model-visible content; drop it.
+                                }
+                                _ => anyhow::bail!(
+                                    "tool result supports text, image, and tool_reference children only"
+                                ),
                             }
-                            if part.get("type").and_then(Value::as_str) != Some("text")
-                                || part.keys().any(|key| {
-                                    !["type", "text", "cache_control"].contains(&key.as_str())
-                                })
-                                || !valid_cache_control(part.get("cache_control"))
-                            {
-                                anyhow::bail!("tool result supports text children only");
-                            }
-                            texts.push(
-                                part.get("text").and_then(Value::as_str).ok_or_else(|| {
-                                    anyhow::anyhow!("tool result text is invalid")
-                                })?,
-                            );
                         }
-                        texts.join("")
+                        if has_image {
+                            GrokFunctionCallOutput::Content(content)
+                        } else {
+                            GrokFunctionCallOutput::Text(text)
+                        }
                     }
-                    _ => anyhow::bail!("tool result supports text only"),
+                    _ => anyhow::bail!("tool result supports text and image content only"),
                 };
                 out.push(GrokInputItem::FunctionCallOutput {
                     call_id: id.into(),
@@ -602,6 +652,9 @@ fn parse_message(
 
 fn valid_cache_control(value: Option<&Value>) -> bool {
     let Some(value) = value else { return true };
+    if value.is_null() {
+        return true;
+    }
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -675,7 +728,7 @@ mod tests {
     #[test]
     fn grok_translation_maps_base64_image_to_input_image() {
         let request = request_with_blocks(serde_json::json!([
-            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="},"cache_control":null},
             {"type":"text","text":"describe it"}
         ]));
         let value =
@@ -701,16 +754,50 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_rejects_unknown_image_source_and_fields() {
-        let bad_source = request_with_blocks(serde_json::json!([
-            {"type":"image","source":{"type":"file","file_id":"f_1"}}
-        ]));
-        assert!(translate_request(&bad_source, "grok-4.5".into()).is_err());
+    fn grok_translation_maps_tool_result_images_to_function_output_content() {
+        let request = request_with_blocks(serde_json::json!([{
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":[
+                {"type":"text","text":"screenshot"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+            ]
+        }]));
+        let value =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let output = &value["input"][1]["output"];
+        assert_eq!(
+            output[0],
+            serde_json::json!({"type":"input_text","text":"screenshot"})
+        );
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,aGVsbG8=");
+    }
 
-        let unknown_field = request_with_blocks(serde_json::json!([
-            {"type":"image","source":{"type":"url","url":"https://x/y.png"},"unknown":true}
-        ]));
-        assert!(translate_request(&unknown_field, "grok-4.5".into()).is_err());
+    #[test]
+    fn grok_translation_rejects_unknown_image_source_and_fields() {
+        for image in [
+            serde_json::json!({"type":"image","source":{"type":"file","file_id":"f_1"}}),
+            serde_json::json!({"type":"image","source":{"type":"url","url":"https://x/y.png"},"unknown":true}),
+            serde_json::json!({"type":"image","source":{"type":"url","url":"https://x/y.png","unknown":true}}),
+            serde_json::json!({"type":"image","source":{"type":"url","url":"https://x/y.png","data":"aGVsbG8="}}),
+        ] {
+            let request = request_with_blocks(serde_json::json!([image]));
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn grok_translation_rejects_unsupported_or_empty_image_values() {
+        for image in [
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/gif","data":"aGVsbG8="}}),
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/webp","data":"aGVsbG8="}}),
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}),
+            serde_json::json!({"type":"image","source":{"type":"url","url":""}}),
+        ] {
+            let request = request_with_blocks(serde_json::json!([image]));
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
     }
 
     #[test]

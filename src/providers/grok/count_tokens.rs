@@ -1,4 +1,6 @@
-use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesRequest};
+use super::translate::request::{
+    GrokContentPart, GrokFunctionCallOutput, GrokInputItem, GrokResponsesRequest,
+};
 
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_OVERHEAD_TOKENS: u64 = 4;
@@ -39,19 +41,25 @@ pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
 
 fn count_input_item(item: &GrokInputItem) -> u64 {
     match item {
-        GrokInputItem::Message { content, .. } => content
-            .iter()
-            .map(|part| match part {
-                GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
-                    approx_token_count(text)
-                }
-                GrokContentPart::InputImage { .. } => IMAGE_TOKENS,
-            })
-            .sum(),
+        GrokInputItem::Message { content, .. } => content.iter().map(count_content_part).sum(),
         GrokInputItem::FunctionCall {
             name, arguments, ..
         } => approx_token_count(name) + approx_token_count(arguments),
-        GrokInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
+        GrokInputItem::FunctionCallOutput { output, .. } => match output {
+            GrokFunctionCallOutput::Text(text) => approx_token_count(text),
+            GrokFunctionCallOutput::Content(content) => {
+                content.iter().map(count_content_part).sum()
+            }
+        },
+    }
+}
+
+fn count_content_part(part: &GrokContentPart) -> u64 {
+    match part {
+        GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
+            approx_token_count(text)
+        }
+        GrokContentPart::InputImage { .. } => IMAGE_TOKENS,
     }
 }
 
@@ -113,6 +121,21 @@ mod tests {
         }));
 
         assert!(count_tokens(&long) > count_tokens(&short));
+    }
+
+    #[test]
+    fn count_tokens_includes_tool_result_images() {
+        let request = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"screenshot","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+                ]}]}
+            ]
+        }));
+
+        assert!(count_tokens(&request) >= IMAGE_TOKENS);
     }
 
     #[test]
