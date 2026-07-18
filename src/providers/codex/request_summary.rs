@@ -1,7 +1,8 @@
 use serde_json::Value;
 
 use super::translate::request::{
-    ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesTool,
+    ResponsesContentPart, ResponsesFunctionCallOutput, ResponsesFunctionCallOutputContentPart,
+    ResponsesInputItem, ResponsesRequest, ResponsesTool,
 };
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -63,12 +64,28 @@ fn json_bytes(value: Option<&Value>) -> u64 {
 fn input_image_parts(input: &[ResponsesInputItem]) -> Vec<(usize, usize, &str)> {
     let mut parts = Vec::new();
     for (item_idx, item) in input.iter().enumerate() {
-        if let ResponsesInputItem::Message { content, .. } = item {
-            for (part_idx, part) in content.iter().enumerate() {
-                if let ResponsesContentPart::InputImage { image_url, .. } = part {
-                    parts.push((item_idx, part_idx, image_url.as_str()));
+        match item {
+            ResponsesInputItem::Message { content, .. } => {
+                for (part_idx, part) in content.iter().enumerate() {
+                    if let ResponsesContentPart::InputImage { image_url, .. } = part {
+                        parts.push((item_idx, part_idx, image_url.as_str()));
+                    }
                 }
             }
+            ResponsesInputItem::FunctionCallOutput {
+                output: ResponsesFunctionCallOutput::ContentItems(content),
+                ..
+            } => {
+                for (part_idx, part) in content.iter().enumerate() {
+                    if let ResponsesFunctionCallOutputContentPart::InputImage {
+                        image_url, ..
+                    } = part
+                    {
+                        parts.push((item_idx, part_idx, image_url.as_str()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     parts
@@ -268,14 +285,24 @@ mod tests {
     fn summarize_with_tools_and_images() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "describe"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,abc"}
-                ]
-            }],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+                    ]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "input_text", "text": "tool image"},
+                        {"type": "input_image", "image_url": "data:image/jpeg;base64,def"}
+                    ]
+                }
+            ],
             "store": false,
             "stream": true,
             "parallel_tool_calls": true,
@@ -283,7 +310,7 @@ mod tests {
         }))
         .unwrap();
         let summary = summarize_codex_request_size(&req);
-        assert_eq!(summary.input_image_part_count, 1);
+        assert_eq!(summary.input_image_part_count, 2);
         assert!(summary.input_image_data_url_bytes > 0);
     }
 }

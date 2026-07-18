@@ -151,13 +151,43 @@ pub enum ResponsesInputItem {
     FunctionCallOutput {
         #[serde(default)]
         call_id: String,
-        output: String,
+        output: ResponsesFunctionCallOutput,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
         summary: Vec<Value>,
         encrypted_content: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesFunctionCallOutput {
+    Text(String),
+    ContentItems(Vec<ResponsesFunctionCallOutputContentPart>),
+}
+
+impl ResponsesFunctionCallOutput {
+    #[cfg(test)]
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::ContentItems(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesFunctionCallOutputContentPart {
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -673,22 +703,22 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                     content: std::mem::take(&mut parts),
                                 });
                             }
-                            let body = tool_result_to_string(content);
-                            let output = if is_error.unwrap_or(false) {
-                                format!("[tool execution error]\n{body}")
+                            let rendered = render_tool_result(content);
+                            let output_text = if is_error.unwrap_or(false) {
+                                format!("[tool execution error]\n{}", rendered.text)
                             } else {
-                                body
+                                rendered.text
                             };
-                            let output =
-                                maybe_append_rewritten_read_offset_note(output, tool_use_id);
-                            let output = maybe_append_read_offset_guidance(
-                                output,
+                            let output_text =
+                                maybe_append_rewritten_read_offset_note(output_text, tool_use_id);
+                            let output_text = maybe_append_read_offset_guidance(
+                                output_text,
                                 read_tool_uses_with_offset.contains(tool_use_id),
                                 is_error.unwrap_or(false),
                             );
                             out.push(ResponsesInputItem::FunctionCallOutput {
                                 call_id: tool_use_id.clone(),
-                                output,
+                                output: function_call_output(output_text, rendered.images),
                             });
                         }
                         _ => {}
@@ -844,57 +874,95 @@ fn read_offset_guidance() -> &'static str {
 // Tool result rendering
 // ---------------------------------------------------------------------------
 
-fn tool_result_to_string(content: &Value) -> String {
+struct RenderedToolResult {
+    text: String,
+    images: Vec<String>,
+}
+
+fn render_tool_result(content: &Value) -> RenderedToolResult {
     match content {
-        Value::String(s) => s.clone(),
+        Value::String(s) => RenderedToolResult {
+            text: s.clone(),
+            images: Vec::new(),
+        },
         Value::Array(arr) => {
-            let mut parts = Vec::new();
-            for b in arr {
-                match b.get("type").and_then(|v| v.as_str()) {
-                    Some("text") => match b.get("text").and_then(|v| v.as_str()) {
-                        Some(text) => parts.push(text.to_string()),
-                        None => parts.push(unsupported_tool_result_block_to_string(b)),
+            let mut text_parts = Vec::new();
+            let mut images = Vec::new();
+            for block in arr {
+                match block.get("type").and_then(|value| value.as_str()) {
+                    Some("text") => match block.get("text").and_then(|value| value.as_str()) {
+                        Some(text) => text_parts.push(text.to_string()),
+                        None => text_parts.push(unsupported_tool_result_block_to_string(block)),
                     },
                     Some("image") => {
-                        if let Some(source) = b.get("source").and_then(|v| v.as_object()) {
-                            match source.get("type").and_then(|v| v.as_str()) {
-                                Some("url")
-                                    if source.get("url").and_then(|v| v.as_str()).is_some() =>
-                                {
-                                    parts.push("[image omitted: url]".to_string());
+                        if let Some(source) =
+                            block.get("source").and_then(|value| value.as_object())
+                        {
+                            match source.get("type").and_then(|value| value.as_str()) {
+                                Some("url") => {
+                                    match source.get("url").and_then(|value| value.as_str()) {
+                                        Some(url) => images.push(url.to_string()),
+                                        None => text_parts
+                                            .push(unsupported_tool_result_block_to_string(block)),
+                                    }
                                 }
                                 Some("base64")
                                     if source
                                         .get("media_type")
-                                        .and_then(|v| v.as_str())
+                                        .and_then(|value| value.as_str())
                                         .is_some()
                                         && source
                                             .get("data")
-                                            .and_then(|v| v.as_str())
+                                            .and_then(|value| value.as_str())
                                             .is_some() =>
                                 {
-                                    let media_type = source
-                                        .get("media_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("image");
-                                    parts.push(format!("[image omitted: {media_type}]"));
+                                    let media_type =
+                                        source["media_type"].as_str().unwrap_or("image");
+                                    let data = source["data"].as_str().unwrap_or_default();
+                                    images.push(format!("data:{media_type};base64,{data}"));
                                 }
-                                _ => parts.push(unsupported_tool_result_block_to_string(b)),
+                                _ => {
+                                    text_parts.push(unsupported_tool_result_block_to_string(block))
+                                }
                             }
                         } else {
-                            parts.push(unsupported_tool_result_block_to_string(b));
+                            text_parts.push(unsupported_tool_result_block_to_string(block));
                         }
                     }
                     Some(other) => {
-                        parts.push(format!("[unsupported content block omitted: {other}]"));
+                        text_parts.push(format!("[unsupported content block omitted: {other}]"));
                     }
-                    None => parts.push(unsupported_tool_result_block_to_string(b)),
+                    None => text_parts.push(unsupported_tool_result_block_to_string(block)),
                 }
             }
-            parts.join("\n")
+            RenderedToolResult {
+                text: text_parts.join("\n"),
+                images,
+            }
         }
-        _ => String::new(),
+        _ => RenderedToolResult {
+            text: String::new(),
+            images: Vec::new(),
+        },
     }
+}
+
+fn function_call_output(text: String, images: Vec<String>) -> ResponsesFunctionCallOutput {
+    if images.is_empty() {
+        return ResponsesFunctionCallOutput::Text(text);
+    }
+
+    let mut content = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+    if !text.is_empty() {
+        content.push(ResponsesFunctionCallOutputContentPart::InputText { text });
+    }
+    content.extend(images.into_iter().map(|image_url| {
+        ResponsesFunctionCallOutputContentPart::InputImage {
+            image_url,
+            detail: None,
+        }
+    }));
+    ResponsesFunctionCallOutput::ContentItems(content)
 }
 
 fn unsupported_tool_result_block_to_string(block: &Value) -> String {
@@ -1384,8 +1452,9 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 1);
-        if let ResponsesInputItem::FunctionCallOutput { call_id, .. } = &out.input[0] {
+        if let ResponsesInputItem::FunctionCallOutput { call_id, output } = &out.input[0] {
             assert_eq!(call_id, "tu_1");
+            assert_eq!(output.as_text(), Some("result"));
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -1414,6 +1483,7 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
+            let output = output.as_text().expect("text tool output");
             assert!(output.contains("[tool execution error]"));
             assert!(output.contains("File has 331 lines"));
             assert!(output.contains("Codex Read guidance:"));
@@ -1446,7 +1516,10 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
-            assert_eq!(output, "[tool execution error]\nFile does not exist.");
+            assert_eq!(
+                output.as_text(),
+                Some("[tool execution error]\nFile does not exist.")
+            );
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -1479,6 +1552,7 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
+            let output = output.as_text().expect("text tool output");
             assert!(output.contains("1\tcontent"));
             assert!(output.contains("Proxy Read offset note:"));
             assert!(output.contains("1300000"));
@@ -1511,8 +1585,8 @@ mod tests {
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             assert_eq!(
-                output,
-                "File has 331 lines, and the requested offset is shown in this fixture."
+                output.as_text(),
+                Some("File has 331 lines, and the requested offset is shown in this fixture.")
             );
         } else {
             panic!("expected FunctionCallOutput");
@@ -1520,19 +1594,56 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_stringifies_images_and_malformed_blocks() {
-        let rendered = tool_result_to_string(&json!([
-            {"type": "text", "text": "caption"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
-            {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
+    fn translate_tool_result_images_as_native_function_output_content() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tu_image",
+                "content": [
+                    {"type": "text", "text": "caption"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc"
+                    }},
+                    {"type": "image", "source": {
+                        "type": "url",
+                        "url": "https://example.invalid/a.png"
+                    }}
+                ]
+            }]}]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&out.input[0]).unwrap(),
+            json!({
+                "type": "function_call_output",
+                "call_id": "tu_image",
+                "output": [
+                    {"type": "input_text", "text": "caption"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                    {"type": "input_image", "image_url": "https://example.invalid/a.png"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_tool_result_blocks_still_become_text_placeholders() {
+        let rendered = render_tool_result(&json!([
             {"type": "text"},
             {"type": "image"},
             {}
         ]));
+
         assert_eq!(
-            rendered,
-            "caption\n[image omitted: image/png]\n[image omitted: url]\n[unsupported content block omitted: text]\n[unsupported content block omitted: image]\n[unsupported content block omitted: unknown]"
+            rendered.text,
+            "[unsupported content block omitted: text]\n[unsupported content block omitted: image]\n[unsupported content block omitted: unknown]"
         );
+        assert!(rendered.images.is_empty());
     }
 
     #[test]
