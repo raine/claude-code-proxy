@@ -1481,6 +1481,42 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
     );
+
+    if let Some(quota) = codex_quota_spans() {
+        frame.render_widget(
+            Paragraph::new(Line::from(quota))
+                .alignment(Alignment::Right)
+                .style(Style::default().bg(BG)),
+            area,
+        );
+    }
+}
+
+/// Compact right-aligned Codex quota for the footer, from the latest
+/// `codex.rate_limits` snapshot. Shows the weekly window as remaining
+/// percent (matching the Codex app convention). None when no snapshot yet.
+fn codex_quota_spans() -> Option<Vec<Span<'static>>> {
+    let snapshot = crate::providers::codex::rate_limits::latest()?;
+    let rl = snapshot.get("rate_limits")?;
+    let primary = rl.get("primary")?;
+    let used = primary.get("used_percent").and_then(|v| v.as_f64())?;
+    let left = 100.0 - used;
+    let color = if left > 30.0 {
+        GREEN
+    } else if left > 10.0 {
+        YELLOW
+    } else {
+        RED
+    };
+    let mut spans = vec![
+        Span::styled("codex wk ", Style::default().fg(DIM)),
+        Span::styled(format!("{left:.0}% left"), Style::default().fg(color)),
+    ];
+    if rl.get("limit_reached").and_then(|v| v.as_bool()) == Some(true) {
+        spans.push(Span::styled("  LIMIT", Style::default().fg(RED)));
+    }
+    spans.push(Span::raw(" "));
+    Some(spans)
 }
 
 fn render_shutdown_confirmation(frame: &mut ratatui::Frame<'_>, area: Rect) {

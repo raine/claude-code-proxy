@@ -358,3 +358,75 @@ async fn monitor_records_unknown_model_failure() {
     assert!(error.starts_with("Unknown model \"not-a-model\""));
     assert!(error.contains("Supported:"));
 }
+
+#[tokio::test]
+async fn usage_endpoint_serves_latest_codex_rate_limit_snapshot() {
+    // Isolate the persisted-snapshot file so a prior run's quota does not
+    // leak into the empty-state assertion.
+    let state = tempfile::tempdir().unwrap();
+    let prev_state = std::env::var_os("XDG_STATE_HOME");
+    // SAFETY: single-threaded test; restored below.
+    unsafe { std::env::set_var("XDG_STATE_HOME", state.path()) };
+
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let empty = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/usage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(empty.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["codex"], Value::Null);
+
+    claude_code_proxy::providers::codex::rate_limits::record_event(&json!({
+        "type": "codex.rate_limits",
+        "rate_limits": {
+            "limit_reached": false,
+            "primary": {"used_percent": 16.0, "window_minutes": 10080},
+            "secondary": null
+        }
+    }));
+
+    let populated = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/usage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(populated.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(populated.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value.pointer("/codex/rate_limits/primary/used_percent"),
+        Some(&json!(16.0))
+    );
+    assert!(
+        value
+            .pointer("/codex/captured_at")
+            .and_then(Value::as_str)
+            .is_some()
+    );
+
+    // SAFETY: single-threaded test; restore the prior value.
+    unsafe {
+        match prev_state {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+}

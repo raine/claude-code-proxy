@@ -3,6 +3,7 @@ pub mod client;
 pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
+pub mod rate_limits;
 pub mod request_summary;
 pub mod translate;
 pub mod websocket;
@@ -511,6 +512,7 @@ fn translate_live_stream_payload(
     payload: &serde_json::Value,
     ctx: &RequestContext,
 ) -> Result<(Vec<u8>, bool), String> {
+    rate_limits::record_event(payload);
     let chunk = translator.accept(payload, ctx.traffic.as_deref())?;
     let terminal = is_codex_terminal_event(payload) || translator.is_finished();
     Ok((chunk, terminal))
