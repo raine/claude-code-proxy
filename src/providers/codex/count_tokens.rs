@@ -196,6 +196,25 @@ mod tests {
     }
 
     #[test]
+    fn structured_tool_output_counts_text_and_images() {
+        let text = ResponsesFunctionCallOutput::Text("caption".to_string());
+        let mixed = ResponsesFunctionCallOutput::ContentItems(vec![
+            ResponsesFunctionCallOutputContentPart::InputText {
+                text: "caption".to_string(),
+            },
+            ResponsesFunctionCallOutputContentPart::InputImage {
+                image_url: "data:image/png;base64,YQ==".to_string(),
+                detail: None,
+            },
+        ]);
+
+        assert_eq!(
+            count_function_call_output_tokens(&mixed),
+            count_function_call_output_tokens(&text) + 2000
+        );
+    }
+
+    #[test]
     fn encrypted_reasoning_uses_codex_model_visible_size_estimate() {
         let encoded_content = "A".repeat(4000);
         assert_eq!(approx_reasoning_token_count(&encoded_content), 588);

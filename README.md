@@ -1023,10 +1023,10 @@ supported shape.
 - **Rate limits:** shared across all clients of your upstream account. Codex's
   `codex.rate_limits.limit_reached` and Kimi's HTTP 429 are both surfaced as
   HTTP 429 with `retry-after`.
-- **Codex — image inputs:** top-level user-message images and valid image blocks
-  nested inside `tool_result` pass through as Responses API `input_image`
-  content. Malformed or unsupported tool-result blocks remain textual
-  placeholders.
+- **Codex - image inputs:** top-level user-message images and supported
+  base64 image blocks nested inside `tool_result` pass through as Responses API
+  `input_image` content. Remote URL, malformed, and unsupported tool-result
+  images remain textual placeholders.
 - **Kimi — image inputs in tool results:** pass through as `image_url` parts
   (Kimi accepts them in `role:"tool"` content).
 - **Codex — reasoning blocks:** not forwarded to Claude Code (dropped), even if
