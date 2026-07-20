@@ -849,7 +849,10 @@ fn image_placeholder(object: &serde_json::Map<String, Value>) -> Option<String> 
 }
 
 // ---------------------------------------------------------------------------
-// L2a reattach gates (upstream-verified limits; see grok-tool-image/handoff.md)
+// L2a reattach gates (limits verified against cli-chat-proxy.grok.com on
+// 2026-07-20: 1x1 and 8x8 rejected, 32x32 accepted; production-scale
+// screenshots well above the minimums; both `reattach` and `inline` wire
+// shapes returned 200 with correct visual answers)
 // ---------------------------------------------------------------------------
 
 /// Upstream rejects images whose smallest side is under this many pixels.
@@ -858,7 +861,7 @@ const MIN_IMAGE_SIDE_PX: u32 = 8;
 const MIN_IMAGE_AREA_PX: u64 = 512;
 /// Decoded RGB(A) payload cap; larger images are degraded to the omit marker.
 const MAX_IMAGE_DECODED_BYTES: u64 = 5 * 1024 * 1024;
-/// Only the last few images per tool result are reattached.
+/// Only the last few images across the whole request are attached.
 const MAX_REATTACHED_IMAGES: usize = 4;
 
 /// Parse an Anthropic image block into a shared `ImageSource`. Returns `None`
@@ -921,9 +924,9 @@ fn gate_image(source: &ImageSource) -> Result<(), String> {
             "{width}x{height} below minimum area {MIN_IMAGE_AREA_PX}px"
         ));
     }
-    // Decoded raster is at least 3 bytes per pixel (RGB); RGBA is 4. Use 3 as
-    // a conservative lower bound so borderline images stay under the cap.
-    let decoded = area.saturating_mul(3);
+    // Worst-case raster is 8 bytes per pixel (RGBA, 16-bit channels).
+    // Over-estimating is the safe direction for a pre-flight gate.
+    let decoded = area.saturating_mul(8);
     if decoded > MAX_IMAGE_DECODED_BYTES {
         return Err(format!(
             "{width}x{height} too large (decoded ~{}MB > {}MB cap)",
@@ -951,7 +954,8 @@ fn cap_reason() -> String {
 }
 
 /// Extract pixel dimensions from the encoded image header. Supports PNG, JPEG
-/// and GIF; returns `None` for unknown/corrupt formats.
+/// and GIF only — other formats (e.g. WebP) always degrade to the omit
+/// marker; `None` also covers unknown/corrupt data.
 fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
     match media_type {
         "image/png" => png_dimensions(bytes),

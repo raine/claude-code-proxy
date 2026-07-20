@@ -406,23 +406,31 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
 }
 
 fn is_data_url(text: &str) -> bool {
-    text.starts_with("data:image/") && text.contains(";base64,")
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("data:image/") && text.contains(";base64,")
 }
 
-/// An object shaped like an Anthropic image source: `type: "base64"` plus a
-/// `media_type`. Used to redact only image payloads, not arbitrary `data` keys.
+/// An object shaped like an Anthropic image source: `type: "base64"` and
+/// either an image `media_type` or none at all. Used to redact only image
+/// payloads, not arbitrary `data` keys. Missing `media_type` is treated as
+/// an image: the capture is written before translation, so a malformed block
+/// that the translator would reject must still not persist its payload.
 fn looks_like_image_source(map: &Map<String, Value>) -> bool {
-    map.get("type").and_then(Value::as_str) == Some("base64")
-        && map
-            .get("media_type")
-            .and_then(Value::as_str)
-            .is_some_and(|media_type| media_type.starts_with("image/"))
+    if map.get("type").and_then(Value::as_str) != Some("base64") {
+        return false;
+    }
+    match map.get("media_type").and_then(Value::as_str) {
+        Some(media_type) => media_type.to_ascii_lowercase().starts_with("image/"),
+        None => true,
+    }
 }
 
 fn redact_traffic_value(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
-        Value::Object(_) | Value::Array(_) => Value::String("[redacted]".to_string()),
+        // Structured values (e.g. Kimi's `{url: ...}` image_url) keep their
+        // shape so captures stay parseable; only the payload leaves.
+        Value::Object(_) | Value::Array(_) => redact_traffic(value),
         _ => Value::String("[redacted]".to_string()),
     }
 }
@@ -543,5 +551,70 @@ mod tests {
         assert!(rendered.contains("input_image"));
         assert!(rendered.contains("screenshot"));
         assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn redact_traffic_strips_uppercase_media_type_image_source() {
+        // Captures are written before translation validates anything, so a
+        // non-standard casing must still not persist its payload.
+        let value = serde_json::json!({
+            "source": {"type": "base64", "media_type": "IMAGE/PNG", "data": "QUJDREVGRw=="}
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("QUJDREVGRw"),
+            "payload leaked: {rendered}"
+        );
+        assert!(
+            redacted["source"]["data"]
+                .as_str()
+                .unwrap()
+                .contains("redacted")
+        );
+    }
+
+    #[test]
+    fn redact_traffic_strips_image_source_without_media_type() {
+        // A malformed block the translator would reject must still be redacted
+        // in the pre-translation capture.
+        let value = serde_json::json!({
+            "source": {"type": "base64", "data": "QUJDREVGRw=="}
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("QUJDREVGRw"),
+            "payload leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn redact_traffic_strips_uppercase_data_url_scheme() {
+        let value = serde_json::json!({
+            "image_url": "DATA:IMAGE/PNG;base64,iVBORw0KGgoAAAANSUhEUg"
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("iVBORw0KGgo"),
+            "data URL payload leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn redact_traffic_keeps_structured_image_url_shape() {
+        // Kimi-style object image_url: redact the payload but keep the object
+        // structure so captures stay parseable.
+        let value = serde_json::json!({
+            "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg"}
+        });
+        let redacted = redact_traffic(&value);
+        assert!(redacted["image_url"].is_object(), "shape lost: {redacted}");
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("iVBORw0KGgo"),
+            "nested payload leaked: {rendered}"
+        );
     }
 }

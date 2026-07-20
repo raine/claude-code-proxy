@@ -352,8 +352,12 @@ pub fn grok_tool_image_mode() -> GrokToolImageMode {
 /// Warn once at startup when an unknown mode was requested. Called from the
 /// Grok provider constructor rather than per request.
 pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
-    match std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref() {
-        Some(other) if !matches!(other, "omit" | "reattach" | "inline" | "reject") => {
+    match std::env::var("CCP_GROK_TOOL_IMAGE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(other) if !matches!(other, "" | "omit" | "reattach" | "inline" | "reject") => {
             let mut fields = serde_json::Map::new();
             fields.insert(
                 "value".to_string(),
