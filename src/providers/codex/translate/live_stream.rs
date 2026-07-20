@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
+use crate::providers::codex::events::is_terminal_rate_limit_event;
 use crate::traffic::TrafficCapture;
 
 use super::read_rewrite::sanitize_read_args;
@@ -99,7 +100,7 @@ impl LiveStreamTranslator {
 
         match kind {
             "codex.rate_limits" => {
-                if crate::providers::codex::events::is_terminal_rate_limit_event(payload) {
+                if is_terminal_rate_limit_event(payload) {
                     return Err("rate limit reached".to_string());
                 }
             }

@@ -1,4 +1,5 @@
 use crate::anthropic::sse::parse_sse_events;
+use crate::providers::codex::events::is_terminal_rate_limit_event;
 
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
@@ -329,7 +330,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         last_event_type = Some(t.clone());
 
         if t == "codex.rate_limits" {
-            if crate::providers::codex::events::is_terminal_rate_limit_event(&p) {
+            if is_terminal_rate_limit_event(&p) {
                 let retry_after = p
                     .get("rate_limits")
                     .and_then(|r| r.get("primary"))

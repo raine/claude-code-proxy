@@ -217,6 +217,61 @@ mod tests {
     }
 
     #[test]
+    fn terminal_rate_limit_honors_credits() {
+        // No credits field at all: legacy payload stays terminal.
+        assert!(is_terminal_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true}
+        })));
+
+        // Credits exhausted: terminal.
+        assert!(is_terminal_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true},
+            "credits": {"has_credits": false, "unlimited": false}
+        })));
+
+        // Usable credits remain: informational.
+        assert!(!is_terminal_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true},
+            "credits": {"has_credits": true, "unlimited": false}
+        })));
+
+        // Unlimited plan: informational.
+        assert!(!is_terminal_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true},
+            "credits": {"has_credits": false, "unlimited": true}
+        })));
+
+        // Limit not reached: never terminal, credits irrelevant.
+        assert!(!is_terminal_rate_limit_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": false},
+            "credits": {"has_credits": false, "unlimited": false}
+        })));
+
+        // Wrong event type never matches.
+        assert!(!is_terminal_rate_limit_event(&serde_json::json!({
+            "type": "response.completed",
+            "rate_limits": {"limit_reached": true}
+        })));
+    }
+
+    #[test]
+    fn classifier_skips_credited_rate_limit_snapshots() {
+        assert!(
+            classify_event_failure(&serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {"limit_reached": true},
+                "credits": {"has_credits": true, "unlimited": false}
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn ignores_informational_and_permanent_events() {
         assert!(
             classify_event_failure(&serde_json::json!({
