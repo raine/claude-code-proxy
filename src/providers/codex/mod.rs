@@ -567,6 +567,8 @@ async fn live_stream_response_once(
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
+    // Keep protocol framing private until real output makes a transparent retry unsafe.
+    let mut pending_chunk = Vec::new();
     let mut generation_started = false;
 
     while let Some(item) = upstream_events.recv().await {
@@ -638,8 +640,17 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
-        if !chunk.is_empty() {
-            record_live_stream_progress(&ctx, &chunk);
+        pending_chunk.extend_from_slice(&chunk);
+        if terminal
+            && is_codex_success_terminal_event(&payload)
+            && !translator.has_semantic_output()
+        {
+            return LiveStreamStart::Retry {
+                error: empty_live_completion_error(),
+            };
+        }
+        if translator.has_semantic_output() && !pending_chunk.is_empty() {
+            record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
@@ -648,12 +659,12 @@ async fn live_stream_response_once(
                     &upstream_sse_body,
                     compact_boundary,
                 );
-                return LiveStreamStart::Response(single_live_stream_response(chunk));
+                return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
             }
             return LiveStreamStart::Response(remaining_live_stream_response(
                 upstream_events,
                 translator,
-                chunk,
+                pending_chunk,
                 ctx,
                 turn_id,
                 request_body,
@@ -669,7 +680,11 @@ async fn live_stream_response_once(
                 &upstream_sse_body,
                 compact_boundary,
             );
-            return LiveStreamStart::Response(empty_live_stream_response());
+            if pending_chunk.is_empty() {
+                return LiveStreamStart::Response(empty_live_stream_response());
+            }
+            record_live_stream_progress(&ctx, &pending_chunk);
+            return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
         }
     }
 
@@ -681,6 +696,16 @@ async fn live_stream_response_once(
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocket,
         },
+    }
+}
+
+fn empty_live_completion_error() -> client::CodexError {
+    client::CodexError {
+        status: 503,
+        message: "Codex completed without producing output".to_string(),
+        detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
+        retry_after: None,
+        origin: client::CodexErrorOrigin::WebSocket,
     }
 }
 
@@ -923,6 +948,13 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
             | Some("response.failed")
             | Some("response.error")
             | Some("error")
+    )
+}
+
+fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(|v| v.as_str()),
+        Some("response.completed") | Some("response.done")
     )
 }
 
@@ -1478,6 +1510,18 @@ mod tests {
         assert_eq!(
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_live_completion_maps_to_explicit_service_unavailable() {
+        let err = empty_live_completion_error();
+
+        assert_eq!(err.status, 503);
+        assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
+        assert_eq!(
+            map_codex_error_to_response(&err).status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

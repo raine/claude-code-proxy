@@ -538,6 +538,92 @@ async fn spawn_websocket_close_then_retry_upstream(captured: Arc<Mutex<Vec<Value
     addr_str
 }
 
+async fn spawn_websocket_empty_completion_then_retry_upstream(
+    captured: Arc<Mutex<Vec<Value>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        let mut handled = 0usize;
+        while handled < 3 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sender, mut receiver) = ws.split();
+
+            while handled < 3 {
+                let Some(text) = (loop {
+                    match receiver.next().await {
+                        Some(Ok(Message::Text(text))) => break Some(text),
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = sender.send(Message::Pong(data)).await;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break None,
+                    }
+                }) else {
+                    break;
+                };
+                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                    let _ = captured.lock().map(|mut g| g.push(json));
+                }
+
+                if handled == 1 {
+                    let event = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_empty",
+                            "status": "completed",
+                            "incomplete_details": null,
+                            "usage": {"input_tokens": 5, "output_tokens": 0}
+                        }
+                    });
+                    let _ = sender.send(Message::Text(event.to_string())).await;
+                    handled += 1;
+                    continue;
+                }
+
+                let response_text = if handled == 0 { "first" } else { "retry" };
+                let response_id = if handled == 0 { "resp_1" } else { "resp_retry" };
+                let events = [
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{"type":"message","id":format!("msg_empty_{handled}")}
+                    }),
+                    json!({
+                        "type":"response.output_text.delta",
+                        "output_index":0,
+                        "delta":response_text
+                    }),
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":{"type":"message"}
+                    }),
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":response_id,"usage":{"input_tokens":5,"output_tokens":2}}
+                    }),
+                ];
+
+                for event in &events {
+                    let _ = sender.send(Message::Text(event.to_string())).await;
+                }
+                handled += 1;
+            }
+        }
+    });
+
+    addr_str
+}
+
 // ---------------------------------------------------------------------------
 // Health and routing smoke tests (no env var mutation needed)
 // ---------------------------------------------------------------------------
@@ -1682,6 +1768,71 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_websocket_close_then_retry_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"}
+        ]
+    }))
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&second_body).contains("retry"),
+        "second response body: {}",
+        String::from_utf8_lossy(&second_body)
+    );
+
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 3, "expected full-context retry request");
+    assert!(guard[0].get("previous_response_id").is_none());
+    assert_eq!(guard[1]["previous_response_id"], "resp_1");
+    assert!(guard[2].get("previous_response_id").is_none());
+    assert_eq!(
+        guard[2]["input"].as_array().map(Vec::len),
+        Some(3),
+        "retry request should send the full input"
+    );
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full_context() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_empty_completion_then_retry_upstream(captured.clone()).await;
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);

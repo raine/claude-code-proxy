@@ -63,6 +63,7 @@ pub struct LiveStreamTranslator {
     web_searches: Vec<LiveWebSearch>,
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
+    semantic_output_started: bool,
     finished: bool,
 }
 
@@ -82,6 +83,7 @@ impl LiveStreamTranslator {
             web_searches: Vec::new(),
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
+            semantic_output_started: false,
             finished: false,
         }
     }
@@ -161,6 +163,10 @@ impl LiveStreamTranslator {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    pub fn has_semantic_output(&self) -> bool {
+        self.semantic_output_started
     }
 
     pub fn finish_after_closed_completed_tool_call(
@@ -305,6 +311,7 @@ impl LiveStreamTranslator {
             "function_call" => {
                 self.close_thinking(traffic, out);
                 self.saw_tool_use = true;
+                self.semantic_output_started = true;
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
                 let call_id = item
@@ -364,6 +371,7 @@ impl LiveStreamTranslator {
         if delta.is_empty() {
             return;
         }
+        self.semantic_output_started = true;
         if self.thinking.map(|thinking| thinking.output_index) != Some(output_index) {
             self.close_thinking(traffic, out);
             let index = self.anthropic_index;
@@ -411,6 +419,7 @@ impl LiveStreamTranslator {
         if delta.is_empty() {
             return;
         }
+        self.semantic_output_started = true;
 
         let output_index = payload
             .get("output_index")
@@ -626,6 +635,7 @@ impl LiveStreamTranslator {
             == Some("web_search_call")
         {
             self.close_thinking(traffic, out);
+            self.semantic_output_started = true;
             let item = &payload["item"];
             let index = self.anthropic_index;
             self.anthropic_index += 1;
@@ -1188,6 +1198,7 @@ mod tests {
         assert!(out.contains("text_delta"));
         assert!(out.contains("hello"));
         assert!(!out.contains("message_stop"));
+        assert!(translator.has_semantic_output());
     }
 
     #[test]
@@ -1220,13 +1231,77 @@ mod tests {
     }
 
     #[test]
-    fn completed_response_with_null_incomplete_details_is_end_turn() {
-        let out = render(vec![json!({
-            "type": "response.completed",
-            "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {}}
-        })]);
+    fn terminal_only_completion_remains_non_semantic() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let out = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {}}
+                }),
+                None,
+            )
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
         assert!(out.contains(r#""stop_reason":"end_turn""#));
         assert!(!out.contains(r#""stop_reason":"max_tokens""#));
+        assert!(!translator.has_semantic_output());
+    }
+
+    #[test]
+    fn tool_thinking_and_web_search_events_are_semantic() {
+        let mut tool = LiveStreamTranslator::new("msg_tool", "gpt-5.5");
+        tool.accept(
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(tool.has_semantic_output());
+
+        let mut thinking = LiveStreamTranslator::new("msg_thinking", "gpt-5.5");
+        thinking
+            .accept(
+                &json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": "plan"
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(thinking.has_semantic_output());
+
+        let mut web_search = LiveStreamTranslator::new("msg_search", "gpt-5.5");
+        web_search
+            .accept(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "web_search_call", "id": "ws_1"}
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(!web_search.has_semantic_output());
+        web_search
+            .accept(
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "action": {"query": "claude-code-proxy"}
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(web_search.has_semantic_output());
     }
 
     #[test]
