@@ -54,6 +54,17 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Grok gains opt-in real vision via `CCP_GROK_TOOL_IMAGE=reattach`: image blocks
+  that pass the upstream gates (min side 8px, min area 512px, decoded size ≤5MB,
+  last 4 per request) are reattached as a following user message carrying
+  `input_image` data URLs, in addition to the omit marker left in the tool
+  output. Images that fail a gate — or lose the per-request cap — degrade to
+  the omit marker with a reason; never a request-level 400. URL-source images
+  cannot be gated and always degrade in this mode. Top-level user-message
+  images become real `input_image` parts. `CCP_GROK_TOOL_IMAGE=reject` restores
+  the pre-L1 hard error; `inline` is reserved and currently warns and falls
+  back to the default `omit`. Data URLs and Anthropic image `source.data`
+  payloads are redacted from traffic captures.
 - Grok no longer fails requests whose `tool_result` contains image blocks (for
   example Claude Code `Read` of a PNG): image children degrade to
   `[image omitted: <media_type>]` / `[image omitted: url]` placeholders joined

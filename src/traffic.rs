@@ -357,7 +357,15 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
             let mut out = Map::new();
             for (key, value) in map {
                 let normalized = key.to_lowercase();
-                if REDACT_KEYS.contains(&normalized.as_str())
+                if normalized == "image_url" {
+                    // Grok/OpenAI `input_image` parts carry data URLs; never
+                    // persist the payload in traffic captures.
+                    out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "data" && looks_like_image_source(map) {
+                    // Anthropic image blocks carry raw base64 under
+                    // `source.data`; redact it for the same reason.
+                    out.insert(key.clone(), redact_traffic_value(value));
+                } else if REDACT_KEYS.contains(&normalized.as_str())
                     || matches!(
                         normalized.as_str(),
                         "token"
@@ -390,8 +398,25 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                 .map(|value| redact_traffic_with_depth(value, depth + 1))
                 .collect(),
         ),
+        Value::String(text) if is_data_url(text) => {
+            Value::String(format!("[redacted data-url len={}]", text.len()))
+        }
         _ => value.clone(),
     }
+}
+
+fn is_data_url(text: &str) -> bool {
+    text.starts_with("data:image/") && text.contains(";base64,")
+}
+
+/// An object shaped like an Anthropic image source: `type: "base64"` plus a
+/// `media_type`. Used to redact only image payloads, not arbitrary `data` keys.
+fn looks_like_image_source(map: &Map<String, Value>) -> bool {
+    map.get("type").and_then(Value::as_str) == Some("base64")
+        && map
+            .get("media_type")
+            .and_then(Value::as_str)
+            .is_some_and(|media_type| media_type.starts_with("image/"))
 }
 
 fn redact_traffic_value(value: &Value) -> Value {
@@ -417,4 +442,78 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_traffic_strips_input_image_data_urls() {
+        let value = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "what color?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
+                ]}
+            ]
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("iVBORw0KGgo"),
+            "base64 payload leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("data:image/png;base64,iVBOR"),
+            "data URL payload leaked: {rendered}"
+        );
+        // The image part is still structurally visible (redacted marker).
+        assert!(rendered.contains("input_image"));
+    }
+
+    #[test]
+    fn redact_traffic_strips_inline_base64_image_values() {
+        let value = serde_json::json!({
+            "output": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(!rendered.contains("iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn redact_traffic_strips_anthropic_image_source_data() {
+        // The incoming Anthropic request body carries raw base64 under
+        // `source.data` (no data: URL wrapper) — it must not persist either.
+        let value = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+                    }}
+                ]
+            }]
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("iVBORw0KGgo"),
+            "source.data base64 leaked: {rendered}"
+        );
+        assert!(rendered.contains("redacted"));
+        // Structure is preserved.
+        assert!(rendered.contains("image/png"));
+    }
+
+    #[test]
+    fn redact_traffic_keeps_unrelated_data_keys() {
+        let value = serde_json::json!({"data": "some-non-image-payload", "count": 3});
+        let redacted = redact_traffic(&value);
+        assert_eq!(redacted["data"], "some-non-image-payload");
+    }
 }

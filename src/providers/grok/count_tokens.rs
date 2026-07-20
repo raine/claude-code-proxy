@@ -43,6 +43,9 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
                 GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
                     approx_token_count(text)
                 }
+                // Images count toward tokens; charge a flat per-image estimate
+                // instead of counting base64 payload characters.
+                GrokContentPart::InputImage { .. } => IMAGE_TOKEN_ESTIMATE,
             })
             .sum(),
         GrokInputItem::FunctionCall {
@@ -51,6 +54,8 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
         GrokInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
     }
 }
+
+const IMAGE_TOKEN_ESTIMATE: u64 = 1_024;
 
 fn approx_token_count(text: &str) -> u64 {
     if text.is_empty() {

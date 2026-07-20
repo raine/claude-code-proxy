@@ -316,6 +316,59 @@ pub fn grok_client_version() -> String {
     "0.2.93".to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Grok tool-image policy (CCP_GROK_TOOL_IMAGE)
+// ---------------------------------------------------------------------------
+
+/// How the Grok translator treats Anthropic `image` blocks (tool results and
+/// top-level user messages). `omit` is the safe default: degrade to the L1
+/// placeholder string. `reattach` keeps the placeholder in the tool output and
+/// additionally appends a user message carrying the images as `input_image`
+/// data URLs. `reject` restores the pre-L1 hard error. `inline` is reserved
+/// for ticket 04 and currently warns and falls back to `omit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokToolImageMode {
+    Omit,
+    Reattach,
+    Reject,
+}
+
+pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
+    match raw.map(str::trim) {
+        Some("reattach") => GrokToolImageMode::Reattach,
+        Some("reject") => GrokToolImageMode::Reject,
+        // `inline` (ticket 04) and any unknown/empty value degrade to omit.
+        _ => GrokToolImageMode::Omit,
+    }
+}
+
+pub fn grok_tool_image_mode() -> GrokToolImageMode {
+    parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
+}
+
+/// Warn once at startup when a reserved/unknown mode was requested. Called from
+/// the Grok provider constructor rather than per request.
+pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
+    match std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref() {
+        Some("inline") => log.warn(
+            "CCP_GROK_TOOL_IMAGE=inline is not implemented yet; falling back to omit",
+            None,
+        ),
+        Some(other) if !matches!(other, "omit" | "reattach" | "reject") => {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                "value".to_string(),
+                serde_json::Value::String(other.to_string()),
+            );
+            log.warn(
+                "unrecognized CCP_GROK_TOOL_IMAGE value; falling back to omit",
+                Some(fields),
+            );
+        }
+        _ => {}
+    }
+}
+
 pub fn is_verbose() -> bool {
     log_verbose()
 }

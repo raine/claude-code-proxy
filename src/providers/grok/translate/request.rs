@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
+use crate::config::GrokToolImageMode;
+use crate::providers::translate_shared::{ImageSource, image_source_to_url};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -46,6 +48,8 @@ pub enum GrokContentPart {
     InputText { text: String },
     #[serde(rename = "output_text")]
     OutputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { image_url: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +113,14 @@ pub fn translate_request(
     req: &MessagesRequest,
     model: String,
 ) -> anyhow::Result<GrokResponsesRequest> {
+    translate_request_with_mode(req, model, crate::config::grok_tool_image_mode())
+}
+
+pub fn translate_request_with_mode(
+    req: &MessagesRequest,
+    model: String,
+    image_mode: GrokToolImageMode,
+) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
     let mut instructions = parse_system(req.extra.get("system"))?;
     let mut tools = parse_tools(req.extra.get("tools"))?;
@@ -148,8 +160,9 @@ pub fn translate_request(
     };
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
+    let mut budget = ReattachBudget::new(&req.messages, image_mode);
     for message in &req.messages {
-        parse_message(message, &mut input, &mut call_ids)?;
+        parse_message(message, &mut input, &mut call_ids, image_mode, &mut budget)?;
     }
     Ok(GrokResponsesRequest {
         model,
@@ -161,6 +174,83 @@ pub fn translate_request(
         stream: true,
         max_output_tokens: req.max_tokens,
     })
+}
+
+/// Pre-scans the request to decide which gate-passing images survive the
+/// request-wide "keep only the last few" cap, so the main walk can mark
+/// cap-dropped images with a reason instead of silently dropping pixels.
+struct ReattachBudget {
+    /// Per-image-URL count of gate-passing occurrences that must be dropped
+    /// (the oldest ones) before survivors begin, so the *last* few images win.
+    drops: std::collections::HashMap<String, usize>,
+}
+
+impl ReattachBudget {
+    fn new(messages: &[Message], image_mode: GrokToolImageMode) -> Self {
+        let mut drops: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        if image_mode == GrokToolImageMode::Reattach {
+            let passing: Vec<String> = messages
+                .iter()
+                .flat_map(candidate_image_blocks)
+                .filter_map(|block| {
+                    let source = parse_image_source(block)?;
+                    gate_image(&source)
+                        .ok()
+                        .map(|()| image_source_to_url(&source))
+                })
+                .collect();
+            // Drop the oldest occurrences beyond the cap, keeping the last few.
+            for url in passing
+                .iter()
+                .take(passing.len().saturating_sub(MAX_REATTACHED_IMAGES))
+            {
+                *drops.entry(url.clone()).or_insert(0) += 1;
+            }
+        }
+        Self { drops }
+    }
+
+    /// Record a gate-passing image; `true` when it survives the request cap.
+    /// Oldest occurrences are dropped first, in conversation order.
+    fn admit(&mut self, image_url: &str) -> bool {
+        let Some(drops) = self.drops.get_mut(image_url) else {
+            return true;
+        };
+        *drops -= 1;
+        if *drops == 0 {
+            self.drops.remove(image_url);
+        }
+        false
+    }
+}
+
+/// Every image block in one message: top-level user images and tool_result
+/// image children, in conversation order.
+fn candidate_image_blocks(message: &Message) -> Vec<&serde_json::Map<String, Value>> {
+    let mut blocks = Vec::new();
+    if let Value::Array(items) = &message.content {
+        for item in items {
+            let Some(object) = item.as_object() else {
+                continue;
+            };
+            match object.get("type").and_then(Value::as_str) {
+                Some("image") => blocks.push(object),
+                Some("tool_result") => {
+                    if let Some(Value::Array(parts)) = object.get("content") {
+                        for part in parts {
+                            if let Some(part) = part.as_object()
+                                && part.get("type").and_then(Value::as_str) == Some("image")
+                            {
+                                blocks.push(part);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    blocks
 }
 
 fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
@@ -400,6 +490,8 @@ fn parse_message(
     message: &Message,
     out: &mut Vec<GrokInputItem>,
     calls: &mut HashSet<String>,
+    image_mode: GrokToolImageMode,
+    budget: &mut ReattachBudget,
 ) -> anyhow::Result<()> {
     if !["system", "user", "assistant"].contains(&message.role.as_str()) {
         anyhow::bail!("unsupported message role");
@@ -454,9 +546,37 @@ fn parse_message(
                 {
                     anyhow::bail!("unsupported image block field");
                 }
-                let placeholder = image_placeholder(object)
-                    .ok_or_else(|| anyhow::anyhow!("image source is invalid"))?;
-                content.push(GrokContentPart::InputText { text: placeholder });
+                match image_mode {
+                    GrokToolImageMode::Reject => {
+                        anyhow::bail!("unsupported content block: image");
+                    }
+                    GrokToolImageMode::Omit => {
+                        let placeholder = image_placeholder(object)
+                            .ok_or_else(|| anyhow::anyhow!("image source is invalid"))?;
+                        content.push(GrokContentPart::InputText { text: placeholder });
+                    }
+                    GrokToolImageMode::Reattach => {
+                        let source = parse_image_source(object)
+                            .ok_or_else(|| anyhow::anyhow!("image source is invalid"))?;
+                        match gate_image(&source) {
+                            Ok(()) => {
+                                let image_url = image_source_to_url(&source);
+                                if budget.admit(&image_url) {
+                                    content.push(GrokContentPart::InputImage { image_url });
+                                } else {
+                                    content.push(GrokContentPart::InputText {
+                                        text: omit_with_reason(&source, &cap_reason()),
+                                    });
+                                }
+                            }
+                            Err(reason) => {
+                                content.push(GrokContentPart::InputText {
+                                    text: omit_with_reason(&source, &reason),
+                                });
+                            }
+                        }
+                    }
+                }
             }
             ("assistant", "tool_use") => {
                 if object.keys().any(|key| {
@@ -519,6 +639,7 @@ fn parse_message(
                 let value = object
                     .get("content")
                     .ok_or_else(|| anyhow::anyhow!("tool result content is required"))?;
+                let mut tool_result_images: Vec<String> = Vec::new();
                 let output = match value {
                     Value::String(text) => text.clone(),
                     Value::Array(parts) => {
@@ -547,10 +668,48 @@ fn parse_message(
                                 {
                                     anyhow::bail!("unsupported image child");
                                 }
-                                let placeholder = image_placeholder(part).ok_or_else(|| {
-                                    anyhow::anyhow!("tool result image source is invalid")
-                                })?;
-                                texts.push(placeholder);
+                                match image_mode {
+                                    GrokToolImageMode::Reject => {
+                                        anyhow::bail!("tool result supports text children only");
+                                    }
+                                    GrokToolImageMode::Omit => {
+                                        let placeholder =
+                                            image_placeholder(part).ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "tool result image source is invalid"
+                                                )
+                                            })?;
+                                        texts.push(placeholder);
+                                    }
+                                    GrokToolImageMode::Reattach => {
+                                        let source = parse_image_source(part).ok_or_else(|| {
+                                            anyhow::anyhow!("tool result image source is invalid")
+                                        })?;
+                                        match gate_image(&source) {
+                                            Ok(()) => {
+                                                let image_url = image_source_to_url(&source);
+                                                if budget.admit(&image_url) {
+                                                    texts.push(image_placeholder(part).ok_or_else(
+                                                        || {
+                                                            anyhow::anyhow!(
+                                                                "tool result image source is invalid"
+                                                            )
+                                                        },
+                                                    )?);
+                                                    tool_result_images.push(image_url);
+                                                } else {
+                                                    texts.push(omit_with_reason(
+                                                        &source,
+                                                        &cap_reason(),
+                                                    ));
+                                                }
+                                            }
+                                            Err(reason) => {
+                                                texts.push(omit_with_reason(&source, &reason));
+                                            }
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                             if part.get("type").and_then(Value::as_str) != Some("text")
@@ -576,6 +735,15 @@ fn parse_message(
                     call_id: id.into(),
                     output,
                 });
+                if image_mode == GrokToolImageMode::Reattach && !tool_result_images.is_empty() {
+                    out.push(GrokInputItem::Message {
+                        role: "user".into(),
+                        content: tool_result_images
+                            .into_iter()
+                            .map(|image_url| GrokContentPart::InputImage { image_url })
+                            .collect(),
+                    });
+                }
             }
             _ => anyhow::bail!("unsupported content block: {typ}"),
         }
@@ -607,6 +775,184 @@ fn image_placeholder(object: &serde_json::Map<String, Value>) -> Option<String> 
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// L2a reattach gates (upstream-verified limits; see grok-tool-image/handoff.md)
+// ---------------------------------------------------------------------------
+
+/// Upstream rejects images whose smallest side is under this many pixels.
+const MIN_IMAGE_SIDE_PX: u32 = 8;
+/// Upstream rejects images whose area is under this many square pixels.
+const MIN_IMAGE_AREA_PX: u64 = 512;
+/// Decoded RGB(A) payload cap; larger images are degraded to the omit marker.
+const MAX_IMAGE_DECODED_BYTES: u64 = 5 * 1024 * 1024;
+/// Only the last few images per tool result are reattached.
+const MAX_REATTACHED_IMAGES: usize = 4;
+
+/// Parse an Anthropic image block into a shared `ImageSource`. Returns `None`
+/// for structurally invalid blocks (missing fields, unknown source type).
+fn parse_image_source(object: &serde_json::Map<String, Value>) -> Option<ImageSource> {
+    let source = object.get("source")?.as_object()?;
+    let source_type = source.get("type").and_then(Value::as_str)?;
+    match source_type {
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .filter(|media_type| !media_type.is_empty())?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            Some(ImageSource {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+                source_type: source_type.to_string(),
+            })
+        }
+        "url" => {
+            let url = source
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())?;
+            Some(ImageSource {
+                media_type: "image/*".to_string(),
+                data: url.to_string(),
+                source_type: source_type.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Gate a candidate image against the upstream-verified limits. Returns the
+/// omit reason on failure so the caller can degrade just this one image.
+fn gate_image(source: &ImageSource) -> Result<(), String> {
+    if source.source_type == "url" {
+        // The proxy cannot gate a remote image without fetching it (dimensions
+        // and decoded size are unknown), and an unverifiable image can 400 the
+        // whole turn upstream — so URL sources never reattach.
+        return Err("url source cannot be gated".to_string());
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(source.data.as_bytes())
+        .map_err(|_| "undecodable base64".to_string())?;
+    let (width, height) = image_dimensions(&bytes, &source.media_type)
+        .ok_or_else(|| format!("unreadable dimensions for {}", source.media_type))?;
+    let min_side = width.min(height);
+    if min_side < MIN_IMAGE_SIDE_PX {
+        return Err(format!(
+            "{width}x{height} below minimum side {MIN_IMAGE_SIDE_PX}px"
+        ));
+    }
+    let area = width as u64 * height as u64;
+    if area < MIN_IMAGE_AREA_PX {
+        return Err(format!(
+            "{width}x{height} below minimum area {MIN_IMAGE_AREA_PX}px"
+        ));
+    }
+    // Decoded raster is at least 3 bytes per pixel (RGB); RGBA is 4. Use 3 as
+    // a conservative lower bound so borderline images stay under the cap.
+    let decoded = area.saturating_mul(3);
+    if decoded > MAX_IMAGE_DECODED_BYTES {
+        return Err(format!(
+            "{width}x{height} too large (decoded ~{}MB > {}MB cap)",
+            decoded / (1024 * 1024),
+            MAX_IMAGE_DECODED_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// Render the L1 omit marker with a gate-failure reason appended.
+fn omit_with_reason(source: &ImageSource, reason: &str) -> String {
+    let base = if source.source_type == "url" {
+        "[image omitted: url]".to_string()
+    } else {
+        format!("[image omitted: {}]", source.media_type)
+    };
+    format!("{base} ({reason})")
+}
+
+/// Reason attached to images that passed every per-image gate but lost the
+/// request-wide "keep only the last few" cap.
+fn cap_reason() -> String {
+    format!("only the last {MAX_REATTACHED_IMAGES} images are attached per request")
+}
+
+/// Extract pixel dimensions from the encoded image header. Supports PNG, JPEG
+/// and GIF; returns `None` for unknown/corrupt formats.
+fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
+    match media_type {
+        "image/png" => png_dimensions(bytes),
+        "image/jpeg" => jpeg_dimensions(bytes),
+        "image/gif" => gif_dimensions(bytes),
+        _ => sniff_dimensions(bytes),
+    }
+}
+
+fn sniff_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    png_dimensions(bytes)
+        .or_else(|| jpeg_dimensions(bytes))
+        .or_else(|| gif_dimensions(bytes))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // Signature (8) + IHDR length (4) + "IHDR" (4) + width (4) + height (4).
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((width, height))
+}
+
+fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // "GIF87a"/"GIF89a" (6) + width (2 LE) + height (2 LE).
+    if bytes.len() < 10 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
+        return None;
+    }
+    let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+    let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+    Some((width, height))
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // Walk SOI-delimited segments to the first SOF0..SOF15 frame header.
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut cursor = 2usize;
+    while cursor + 4 <= bytes.len() {
+        if bytes[cursor] != 0xff {
+            return None;
+        }
+        let marker = bytes[cursor + 1];
+        // Standalone markers without a length field.
+        if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            cursor += 2;
+            continue;
+        }
+        let segment_len =
+            u16::from_be_bytes(bytes[cursor + 2..cursor + 4].try_into().ok()?) as usize;
+        if segment_len < 2 || cursor + 2 + segment_len > bytes.len() {
+            return None;
+        }
+        let is_sof = matches!(
+            marker,
+            0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+        );
+        if is_sof {
+            // Segment: length (2) + precision (1) + height (2) + width (2).
+            if segment_len < 7 {
+                return None;
+            }
+            let height = u16::from_be_bytes(bytes[cursor + 5..cursor + 7].try_into().ok()?) as u32;
+            let width = u16::from_be_bytes(bytes[cursor + 7..cursor + 9].try_into().ok()?) as u32;
+            return Some((width, height));
+        }
+        cursor += 2 + segment_len;
+    }
+    None
 }
 
 fn valid_cache_control(value: Option<&Value>) -> bool {
@@ -1127,5 +1473,393 @@ mod tests {
         assert_eq!(translated["input"][1]["type"], "function_call_output");
         assert_eq!(translated["input"][1]["output"], "result");
         assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    // ---------------------------------------------------------------------
+    // L2a: CCP_GROK_TOOL_IMAGE flag + reattach vision tests
+    // ---------------------------------------------------------------------
+
+    // 32x32 solid red PNG (valid dimensions, passes all gates).
+    const PNG_32_RED: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg==";
+    // 1x1 red PNG (min-side + area gate failure).
+    const PNG_1_RED: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    // 8x8 red PNG (area gate failure: 64 < 512).
+    const PNG_8_RED: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn grok_tool_image_mode_parses_flag_values() {
+        use crate::config::{GrokToolImageMode, parse_grok_tool_image_mode};
+        assert_eq!(parse_grok_tool_image_mode(None), GrokToolImageMode::Omit);
+        assert_eq!(
+            parse_grok_tool_image_mode(Some("omit")),
+            GrokToolImageMode::Omit
+        );
+        assert_eq!(
+            parse_grok_tool_image_mode(Some("reattach")),
+            GrokToolImageMode::Reattach
+        );
+        assert_eq!(
+            parse_grok_tool_image_mode(Some("reject")),
+            GrokToolImageMode::Reject
+        );
+        // inline is not implemented yet (ticket 04): warn + fall back to omit.
+        assert_eq!(
+            parse_grok_tool_image_mode(Some("inline")),
+            GrokToolImageMode::Omit
+        );
+        // Unknown values are the safe default.
+        assert_eq!(
+            parse_grok_tool_image_mode(Some("bogus")),
+            GrokToolImageMode::Omit
+        );
+        assert_eq!(
+            parse_grok_tool_image_mode(Some("")),
+            GrokToolImageMode::Omit
+        );
+    }
+
+    #[test]
+    fn reattach_tool_result_image_emits_following_user_message_with_input_image() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"screenshot"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // function_call_output keeps the L1 omit marker (text stays verbatim).
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert_eq!(
+            translated["input"][1]["output"],
+            "screenshot\n[image omitted: image/png]"
+        );
+        // A user message follows carrying the image as an input_image data URL.
+        assert_eq!(translated["input"][2]["type"], "message");
+        assert_eq!(translated["input"][2]["role"], "user");
+        let parts = translated["input"][2]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "input_image");
+        let url = parts[0]["image_url"].as_str().unwrap();
+        assert!(
+            url.starts_with("data:image/png;base64,"),
+            "unexpected image_url prefix: {}",
+            &url[..url.len().min(40)]
+        );
+        assert!(url.contains(PNG_32_RED));
+    }
+
+    #[test]
+    fn reattach_top_level_user_image_becomes_input_image_part() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"what color is this?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}]
+        }))
+        .unwrap();
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parts = translated["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "what color is this?");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert!(
+            parts[1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[test]
+    fn reattach_degrades_tiny_image_to_omit_with_reason_never_error() {
+        for (data, dims) in [(PNG_1_RED, "1x1"), (PNG_8_RED, "8x8")] {
+            let request = request_with_blocks(serde_json::json!([
+                {"type":"tool_result","tool_use_id":"call_1","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}
+                ]}
+            ]));
+            let translated = serde_json::to_value(
+                translate_request_with_mode(
+                    &request,
+                    "grok-4.5".into(),
+                    crate::config::GrokToolImageMode::Reattach,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let output = translated["input"][1]["output"].as_str().unwrap();
+            assert!(
+                output.starts_with("[image omitted: image/png"),
+                "unexpected output: {output}"
+            );
+            assert!(output.contains(dims), "reason must cite dims: {output}");
+            // No reattached message: gated-out images never produce input_image.
+            assert_eq!(translated["input"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn reattach_degrades_oversized_image_to_omit_with_reason() {
+        // 6000x6000 solid PNG: decoded raw size ~108MB > 5MB cap. Deflate of a
+        // solid scanline is tiny, so the base64 fixture stays small.
+        let big = oversized_png_base64(6000, 6000);
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":big}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let output = translated["input"][1]["output"].as_str().unwrap();
+        assert!(
+            output.starts_with("[image omitted: image/png"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("too large"),
+            "reason must cite size: {output}"
+        );
+        assert_eq!(translated["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reattach_keeps_only_last_four_images_per_request() {
+        let mut result_parts = Vec::new();
+        for _ in 0..6 {
+            result_parts.push(serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}));
+        }
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":result_parts}]}
+            ]
+        }))
+        .unwrap();
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let input = translated["input"].as_array().unwrap();
+        // function_call + function_call_output + one reattached user message.
+        assert_eq!(input.len(), 3);
+        let parts = input[2]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4, "only the last 4 images survive");
+        assert!(parts.iter().all(|part| part["type"] == "input_image"));
+        // The two cap-dropped images degrade with a reason in the tool output.
+        let output = input[1]["output"].as_str().unwrap();
+        let cap_drops = output.matches("only the last 4 images").count();
+        assert_eq!(
+            cap_drops, 2,
+            "cap-dropped images must carry a reason: {output}"
+        );
+        let attached = output.matches("[image omitted: image/png]\n").count()
+            + if output.ends_with("[image omitted: image/png]") {
+                1
+            } else {
+                0
+            };
+        assert_eq!(attached, 4, "surviving images keep the plain L1 marker");
+    }
+
+    #[test]
+    fn reattach_cap_applies_across_tool_results_in_one_request() {
+        // Two tool results with 3 images each: 6 gate-passing images, so only
+        // the last 4 across the request reattach (the whole second result's 3
+        // plus the first result's last 1).
+        let image = || serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}});
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_1","name":"lookup","input":{}},
+                    {"type":"tool_use","id":"call_2","name":"lookup","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":[image(),image(),image()]},
+                    {"type":"tool_result","tool_use_id":"call_2","content":[image(),image(),image()]}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let input = translated["input"].as_array().unwrap();
+        let total_attached: usize = input
+            .iter()
+            .map(|item| {
+                item["content"]
+                    .as_array()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|part| part["type"] == "input_image")
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(
+            total_attached, 4,
+            "cap is request-wide, not per tool result"
+        );
+    }
+
+    #[test]
+    fn reattach_degrades_url_images_with_reason_instead_of_reattaching() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let output = translated["input"][1]["output"].as_str().unwrap();
+        assert!(
+            output.starts_with("[image omitted: url]"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("cannot be gated"),
+            "reason must explain the skip: {output}"
+        );
+        // No input_image part anywhere.
+        assert!(!translated.to_string().contains("input_image"));
+    }
+
+    #[test]
+    fn reject_mode_restores_old_bail_on_tool_result_images() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}
+        ]));
+        let result = translate_request_with_mode(
+            &request,
+            "grok-4.5".into(),
+            crate::config::GrokToolImageMode::Reject,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("tool result supports text children only")
+        );
+    }
+
+    #[test]
+    fn reject_mode_restores_old_bail_on_top_level_user_images() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}]
+        }))
+        .unwrap();
+        let result = translate_request_with_mode(
+            &request,
+            "grok-4.5".into(),
+            crate::config::GrokToolImageMode::Reject,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported content block: image")
+        );
+    }
+
+    /// Build a solid-color PNG of the given size, returned as base64. Used to
+    /// create dimension-valid but decoded-size-oversized fixtures without a
+    /// large test file.
+    fn oversized_png_base64(width: u32, height: u32) -> String {
+        use base64::Engine;
+        use std::io::Write as _;
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+        write_chunk(&mut png, b"IHDR", &ihdr);
+        // One scanline: filter byte + width * 3 zero bytes, repeated.
+        let mut raw = Vec::with_capacity((width as usize * 3 + 1) * height as usize);
+        for _ in 0..height {
+            raw.push(0u8);
+            raw.extend(std::iter::repeat_n(0u8, width as usize * 3));
+        }
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        let idat = encoder.finish().unwrap();
+        write_chunk(&mut png, b"IDAT", &idat);
+        write_chunk(&mut png, b"IEND", &[]);
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
+    fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_data = Vec::with_capacity(4 + data.len());
+        crc_data.extend_from_slice(kind);
+        crc_data.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_data).to_be_bytes());
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xffff_ffff;
+        for byte in data {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
     }
 }
