@@ -50,6 +50,8 @@ use self::translate::request::{
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
+const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
+const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
 // ---------------------------------------------------------------------------
@@ -225,16 +227,44 @@ impl Provider for CodexProvider {
             .await;
         }
 
-        let upstream = match client
-            .post_codex(&translated, &ctx, Some(&continuation))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        let mut continuation = Some(continuation);
+        let mut attempt = 0_u32;
+        let upstream = loop {
+            let response = match client
+                .post_codex(&translated, &ctx, continuation.as_ref())
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    abort_compaction_attempt(
+                        ctx.session_id.as_deref(),
+                        compact_boundary,
+                        &translated,
+                    );
+                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    return map_codex_error_to_response(&e);
+                }
+            };
+            if !is_empty_codex_success_completion(&response.body) {
+                break response;
+            }
+            // A successful terminal event with no output would translate into
+            // an empty end_turn; retry with full context instead.
+            let error = empty_buffered_completion_error();
+            drop_live_continuation_for_retry(&mut continuation);
+            if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
-                return map_codex_error_to_response(&e);
+                return map_codex_error_to_response(&error);
             }
+            let delay = compute_backoff_delay(attempt, None);
+            if delay.exceeds_budget {
+                abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
+                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                return map_codex_error_to_response(&error);
+            }
+            attempt += 1;
+            sleep(delay.wait_ms).await;
         };
 
         if want_stream {
@@ -841,6 +871,45 @@ where
     (headers, Body::from_stream(stream)).into_response()
 }
 
+fn empty_buffered_completion_error() -> client::CodexError {
+    client::CodexError {
+        status: 503,
+        message: "Codex completed without producing output".to_string(),
+        detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
+        retry_after: None,
+        origin: match config::codex_transport() {
+            config::CodexTransport::Http => client::CodexErrorOrigin::BufferedHttp,
+            _ => client::CodexErrorOrigin::BufferedWebSocket,
+        },
+    }
+}
+
+/// True when the buffered upstream body ended in a successful terminal event
+/// without ever producing semantic output (text, thinking, tool, web search).
+fn is_empty_codex_success_completion(upstream_sse: &[u8]) -> bool {
+    use self::translate::reducer::{ReducerEvent, TERM_COMPLETED, TERM_DONE};
+
+    let Ok(events) = self::translate::reducer::reduce_upstream_bytes(upstream_sse) else {
+        return false;
+    };
+    let mut saw_success_terminal = false;
+    for event in &events {
+        match event {
+            ReducerEvent::TextDelta { text, .. } if !text.is_empty() => return false,
+            ReducerEvent::ThinkingStart { .. }
+            | ReducerEvent::ToolStart { .. }
+            | ReducerEvent::WebSearch { .. } => return false,
+            ReducerEvent::Finish { terminal_type, .. }
+                if terminal_type == TERM_COMPLETED || terminal_type == TERM_DONE =>
+            {
+                saw_success_terminal = true;
+            }
+            _ => {}
+        }
+    }
+    saw_success_terminal
+}
+
 fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
     matches!(
         payload.get("type").and_then(|v| v.as_str()),
@@ -954,6 +1023,9 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     let message = codex_error_message(err);
     if is_context_window_overflow(message) {
         return map_codex_failure_to_response(message);
+    }
+    if err.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message);
     }
 
     match err.status {
@@ -1126,6 +1198,114 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in events {
+            bytes.extend_from_slice(format!("data: {event}\n\n").as_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn terminal_only_completed_upstream_is_empty_completion() {
+        let body = upstream_sse(&[serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {"input_tokens": 5, "output_tokens": 0}}
+        })]);
+        assert!(is_empty_codex_success_completion(&body));
+    }
+
+    #[test]
+    fn terminal_only_done_upstream_is_empty_completion() {
+        let body = upstream_sse(&[serde_json::json!({
+            "type": "response.done",
+            "response": {"id": "resp_1", "usage": {}}
+        })]);
+        assert!(is_empty_codex_success_completion(&body));
+    }
+
+    #[test]
+    fn empty_message_item_is_empty_completion() {
+        let body = upstream_sse(&[
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_1"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}}
+            }),
+        ]);
+        assert!(is_empty_codex_success_completion(&body));
+    }
+
+    #[test]
+    fn upstream_with_text_is_not_empty_completion() {
+        let body = upstream_sse(&[
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_1"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "hello"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}}
+            }),
+        ]);
+        assert!(!is_empty_codex_success_completion(&body));
+    }
+
+    #[test]
+    fn upstream_with_tool_call_is_not_empty_completion() {
+        let body = upstream_sse(&[
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": ""}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{}"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}}
+            }),
+        ]);
+        assert!(!is_empty_codex_success_completion(&body));
+    }
+
+    #[test]
+    fn terminal_only_incomplete_upstream_is_not_empty_completion() {
+        let body = upstream_sse(&[serde_json::json!({
+            "type": "response.incomplete",
+            "response": {"id": "resp_1", "incomplete_details": {"reason": "max_output_tokens"}, "usage": {}}
+        })]);
+        assert!(!is_empty_codex_success_completion(&body));
+    }
+
+    #[test]
+    fn upstream_without_terminal_event_is_not_empty_completion() {
+        assert!(!is_empty_codex_success_completion(&upstream_sse(&[])));
+    }
 
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
