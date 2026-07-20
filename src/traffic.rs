@@ -516,4 +516,32 @@ mod tests {
         let redacted = redact_traffic(&value);
         assert_eq!(redacted["data"], "some-non-image-payload");
     }
+
+    #[test]
+    fn redact_traffic_strips_data_urls_in_array_shaped_tool_output() {
+        // L2b inline mode: function_call_output.output is an array of content
+        // parts — the image_url inside must be redacted just like message parts.
+        let value = serde_json::json!({
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
+                ]}
+            ]
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("iVBORw0KGgo"),
+            "base64 payload leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("data:image/png;base64,iVBOR"),
+            "data URL payload leaked: {rendered}"
+        );
+        // Structure and text survive.
+        assert!(rendered.contains("input_image"));
+        assert!(rendered.contains("screenshot"));
+        assert!(rendered.contains("redacted"));
+    }
 }

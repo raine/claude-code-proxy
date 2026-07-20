@@ -38,7 +38,20 @@ pub enum GrokInputItem {
         arguments: String,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: GrokToolOutput,
+    },
+}
+
+/// Tool output payload: a plain string, or (in `inline` image mode) an array
+/// of `input_text` + `input_image` parts. Untagged so string outputs serialize
+/// byte-identically to the pre-inline shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum GrokToolOutput {
+    Text(String),
+    Parts(Vec<GrokContentPart>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,7 +201,10 @@ struct ReattachBudget {
 impl ReattachBudget {
     fn new(messages: &[Message], image_mode: GrokToolImageMode) -> Self {
         let mut drops: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        if image_mode == GrokToolImageMode::Reattach {
+        if matches!(
+            image_mode,
+            GrokToolImageMode::Reattach | GrokToolImageMode::Inline
+        ) {
             let passing: Vec<String> = messages
                 .iter()
                 .flat_map(candidate_image_blocks)
@@ -555,7 +571,7 @@ fn parse_message(
                             .ok_or_else(|| anyhow::anyhow!("image source is invalid"))?;
                         content.push(GrokContentPart::InputText { text: placeholder });
                     }
-                    GrokToolImageMode::Reattach => {
+                    GrokToolImageMode::Reattach | GrokToolImageMode::Inline => {
                         let source = parse_image_source(object)
                             .ok_or_else(|| anyhow::anyhow!("image source is invalid"))?;
                         match gate_image(&source) {
@@ -641,9 +657,10 @@ fn parse_message(
                     .ok_or_else(|| anyhow::anyhow!("tool result content is required"))?;
                 let mut tool_result_images: Vec<String> = Vec::new();
                 let output = match value {
-                    Value::String(text) => text.clone(),
+                    Value::String(text) => GrokToolOutput::Text(text.clone()),
                     Value::Array(parts) => {
                         let mut texts = Vec::new();
+                        let mut inline_parts: Vec<GrokContentPart> = Vec::new();
                         for part in parts {
                             let part = part.as_object().ok_or_else(|| {
                                 anyhow::anyhow!("tool result child must be an object")
@@ -709,6 +726,33 @@ fn parse_message(
                                             }
                                         }
                                     }
+                                    GrokToolImageMode::Inline => {
+                                        let source = parse_image_source(part).ok_or_else(|| {
+                                            anyhow::anyhow!("tool result image source is invalid")
+                                        })?;
+                                        match gate_image(&source) {
+                                            Ok(()) => {
+                                                let image_url = image_source_to_url(&source);
+                                                if budget.admit(&image_url) {
+                                                    inline_parts.push(
+                                                        GrokContentPart::InputImage { image_url },
+                                                    );
+                                                } else {
+                                                    inline_parts.push(GrokContentPart::InputText {
+                                                        text: omit_with_reason(
+                                                            &source,
+                                                            &cap_reason(),
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                            Err(reason) => {
+                                                inline_parts.push(GrokContentPart::InputText {
+                                                    text: omit_with_reason(&source, &reason),
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                                 continue;
                             }
@@ -720,14 +764,41 @@ fn parse_message(
                             {
                                 anyhow::bail!("tool result supports text children only");
                             }
-                            texts.push(
-                                part.get("text")
-                                    .and_then(Value::as_str)
-                                    .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))?
-                                    .to_string(),
-                            );
+                            let text = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))?
+                                .to_string();
+                            if image_mode == GrokToolImageMode::Inline {
+                                inline_parts.push(GrokContentPart::InputText { text });
+                            } else {
+                                texts.push(text);
+                            }
                         }
-                        texts.join("\n")
+                        if image_mode == GrokToolImageMode::Inline {
+                            // Text-only results keep the plain-string shape so
+                            // inline mode is invisible unless an image is present.
+                            let mut joined: Option<String> = Some(String::new());
+                            for part in &inline_parts {
+                                match part {
+                                    GrokContentPart::InputText { text } => {
+                                        if let Some(acc) = joined.as_mut() {
+                                            if !acc.is_empty() {
+                                                acc.push('\n');
+                                            }
+                                            acc.push_str(text);
+                                        }
+                                    }
+                                    _ => joined = None,
+                                }
+                            }
+                            match joined {
+                                Some(text) => GrokToolOutput::Text(text),
+                                None => GrokToolOutput::Parts(inline_parts),
+                            }
+                        } else {
+                            GrokToolOutput::Text(texts.join("\n"))
+                        }
                     }
                     _ => anyhow::bail!("tool result supports text only"),
                 };
@@ -1502,10 +1573,9 @@ mod tests {
             parse_grok_tool_image_mode(Some("reject")),
             GrokToolImageMode::Reject
         );
-        // inline is not implemented yet (ticket 04): warn + fall back to omit.
         assert_eq!(
             parse_grok_tool_image_mode(Some("inline")),
-            GrokToolImageMode::Omit
+            GrokToolImageMode::Inline
         );
         // Unknown values are the safe default.
         assert_eq!(
@@ -1861,5 +1931,291 @@ mod tests {
             }
         }
         !crc
+    }
+
+    // ---------------------------------------------------------------------
+    // L2b: CCP_GROK_TOOL_IMAGE=inline — tool output as a content-part array
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn inline_tool_result_image_emits_array_output_with_input_image_part() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"screenshot"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        // output is an untagged array of content parts, not a string.
+        let parts = translated["input"][1]["output"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "screenshot");
+        assert_eq!(parts[1]["type"], "input_image");
+        let url = parts[1]["image_url"].as_str().unwrap();
+        assert!(
+            url.starts_with("data:image/png;base64,"),
+            "unexpected image_url prefix: {}",
+            &url[..url.len().min(40)]
+        );
+        assert!(url.contains(PNG_32_RED));
+        // No reattached user message: the image rides inside the tool output.
+        assert_eq!(translated["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn inline_image_only_tool_result_emits_array_with_single_image_part() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parts = translated["input"][1]["output"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "input_image");
+    }
+
+    #[test]
+    fn inline_text_only_tool_result_serializes_byte_identically_to_omit() {
+        // String-only outputs (and text-only array results) must keep the
+        // plain-string shape in every mode — inline included.
+        let shapes = [
+            serde_json::json!({"type":"tool_result","tool_use_id":"call_1","content":"plain string"}),
+            serde_json::json!({"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"first"},
+                {"type":"text","text":"second"}
+            ]}),
+        ];
+        for shape in shapes {
+            let request = request_with_blocks(serde_json::json!([shape]));
+            let omit = serde_json::to_string(
+                &translate_request_with_mode(
+                    &request,
+                    "grok-4.5".into(),
+                    crate::config::GrokToolImageMode::Omit,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let inline = serde_json::to_string(
+                &translate_request_with_mode(
+                    &request,
+                    "grok-4.5".into(),
+                    crate::config::GrokToolImageMode::Inline,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(omit, inline, "text-only outputs must be byte-identical");
+            // And the output field really is a bare JSON string, not an array.
+            let value: Value = serde_json::from_str(&inline).unwrap();
+            assert!(value["input"][1]["output"].is_string());
+        }
+    }
+
+    #[test]
+    fn inline_string_output_matches_pre_inline_serialization_exactly() {
+        // Regression: the whole upstream-bound request body for a string tool
+        // result must serialize exactly as before the GrokToolOutput widening.
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":"result"}
+        ]));
+        let body = serde_json::to_string(
+            &translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body.contains(r#""output":"result""#),
+            "output must serialize as a bare string: {body}"
+        );
+        assert!(!body.contains(r#""output":["#));
+    }
+
+    #[test]
+    fn inline_all_images_gated_out_collapse_to_string_with_reasons() {
+        for (data, dims) in [(PNG_1_RED, "1x1"), (PNG_8_RED, "8x8")] {
+            let request = request_with_blocks(serde_json::json!([
+                {"type":"tool_result","tool_use_id":"call_1","content":[
+                    {"type":"text","text":"shot"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}}
+                ]}
+            ]));
+            // Gate failures degrade per-image, never a 400 for the whole turn.
+            let translated = serde_json::to_value(
+                translate_request_with_mode(
+                    &request,
+                    "grok-4.5".into(),
+                    crate::config::GrokToolImageMode::Inline,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            // All parts ended up as text → collapses back to a plain string.
+            let output = translated["input"][1]["output"].as_str().unwrap();
+            assert!(
+                output.contains("[image omitted: image/png"),
+                "unexpected output: {output}"
+            );
+            assert!(output.contains(dims), "reason must cite dims: {output}");
+            assert!(output.starts_with("shot\n"));
+        }
+    }
+
+    #[test]
+    fn inline_mixed_passing_and_failing_images_keep_array_shape() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_1_RED}},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parts = translated["input"][1]["output"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        // The gated-out image becomes an in-band omit fragment inside the array.
+        assert_eq!(parts[0]["type"], "input_text");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[image omitted: image/png")
+        );
+        assert!(parts[0]["text"].as_str().unwrap().contains("1x1"));
+        assert_eq!(parts[1]["type"], "input_image");
+    }
+
+    #[test]
+    fn inline_degrades_url_images_to_omit_fragment_inside_array() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parts = translated["input"][1]["output"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "input_text");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be gated")
+        );
+        assert_eq!(parts[1]["type"], "input_image");
+    }
+
+    #[test]
+    fn inline_keeps_only_last_four_images_per_request() {
+        let mut result_parts = Vec::new();
+        for _ in 0..6 {
+            result_parts.push(serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}));
+        }
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":result_parts}]}
+            ]
+        }))
+        .unwrap();
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let input = translated["input"].as_array().unwrap();
+        // function_call + function_call_output only — no reattached message.
+        assert_eq!(input.len(), 2);
+        let parts = input[1]["output"].as_array().unwrap();
+        assert_eq!(parts.len(), 6);
+        let images = parts
+            .iter()
+            .filter(|part| part["type"] == "input_image")
+            .count();
+        assert_eq!(images, 4, "only the last 4 images survive");
+        let cap_drops = parts
+            .iter()
+            .filter(|part| {
+                part["type"] == "input_text"
+                    && part["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("only the last 4 images"))
+            })
+            .count();
+        assert_eq!(cap_drops, 2, "cap-dropped images carry a reason");
+    }
+
+    #[test]
+    fn inline_top_level_user_image_becomes_input_image_part() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"what color is this?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_32_RED}}
+            ]}]
+        }))
+        .unwrap();
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Inline,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parts = translated["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert!(
+            parts[1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 }

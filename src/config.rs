@@ -324,20 +324,23 @@ pub fn grok_client_version() -> String {
 /// top-level user messages). `omit` is the safe default: degrade to the L1
 /// placeholder string. `reattach` keeps the placeholder in the tool output and
 /// additionally appends a user message carrying the images as `input_image`
-/// data URLs. `reject` restores the pre-L1 hard error. `inline` is reserved
-/// for ticket 04 and currently warns and falls back to `omit`.
+/// data URLs. `inline` sends the tool output itself as an array of
+/// `input_text` + `input_image` parts (string-only outputs still serialize as
+/// plain strings). `reject` restores the pre-L1 hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokToolImageMode {
     Omit,
     Reattach,
+    Inline,
     Reject,
 }
 
 pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
     match raw.map(str::trim) {
         Some("reattach") => GrokToolImageMode::Reattach,
+        Some("inline") => GrokToolImageMode::Inline,
         Some("reject") => GrokToolImageMode::Reject,
-        // `inline` (ticket 04) and any unknown/empty value degrade to omit.
+        // Any unknown/empty value degrades to the safe default.
         _ => GrokToolImageMode::Omit,
     }
 }
@@ -346,15 +349,11 @@ pub fn grok_tool_image_mode() -> GrokToolImageMode {
     parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
 }
 
-/// Warn once at startup when a reserved/unknown mode was requested. Called from
-/// the Grok provider constructor rather than per request.
+/// Warn once at startup when an unknown mode was requested. Called from the
+/// Grok provider constructor rather than per request.
 pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
     match std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref() {
-        Some("inline") => log.warn(
-            "CCP_GROK_TOOL_IMAGE=inline is not implemented yet; falling back to omit",
-            None,
-        ),
-        Some(other) if !matches!(other, "omit" | "reattach" | "reject") => {
+        Some(other) if !matches!(other, "omit" | "reattach" | "inline" | "reject") => {
             let mut fields = serde_json::Map::new();
             fields.insert(
                 "value".to_string(),
