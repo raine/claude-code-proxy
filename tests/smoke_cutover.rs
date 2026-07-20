@@ -624,6 +624,58 @@ async fn spawn_websocket_empty_completion_then_retry_upstream(
     addr_str
 }
 
+/// Upstream that answers every request with a terminal-only completion,
+/// so the proxy's bounded retry loop always exhausts.
+async fn spawn_websocket_always_empty_completion_upstream(
+    request_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sender, mut receiver) = ws.split();
+            let request_count = request_count.clone();
+
+            tokio::spawn(async move {
+                while let Some(message) = receiver.next().await {
+                    match message {
+                        Ok(Message::Text(_)) => {
+                            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let event = json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_empty",
+                                    "status": "completed",
+                                    "incomplete_details": null,
+                                    "usage": {"input_tokens": 5, "output_tokens": 0}
+                                }
+                            });
+                            if sender.send(Message::Text(event.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(Message::Ping(data)) => {
+                            let _ = sender.send(Message::Pong(data)).await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+    });
+
+    addr_str
+}
+
 // ---------------------------------------------------------------------------
 // Health and routing smoke tests (no env var mutation needed)
 // ---------------------------------------------------------------------------
@@ -1881,6 +1933,73 @@ async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full
         guard[2]["input"].as_array().map(Vec::len),
         Some(3),
         "retry request should send the full input"
+    );
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+/// Resets the retry-delay override even when the test panics, so later tests
+/// in this process keep real backoff behavior.
+struct ZeroRetryDelayGuard;
+
+impl ZeroRetryDelayGuard {
+    fn enable() -> Self {
+        claude_code_proxy::retry::set_zero_retry_delay_for_tests(true);
+        ZeroRetryDelayGuard
+    }
+}
+
+impl Drop for ZeroRetryDelayGuard {
+    fn drop(&mut self) {
+        claude_code_proxy::retry::set_zero_retry_delay_for_tests(false);
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_empty_completions_exhaust_to_service_unavailable() {
+    let _guard = env_lock();
+    let _delay_guard = ZeroRetryDelayGuard::enable();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_websocket_always_empty_completion_upstream(request_count.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "exhausted empty completions must surface an explicit error: {body_text}"
+    );
+    assert!(
+        body_text.contains("Codex completed without producing output"),
+        "unexpected exhaustion body: {body_text}"
+    );
+    // Initial attempt plus MAX_RETRYABLE_LIVE_STREAM_RETRIES full-context retries.
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        11,
+        "retry loop must stay bounded"
     );
 
     clear_all_continuations_for_tests();
