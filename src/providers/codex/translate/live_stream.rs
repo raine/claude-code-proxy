@@ -956,6 +956,7 @@ impl LiveStreamTranslator {
         let Some(signature) = encode_reasoning_signature(&replay) else {
             return;
         };
+        self.semantic_output_started = true;
         let index = self.anthropic_index;
         self.anthropic_index += 1;
         self.ensure_message_start(traffic, out);
@@ -1511,5 +1512,29 @@ mod tests {
         assert!(thinking_delta < signature_delta);
         assert!(signature_delta < thinking_stop);
         assert!(out.contains("ccp:codex:v1:"));
+    }
+
+    #[test]
+    fn signature_only_reasoning_is_semantic_output() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"reasoning","id":"rs_1"}
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(r#""type":"signature_delta""#));
+        assert!(translator.has_semantic_output());
     }
 }
