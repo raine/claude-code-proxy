@@ -52,6 +52,16 @@ description: Release notes for claude-code-proxy.
   reasoning-token usage. `CCP_COMPACT_EFFORT` can choose a different cap or
   disable the behavior. ([#67](https://github.com/raine/claude-code-proxy/pull/67))
 
+## Unreleased
+
+- Grok no longer fails requests whose `tool_result` contains image blocks (for
+  example Claude Code `Read` of a PNG): image children degrade to
+  `[image omitted: <media_type>]` / `[image omitted: url]` placeholders joined
+  with text children, matching the Codex translator. Top-level user-message
+  image blocks degrade to the same placeholder instead of erroring.
+- Grok multi-part text `tool_result` content is now joined with `\n` between
+  parts (previously concatenated without a separator), mirroring Codex.
+
 ## v0.1.21 (2026-07-15)
 
 - The monitor shows session token activity trends at common terminal widths,

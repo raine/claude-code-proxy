@@ -446,6 +446,18 @@ fn parse_message(
             }
             ("assistant", "web_search_tool_result" | "x_search_tool_result")
             | ("user", "web_search_tool_result" | "x_search_tool_result") => {}
+            ("user", "image") => {
+                if object
+                    .keys()
+                    .any(|key| !["type", "source", "cache_control"].contains(&key.as_str()))
+                    || !valid_cache_control(object.get("cache_control"))
+                {
+                    anyhow::bail!("unsupported image block field");
+                }
+                let placeholder = image_placeholder(object)
+                    .ok_or_else(|| anyhow::anyhow!("image source is invalid"))?;
+                content.push(GrokContentPart::InputText { text: placeholder });
+            }
             ("assistant", "tool_use") => {
                 if object.keys().any(|key| {
                     !["type", "id", "name", "input", "cache_control"].contains(&key.as_str())
@@ -528,6 +540,19 @@ fn parse_message(
                                 }
                                 continue;
                             }
+                            if part.get("type").and_then(Value::as_str) == Some("image") {
+                                if part.keys().any(|key| {
+                                    !["type", "source", "cache_control"].contains(&key.as_str())
+                                }) || !valid_cache_control(part.get("cache_control"))
+                                {
+                                    anyhow::bail!("unsupported image child");
+                                }
+                                let placeholder = image_placeholder(part).ok_or_else(|| {
+                                    anyhow::anyhow!("tool result image source is invalid")
+                                })?;
+                                texts.push(placeholder);
+                                continue;
+                            }
                             if part.get("type").and_then(Value::as_str) != Some("text")
                                 || part.keys().any(|key| {
                                     !["type", "text", "cache_control"].contains(&key.as_str())
@@ -537,12 +562,13 @@ fn parse_message(
                                 anyhow::bail!("tool result supports text children only");
                             }
                             texts.push(
-                                part.get("text").and_then(Value::as_str).ok_or_else(|| {
-                                    anyhow::anyhow!("tool result text is invalid")
-                                })?,
+                                part.get("text")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))?
+                                    .to_string(),
                             );
                         }
-                        texts.join("")
+                        texts.join("\n")
                     }
                     _ => anyhow::bail!("tool result supports text only"),
                 };
@@ -556,6 +582,31 @@ fn parse_message(
     }
     flush_message(&message.role, &mut content, out);
     Ok(())
+}
+
+fn image_placeholder(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let source = object.get("source")?.as_object()?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64")
+            if source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .is_some_and(|media_type| !media_type.is_empty())
+                && source.get("data").and_then(Value::as_str).is_some() =>
+        {
+            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            Some(format!("[image omitted: {media_type}]"))
+        }
+        Some("url")
+            if source
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| !url.is_empty()) =>
+        {
+            Some("[image omitted: url]".into())
+        }
+        _ => None,
+    }
 }
 
 fn valid_cache_control(value: Option<&Value>) -> bool {
@@ -912,11 +963,89 @@ mod tests {
     }
 
     #[test]
+    fn grok_translation_omits_image_only_tool_result_children() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+            ]}
+        ]));
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert_eq!(
+            translated["input"][1]["output"],
+            "[image omitted: image/png]"
+        );
+    }
+
+    #[test]
+    fn grok_translation_omits_url_image_tool_result_children() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}
+            ]}
+        ]));
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][1]["output"], "[image omitted: url]");
+    }
+
+    #[test]
+    fn grok_translation_joins_text_and_image_tool_result_children() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"caption"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},
+                {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}
+            ]}
+        ]));
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["input"][1]["output"],
+            "caption\n[image omitted: image/png]\n[image omitted: url]"
+        );
+    }
+
+    #[test]
+    fn grok_translation_joins_multiple_text_tool_result_children_with_newlines() {
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"text","text":"first"},
+                {"type":"text","text":"second"}
+            ]}
+        ]));
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][1]["output"], "first\nsecond");
+    }
+
+    #[test]
+    fn grok_translation_omits_top_level_user_image_blocks() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+            ]}]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["input"][0]["content"],
+            serde_json::json!([
+                {"type":"input_text","text":"what is this?"},
+                {"type":"input_text","text":"[image omitted: image/png]"}
+            ])
+        );
+    }
+
+    #[test]
     fn grok_translation_rejects_malformed_tool_result_children() {
         for child in [
             serde_json::json!("text"),
             serde_json::json!({"text":"ok"}),
-            serde_json::json!({"type":"image","text":"ok"}),
             serde_json::json!({"type":"text","text":1}),
             serde_json::json!({"type":"text","text":"ok","unknown":true}),
         ] {
