@@ -329,11 +329,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         last_event_type = Some(t.clone());
 
         if t == "codex.rate_limits" {
-            if let Some(true) = p
-                .get("rate_limits")
-                .and_then(|r| r.get("limit_reached"))
-                .and_then(|v| v.as_bool())
-            {
+            if crate::providers::codex::events::is_terminal_rate_limit_event(&p) {
                 let retry_after = p
                     .get("rate_limits")
                     .and_then(|r| r.get("primary"))

@@ -99,12 +99,7 @@ impl LiveStreamTranslator {
 
         match kind {
             "codex.rate_limits" => {
-                if payload
-                    .get("rate_limits")
-                    .and_then(|r| r.get("limit_reached"))
-                    .and_then(|v| v.as_bool())
-                    == Some(true)
-                {
+                if crate::providers::codex::events::is_terminal_rate_limit_event(payload) {
                     return Err("rate limit reached".to_string());
                 }
             }

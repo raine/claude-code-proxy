@@ -23,14 +23,26 @@ impl CodexEventFailure {
     }
 }
 
+pub(crate) fn is_terminal_rate_limit_event(payload: &Value) -> bool {
+    payload.get("type").and_then(Value::as_str) == Some("codex.rate_limits")
+        && payload
+            .pointer("/rate_limits/limit_reached")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && payload
+            .pointer("/credits/has_credits")
+            .and_then(Value::as_bool)
+            != Some(true)
+        && payload
+            .pointer("/credits/unlimited")
+            .and_then(Value::as_bool)
+            != Some(true)
+}
+
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
     if event_type == "codex.rate_limits" {
-        if payload
-            .pointer("/rate_limits/limit_reached")
-            .and_then(Value::as_bool)
-            != Some(true)
-        {
+        if !is_terminal_rate_limit_event(payload) {
             return None;
         }
         return Some(CodexEventFailure {

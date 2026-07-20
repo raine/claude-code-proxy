@@ -212,6 +212,36 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
     addr_str
 }
 
+/// Reproduce the Codex subscription-credit response observed in production:
+/// the included window is exhausted, but usable credits remain and the model
+/// still completes the response after the rate-limit snapshot.
+async fn spawn_websocket_credited_rate_limit_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let _ = ws.next().await;
+            let events = [
+                r#"{"type":"codex.rate_limits","rate_limits":{"allowed":false,"limit_reached":true,"primary":{"used_percent":100,"window_minutes":10080,"reset_after_seconds":509821}},"credits":{"has_credits":true,"unlimited":false,"balance":null}}"#,
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"credited codex ok"}"#,
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+            ];
+
+            for event in &events {
+                let _ = ws.send(Message::Text(event.to_string())).await;
+            }
+        }
+    });
+
+    addr_str
+}
+
 async fn spawn_websocket_delayed_terminal_upstream() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -874,6 +904,35 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert_eq!(sent["model"], "gpt-5.5");
     assert!(sent.get("max_output_tokens").is_none());
     assert!(sent.get("stream").is_none());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_uses_credits_after_included_limit() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let upstream = spawn_websocket_credited_rate_limit_upstream().await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages("gpt-5.5").await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "credited Codex response must not be discarded: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["content"][0]["text"], "credited codex ok");
 }
 
 #[allow(clippy::await_holding_lock)]
