@@ -37,6 +37,8 @@ struct FileConfig {
     pub port: Option<u16>,
     #[serde(rename = "aliasProvider")]
     pub alias_provider: Option<String>,
+    #[serde(rename = "autoReviewModel")]
+    pub auto_review_model: Option<String>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -244,6 +246,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     {
         out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
     }
+    if env
+        .get("CCP_AUTO_REVIEW_MODEL")
+        .is_some_and(|raw| !raw.is_empty())
+    {
+        out.push("CCP_AUTO_REVIEW_MODEL (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
             out.push(format!("bindAddress: {bind_address}"));
@@ -253,6 +261,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         }
         if let Some(alias) = file_cfg.alias_provider {
             out.push(format!("aliasProvider: {alias}"));
+        }
+        if file_cfg
+            .auto_review_model
+            .is_some_and(|model| !model.is_empty())
+        {
+            out.push("autoReviewModel (config)".to_string());
         }
         if let Some(log) = file_cfg.log {
             if let Some(v) = log.verbose {
@@ -480,6 +494,19 @@ pub fn codex_model() -> Option<String> {
     None
 }
 
+pub fn auto_review_model() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env
+        .get("CCP_AUTO_REVIEW_MODEL")
+        .filter(|raw| !raw.is_empty())
+    {
+        return Some(raw.clone());
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.auto_review_model)
+        .filter(|model| !model.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Codex transport config
 // ---------------------------------------------------------------------------
@@ -592,6 +619,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
     }
 
@@ -780,6 +808,29 @@ mod tests {
         {
             let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "");
             assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
+        }
+    }
+
+    #[test]
+    fn auto_review_model_reads_top_level_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"autoReviewModel":"grok-4.5"}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
+        {
+            let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+            assert_eq!(auto_review_model().as_deref(), Some("gpt-5.6-terra"));
+        }
+        {
+            let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "");
+            assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         }
     }
 }

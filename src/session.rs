@@ -53,6 +53,17 @@ pub fn record_session_request(
     model: &str,
     now: u64,
 ) -> Option<SessionState> {
+    record_session_request_with_affinity_update(session_id, prior, provider_name, model, true, now)
+}
+
+pub(crate) fn record_session_request_with_affinity_update(
+    session_id: Option<&str>,
+    prior: Option<&SessionState>,
+    provider_name: &str,
+    model: &str,
+    update_affinity: bool,
+    now: u64,
+) -> Option<SessionState> {
     let id = session_id?;
     let mut store = SESSIONS.lock().expect("session lock");
     let mut next = prior.cloned().unwrap_or(SessionState {
@@ -62,7 +73,8 @@ pub fn record_session_request(
     });
     next.seq += 1;
     next.last_seen = now;
-    if is_alias_routable_provider(provider_name)
+    if update_affinity
+        && is_alias_routable_provider(provider_name)
         && !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
     {
         next.affinity_provider = Some(match provider_name {
@@ -101,4 +113,29 @@ pub fn reset_sessions_for_test() {
 
 pub fn affinity_provider_from_session(session: &SessionState) -> Option<AliasProvider> {
     session.affinity_provider
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auxiliary_request_does_not_change_session_affinity() {
+        let session_id = "session-affinity-auxiliary-request-test";
+        let initial = record_session_request(Some(session_id), None, "codex", "gpt-5.6-sol", 1)
+            .expect("initial session");
+        assert_eq!(initial.affinity_provider, Some(AliasProvider::Codex));
+
+        let after_review = record_session_request_with_affinity_update(
+            Some(session_id),
+            Some(&initial),
+            "kimi",
+            "kimi-for-coding",
+            false,
+            2,
+        )
+        .expect("updated session");
+        assert_eq!(after_review.seq, 2);
+        assert_eq!(after_review.affinity_provider, Some(AliasProvider::Codex));
+    }
 }

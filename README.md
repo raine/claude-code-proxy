@@ -683,6 +683,7 @@ Windows, and at
   "bindAddress": "127.0.0.1",
   "port": 18765,
   "aliasProvider": "codex",
+  "autoReviewModel": "gpt-5.6-terra",
   "codex": {
     "originator": "claude-code-proxy",
     "userAgent": "claude-code-proxy/dev",
@@ -725,6 +726,7 @@ Windows, and at
 | `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                                                                              |
 | `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                                                                            |
 | `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
+| `CCP_AUTO_REVIEW_MODEL`          | `autoReviewModel`          | unset                                             | Route Claude Code's autonomous Bash security-review classifier through any registered model; use a direct model ID for deterministic provider selection                           |
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
@@ -749,6 +751,11 @@ Windows, and at
 A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
+
+`CCP_AUTO_REVIEW_MODEL` only applies to Claude Code's non-streaming, tool-free
+Bash security-review classifier request. It does not affect normal messages or
+token counting, and the one-off route does not change the session's provider
+affinity. When unset, routing is unchanged.
 
 Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
