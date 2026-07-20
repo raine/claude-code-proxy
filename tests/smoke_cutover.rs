@@ -937,6 +937,43 @@ async fn smoke_codex_websocket_uses_credits_after_included_limit() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_uses_credits_after_included_limit() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let upstream = spawn_websocket_credited_rate_limit_upstream().await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "credited Codex stream must not be discarded: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("credited codex ok"), "stream body: {text}");
+    assert!(text.contains("message_stop"), "stream body: {text}");
+    assert!(!text.contains("event: error"), "stream body: {text}");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
