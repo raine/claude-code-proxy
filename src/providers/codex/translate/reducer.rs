@@ -1,4 +1,5 @@
 use crate::anthropic::sse::parse_sse_events;
+use crate::config;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
 
 use super::read_rewrite::sanitize_read_args;
@@ -169,16 +170,19 @@ fn finalize_active_thinking(
     reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
     output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
 ) {
-    if let Some(replay) = reasoning_by_output_index
+    let replay = reasoning_by_output_index
         .remove(&active.output_index)
-        .and_then(|pending| pending.replay())
-        && let Some(signature) = encode_reasoning_signature(&replay)
-    {
-        out.push(ReducerEvent::ThinkingSignature {
-            index: active.anthropic_index,
-            signature,
-        });
-        output_items_by_index.insert(active.output_index, reasoning_input_item(replay));
+        .and_then(|pending| pending.replay());
+    if config::codex_reasoning_signatures_enabled() {
+        if let Some(replay) = replay
+            && let Some(signature) = encode_reasoning_signature(&replay)
+        {
+            out.push(ReducerEvent::ThinkingSignature {
+                index: active.anthropic_index,
+                signature,
+            });
+            output_items_by_index.insert(active.output_index, reasoning_input_item(replay));
+        }
     }
     out.push(ReducerEvent::ThinkingStop {
         index: active.anthropic_index,
@@ -208,6 +212,10 @@ fn emit_signature_only_reasoning(
     reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
     output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
 ) {
+    if !config::codex_reasoning_signatures_enabled() {
+        reasoning_by_output_index.remove(&output_index);
+        return;
+    }
     let Some(replay) = reasoning_by_output_index
         .remove(&output_index)
         .and_then(|pending| pending.replay())

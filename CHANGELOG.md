@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Codex encrypted reasoning continuation signatures can now be disabled with
+  `codex.reasoningSignatures` / `CCP_CODEX_REASONING_SIGNATURES`, reducing
+  transcript growth in tool-heavy Claude Code sessions.
+
 ## v0.1.22 (2026-07-20)
 
 - Grok accepts request metadata and tool-result references sent by current Claude
