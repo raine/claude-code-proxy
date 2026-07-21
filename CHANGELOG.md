@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Codex reasoning summaries are now opt-in via `codex.reasoningSummary` /
+  `CCP_CODEX_REASONING_SUMMARY`, preventing internal planning summaries from
+  being surfaced in Claude Code sessions by default.
+
 ## v0.1.22 (2026-07-20)
 
 - Grok accepts request metadata and tool-result references sent by current Claude

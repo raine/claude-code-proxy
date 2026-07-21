@@ -276,12 +276,12 @@ the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`lo
 / `medium` / `high` / `xhigh` / `max`). An explicit `codex.effort` /
 `CCP_CODEX_EFFORT` override still takes precedence and can also force `none`.
 
-Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
-Codex for `reasoning.summary: "auto"` and translates returned summary deltas
-into Anthropic `thinking` content blocks. Codex decides when a summary is useful,
-so simple prompts can emit no thinking block. Set `codex.reasoningSummary` /
-`CCP_CODEX_REASONING_SUMMARY` to `off` or `none` to suppress summaries while
-keeping `reasoning.effort` and encrypted continuation content.
+Reasoning summaries: when `codex.reasoningSummary` /
+`CCP_CODEX_REASONING_SUMMARY` is set to `auto` or `detailed`, Codex requests
+include `reasoning.summary: "auto"` and returned summary deltas are translated
+into Anthropic `thinking` content blocks. Summaries are disabled by default to
+avoid exposing internal planning text in Claude Code sessions while keeping
+`reasoning.effort` and encrypted continuation content active.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool with live external web access and non-empty native
@@ -729,7 +729,7 @@ Windows, and at
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
-| `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
+| `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when set to `auto` or `detailed`; unset, `off`, and `none` suppress summaries                                                                  |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
@@ -1029,8 +1029,9 @@ supported shape.
   images remain textual placeholders.
 - **Kimi — image inputs in tool results:** pass through as `image_url` parts
   (Kimi accepts them in `role:"tool"` content).
-- **Codex — reasoning blocks:** not forwarded to Claude Code (dropped), even if
-  the upstream model produced them.
+- **Codex — reasoning summaries:** forwarded as Anthropic `thinking` content
+  blocks only when `codex.reasoningSummary` / `CCP_CODEX_REASONING_SUMMARY` is
+  set to `auto` or `detailed`; otherwise summary display is suppressed.
 - **Kimi — reasoning blocks:** forwarded as Anthropic `thinking` content blocks
   and rendered by Claude Code. Disable by setting
   `thinking: {"type":"disabled"}` in your Anthropic request.
