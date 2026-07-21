@@ -294,7 +294,7 @@ fn resolve_effort_override(
 }
 
 fn reasoning_summary_requested(summary: Option<&str>) -> bool {
-    !matches!(summary, Some("off" | "none"))
+    matches!(summary, Some("auto" | "detailed"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,7 +1399,7 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         let reasoning = out.reasoning.unwrap();
         assert!(matches!(reasoning.effort, Some(Effort::Medium)));
-        assert_eq!(reasoning.summary.as_deref(), Some("auto"));
+        assert_eq!(reasoning.summary, None);
         assert_eq!(
             out.include,
             Some(vec!["reasoning.encrypted_content".to_string()])
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_override_values() {
-        assert!(reasoning_summary_requested(None));
+        assert!(!reasoning_summary_requested(None));
         assert!(reasoning_summary_requested(Some("auto")));
         assert!(reasoning_summary_requested(Some("detailed")));
         assert!(!reasoning_summary_requested(Some("off")));
