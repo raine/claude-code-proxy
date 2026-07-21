@@ -689,6 +689,7 @@ Windows, and at
     "model": "gpt-5.4",
     "effort": "medium",
     "reasoningSummary": "auto",
+    "reasoningSignatures": "on",
     "serviceTier": "fast",
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "websocket",
@@ -730,6 +731,7 @@ Windows, and at
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
+| `CCP_CODEX_REASONING_SIGNATURES` | `codex.reasoningSignatures` | `on`                                              | Preserve Codex encrypted reasoning continuation in Anthropic thinking signatures; `off`, `none`, `false`, and `0` suppress signature storage                                      |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
@@ -1031,6 +1033,8 @@ supported shape.
   (Kimi accepts them in `role:"tool"` content).
 - **Codex — reasoning blocks:** not forwarded to Claude Code (dropped), even if
   the upstream model produced them.
+  Encrypted continuation signatures are preserved by default and can be disabled
+  with `codex.reasoningSignatures` / `CCP_CODEX_REASONING_SIGNATURES`.
 - **Kimi — reasoning blocks:** forwarded as Anthropic `thinking` content blocks
   and rendered by Claude Code. Disable by setting
   `thinking: {"type":"disabled"}` in your Anthropic request.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
+use crate::config;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
 use crate::traffic::TrafficCapture;
 
@@ -936,6 +937,9 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
+        if !config::codex_reasoning_signatures_enabled() {
+            return;
+        }
         let Some(replay) = self
             .reasoning_by_output_index
             .remove(&output_index)
@@ -984,22 +988,26 @@ impl LiveStreamTranslator {
         let Some(thinking) = self.thinking.take() else {
             return;
         };
-        if let Some(signature) = self
+        let replay = self
             .reasoning_by_output_index
             .remove(&thinking.output_index)
-            .and_then(|pending| pending.replay())
-            .and_then(|replay| encode_reasoning_signature(&replay))
-        {
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": thinking.anthropic_index,
-                    "delta": {"type": "signature_delta", "signature": signature}
-                }),
-            );
+            .and_then(|pending| pending.replay());
+        if config::codex_reasoning_signatures_enabled() {
+            if let Some(signature) = replay
+                .as_ref()
+                .and_then(|replay| encode_reasoning_signature(replay))
+            {
+                self.emit(
+                    traffic,
+                    out,
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": thinking.anthropic_index,
+                        "delta": {"type": "signature_delta", "signature": signature}
+                    }),
+                );
+            }
         }
         self.emit(
             traffic,

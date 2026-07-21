@@ -510,7 +510,7 @@ pub fn translate_request(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if resolved_effort.is_some() {
+    if resolved_effort.is_some() && config::codex_reasoning_signatures_enabled() {
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
 
