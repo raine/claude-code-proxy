@@ -725,6 +725,10 @@ Windows, and at
 | `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                                                                              |
 | `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                                                                            |
 | `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
+| `CCP_COMPACTION_MODEL`           | —                          | unset (disabled)                                  | One-shot target model for signaled Claude Code compaction requests                                                                                                                |
+| `CCP_COMPACTION_EFFORT`          | —                          | `medium`                                          | One-shot compaction effort (`low`, `medium`, `high`, `xhigh`, or `max`)                                                                                                           |
+| `CCP_COMPACTION_MARKER_DIR`      | —                          | unset                                             | Shared directory containing short-lived `<session-id>.json` compaction markers; required when routing is enabled                                                                 |
+| `CCP_COMPACTION_MARKER_TTL_SECONDS` | —                       | `60`                                              | Marker lifetime in seconds (1–86400)                                                                                                                                              |
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
@@ -764,6 +768,26 @@ proxy clears unsafe continuation state and sends the full request instead.
 Continuation reduces repeated request upload size, but it does not increase the
 upstream model context window. Multi-process or load-balanced deployments need
 sticky sessions or shared state before enabling continuation.
+
+### One-shot compaction routing
+
+Compaction routing is disabled unless both `CCP_COMPACTION_MODEL` and
+`CCP_COMPACTION_MARKER_DIR` are set. A cooperating Claude Code `PreCompact` hook
+writes `<marker-dir>/<session-id>.json` with this schema:
+
+```json
+{"version":1,"sessionId":"<session-id>","createdAtMs":1750000000000}
+```
+
+For `/v1/messages` only, the proxy requires the same validated
+`x-claude-code-session-id`, a fresh marker, and Claude Code's compaction prompt
+anchor. It atomically claims the marker, changes that request's model, and merges
+`output_config.effort`. `/count_tokens`, ordinary prompts, wrong sessions, and
+stale or malformed markers do not route. A marker can route at most one request;
+all marker errors fail open to the original request model. Logs contain only the
+request/session correlation and selected model/effort, never marker or prompt bodies.
+The prompt guard is intentionally conservative: if Claude Code changes its
+compaction prompt, routing stops rather than rerouting an ambiguous request.
 
 ### Files
 
