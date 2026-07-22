@@ -4,6 +4,7 @@ pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
 pub mod request_summary;
+pub(crate) mod responses_proxy;
 pub mod translate;
 pub mod websocket;
 

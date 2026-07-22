@@ -101,13 +101,18 @@ pub fn app(registry: Arc<Registry>) -> Router {
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
     let state = Arc::new(AppState { registry, monitor });
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models))
         .fallback(fallback_handler)
-        .with_state(state)
+        .with_state(state);
+    if crate::providers::codex::responses_proxy::enabled() {
+        app.merge(crate::providers::codex::responses_proxy::router())
+    } else {
+        app
+    }
 }
 
 #[derive(Clone)]
