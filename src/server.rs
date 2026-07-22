@@ -108,7 +108,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
         .route("/v1/models", get(handler_models))
         .fallback(fallback_handler)
         .with_state(state);
-    if crate::providers::codex::responses_proxy::enabled() {
+    if crate::providers::codex::responses_proxy::any_enabled() {
         app.merge(crate::providers::codex::responses_proxy::router())
     } else {
         app

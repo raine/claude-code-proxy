@@ -20,6 +20,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const ENABLE_ENV: &str = "CCP_ENABLE_CODEX_RESPONSES";
+const IMAGES_ENABLE_ENV: &str = "CCP_ENABLE_CODEX_IMAGES";
+const IMAGES_BASE_URL_ENV: &str = "CCP_CODEX_IMAGES_BASE_URL";
 
 #[derive(Clone)]
 struct ResponsesProxyState {
@@ -27,8 +29,8 @@ struct ResponsesProxyState {
     auth: Arc<CodexAuthManager<DefaultCodexAuthStore>>,
 }
 
-pub fn enabled() -> bool {
-    std::env::var(ENABLE_ENV).is_ok_and(|value| {
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -36,14 +38,34 @@ pub fn enabled() -> bool {
     })
 }
 
+pub fn enabled() -> bool {
+    env_enabled(ENABLE_ENV)
+}
+
+pub fn images_enabled() -> bool {
+    env_enabled(IMAGES_ENABLE_ENV)
+}
+
+pub fn any_enabled() -> bool {
+    enabled() || images_enabled()
+}
+
 pub fn router() -> Router {
     let state = ResponsesProxyState {
         client: reqwest::Client::new(),
         auth: Arc::new(CodexAuthManager::new(file_store())),
     };
-    Router::new()
-        .route("/v1/responses", post(handler))
-        .with_state(state)
+    let mut router = Router::new();
+    if enabled() {
+        router = router.route("/v1/responses", post(handler));
+    }
+    if images_enabled() {
+        router = router
+            .route("/v1/images/generations", post(images_handler))
+            .route("/v1/images/edits", post(images_handler))
+            .route("/v1/images/variations", post(images_handler));
+    }
+    router.with_state(state)
 }
 
 async fn handler(State(state): State<ResponsesProxyState>, req: Request<Body>) -> Response {
@@ -109,6 +131,129 @@ async fn handler(State(state): State<ResponsesProxyState>, req: Request<Body>) -
         };
     }
     upstream_response(upstream)
+}
+
+async fn images_handler(
+    State(state): State<ResponsesProxyState>,
+    req: Request<Body>,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let content_type = req.headers().get(http::header::CONTENT_TYPE).cloned();
+    let accept = req.headers().get(http::header::ACCEPT).cloned();
+    let session_id = req
+        .headers()
+        .get("x-client-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Unable to read request body: {err}"),
+            );
+        }
+    };
+    let context = RequestContext {
+        req_id: Uuid::new_v4().to_string(),
+        session_id,
+        session_seq: None,
+        provider: "codex-images".to_string(),
+        traffic: None,
+        monitor: None,
+    };
+    let auth = match state.auth.get_auth().await {
+        Ok(auth) => auth,
+        Err(err) => {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                err.to_string(),
+            );
+        }
+    };
+    let mut upstream = match send_image(
+        &state,
+        &path,
+        &body,
+        content_type.as_ref(),
+        accept.as_ref(),
+        &context,
+        &auth,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    if upstream.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let refreshed = match state.auth.force_refresh(&auth.access).await {
+            Ok(auth) => auth,
+            Err(err) => {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    format!("Codex authentication refresh failed: {err}"),
+                );
+            }
+        };
+        upstream = match send_image(
+            &state,
+            &path,
+            &body,
+            content_type.as_ref(),
+            accept.as_ref(),
+            &context,
+            &refreshed,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(response) => return response,
+        };
+    }
+    upstream_response(upstream)
+}
+
+async fn send_image(
+    state: &ResponsesProxyState,
+    path: &str,
+    body: &[u8],
+    content_type: Option<&http::HeaderValue>,
+    accept: Option<&http::HeaderValue>,
+    context: &RequestContext,
+    auth: &StoredAuth,
+) -> Result<reqwest::Response, Response> {
+    let base_url = std::env::var(IMAGES_BASE_URL_ENV).map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "configuration_error",
+            format!("{IMAGES_BASE_URL_ENV} must be set when {IMAGES_ENABLE_ENV} is enabled"),
+        )
+    })?;
+    let suffix = path.strip_prefix("/v1").unwrap_or(path);
+    let url = format!("{}{}", base_url.trim_end_matches('/'), suffix);
+    let headers = build_codex_headers(auth, context, false).map_err(|err| {
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "proxy_error", err.to_string())
+    })?;
+    let mut request = state.client.post(url);
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    if let Some(value) = content_type {
+        request = request.header(http::header::CONTENT_TYPE, value);
+    }
+    if let Some(value) = accept {
+        request = request.header(http::header::ACCEPT, value);
+    }
+    request.body(body.to_vec()).send().await.map_err(|err| {
+        json_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            format!("Images upstream request failed: {err}"),
+        )
+    })
 }
 
 async fn send(
