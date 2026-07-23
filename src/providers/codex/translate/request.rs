@@ -366,6 +366,9 @@ pub fn translate_request(
             "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
             "true".to_string(),
         )]));
+        // The lite lane hard-requires this: sending `true` is rejected with
+        // 400 unsupported_value ("X-OpenAI-Internal-Codex-Responses-Lite
+        // requires `parallel_tool_calls` to be false").
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();

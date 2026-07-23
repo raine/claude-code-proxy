@@ -276,6 +276,16 @@ the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`lo
 / `medium` / `high` / `xhigh` / `max`). An explicit `codex.effort` /
 `CCP_CODEX_EFFORT` override still takes precedence and can also force `none`.
 
+Responses lanes and parallel tool calls: the gpt-5.6 family (`luna` / `sol` /
+`terra`) is served through the Responses **Lite** lane by default. The Lite
+lane rejects `parallel_tool_calls: true` (400 `unsupported_value`), so through
+it a model emits at most one tool call per assistant turn — Claude Code's
+parallel `tool_use` batching degrades into serialized round-trips. `gpt-5.6-sol`
+and `gpt-5.6-terra` also exist on the full Responses lane, where parallel tool
+calls work; set `codex.fullLane` / `CCP_CODEX_FULL_LANE` to opt them into it.
+`gpt-5.6-luna` is Lite-only (the full lane resolves it to a `-free` variant and
+returns 404) and ignores the override.
+
 Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
 Codex for `reasoning.summary: "auto"` and translates returned summary deltas
 into Anthropic `thinking` content blocks. Codex decides when a summary is useful,
@@ -734,6 +744,7 @@ Windows, and at
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                                                                         |
+| `CCP_CODEX_FULL_LANE`            | `codex.fullLane`           | `false`                                           | Route `gpt-5.6-sol` / `gpt-5.6-terra` through the full Responses lane instead of Responses Lite, enabling parallel tool calls (`gpt-5.6-luna` stays on Lite — full lane 404s it)   |
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
 | `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                                                                                     |
