@@ -48,7 +48,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.6-terra",
 ];
 
-pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
+pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
 pub struct Registry {

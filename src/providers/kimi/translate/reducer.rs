@@ -159,6 +159,7 @@ struct StreamError {
 
 #[allow(dead_code)]
 struct ToolSlot {
+    tc_index: usize,
     block_index: usize,
     id: String,
     name: String,
@@ -270,7 +271,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             }
 
             for tc in tool_calls {
-                let existing_pos = tool_slots.iter().position(|s| s.block_index == tc.index);
+                let existing_pos = tool_slots.iter().position(|s| s.tc_index == tc.index);
                 let block_index = if let Some(pos) = existing_pos {
                     tool_slots[pos].block_index
                 } else {
@@ -281,13 +282,13 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         .and_then(|f| f.name.clone())
                         .unwrap_or_default();
                     if id.is_empty() || name.is_empty() {
-                        // Defensive: skip out-of-order fragments
                         continue;
                     }
                     saw_tool_calls = true;
                     let bi = next_block_index;
                     next_block_index += 1;
                     tool_slots.push(ToolSlot {
+                        tc_index: tc.index,
                         block_index: bi,
                         id: id.clone(),
                         name: name.clone(),
