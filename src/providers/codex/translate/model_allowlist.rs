@@ -108,8 +108,25 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+/// The gpt-5.6 family defaults to the Responses Lite lane. The lite lane
+/// requires `parallel_tool_calls: false` (the backend rejects the request
+/// with 400 `unsupported_value` otherwise), so every tool call is serialized
+/// into its own assistant turn there. `gpt-5.6-sol` and `gpt-5.6-terra` also
+/// exist on the full Responses lane, where parallel tool calls work;
+/// `codex.fullLane` / `CCP_CODEX_FULL_LANE` opts them into it. `gpt-5.6-luna`
+/// stays on the lite lane unconditionally — see [`full_lane_web_search_model`].
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
+    uses_responses_lite_with_full_lane(model, config::codex_full_lane())
+}
+
+fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    if model == "gpt-5.6-luna" {
+        return true;
+    }
+    if full_lane {
+        return false;
+    }
+    matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra")
 }
 
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
@@ -143,6 +160,24 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn responses_lite_defaults_for_56_family_only() {
+        for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert!(uses_responses_lite_with_full_lane(model, false));
+        }
+        for model in ["gpt-5.3-codex", "gpt-5.4", "gpt-5.5"] {
+            assert!(!uses_responses_lite_with_full_lane(model, false));
+        }
+    }
+
+    #[test]
+    fn full_lane_opts_sol_and_terra_out_of_lite_but_never_luna() {
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.6-sol", true));
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.6-terra", true));
+        assert!(uses_responses_lite_with_full_lane("gpt-5.6-luna", true));
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.4", true));
     }
 
     #[test]

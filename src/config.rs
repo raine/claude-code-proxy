@@ -54,6 +54,8 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(rename = "reasoningSummary")]
@@ -448,6 +450,20 @@ pub fn codex_effort() -> Option<String> {
     None
 }
 
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        return raw == "1" || raw == "true";
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+    {
+        return codex.full_lane.unwrap_or(false);
+    }
+    false
+}
+
 pub fn codex_reasoning_summary() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env
@@ -592,6 +608,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_CODEX_FULL_LANE");
         }
     }
 
@@ -603,6 +620,26 @@ mod tests {
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
         assert_eq!(load_config().bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_off_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+
+        let _env = EnvGuard::set("CCP_CODEX_FULL_LANE", "0");
+        assert!(!codex_full_lane());
     }
 
     #[test]
