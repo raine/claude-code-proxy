@@ -26,6 +26,7 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("opus", "gpt-5.6-sol"),
     ("claude-opus-4-7", "gpt-5.6-sol"),
     ("claude-opus-4-8", "gpt-5.6-sol"),
+    ("claude-opus-5", "gpt-5.6-sol"),
     ("fable", "gpt-5.6-sol"),
     ("claude-fable-5", "gpt-5.6-sol"),
 ];
@@ -154,6 +155,12 @@ mod tests {
     #[test]
     fn opus_4_8_resolves_to_sol() {
         let r = resolve_model_request("claude-opus-4-8");
+        assert_eq!(r.model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn opus_5_resolves_to_sol() {
+        let r = resolve_model_request("claude-opus-5");
         assert_eq!(r.model, "gpt-5.6-sol");
     }
 

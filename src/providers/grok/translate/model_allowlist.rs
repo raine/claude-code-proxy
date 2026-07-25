@@ -14,6 +14,12 @@ pub fn resolve_model_request(model: &str) -> ResolvedModel {
             model: "grok-4.5".into(),
             reasoning_effort: Some("high"),
         },
+        // Claude Code may request the Anthropic Opus 5 id; map it to the
+        // base Grok 4.5 wire model so /effort remains effective.
+        "claude-opus-5" => ResolvedModel {
+            model: "grok-4.5".into(),
+            reasoning_effort: None,
+        },
         _ => ResolvedModel {
             model: model.into(),
             reasoning_effort: None,
@@ -59,6 +65,17 @@ mod tests {
     fn regular_model_does_not_override_effort() {
         assert_eq!(
             resolve_model_request("grok-4.5"),
+            ResolvedModel {
+                model: "grok-4.5".into(),
+                reasoning_effort: None,
+            }
+        );
+    }
+
+    #[test]
+    fn opus_5_alias_resolves_to_grok_4_5() {
+        assert_eq!(
+            resolve_model_request("claude-opus-5"),
             ResolvedModel {
                 model: "grok-4.5".into(),
                 reasoning_effort: None,
