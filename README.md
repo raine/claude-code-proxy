@@ -174,7 +174,7 @@ claude-code-proxy claude grok -- --continue
 
 | Profile | Main model | `haiku` | `sonnet` | `opus` | Context | Default effort |
 | --- | --- | --- | --- | --- | ---: | --- |
-| `gpt` / `co` | GPT-5.6 Sol | GPT-5.6 Luna | GPT-5.6 Terra | GPT-5.6 Sol | 272K | ultracode (Claude xhigh orchestration; Codex wire max) |
+| `gpt` / `co` | GPT-5.6 Sol | GPT-5.6 Luna | GPT-5.6 Terra | GPT-5.6 Sol | 272K | high |
 | `grok` / `cg` | Grok 4.5 | Grok 4.5 Medium | Grok 4.5 High | Grok 4.5 High | 500K | high |
 
 Each profile also supplies Claude Code with a concrete, same-family model
@@ -185,7 +185,7 @@ agent files:
 
 | Agent type | `co` | `cg` |
 | --- | --- | --- |
-| built-in `claude` | GPT-5.6 Sol / inherited (`max` wire by default) | Grok 4.5 / inherited (`high` by default) |
+| built-in `claude` | GPT-5.6 Sol / inherited (`high` by default) | Grok 4.5 / inherited (`high` by default) |
 | `Explore` | GPT-5.6 Luna / `medium` | Grok 4.5 Medium / `medium` |
 | `general-purpose` | GPT-5.6 Sol / `high` | Grok 4.5 High / `high` |
 | `Plan` | GPT-5.6 Terra / `high` | Grok 4.5 High / `high` |
@@ -193,8 +193,8 @@ agent files:
 The special built-in `claude` catch-all remains untouched because Claude Code
 adds a private background-job and Agent View protocol that public `--agents`
 definitions cannot preserve. It therefore inherits the current main-session
-effort: the profile defaults still produce `max` wire effort under `co` and
-`high` under `cg`, while an explicit `/effort` change also applies to this one
+effort: the profile defaults still produce `high` under `co` and
+`cg`, while an explicit `/effort` change also applies to this one
 built-in agent. Explore and Plan use profile-managed read-only definitions;
 general-purpose inherits the parent tool set.
 
@@ -204,12 +204,12 @@ now changes the wire request. Selecting `grok-4.5-high` explicitly remains a
 way to lock high effort regardless of the UI setting; the model picker also
 offers `grok-composer-2.5-fast` as an explicit speed-first option.
 
-The `co` launcher keeps Claude Code's Ultracode workflow and internal `xhigh`
-orchestration, then adds an internal profile marker that makes ordinary Codex
-requests use wire-level `max`. It newline-merges that marker into
-`ANTHROPIC_CUSTOM_HEADERS`, preserving custom headers inherited from the launch
-environment. The `cg` profile does not add the marker and keeps its existing
-Grok effort behavior.
+The `co` launcher defaults to Claude Code `high` effort with Ultracode off.
+It still installs an internal profile marker so that if you later raise effort
+to `xhigh` (or enable Ultracode), those requests are promoted to Codex
+wire-level `max`. The marker is newline-merged into `ANTHROPIC_CUSTOM_HEADERS`,
+preserving custom headers inherited from the launch environment. The `cg`
+profile does not add the marker and keeps its existing Grok effort behavior.
 
 The generic Claude aliases are not broad family entries in the model picker.
 `--model` and `--fallback-model` remain available for concrete models in the

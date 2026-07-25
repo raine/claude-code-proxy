@@ -155,8 +155,10 @@ impl ClaudeProfile {
                 sonnet_model: "gpt-5.6-terra",
                 haiku_model: "gpt-5.6-luna",
                 context_tokens: "272000",
-                effort_level: "xhigh",
-                ultracode: true,
+                // Default to high (not ultracode/xhigh) so ordinary co sessions
+                // start at a calmer effort; users can still raise /effort later.
+                effort_level: "high",
+                ultracode: false,
                 explore_effort: "medium",
                 general_purpose_effort: "high",
                 plan_effort: "high",
@@ -2140,8 +2142,8 @@ mod tests {
         let agents = command_inline_agents(&command);
         assert_complete_inline_agents(&agents);
         assert_eq!(settings["model"], "gpt-5.6-sol");
-        assert_eq!(settings["effortLevel"], "xhigh");
-        assert_eq!(settings["ultracode"], true);
+        assert_eq!(settings["effortLevel"], "high");
+        assert_eq!(settings["ultracode"], false);
         assert_eq!(settings["enforceAvailableModels"], true);
         assert_eq!(settings["fallbackModel"], serde_json::json!([]));
         assert!(
