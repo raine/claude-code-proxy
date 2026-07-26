@@ -115,7 +115,7 @@ fn mock_state_for_tick(
     let mut upstream = active_request(
         now,
         instant_now,
-        "req-active-kimi",
+        "req-active-codex-upstream",
         Some("terminal-refactor"),
         Some(4),
         EndpointKind::Messages,
@@ -123,8 +123,8 @@ fn mock_state_for_tick(
         RequestStatus::Upstream,
     );
     upstream.project = Some("terminal-dashboard".to_string());
-    upstream.provider = Some("kimi".to_string());
-    upstream.model = Some("kimi-k2.6".to_string());
+    upstream.provider = Some("codex".to_string());
+    upstream.model = Some("gpt-5.6-terra".to_string());
     upstream.effort = Some("medium".to_string());
     upstream.input_tokens = Some(3_200);
 
@@ -157,16 +157,16 @@ fn mock_state_for_tick(
     let mut byte_stream = active_request(
         now,
         instant_now,
-        "req-active-cursor",
-        Some("cursor-session"),
+        "req-active-grok-bytes",
+        Some("grok-stream-session"),
         Some(2),
         EndpointKind::Messages,
         Duration::from_secs(22),
         RequestStatus::Streaming,
     );
     byte_stream.project = Some("responsive-layout-lab".to_string());
-    byte_stream.provider = Some("cursor".to_string());
-    byte_stream.model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
+    byte_stream.provider = Some("grok".to_string());
+    byte_stream.model = Some("grok-4.5-high".to_string());
     byte_stream.generation_started_at = Some(now - Duration::from_secs(20));
     byte_stream.generation_started_instant = Some(instant_now - Duration::from_secs(20));
     byte_stream.generation_finished_at = Some(now - Duration::from_secs(4));
@@ -205,7 +205,7 @@ fn mock_state_for_tick(
 
     let mut unavailable = completed_request(
         now,
-        "req-failed-kimi",
+        "req-failed-grok",
         Some("terminal-refactor"),
         Some(3),
         EndpointKind::Messages,
@@ -215,20 +215,20 @@ fn mock_state_for_tick(
         Some(502),
     );
     unavailable.project = Some("terminal-dashboard".to_string());
-    unavailable.provider = Some("kimi".to_string());
-    unavailable.model = Some("kimi-for-coding".to_string());
+    unavailable.provider = Some("grok".to_string());
+    unavailable.model = Some("grok-4.5-high".to_string());
     unavailable.effort = Some("high".to_string());
     unavailable.input_tokens = Some(8_900);
     unavailable.error = Some("upstream connection closed before response headers".to_string());
     unavailable.traffic_capture_path = Some(PathBuf::from(
-        "/tmp/claude-code-proxy-demo/errors/req-failed-kimi.json",
+        "/tmp/claude-code-proxy-demo/errors/req-failed-grok.json",
     ));
     recent.push_back(unavailable);
 
     let mut rate_limited = completed_request(
         now,
-        "req-failed-cursor",
-        Some("cursor-session"),
+        "req-rate-limited-grok",
+        Some("grok-stream-session"),
         Some(1),
         EndpointKind::Messages,
         Duration::from_secs(66),
@@ -237,8 +237,8 @@ fn mock_state_for_tick(
         Some(429),
     );
     rate_limited.project = Some("responsive-layout-lab".to_string());
-    rate_limited.provider = Some("cursor".to_string());
-    rate_limited.model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
+    rate_limited.provider = Some("grok".to_string());
+    rate_limited.model = Some("grok-4.5-high".to_string());
     rate_limited.error = Some("provider rate limit reached; retry after 30 seconds".to_string());
     recent.push_back(rate_limited);
 
@@ -306,8 +306,8 @@ fn mock_state_for_tick(
         Some(200),
     );
     counted.project = Some("terminal-dashboard".to_string());
-    counted.provider = Some("kimi".to_string());
-    counted.model = Some("kimi-k2.6".to_string());
+    counted.provider = Some("grok".to_string());
+    counted.model = Some("grok-4.5-medium".to_string());
     counted.input_tokens = Some(2_048);
     recent.push_back(counted);
 
@@ -368,7 +368,7 @@ fn initial_output_buckets(now: SystemTime) -> HashMap<Option<String>, Vec<(u64, 
             [180, 0, 420, 960, 0, 0, 1_300, 740, 2_100, 0, 350, 0],
         ),
         (
-            "cursor-session",
+            "grok-stream-session",
             [0, 640, 1_200, 2_400, 3_800, 1_900, 0, 0, 820, 1_500, 0, 0],
         ),
     ];
@@ -415,7 +415,7 @@ fn advance_output_buckets(
     if tick.is_multiple_of(5) {
         record_output_bucket(
             buckets,
-            Some("cursor-session".to_string()),
+            Some("grok-stream-session".to_string()),
             current_bucket,
             220,
         );
@@ -604,15 +604,15 @@ fn simulation_profile(cycle: u64) -> SimulationProfile {
         },
         SimulationProfile {
             project: "api-client",
-            provider: "kimi",
-            model: "kimi-k2.6",
+            provider: "grok",
+            model: "grok-composer-2.5-fast",
             effort: Some("medium"),
         },
         SimulationProfile {
             project: "editor-extension",
-            provider: "cursor",
-            model: "cursor:composer-2.5-fast",
-            effort: None,
+            provider: "codex",
+            model: "gpt-5.6-terra",
+            effort: Some("high"),
         },
         SimulationProfile {
             project: "agent-workbench",

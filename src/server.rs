@@ -499,21 +499,14 @@ fn initialize_config_fingerprint(
             limits,
             bind_address.unwrap_or(config.bind_address.as_str()),
             port.unwrap_or(config.port),
-            config.alias_provider.as_str(),
         )
     });
 }
 
-fn effective_config_fingerprint(
-    limits: &ServerLimits,
-    bind_address: &str,
-    port: u16,
-    alias_provider: &str,
-) -> String {
+fn effective_config_fingerprint(limits: &ServerLimits, bind_address: &str, port: u16) -> String {
     let values = [
         format!("bindAddress={bind_address}"),
         format!("port={port}"),
-        format!("aliasProvider={alias_provider}"),
         format!("maxRequestBodyBytes={}", limits.max_request_body_bytes),
         format!(
             "maxBufferedRequestBytes={}",
@@ -2810,8 +2803,8 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         second.max_concurrent_requests += 1;
 
         assert_ne!(
-            effective_config_fingerprint(&first, "127.0.0.1", 18765, "codex"),
-            effective_config_fingerprint(&second, "127.0.0.1", 18765, "codex")
+            effective_config_fingerprint(&first, "127.0.0.1", 18765),
+            effective_config_fingerprint(&second, "127.0.0.1", 18765)
         );
     }
 

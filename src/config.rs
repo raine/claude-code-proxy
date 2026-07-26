@@ -22,26 +22,10 @@ fn environment_value(key: &str) -> Option<String> {
     std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AliasProvider {
-    Codex,
-    Kimi,
-}
-
-impl AliasProvider {
-    pub fn as_str(&self) -> &str {
-        match self {
-            AliasProvider::Codex => "codex",
-            AliasProvider::Kimi => "kimi",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub bind_address: String,
     pub port: u16,
-    pub alias_provider: AliasProvider,
     pub log_verbose: bool,
     pub log_stderr: bool,
     pub config_dir: PathBuf,
@@ -57,12 +41,8 @@ struct FileConfig {
     #[serde(rename = "bindAddress")]
     pub bind_address: Option<String>,
     pub port: Option<u16>,
-    #[serde(rename = "aliasProvider")]
-    pub alias_provider: Option<String>,
     pub log: Option<FileLog>,
-    pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
-    pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub server: Option<ServerResourceConfig>,
 }
@@ -135,26 +115,6 @@ struct CodexConfig {
 }
 
 #[derive(Deserialize, Clone)]
-struct CursorConfig {
-    #[serde(rename = "baseUrl")]
-    pub base_url: Option<String>,
-    #[serde(rename = "clientVersion")]
-    pub client_version: Option<String>,
-    #[serde(rename = "agentBundle")]
-    pub agent_bundle: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct KimiConfig {
-    #[serde(rename = "userAgent")]
-    pub user_agent: Option<String>,
-    #[serde(rename = "oauthHost")]
-    pub oauth_host: Option<String>,
-    #[serde(rename = "baseUrl")]
-    pub base_url: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
 struct GrokConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
@@ -178,14 +138,6 @@ struct GrokConfig {
 struct FileLog {
     pub verbose: Option<bool>,
     pub stderr: Option<bool>,
-}
-
-fn parse_alias(raw: &str) -> Option<AliasProvider> {
-    match raw {
-        "codex" => Some(AliasProvider::Codex),
-        "kimi" => Some(AliasProvider::Kimi),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -303,7 +255,6 @@ pub fn load_config() -> LoadedConfig {
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
         port: 18765,
-        alias_provider: AliasProvider::Codex,
         log_verbose: false,
         log_stderr: false,
         config_dir: config_dir.clone(),
@@ -314,18 +265,6 @@ pub fn load_config() -> LoadedConfig {
         out.bind_address = raw.clone();
     } else if let Some(bind_address) = file.as_ref().and_then(|f| f.bind_address.clone()) {
         out.bind_address = bind_address;
-    }
-
-    if let Some(raw) = env.get("CCP_ALIAS_PROVIDER") {
-        if let Some(alias) = parse_alias(raw) {
-            out.alias_provider = alias;
-        }
-    } else if let Some(alias_provider) = file
-        .as_ref()
-        .and_then(|f| f.alias_provider.as_deref())
-        .and_then(parse_alias)
-    {
-        out.alias_provider = alias_provider;
     }
 
     if let Some(raw) = env.get("PORT") {
@@ -367,10 +306,6 @@ pub fn port() -> u16 {
 
 pub fn bind_address() -> String {
     load_config().bind_address
-}
-
-pub fn alias_provider() -> AliasProvider {
-    load_config().alias_provider
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,29 +357,11 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("PORT") {
         out.push("port (env)".to_string());
     }
-    if env.contains_key("CCP_ALIAS_PROVIDER") {
-        out.push("aliasProvider (env)".to_string());
-    }
     if env.contains_key("CCP_LOG_VERBOSE") {
         out.push("log.verbose (env)".to_string());
     }
     if env.contains_key("CCP_LOG_STDERR") {
         out.push("log.stderr (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_OAUTH_HOST") {
-        out.push("kimi.oauthHost (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_BASE_URL") {
-        out.push("kimi.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CURSOR_BASE_URL") {
-        out.push("cursor.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CURSOR_CLIENT_VERSION") {
-        out.push("cursor.clientVersion (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_USER_AGENT") {
-        out.push("kimi.userAgent (env)".to_string());
     }
     if env.contains_key("CCP_GROK_BASE_URL") {
         out.push("grok.baseUrl (env)".to_string());
@@ -545,9 +462,6 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         }
         if let Some(p) = file_cfg.port {
             out.push(format!("port: {p}"));
-        }
-        if let Some(alias) = file_cfg.alias_provider {
-            out.push(format!("aliasProvider: {alias}"));
         }
         if let Some(log) = file_cfg.log {
             if let Some(v) = log.verbose {
@@ -852,54 +766,6 @@ pub fn grok_stream_heartbeat_ms(default: u64) -> u64 {
 
 pub fn is_verbose() -> bool {
     log_verbose()
-}
-
-pub fn kimi_oauth_host() -> String {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(kimi) = file.kimi
-        && let Some(host) = kimi.oauth_host
-    {
-        return host;
-    }
-    "https://auth.kimi.com".to_string()
-}
-
-pub fn kimi_base_url() -> String {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(kimi) = file.kimi
-        && let Some(url) = kimi.base_url
-    {
-        return url;
-    }
-    "https://api.kimi.com/coding/v1".to_string()
-}
-
-pub fn kimi_user_agent(default: &str) -> String {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
-        return raw.clone();
-    }
-    if let Some(raw) = env.get("CCP_USER_AGENT") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(kimi) = file.kimi
-        && let Some(ua) = kimi.user_agent
-    {
-        return ua;
-    }
-    default.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,55 +1205,6 @@ pub fn codex_transport() -> CodexTransport {
     codex_transport_decision().effective()
 }
 
-// ---------------------------------------------------------------------------
-// Cursor config
-// ---------------------------------------------------------------------------
-
-pub fn cursor_base_url() -> String {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(cursor) = file.cursor
-        && let Some(url) = cursor.base_url
-    {
-        return url;
-    }
-    "https://api2.cursor.sh".to_string()
-}
-
-pub fn cursor_client_version() -> String {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(cursor) = file.cursor
-        && let Some(version) = cursor.client_version
-    {
-        return version;
-    }
-    "0.48.5".to_string()
-}
-
-pub fn cursor_agent_bundle() -> Option<String> {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
-        return Some(raw.clone());
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(cursor) = file.cursor
-        && let Some(bundle) = cursor.agent_bundle
-    {
-        return Some(bundle);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1398,7 +1215,6 @@ mod tests {
 
     const TEST_ENV_KEYS: &[&str] = &[
         "CCP_ALLOW_REMOTE_UNAUTHENTICATED",
-        "CCP_ALIAS_PROVIDER",
         "CCP_BIND_ADDRESS",
         "CCP_CODEX_TRANSPORT",
         "CCP_CONFIG_DIR",
@@ -1492,30 +1308,6 @@ mod tests {
         assert_eq!(load_config().bind_address, "192.0.2.10");
         let _bind_env = EnvGuard::set("CCP_BIND_ADDRESS", "0.0.0.0");
         assert_eq!(load_config().bind_address, "0.0.0.0");
-    }
-
-    #[test]
-    fn alias_provider_defaults_to_codex_and_legacy_kimi_still_parses() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _cleared_env = clear_env();
-
-        let default_config = tempfile::TempDir::new().unwrap();
-        let _default_config_env = EnvGuard::set("CCP_CONFIG_DIR", default_config.path());
-        assert_eq!(load_config().alias_provider, AliasProvider::Codex);
-
-        let file_config = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            file_config.path().join("config.json"),
-            r#"{"aliasProvider":"kimi"}"#,
-        )
-        .unwrap();
-        let _file_config_env = EnvGuard::set("CCP_CONFIG_DIR", file_config.path());
-        assert_eq!(load_config().alias_provider, AliasProvider::Kimi);
-
-        let env_config = tempfile::TempDir::new().unwrap();
-        let _env_config_dir = EnvGuard::set("CCP_CONFIG_DIR", env_config.path());
-        let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "kimi");
-        assert_eq!(load_config().alias_provider, AliasProvider::Kimi);
     }
 
     #[test]

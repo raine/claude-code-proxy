@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
-use crate::config::AliasProvider;
 use crate::logging::REDACT_KEYS;
 use crate::paths;
 
@@ -951,11 +950,6 @@ fn set_mode(path: &Path, mode: u32) {
             let _ = fs::set_permissions(path, perm);
         }
     }
-}
-
-#[allow(dead_code)]
-fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
-    None
 }
 
 #[cfg(test)]

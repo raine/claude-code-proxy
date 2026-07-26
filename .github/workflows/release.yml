@@ -25,7 +25,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         # Keep warnings fatal while carrying a narrow, explicit baseline for
-        # pre-existing monitor/Cursor lint debt outside the Codex/Grok scope.
+        # pre-existing lint debt outside the active provider work.
         run: >-
           cargo clippy --all-targets --locked -- -D warnings
           -A clippy::empty_line_after_doc_comments

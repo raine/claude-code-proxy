@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`claude-code-proxy` is a Rust 2024 CLI and Axum server that accepts the Anthropic Messages API shape used by Claude Code and routes public HTTP model requests only to Codex or Grok. Kimi and Cursor provider/auth implementations remain in the tree, but their models are not catalogued or routable through the HTTP API. The process also owns provider authentication, streaming translation, process-local session state, logging, traffic capture, and the terminal monitor.
+`claude-code-proxy` is a Rust 2024 CLI and Axum server that accepts the Anthropic Messages API shape used by Claude Code and routes model requests to Codex or Grok. The process also owns provider authentication, streaming translation, process-local session state, logging, traffic capture, and the terminal monitor.
 
 ## Development commands
 
@@ -58,19 +58,18 @@ For an in-module unit test, use Cargo's name filter: `cargo test <test_name>`.
 
 ### Model routing and process-local state
 
-- `src/registry.rs` is the routing authority and public model catalog. Only Codex/Grok routes and their active Anthropic-compatible aliases appear in the CLI model list or `/v1/models`; concrete Kimi and Cursor IDs must remain unroutable. The optional `[1m]` suffix is removed before routing.
-- Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, and `claude-*` route to Codex by default. `aliasProvider: "codex"` is the only active configured alias provider. The legacy `kimi` value remains parseable solely to fail closed: when no supported Codex/Grok session affinity applies, aliases return unknown-model HTTP 400 instead of falling back to Codex.
+- `src/registry.rs` is the routing authority and public model catalog. Only Codex/Grok routes and their active Anthropic-compatible aliases appear in the CLI model list or `/v1/models`. The optional `[1m]` suffix is removed before routing.
+- Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, and `claude-*` route to Codex by default.
 - `src/session.rs` tracks request sequence and alias affinity by `x-claude-code-session-id`. A concrete Codex or Grok request can pin the session, but only `claude-opus-5` currently follows Grok affinity; other aliases route to Codex. An alias request does not establish the pin. Entries expire after 30 idle minutes and the store is capped at 10,000 sessions.
-- Session affinity, Codex continuation state, and the Codex WebSocket circuit are separate process-local stores. Cursor's tool bridge remains in the inactive provider implementation. Deployments with multiple proxy processes need sticky routing for active features that depend on local state; do not assume all stores share the session store's TTL or capacity.
+- Session affinity, Codex continuation state, and the Codex WebSocket circuit are separate process-local stores. Deployments with multiple proxy processes need sticky routing for active features that depend on local state; do not assume all stores share the session store's TTL or capacity.
 - Unknown models intentionally return an Anthropic-shaped HTTP 400. There is no implicit fallback provider.
 
 ### Provider and translation layer
 
-- `src/provider.rs` defines the `Provider` trait, provider CLI hooks, and `RequestContext`. `src/providers/mod.rs` exposes the concrete backends. `Registry::new` keeps all provider handlers available to their existing auth CLI, but its public model map contains only Codex and Grok.
+- `src/provider.rs` defines the `Provider` trait, provider CLI hooks, and `RequestContext`. `src/providers/mod.rs` exposes the concrete backends. `Registry::new` registers the Codex and Grok handlers and model routes.
 - `src/anthropic/` contains the inbound schema and Anthropic error/SSE shapes. `src/providers/translate_shared.rs` contains normalization shared across backends; keep provider-specific wire formats, retry behavior, token counting, error mapping, and auth behavior inside that provider.
 - `src/providers/codex/` is the largest backend. Request/model translation is under `translate/`; HTTP and WebSocket transport live in `client.rs` and `websocket.rs`; append-only `previous_response_id` state lives in `continuation.rs`; live upstream events are reduced into Anthropic SSE incrementally.
 - `src/providers/grok/` translates to a Responses-style API with an incremental stream reducer.
-- `src/providers/kimi/` still contains the OpenAI-style chat-completions implementation, and `src/providers/cursor/` still contains the Connect/HTTP2 bridge and tool bridge. They are retained implementation/auth surfaces, not active HTTP routes. Do not add their model IDs or dynamic Cursor prefixes back to the registry without an explicit product decision.
 - Adding or reactivating a provider requires a `Provider` implementation plus deliberate registry/model wiring and public-catalog tests; each provider owns its authentication and token refresh manager.
 
 ### Configuration, authentication, and paths
@@ -84,7 +83,7 @@ For an in-module unit test, use Cargo's name filter: `cargo test <test_name>`.
 
 - `src/monitor.rs` records lifecycle and usage state; `src/tui/` renders it. Providers report upstream start, stream progress, resolved models, and usage through the optional monitor in `RequestContext`.
 - `src/logging.rs` writes redacted JSON-lines logs. `src/traffic.rs` writes opt-in, per-request protocol captures; credentials are redacted, but prompt and tool content are intentionally retained. `src/server.rs` separately persists redacted failed-response payloads.
-- Integration tests under `tests/` are grouped by behavior: server/routing, CLI, Codex auth and WebSocket behavior, Cursor protocol behavior, shared foundations, and smoke regressions. Fine-grained translation, continuation, configuration, retry, and reducer tests generally live beside their modules under `src/`.
+- Integration tests under `tests/` are grouped by behavior: server/routing, CLI, Codex auth and WebSocket behavior, shared foundations, and smoke regressions. Fine-grained translation, continuation, configuration, retry, and reducer tests generally live beside their modules under `src/`.
 
 ## Streaming and continuation invariants
 

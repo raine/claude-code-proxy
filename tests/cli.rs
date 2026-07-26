@@ -60,16 +60,7 @@ fn models_prints_only_active_route_providers() -> Result<(), Box<dyn std::error:
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
     assert!(out.contains("grok:"));
-    assert!(!out.contains("kimi:"));
-    assert!(!out.contains("cursor:"));
-
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["models", "--full"]);
-    let out = String::from_utf8(cmd.output()?.stdout)?;
-    assert!(out.contains("codex:"));
-    assert!(out.contains("grok:"));
-    assert!(!out.contains("kimi:"));
-    assert!(!out.contains("cursor:"));
+    assert_eq!(out.lines().count(), 2);
     Ok(())
 }
 
@@ -230,21 +221,10 @@ fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["cursor", "auth", "device"]);
-    let output = cmd.output()?;
-    assert_eq!(output.status.code(), Some(2));
-    let out = String::from_utf8(output.stderr)?;
-    assert!(out.contains("not yet implemented") || out.contains("unsupported"));
-    Ok(())
-}
-
-#[test]
 fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["kimi", "auth", "logout"]);
+    cmd.args(["grok", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success();
     Ok(())
@@ -253,30 +233,12 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
 #[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["models", "--full"]);
+    cmd.arg("models");
     let output = cmd.output()?;
     let out = String::from_utf8(output.stdout)?;
-    let codex_pos = out.find("codex:").unwrap_or(0);
-    let grok_pos = out.find("grok:").unwrap_or(0);
+    let codex_pos = out.find("codex:").expect("codex models");
+    let grok_pos = out.find("grok:").expect("grok models");
     assert!(codex_pos < grok_pos);
-    assert!(!out.contains("kimi:"));
-    assert!(!out.contains("cursor:"));
-    Ok(())
-}
-
-#[test]
-fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-    let auth_dir = temp.path().join("kimi");
-    std::fs::create_dir_all(&auth_dir)?;
-    std::fs::write(
-        auth_dir.join("auth.json"),
-        r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid","userId":"u"}"#,
-    )?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["kimi", "auth", "status"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
-    cmd.assert().success().stdout(contains("User: u"));
     Ok(())
 }
 

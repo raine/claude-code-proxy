@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Remove the Kimi and Cursor providers, including their model routing,
+  authentication commands, configuration, credentials helpers, dependencies,
+  tests, and documentation; the proxy now contains only Codex and Grok
+  backends.
+
 ## v0.1.25 (2026-07-24)
 
 - Keep `co` and `cg` Claude Code transcripts, prompt history, session state,

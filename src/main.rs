@@ -84,19 +84,8 @@ enum Commands {
     },
     /// Open the monitor TUI with mock data and no proxy server
     Demo,
-    Models {
-        #[arg(long)]
-        full: bool,
-    },
+    Models,
     Codex {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    Kimi {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    Cursor {
         #[command(subcommand)]
         command: ProviderGroup,
     },
@@ -380,13 +369,11 @@ fn run() -> Result<()> {
             let registry = Registry::with_default_alias();
             tui::run_mock_monitor(config::port(), &registry)
         }
-        Commands::Models { full } => {
-            print_models(&Registry::with_default_alias(), full);
+        Commands::Models => {
+            print_models(&Registry::with_default_alias());
             Ok(())
         }
         Commands::Codex { command } => run_provider_cli("codex", command),
-        Commands::Kimi { command } => run_provider_cli("kimi", command),
-        Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
         Commands::Diagnostics { command } => run_diagnostics(command),
         Commands::Claude { profile, args } => {
@@ -1609,7 +1596,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     }
 }
 
-fn print_models(registry: &Registry, _full: bool) {
+fn print_models(registry: &Registry) {
     let grouped = registry.grouped_models();
     for provider in ["codex", "grok"] {
         let Some(models) = grouped.get(provider) else {
@@ -1633,7 +1620,7 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     if cfg.exists() {
         println!("Config: {}", cfg.display());
     }
-    print_models(registry, false);
+    print_models(registry);
     println!();
     println!("Configure Claude Code (pick a model from above):");
     println!("  export ANTHROPIC_BASE_URL=\"http://localhost:{port}\"");

@@ -631,8 +631,7 @@ fn provider_cell(value: Option<&str>) -> Cell<'static> {
     let value = value.unwrap_or("-");
     let color = match value {
         "codex" => TEAL,
-        "kimi" => Color::Rgb(190, 150, 220),
-        "cursor" => Color::Rgb(140, 170, 230),
+        "grok" => Color::Rgb(190, 150, 220),
         "-" => DIM,
         _ => DIM_WHITE,
     };
@@ -2323,7 +2322,7 @@ mod tests {
         let failed = state
             .recent
             .iter()
-            .position(|request| request.request_id == "req-failed-kimi")
+            .position(|request| request.request_id == "req-failed-grok")
             .unwrap();
 
         let detail = draw(140, 22, |frame| {
@@ -2331,9 +2330,9 @@ mod tests {
         });
         let text = buffer_text(&detail);
 
-        assert!(text.contains("req-failed-kimi"), "{text}");
+        assert!(text.contains("req-failed-grok"), "{text}");
         assert!(text.contains("upstream connection closed"), "{text}");
-        assert!(text.contains("req-failed-kimi.json"), "{text}");
+        assert!(text.contains("req-failed-grok.json"), "{text}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a single Rust 2024 crate. `src/main.rs` defines the Clap CLI; `src/lib.rs` exports modules. `src/server.rs` handles Axum requests, `src/registry.rs` routes models, and `src/provider.rs` defines provider interfaces. Keep backend-specific authentication, clients, and translation under `src/providers/{codex,kimi,grok,cursor}/`; Anthropic types belong in `src/anthropic/`. Cross-cutting concerns remain in top-level modules.
+This is a single Rust 2024 crate. `src/main.rs` defines the Clap CLI; `src/lib.rs` exports modules. `src/server.rs` handles Axum requests, `src/registry.rs` routes models, and `src/provider.rs` defines provider interfaces. Keep backend-specific authentication, clients, and translation under `src/providers/{codex,grok}/`; Anthropic types belong in `src/anthropic/`. Cross-cutting concerns remain in top-level modules.
 
 Integration tests live in `tests/*.rs`, with fixtures in `tests/fixtures/`; unit tests stay beside implementation code. Scripts, hooks, and CI live in `scripts/`, `hooks/`, and `.github/workflows/`. Do not commit `target/` or `dist/`.
 
