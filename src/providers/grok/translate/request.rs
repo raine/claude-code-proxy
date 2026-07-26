@@ -336,7 +336,7 @@ pub fn translate_request(
     let reasoning = if model == "grok-4.5" {
         reasoning_effort.map(|effort| GrokReasoning {
             effort: match effort {
-                "ultra" | "max" | "xhigh" => "high",
+                "max" | "xhigh" => "high",
                 value => value,
             }
             .to_string(),
@@ -2217,7 +2217,6 @@ mod tests {
             ("high", "high"),
             ("xhigh", "high"),
             ("max", "high"),
-            ("ultra", "high"),
         ] {
             let request: MessagesRequest = serde_json::from_value(serde_json::json!({
                 "model":"grok-4.5",
@@ -2230,6 +2229,22 @@ mod tests {
                     .unwrap();
             assert_eq!(translated["reasoning"]["effort"], expected);
         }
+    }
+
+    #[test]
+    fn grok_translation_rejects_ultra_reasoning_effort() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "output_config":{"effort":"ultra"}
+        }))
+        .unwrap();
+        assert_eq!(
+            translate_request(&request, "grok-4.5".into())
+                .unwrap_err()
+                .to_string(),
+            "Invalid output_config.effort: ultra"
+        );
     }
 
     #[test]

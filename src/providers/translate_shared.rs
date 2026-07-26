@@ -315,7 +315,7 @@ pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error>
     };
     match output_config.get("effort") {
         Some(Value::String(s)) => {
-            let valid = ["low", "medium", "high", "xhigh", "max", "ultra"];
+            let valid = ["low", "medium", "high", "xhigh", "max"];
             if valid.contains(&s.as_str()) {
                 Ok(Some(s.as_str()))
             } else {
@@ -323,9 +323,9 @@ pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error>
             }
         }
         None | Some(Value::Null) => Ok(None),
-        Some(_) => anyhow::bail!(
-            "output_config.effort must be one of low, medium, high, xhigh, max, or ultra"
-        ),
+        Some(_) => {
+            anyhow::bail!("output_config.effort must be one of low, medium, high, xhigh, or max")
+        }
     }
 }
 
@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn effort_reader_accepts_ultra() {
+    fn effort_reader_rejects_ultra() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "gpt-5.6-sol",
             "messages": [{"role": "user", "content": "hello"}],
@@ -1337,7 +1337,10 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(read_effort(&request).unwrap(), Some("ultra"));
+        assert_eq!(
+            read_effort(&request).unwrap_err().to_string(),
+            "Invalid output_config.effort: ultra"
+        );
     }
 
     #[test]

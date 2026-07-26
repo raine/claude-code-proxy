@@ -20,8 +20,6 @@ use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const CODEX_XHIGH_AS_MAX_HEADER_NAME: &str = "x-ccproxy-codex-xhigh-as-max";
-const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max: 1";
 const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
 const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_DIAGNOSTIC_INPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -133,7 +131,6 @@ struct ClaudeProfileConfig {
     explore_effort: &'static str,
     general_purpose_effort: &'static str,
     plan_effort: &'static str,
-    promote_codex_xhigh_to_max: bool,
     available_models: &'static [&'static str],
 }
 
@@ -162,7 +159,6 @@ impl ClaudeProfile {
                 explore_effort: "medium",
                 general_purpose_effort: "high",
                 plan_effort: "high",
-                promote_codex_xhigh_to_max: true,
                 available_models: &[
                     "gpt-5.6-sol",
                     "gpt-5.6-sol-fast",
@@ -187,7 +183,6 @@ impl ClaudeProfile {
                 explore_effort: "medium",
                 general_purpose_effort: "high",
                 plan_effort: "high",
-                promote_codex_xhigh_to_max: false,
                 available_models: &[
                     "grok-4.5",
                     "grok-4.5-high",
@@ -1428,7 +1423,7 @@ fn claude_profile_environment(
     base_url: &str,
     profile_config_directory: &Path,
 ) -> Vec<(&'static str, String)> {
-    let mut environment = vec![
+    vec![
         (CLAUDE_PROFILE_MANAGED_ENV, "1".to_string()),
         (
             "CLAUDE_CONFIG_DIR",
@@ -1488,31 +1483,7 @@ fn claude_profile_environment(
         ("CLAUDE_CODE_MAX_RETRIES", "1".to_string()),
         ("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "10".to_string()),
         ("ENABLE_TOOL_SEARCH", "true".to_string()),
-    ];
-    if profile.promote_codex_xhigh_to_max {
-        let existing = std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
-        environment.push((
-            "ANTHROPIC_CUSTOM_HEADERS",
-            merged_anthropic_custom_headers(existing.as_deref()),
-        ));
-    }
-    environment
-}
-
-fn merged_anthropic_custom_headers(existing: Option<&str>) -> String {
-    let mut headers = existing
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| {
-            let name = line.split_once(':').map_or(*line, |(name, _)| name);
-            !name
-                .trim()
-                .eq_ignore_ascii_case(CODEX_XHIGH_AS_MAX_HEADER_NAME)
-        })
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    headers.push(CODEX_XHIGH_AS_MAX_HEADER);
-    headers.join("\n")
+    ]
 }
 
 fn proxy_client_url(bind_address: &str, port: u16) -> String {
@@ -2199,11 +2170,7 @@ mod tests {
             command_env(&command, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             "272000"
         );
-        assert!(
-            command_env(&command, "ANTHROPIC_CUSTOM_HEADERS")
-                .lines()
-                .any(|line| line == CODEX_XHIGH_AS_MAX_HEADER)
-        );
+        assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
     }
 
     #[test]
@@ -2272,30 +2239,6 @@ mod tests {
             "90"
         );
         assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
-    }
-
-    #[test]
-    fn codex_max_marker_merges_existing_headers_and_deduplicates_it() {
-        let merged = merged_anthropic_custom_headers(Some(
-            "x-existing: keep\nX-CCPROXY-CODEX-XHIGH-AS-MAX: 0\n\nsecond: value\n\
-             x-ccproxy-codex-xhigh-as-max: duplicate",
-        ));
-
-        assert_eq!(
-            merged,
-            "x-existing: keep\nsecond: value\nx-ccproxy-codex-xhigh-as-max: 1"
-        );
-        assert_eq!(
-            merged
-                .lines()
-                .filter(|line| {
-                    line.split_once(':').is_some_and(|(name, _)| {
-                        name.eq_ignore_ascii_case(CODEX_XHIGH_AS_MAX_HEADER_NAME)
-                    })
-                })
-                .count(),
-            1
-        );
     }
 
     #[test]

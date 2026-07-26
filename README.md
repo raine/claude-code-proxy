@@ -206,11 +206,9 @@ way to lock high effort regardless of the UI setting; the model picker also
 offers `grok-composer-2.5-fast` as an explicit speed-first option.
 
 The `co` launcher defaults to Claude Code `high` effort with Ultracode off.
-It still installs an internal profile marker so that if you later raise effort
-to `xhigh` (or enable Ultracode), those requests are promoted to Codex
-wire-level `max`. The marker is newline-merged into `ANTHROPIC_CUSTOM_HEADERS`,
-preserving custom headers inherited from the launch environment. The `cg`
-profile does not add the marker and keeps its existing Grok effort behavior.
+Later `/effort` changes remain one-to-one for Codex: `xhigh` stays `xhigh`, and
+only an explicit `max` request uses wire-level `max`. The `cg` profile keeps its
+existing Grok effort behavior.
 
 The generic Claude aliases are not broad family entries in the model picker.
 `--model` and `--fallback-model` remain available for concrete models in the
@@ -408,15 +406,14 @@ rejected before dispatch instead of being silently ignored. An empty
 `stop_sequences` array is accepted as a no-op.
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
-the UI as `◐ medium · /effort`) is normally forwarded as Codex
-`reasoning.effort` (`low` / `medium` / `high` / `xhigh` / `max`). Under the `co`
-profile, `/effort xhigh` and Ultracode's internal `xhigh` requests become
-wire-level `max`; `low`, `medium`, `high`, and `max` pass through unchanged.
-Claude Code/UltraCode remains responsible for client-side workflow and
-delegation. When Claude Code omits effort for a Haiku request, the mapped
-`gpt-5.6-luna` model defaults to `medium`. An explicit `codex.effort` /
-`CCP_CODEX_EFFORT` override still takes precedence, and the global override can
-also force `none`.
+the UI as `◐ medium · /effort`) is forwarded one-to-one as Codex
+`reasoning.effort` (`low` / `medium` / `high` / `xhigh` / `max`); `co` does not
+elevate `xhigh` to `max`. Claude Code's `ultrathink` keyword leaves the request
+effort unchanged, while Ultracode uses `xhigh` reasoning and keeps its workflow
+orchestration client-side. When Claude Code omits effort for a Haiku request,
+the mapped `gpt-5.6-luna` model defaults to `medium`. An explicit
+`codex.effort` / `CCP_CODEX_EFFORT` override still takes precedence, and the
+global override can also force `none`.
 
 Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
 Codex for `reasoning.summary: "auto"` and translates returned summary deltas
@@ -429,9 +426,8 @@ Without `x-ccproxy-compaction-model`, Claude Code's automatic and manual
 compaction requests keep the selected Codex model but cap reasoning effort at
 `medium`. Compaction is a structured summary pass, and avoiding `max` reasoning
 substantially reduces the wait without changing the effort used by normal
-turns. This existing compaction policy also applies under `co`; its internal
-profile marker does not promote compaction to `max`. An explicit global
-`codex.effort` / `CCP_CODEX_EFFORT` override still takes precedence.
+turns. An explicit global `codex.effort` / `CCP_CODEX_EFFORT` override still
+takes precedence.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool with live external web access and non-empty native
@@ -502,8 +498,8 @@ body/stream failures, and explicit 204 or non-SSE success responses leave the
 POST outcome ambiguous and therefore terminate without replaying the model
 request.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
-Grok 4.5; `xhigh`, `max`, and `ultra` are capped at Grok's supported `high`
-level. Composer has no reliable request-level effort mapping, so a request that
+Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
+Composer has no reliable request-level effort mapping, so a request that
 supplies `output_config.effort` for `grok-composer-2.5-fast` is rejected before
 dispatch instead of silently dropping the control.
 An explicit Anthropic `web_search_...` tool uses Grok's hosted general web
@@ -881,7 +877,7 @@ Windows, and at
 | `CCP_REQUEST_BODY_IDLE_TIMEOUT_MS` | `server.requestBodyIdleTimeoutMs` | `5000`                                       | Maximum pause while reading a local request body                                                                                                                                  |
 | `CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS` | `server.requestBodyTotalTimeoutMs` | `30000`                                    | Absolute request-body read budget; timeout returns 408 and releases all reservations                                                                                              |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
-| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`; `ultra` is sent as wire-level `max`)                                  |
+| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                                |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it; Luna is Lite-only and is rejected rather than silently changed to another model |

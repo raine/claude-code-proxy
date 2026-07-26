@@ -798,11 +798,8 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
         "transport" | "transportRequested" | "fallbackTransport" => {
             enum_string(value, &["http", "websocket", "auto"]).map(|v| (key.into(), v))
         }
-        "reasoningEffort" => enum_string(
-            value,
-            &["none", "low", "medium", "high", "xhigh", "max", "ultra"],
-        )
-        .map(|v| (key.into(), v)),
+        "reasoningEffort" => enum_string(value, &["none", "low", "medium", "high", "xhigh", "max"])
+            .map(|v| (key.into(), v)),
         "phase" => enum_string(
             value,
             &[
@@ -911,7 +908,7 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         "provider" => &["codex", "grok"],
         "transport" | "transportRequested" => &["http", "websocket", "auto"],
         "fallbackTransport" => &["http"],
-        "reasoningEffort" => &["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+        "reasoningEffort" => &["none", "low", "medium", "high", "xhigh", "max"],
         "phase" => &[
             "request",
             "response_body",

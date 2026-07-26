@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep Claude Code reasoning effort one-to-one under `co`, so `xhigh` remains
+  wire-level `xhigh`, only an explicit `max` request uses `max`, and the
+  obsolete `ultra` effort alias is rejected instead of being remapped.
 - Persist Grok OAuth credentials in macOS Keychain with verified migration from
   existing mode-0600 files, while retaining file fallback and isolated
   `CCP_CONFIG_DIR` behavior.

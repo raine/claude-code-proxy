@@ -255,10 +255,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .env("HOME", &fixture.home_dir)
         .env("PORT", "19876")
         .env("CCP_BIND_ADDRESS", "0.0.0.0")
-        .env(
-            "ANTHROPIC_CUSTOM_HEADERS",
-            "x-existing: keep\nX-CCPROXY-CODEX-XHIGH-AS-MAX: 0",
-        );
+        .env("ANTHROPIC_CUSTOM_HEADERS", "x-existing: keep");
 
     cmd.assert()
         .success()
@@ -308,7 +305,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("arg=<max>"))
         .stdout(contains("arg=<hello world>"))
         .stdout(contains("custom_headers=x-existing: keep"))
-        .stdout(contains("x-ccproxy-codex-xhigh-as-max: 1"));
+        .stdout(contains("x-ccproxy-codex-xhigh-as-max").not());
     Ok(())
 }
 

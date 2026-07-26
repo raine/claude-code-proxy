@@ -1250,7 +1250,7 @@ async fn smoke_opus_5_uses_grok_session_affinity() {
 }
 
 #[tokio::test]
-async fn smoke_co_marker_promotes_codex_xhigh_to_wire_max() {
+async fn smoke_codex_xhigh_reaches_wire_unchanged() {
     let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -1262,8 +1262,8 @@ async fn smoke_co_marker_promotes_codex_xhigh_to_wire_max() {
             let _ = captured.lock().map(|mut guard| *guard = Some(body));
             concat!(
                 "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"wire max ok\"}\n\n",
-                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"wire max ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"wire xhigh ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"wire xhigh ok\"}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
             )
@@ -1282,7 +1282,6 @@ async fn smoke_co_marker_promotes_codex_xhigh_to_wire_max() {
                 .method(Method::POST)
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
-                .header("x-ccproxy-codex-xhigh-as-max", "1")
                 .body(Body::from(
                     json!({
                         "model": "gpt-5.6-sol",
@@ -1304,11 +1303,11 @@ async fn smoke_co_marker_promotes_codex_xhigh_to_wire_max() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(value["content"][0]["text"], "wire max ok");
+    assert_eq!(value["content"][0]["text"], "wire xhigh ok");
 
     let sent = captured.lock().unwrap().clone().unwrap();
     assert_eq!(sent["model"], "gpt-5.6-sol");
-    assert_eq!(sent["reasoning"]["effort"], "max");
+    assert_eq!(sent["reasoning"]["effort"], "xhigh");
 }
 
 #[tokio::test]

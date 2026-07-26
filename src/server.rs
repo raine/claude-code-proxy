@@ -45,7 +45,6 @@ const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
-const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max";
 
 fn compaction_model_override(
     headers: &HeaderMap,
@@ -60,33 +59,6 @@ fn compaction_model_override(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(str::to_string)
-}
-
-fn promote_codex_xhigh_as_max(
-    headers: &HeaderMap,
-    request: &mut crate::anthropic::schema::MessagesRequest,
-    provider: &str,
-    count_tokens: bool,
-) -> bool {
-    if count_tokens
-        || provider != "codex"
-        || headers
-            .get(CODEX_XHIGH_AS_MAX_HEADER)
-            .is_none_or(|value| value.as_bytes() != b"1")
-        || crate::providers::translate_shared::is_claude_code_compaction_request(request)
-    {
-        return false;
-    }
-
-    let Some(Value::Object(output_config)) = request.extra.get_mut("output_config") else {
-        return false;
-    };
-    if output_config.get("effort").and_then(Value::as_str) != Some("xhigh") {
-        return false;
-    }
-
-    output_config.insert("effort".to_string(), Value::String("max".to_string()));
-    true
 }
 
 #[derive(Debug, Clone)]
@@ -1039,17 +1011,6 @@ async fn dispatch_request_with_id(
             .await;
         }
     };
-    if promote_codex_xhigh_as_max(&headers, &mut body, provider.name(), count_tokens) {
-        log.info(
-            "internal request effort override",
-            Some(serde_json::Map::from_iter([
-                ("reqId".to_string(), json!(&req_id)),
-                ("reason".to_string(), json!("codex_xhigh_as_max")),
-                ("from".to_string(), json!("xhigh")),
-                ("to".to_string(), json!("max")),
-            ])),
-        );
-    }
     let effort = crate::providers::translate_shared::read_effort(&body)
         .ok()
         .flatten()
@@ -2320,102 +2281,6 @@ mod tests {
         .unwrap();
         assert!(compaction_model_override(&headers, &ordinary).is_none());
         assert!(compaction_model_override(&HeaderMap::new(), &compaction_request()).is_none());
-    }
-
-    fn effort_request(effort: &str) -> crate::anthropic::schema::MessagesRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": "gpt-5.6-sol",
-            "messages": [{"role": "user", "content": "normal work"}],
-            "output_config": {"effort": effort}
-        }))
-        .unwrap()
-    }
-
-    fn effort_of(request: &crate::anthropic::schema::MessagesRequest) -> Option<&str> {
-        request
-            .extra
-            .get("output_config")
-            .and_then(Value::as_object)
-            .and_then(|output_config| output_config.get("effort"))
-            .and_then(Value::as_str)
-    }
-
-    #[test]
-    fn codex_xhigh_as_max_requires_exact_marker_and_messages_endpoint() {
-        let mut enabled = HeaderMap::new();
-        enabled.insert(CODEX_XHIGH_AS_MAX_HEADER, "1".parse().unwrap());
-
-        let mut request = effort_request("xhigh");
-        assert!(promote_codex_xhigh_as_max(
-            &enabled,
-            &mut request,
-            "codex",
-            false
-        ));
-        assert_eq!(effort_of(&request), Some("max"));
-
-        for marker in [None, Some("true"), Some("01"), Some(" 1")] {
-            let mut headers = HeaderMap::new();
-            if let Some(marker) = marker {
-                headers.insert(CODEX_XHIGH_AS_MAX_HEADER, marker.parse().unwrap());
-            }
-            let mut request = effort_request("xhigh");
-            assert!(!promote_codex_xhigh_as_max(
-                &headers,
-                &mut request,
-                "codex",
-                false
-            ));
-            assert_eq!(effort_of(&request), Some("xhigh"));
-        }
-
-        let mut request = effort_request("xhigh");
-        assert!(!promote_codex_xhigh_as_max(
-            &enabled,
-            &mut request,
-            "codex",
-            true
-        ));
-        assert_eq!(effort_of(&request), Some("xhigh"));
-
-        let mut request = effort_request("xhigh");
-        assert!(!promote_codex_xhigh_as_max(
-            &enabled,
-            &mut request,
-            "grok",
-            false
-        ));
-        assert_eq!(effort_of(&request), Some("xhigh"));
-    }
-
-    #[test]
-    fn codex_xhigh_as_max_preserves_other_efforts_and_compaction() {
-        let mut headers = HeaderMap::new();
-        headers.insert(CODEX_XHIGH_AS_MAX_HEADER, "1".parse().unwrap());
-
-        for effort in ["low", "medium", "high", "max", "ultra"] {
-            let mut request = effort_request(effort);
-            assert!(!promote_codex_xhigh_as_max(
-                &headers,
-                &mut request,
-                "codex",
-                false
-            ));
-            assert_eq!(effort_of(&request), Some(effort));
-        }
-
-        let mut compaction = compaction_request();
-        compaction.extra.insert(
-            "output_config".to_string(),
-            serde_json::json!({"effort": "xhigh"}),
-        );
-        assert!(!promote_codex_xhigh_as_max(
-            &headers,
-            &mut compaction,
-            "codex",
-            false
-        ));
-        assert_eq!(effort_of(&compaction), Some("xhigh"));
     }
 
     fn response_log_context(req_id: &str) -> ResponseLogContext {

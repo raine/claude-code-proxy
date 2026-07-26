@@ -841,38 +841,6 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
 }
 
 #[tokio::test]
-async fn codex_xhigh_as_max_marker_does_not_change_count_tokens_effort() {
-    let monitor = MonitorHandle::new(10);
-    let app = app_with_monitor(
-        Arc::new(Registry::with_default_alias()),
-        Some(monitor.clone()),
-    );
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages/count_tokens")
-                .header("content-type", "application/json")
-                .header("x-ccproxy-codex-xhigh-as-max", "1")
-                .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"output_config":{"effort":"xhigh"}}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let state = monitor.snapshot();
-    assert_eq!(state.recent.len(), 1);
-    assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));
-    assert_eq!(state.recent[0].effort.as_deref(), Some("xhigh"));
-}
-
-#[tokio::test]
 async fn compaction_header_routes_only_compaction_requests_to_grok() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(
