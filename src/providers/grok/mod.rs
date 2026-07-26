@@ -31,7 +31,7 @@ use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::retry::sleep;
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
-use self::auth::token_store::file_store;
+use self::auth::token_store::file_store_with_migration;
 use self::client::{
     GrokByteStream, GrokError, GrokRequestDeadline, GrokRetryState, PreparedGrokRequest,
 };
@@ -1531,19 +1531,19 @@ pub struct GrokCli;
 pub static GROK_CLI: GrokCli = GrokCli;
 impl CliHandlers for GrokCli {
     fn login(&self) -> anyhow::Result<()> {
-        let store = file_store();
+        let store = file_store_with_migration();
         auth::login::login(&store)?;
         println!("Grok authentication saved in {}", store.auth_path());
         Ok(())
     }
     fn device(&self) -> anyhow::Result<()> {
-        let store = file_store();
+        let store = file_store_with_migration();
         auth::device::device_login(&store)?;
         println!("Grok authentication saved in {}", store.auth_path());
         Ok(())
     }
     fn status(&self) -> anyhow::Result<()> {
-        let store = file_store();
+        let store = file_store_with_migration();
         match store.load_auth()? {
             Some(auth) => {
                 println!("Auth path: {}", store.auth_path());
@@ -1558,7 +1558,7 @@ impl CliHandlers for GrokCli {
         }
     }
     fn logout(&self) -> anyhow::Result<()> {
-        let store = file_store();
+        let store = file_store_with_migration();
         store.clear_auth_exclusive()?;
         println!("Grok proxy credentials removed");
         Ok(())
@@ -2152,9 +2152,7 @@ mod tests {
             .join("auth.json")
             .to_string_lossy()
             .into_owned();
-        let store = auth::token_store::GrokTokenStore::new(crate::auth::FileAuthStore::new(
-            primary, legacy,
-        ));
+        let store = auth::token_store::test_file_store(primary, legacy);
         store
             .save_auth(auth::token_store::StoredAuth {
                 access: "test-access".into(),

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Persist Grok OAuth credentials in macOS Keychain with verified migration from
+  existing mode-0600 files, while retaining file fallback and isolated
+  `CCP_CONFIG_DIR` behavior.
 - Remove the Kimi and Cursor providers, including their model routing,
   authentication commands, configuration, credentials helpers, dependencies,
   tests, and documentation; the proxy now contains only Codex and Grok

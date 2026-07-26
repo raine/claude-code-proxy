@@ -297,6 +297,12 @@ fn run() -> Result<()> {
             let allow_remote_unauthenticated =
                 allow_remote_unauthenticated || config::allow_remote_unauthenticated();
             let effective_port = port.unwrap_or_else(config::port);
+            // Upgrade an existing Grok file credential before the long-lived
+            // provider client is created. Migration is verified and safely
+            // falls back to the file if Keychain access is unavailable.
+            drop(
+                claude_code_proxy::providers::grok::auth::token_store::file_store_with_migration(),
+            );
             let registry = Registry::with_default_alias();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

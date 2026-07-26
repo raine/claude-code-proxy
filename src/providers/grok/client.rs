@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
 use super::auth::manager::{GrokAuthError, GrokAuthErrorKind, GrokAuthManager};
-use super::auth::token_store::{StoredAuth, file_store};
+use super::auth::token_store::{DefaultGrokAuthStore, StoredAuth, file_store};
 use super::translate::request::GrokResponsesRequest;
 use crate::retry::{
     MAX_RATE_LIMIT_RETRIES, ModelRetryBackoff, ReplaySafety, should_retry_status, sleep,
@@ -543,7 +543,7 @@ pub(super) struct GrokRetryLogContext {
 
 pub struct GrokClient {
     client: Arc<reqwest::Client>,
-    auth: Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
+    auth: Arc<GrokAuthManager<DefaultGrokAuthStore>>,
     url: String,
     client_version: String,
     timeouts: GrokTimeouts,
@@ -602,7 +602,7 @@ impl GrokClient {
         base_url: String,
         client_version: String,
         timeouts: GrokTimeouts,
-        auth: GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>,
+        auth: GrokAuthManager<DefaultGrokAuthStore>,
     ) -> anyhow::Result<Self> {
         let client = Arc::new(
             crate::upstream_http::model_client_builder(Duration::from_millis(timeouts.connect_ms))
@@ -624,7 +624,7 @@ impl GrokClient {
         url: String,
         client_version: String,
         client: Arc<reqwest::Client>,
-        auth: Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
+        auth: Arc<GrokAuthManager<DefaultGrokAuthStore>>,
         timeouts: GrokTimeouts,
     ) -> Self {
         Self {
@@ -1561,7 +1561,7 @@ fn auth_error(error: GrokAuthError) -> GrokError {
     let message = error.to_string();
     let error = match kind {
         GrokAuthErrorKind::CredentialsInvalid => GrokError::auth(format!(
-            "{message}. Re-authenticate with the Grok CLI and import the session again"
+            "{message}. Run `claude-code-proxy grok auth login` to re-authenticate"
         )),
         GrokAuthErrorKind::Temporary => GrokError::auth_temporary(message),
         GrokAuthErrorKind::RateLimited => GrokError::auth_rate_limited(retry_after, message),
@@ -1680,9 +1680,7 @@ mod tests {
             .join("auth.json")
             .to_string_lossy()
             .into_owned();
-        let store = super::super::auth::token_store::GrokTokenStore::new(
-            crate::auth::FileAuthStore::new(primary, legacy),
-        );
+        let store = super::super::auth::token_store::test_file_store(primary, legacy);
         store.save_auth(test_auth()).unwrap();
         let auth = GrokAuthManager::new(store).unwrap();
         let client =
@@ -1710,9 +1708,7 @@ mod tests {
             .join("auth.json")
             .to_string_lossy()
             .into_owned();
-        let store = super::super::auth::token_store::GrokTokenStore::new(
-            crate::auth::FileAuthStore::new(primary, legacy),
-        );
+        let store = super::super::auth::token_store::test_file_store(primary, legacy);
         store
             .save_auth(StoredAuth {
                 access: "expired-access".into(),

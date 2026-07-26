@@ -1,17 +1,20 @@
-use std::fs::File;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Deserialize;
 use tokio::sync::Mutex;
 use url::Url;
 
 use super::login::{CANONICAL_ISSUER, CLIENT_ID};
-use super::token_store::{AuthMutationLock, GrokTokenStore, StoredAuth};
+use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 use crate::oauth_http::{MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_async};
+#[cfg(test)]
+use crate::oauth_rotation::refresh_pending_path;
+use crate::oauth_rotation::{
+    AuthMutationLock, clear_refresh_pending, generation_fingerprint, read_refresh_pending,
+    write_refresh_pending,
+};
 
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -135,21 +138,6 @@ struct RefreshSafetyState {
 struct VolatileAuth {
     auth: StoredAuth,
     base_generation: [u8; 32],
-}
-
-#[derive(Serialize, Deserialize)]
-struct RefreshPendingMarker {
-    auth_generation_sha256: String,
-}
-
-fn filesystem_auth_path(auth_path: &str) -> Option<&Path> {
-    let path = Path::new(auth_path);
-    path.is_absolute().then_some(path)
-}
-
-fn refresh_pending_path(auth_path: &str) -> Option<PathBuf> {
-    filesystem_auth_path(auth_path)
-        .map(|path| PathBuf::from(format!("{}.refresh-pending.json", path.display())))
 }
 
 impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
@@ -477,29 +465,35 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         }
         drop(safety);
 
-        if let Some(pending) = read_refresh_pending(&self.store.auth_path())? {
+        let coordination_path = self.store.coordination_path();
+        if let Some(pending) =
+            read_refresh_pending(coordination_path.as_deref()).map_err(|error| {
+                GrokAuthError::temporary(format!(
+                    "failed to read the OAuth refresh pending marker: {error}"
+                ))
+            })?
+        {
             if pending == fingerprint {
                 return Err(GrokAuthError::RefreshOutcomeUnknown);
             }
-            clear_refresh_pending_file(&self.store.auth_path())?;
+            clear_refresh_pending(coordination_path.as_deref()).map_err(|error| {
+                GrokAuthError::temporary(format!(
+                    "failed to clear the OAuth refresh pending marker: {error}"
+                ))
+            })?;
         }
         Ok(auth)
     }
 
     async fn acquire_refresh_file_lock(&self) -> Result<AuthMutationLock, GrokAuthError> {
-        loop {
-            match AuthMutationLock::try_acquire(&self.store.auth_path()) {
-                Ok(lock) => return Ok(lock),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(error) => {
-                    return Err(GrokAuthError::temporary(format!(
-                        "failed to acquire the OAuth refresh lock: {error}"
-                    )));
-                }
-            }
-        }
+        let coordination_path = self.store.coordination_path();
+        AuthMutationLock::acquire_async(coordination_path.as_deref())
+            .await
+            .map_err(|error| {
+                GrokAuthError::temporary(format!(
+                    "failed to acquire the OAuth refresh lock: {error}"
+                ))
+            })
     }
 
     async fn has_unpersisted_rotation(&self, auth: &StoredAuth) -> bool {
@@ -515,19 +509,12 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
 
     async fn mark_refresh_pending(&self, auth: &StoredAuth) -> Result<(), GrokAuthError> {
         let fingerprint = auth_generation_fingerprint(auth);
-        if let Some(path) = refresh_pending_path(&self.store.auth_path()) {
-            crate::auth::write_atomically(
-                path.to_string_lossy().as_ref(),
-                &RefreshPendingMarker {
-                    auth_generation_sha256: hex::encode(fingerprint),
-                },
-            )
-            .map_err(|error| {
-                GrokAuthError::temporary(format!(
-                    "failed to persist the OAuth refresh pending marker: {error}"
-                ))
-            })?;
-        }
+        let coordination_path = self.store.coordination_path();
+        write_refresh_pending(coordination_path.as_deref(), fingerprint).map_err(|error| {
+            GrokAuthError::temporary(format!(
+                "failed to persist the OAuth refresh pending marker: {error}"
+            ))
+        })?;
         self.refresh_safety.lock().await.ambiguous_generation = Some(fingerprint);
         Ok(())
     }
@@ -537,7 +524,12 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         let mut safety = self.refresh_safety.lock().await;
         // Once the durable marker is removed there must be no cancellation
         // point before the matching in-memory ambiguity is cleared.
-        clear_refresh_pending_file(&self.store.auth_path())?;
+        let coordination_path = self.store.coordination_path();
+        clear_refresh_pending(coordination_path.as_deref()).map_err(|error| {
+            GrokAuthError::temporary(format!(
+                "failed to clear the OAuth refresh pending marker: {error}"
+            ))
+        })?;
         if safety.ambiguous_generation == Some(fingerprint) {
             safety.ambiguous_generation = None;
         }
@@ -546,57 +538,7 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
 }
 
 fn auth_generation_fingerprint(auth: &StoredAuth) -> [u8; 32] {
-    let encoded = serde_json::to_vec(auth).expect("StoredAuth is serializable");
-    Sha256::digest(encoded).into()
-}
-
-fn read_refresh_pending(auth_path: &str) -> Result<Option<[u8; 32]>, GrokAuthError> {
-    let Some(path) = refresh_pending_path(auth_path) else {
-        return Ok(None);
-    };
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(GrokAuthError::temporary(format!(
-                "failed to read the OAuth refresh pending marker: {error}"
-            )));
-        }
-    };
-    let marker: RefreshPendingMarker = serde_json::from_slice(&bytes).map_err(|error| {
-        GrokAuthError::temporary(format!("OAuth refresh pending marker is invalid: {error}"))
-    })?;
-    let decoded = hex::decode(marker.auth_generation_sha256).map_err(|error| {
-        GrokAuthError::temporary(format!("OAuth refresh pending marker is invalid: {error}"))
-    })?;
-    decoded.try_into().map(Some).map_err(|_| {
-        GrokAuthError::temporary("OAuth refresh pending marker has an invalid fingerprint")
-    })
-}
-
-fn clear_refresh_pending_file(auth_path: &str) -> Result<(), GrokAuthError> {
-    let Some(path) = refresh_pending_path(auth_path) else {
-        return Ok(());
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => {
-            #[cfg(unix)]
-            if let Some(parent) = path.parent() {
-                File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| {
-                        GrokAuthError::temporary(format!(
-                            "failed to durably clear the OAuth refresh pending marker: {error}"
-                        ))
-                    })?;
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(GrokAuthError::temporary(format!(
-            "failed to clear the OAuth refresh pending marker: {error}"
-        ))),
-    }
+    generation_fingerprint(auth).expect("StoredAuth is serializable")
 }
 
 fn is_credential_error(error: &str) -> bool {
@@ -791,6 +733,10 @@ mod tests {
 
         fn path(&self) -> String {
             self.inner.path()
+        }
+
+        fn coordination_path(&self) -> Option<std::path::PathBuf> {
+            self.inner.coordination_path()
         }
     }
 
@@ -1005,7 +951,7 @@ mod tests {
             durable.access,
             "lock-free reads must not write the volatile generation"
         );
-        assert!(refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert!(refresh_pending_path(std::path::Path::new(&auth_path_string)).exists());
 
         let repaired = manager.force_refresh("rejected-access").await.unwrap();
         assert_eq!(repaired.access, rotated.access);
@@ -1013,7 +959,7 @@ mod tests {
             manager.store().load_auth().unwrap().unwrap().access,
             rotated.access
         );
-        assert!(!refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert!(!refresh_pending_path(std::path::Path::new(&auth_path_string)).exists());
         assert!(manager.refresh_safety.lock().await.volatile_auth.is_none());
     }
 
@@ -1080,7 +1026,8 @@ mod tests {
             auth: volatile.clone(),
             base_generation: auth_generation_fingerprint(&original),
         });
-        let held = AuthMutationLock::try_acquire(&auth_path_string).unwrap();
+        let held =
+            AuthMutationLock::acquire(Some(std::path::Path::new(&auth_path_string))).unwrap();
         let refresh_manager = manager.clone();
         let mut refresh =
             tokio::spawn(async move { refresh_manager.force_refresh("rejected-access").await });
@@ -1107,7 +1054,8 @@ mod tests {
             auth: volatile,
             base_generation: auth_generation_fingerprint(&original),
         });
-        let held = AuthMutationLock::try_acquire(&auth_path_string).unwrap();
+        let held =
+            AuthMutationLock::acquire(Some(std::path::Path::new(&auth_path_string))).unwrap();
         let refresh_manager = manager.clone();
         let mut refresh =
             tokio::spawn(async move { refresh_manager.force_refresh("rejected-access").await });
@@ -1152,14 +1100,14 @@ mod tests {
             "marker clear should be waiting for the in-memory state lock"
         );
         assert!(
-            refresh_pending_path(&auth_path_string).unwrap().exists(),
+            refresh_pending_path(std::path::Path::new(&auth_path_string)).exists(),
             "cancellation before the state lock is acquired must leave the durable marker"
         );
         clear.abort();
         drop(state_guard);
         let _ = clear.await;
 
-        assert!(refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert!(refresh_pending_path(std::path::Path::new(&auth_path_string)).exists());
         assert_eq!(
             manager.refresh_safety.lock().await.ambiguous_generation,
             Some(auth_generation_fingerprint(&current))
@@ -1194,7 +1142,7 @@ mod tests {
         assert!(second.to_string().contains("not durably persisted"));
         assert!(!second.safe_to_retry());
         assert_eq!(
-            read_refresh_pending(&auth_path_string).unwrap(),
+            read_refresh_pending(Some(std::path::Path::new(&auth_path_string))).unwrap(),
             Some(auth_generation_fingerprint(&initial))
         );
         drop(manager);
@@ -1265,7 +1213,7 @@ mod tests {
         let restarted = GrokAuthManager::new_for_test(restarted_store, issuer).unwrap();
         let blocked = restarted.get_auth().await.unwrap_err();
         assert!(blocked.to_string().contains("outcome is unknown"));
-        assert!(refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert!(refresh_pending_path(std::path::Path::new(&auth_path_string)).exists());
 
         restarted
             .store()
@@ -1277,6 +1225,6 @@ mod tests {
             .unwrap();
         let recovered = restarted.get_auth().await.unwrap();
         assert_eq!(recovered.access, "explicitly-reimported-access");
-        assert!(!refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert!(!refresh_pending_path(std::path::Path::new(&auth_path_string)).exists());
     }
 }

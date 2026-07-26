@@ -146,12 +146,26 @@ fn cargo_test_log_file(executable: &Path, process_id: u32) -> Option<PathBuf> {
 
 pub fn provider_auth_file(provider: &str) -> PathBuf {
     let deps = DirResolverEnv::default();
-    resolve_config_dir(&deps).join(provider).join("auth.json")
+    provider_auth_file_for_env(provider, &deps)
 }
 
 pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     let deps = DirResolverEnv::default();
-    legacy_config_dir(&deps).join(provider).join("auth.json")
+    provider_legacy_auth_file_for_env(provider, &deps)
+}
+
+fn provider_auth_file_for_env(provider: &str, deps: &DirResolverEnv) -> PathBuf {
+    resolve_config_dir(deps).join(provider).join("auth.json")
+}
+
+fn provider_legacy_auth_file_for_env(provider: &str, deps: &DirResolverEnv) -> PathBuf {
+    // An explicit config directory is an isolation boundary. Falling back to
+    // the default HOME path here can make a test or isolated profile read or
+    // delete the user's real credentials.
+    if deps.env.contains_key("CCP_CONFIG_DIR") {
+        return provider_auth_file_for_env(provider, deps);
+    }
+    legacy_config_dir(deps).join(provider).join("auth.json")
 }
 
 fn join_with_sep(base: &str, parts: &[&str]) -> PathBuf {
@@ -236,6 +250,41 @@ mod tests {
         assert_eq!(
             resolve_log_file_for_process(&deps, Some(executable), 4242),
             PathBuf::from("/Users/tester/.local/state/claude-code-proxy/proxy.log")
+        );
+    }
+
+    #[test]
+    fn explicit_config_dir_disables_default_home_auth_fallback() {
+        let deps = DirResolverEnv {
+            platform: "darwin".into(),
+            env: HashMap::from([("CCP_CONFIG_DIR".into(), "/tmp/isolated-ccproxy".into())]),
+            home: "/Users/real-user".into(),
+        };
+
+        let primary = provider_auth_file_for_env("grok", &deps);
+        let legacy = provider_legacy_auth_file_for_env("grok", &deps);
+        assert_eq!(
+            primary,
+            PathBuf::from("/tmp/isolated-ccproxy/grok/auth.json")
+        );
+        assert_eq!(legacy, primary);
+    }
+
+    #[test]
+    fn default_config_keeps_home_legacy_auth_path() {
+        let deps = DirResolverEnv {
+            platform: "linux".into(),
+            env: HashMap::from([("XDG_CONFIG_HOME".into(), "/xdg/config".into())]),
+            home: "/home/tester".into(),
+        };
+
+        assert_eq!(
+            provider_auth_file_for_env("grok", &deps),
+            PathBuf::from("/xdg/config/claude-code-proxy/grok/auth.json")
+        );
+        assert_eq!(
+            provider_legacy_auth_file_for_env("grok", &deps),
+            PathBuf::from("/home/tester/.config/claude-code-proxy/grok/auth.json")
         );
     }
 }

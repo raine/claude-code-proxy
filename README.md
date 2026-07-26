@@ -71,9 +71,10 @@ OAuth session and does not use the official Grok CLI credential file. On a
 headless host, `grok auth device` prints a verification URL and code to enter on
 any other device, then polls until authorization completes.
 
-Codex prefers macOS Keychain and falls back to a mode-0600 provider file when
-non-interactive Keychain writes are unavailable; Grok uses a provider file on
-every platform. Windows stores file credentials under
+Codex and Grok prefer macOS Keychain and fall back to a mode-0600 provider file
+when Keychain access is unavailable. Existing Grok file credentials are
+promoted only after a verified Keychain write, so upgrading does not require
+another login. Windows stores file credentials under
 `%APPDATA%\claude-code-proxy\<provider>\auth.json`; Linux and macOS file
 fallbacks use
 `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`.
@@ -522,6 +523,10 @@ ephemeral loopback callback. Headless hosts can use the OAuth device-code flow
 (`grok auth device`) instead, which prints a verification URL and user code and
 polls the same issuer. The proxy stores its own access and refresh tokens,
 refreshes them five minutes before expiry, and does not use `~/.grok/auth.json`.
+On macOS, Grok prefers Keychain service `claude-code-proxy.grok` and falls back
+to its mode-0600 provider file when Keychain access is unavailable. Setting
+`CCP_CONFIG_DIR` keeps isolated runs file-only and never reads or mutates the
+default Keychain entry.
 
 | Command            | What it does                          |
 | ------------------ | ------------------------------------- |
@@ -1135,9 +1140,11 @@ CCP_TRAFFIC_LOG=1`.
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json` and
   reports that backend. Linux uses the same file path; Windows uses
   `%APPDATA%\claude-code-proxy\codex\auth.json`.
-- Grok tokens — stored in
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json` on macOS
-  and Linux, or `%APPDATA%\claude-code-proxy\grok\auth.json` on Windows.
+- Grok tokens — macOS prefers Keychain service `claude-code-proxy.grok`; when
+  access is unavailable it falls back to
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json`. Linux
+  uses the same file path, and Windows uses
+  `%APPDATA%\claude-code-proxy\grok\auth.json`.
 
 ## Switching models and backends
 

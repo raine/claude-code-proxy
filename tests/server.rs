@@ -487,29 +487,14 @@ async fn missing_model_returns_400() {
     assert_eq!(error_type, "invalid_request_error");
 }
 
-#[tokio::test]
-async fn known_model_reaches_codex_provider() {
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+#[test]
+fn known_model_resolves_to_codex_provider_without_loading_credentials() {
+    let registry = Registry::with_default_alias();
+    let provider = registry
+        .provider_for_model("gpt-5.4", None)
+        .expect("known Codex model");
 
-    // Codex provider is now concrete, so it should attempt auth before returning 501
-    let status = response.status();
-    assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "codex should no longer be a placeholder provider"
-    );
+    assert_eq!(provider.name(), "codex");
 }
 
 #[tokio::test]

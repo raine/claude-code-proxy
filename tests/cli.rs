@@ -226,6 +226,7 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["grok", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
+    cmd.env("HOME", temp.path());
     cmd.assert().success();
     Ok(())
 }

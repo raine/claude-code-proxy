@@ -53,75 +53,31 @@ pub struct SystemKeychain;
 #[cfg(target_os = "macos")]
 impl Keychain for SystemKeychain {
     fn read(&self, service: &str, account: &str) -> Result<Option<String>> {
-        let output = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])?;
-        if output.status.success() {
-            let mut raw = String::from_utf8(output.stdout)
-                .map_err(|err| anyhow::anyhow!("Keychain value is not valid UTF-8: {err}"))?;
-            trim_one_trailing_newline(&mut raw);
-            return Ok(Some(raw));
+        use security_framework::passwords::get_generic_password;
+        use security_framework_sys::base::errSecItemNotFound;
+
+        match get_generic_password(service, account) {
+            Ok(raw) => String::from_utf8(raw)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("Keychain value is not valid UTF-8: {error}")),
+            Err(error) if error.code() == errSecItemNotFound => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("Keychain read failed: {error}")),
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("could not be found") || stderr.contains("specified item could not") {
-            return Ok(None);
-        }
-        Err(anyhow::anyhow!("Keychain read failed: {}", stderr.trim()))
     }
 
-    fn write(&self, _service: &str, _account: &str, _value: &str) -> Result<()> {
-        anyhow::bail!("Keychain write is not available through non-interactive compatibility mode")
+    fn write(&self, service: &str, account: &str, value: &str) -> Result<()> {
+        security_framework::passwords::set_generic_password(service, account, value.as_bytes())
+            .map_err(|error| anyhow::anyhow!("Keychain write failed: {error}"))
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
-        let output = run_security(&["delete-generic-password", "-s", service, "-a", account])?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("could not be found") || stderr.contains("specified item could not") {
-            return Ok(());
-        }
-        Err(anyhow::anyhow!("Keychain delete failed: {}", stderr.trim()))
-    }
-}
+        use security_framework::passwords::delete_generic_password;
+        use security_framework_sys::base::errSecItemNotFound;
 
-#[cfg(target_os = "macos")]
-fn run_security(args: &[&str]) -> Result<std::process::Output> {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    let mut child = Command::new("/usr/bin/security")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| anyhow::anyhow!("Failed to start /usr/bin/security: {err}"))?;
-    let start = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .map_err(|err| anyhow::anyhow!("Failed waiting for /usr/bin/security: {err}"))?
-            .is_some()
-        {
-            return child.wait_with_output().map_err(|err| {
-                anyhow::anyhow!("Failed collecting /usr/bin/security output: {err}")
-            });
-        }
-        if start.elapsed() >= Duration::from_secs(10) {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("Timed out reading macOS Keychain");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn trim_one_trailing_newline(value: &mut String) {
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
+        match delete_generic_password(service, account) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == errSecItemNotFound => Ok(()),
+            Err(error) => Err(anyhow::anyhow!("Keychain delete failed: {error}")),
         }
     }
 }
@@ -170,6 +126,21 @@ where
             return None;
         }
         load_auth_file::<T>(&self.legacy_file).map(|parsed| (parsed, self.legacy_file.clone()))
+    }
+
+    fn clear_legacy_then_primary(&self) -> Result<()> {
+        if self.file != self.legacy_file
+            && let Err(error) = fs::remove_file(&self.legacy_file)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
+        if let Err(error) = fs::remove_file(&self.file)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
+        Ok(())
     }
 }
 
@@ -274,6 +245,34 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Promote a readable file fallback to Keychain.
+    ///
+    /// The caller must hold the store's mutation lock. The current value is
+    /// first rewritten to the primary mode-0600 file, then written to and read
+    /// back from Keychain. File credentials are removed only after that
+    /// verification succeeds, with the primary file removed last so an
+    /// interruption never loses the recoverable copy.
+    pub fn migrate_file_to_keychain(&self) -> Result<bool> {
+        if !self.use_keychain {
+            return Ok(false);
+        }
+        let Some((value, _source)) = self.file_store.load_with_source() else {
+            return Ok(false);
+        };
+
+        self.file_store.save(value.clone())?;
+        let raw = serde_json::to_string(&value)?;
+        self.keychain.write(&self.service, &self.account, &raw)?;
+        match self.keychain.read(&self.service, &self.account)? {
+            Some(stored) if stored == raw => {}
+            Some(_) => anyhow::bail!("Keychain verification returned different credentials"),
+            None => anyhow::bail!("Keychain verification could not find the stored credentials"),
+        }
+        self.file_store.clear_legacy_then_primary()?;
+        self.set_active_backend(KeychainFileBackend::Keychain);
+        Ok(true)
+    }
 }
 
 impl<T, K> AuthStorage<T> for KeychainFileAuthStore<T, K>
@@ -320,18 +319,29 @@ where
                 return Ok(());
             }
             let raw = serde_json::to_string(&value)?;
-            if self
+            let keychain_verified = self
                 .keychain
                 .write(&self.service, &self.account, &raw)
-                .is_ok()
-            {
+                .and_then(
+                    |()| match self.keychain.read(&self.service, &self.account)? {
+                        Some(stored) if stored == raw => Ok(()),
+                        Some(_) => {
+                            anyhow::bail!("Keychain verification returned different credentials")
+                        }
+                        None => {
+                            anyhow::bail!("Keychain verification could not find stored credentials")
+                        }
+                    },
+                )
+                .is_ok();
+            if keychain_verified {
                 self.set_active_backend(KeychainFileBackend::Keychain);
                 return Ok(());
             }
             self.file_store.save(value)?;
             self.set_active_backend(KeychainFileBackend::FileFallback {
                 path: self.file_store.path(),
-                fallback_reason: Some("macOS Keychain write unavailable"),
+                fallback_reason: Some("macOS Keychain write or verification unavailable"),
             });
             return Ok(());
         }
@@ -341,10 +351,20 @@ where
     }
 
     fn clear(&self) -> Result<()> {
-        if self.use_keychain {
-            self.keychain.delete(&self.service, &self.account)?;
+        let keychain_error = self
+            .use_keychain
+            .then(|| self.keychain.delete(&self.service, &self.account))
+            .and_then(Result::err);
+        let file_error = self.file_store.clear().err();
+        match (keychain_error, file_error) {
+            (Some(keychain), Some(file)) => {
+                anyhow::bail!(
+                    "Failed to clear Keychain credentials ({keychain}) and file fallback ({file})"
+                )
+            }
+            (Some(error), None) | (None, Some(error)) => return Err(error),
+            (None, None) => {}
         }
-        self.file_store.clear()?;
         self.set_active_backend(if self.use_keychain {
             KeychainFileBackend::Undetermined
         } else {
@@ -612,6 +632,40 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct DeleteFailingKeychain;
+
+    impl Keychain for DeleteFailingKeychain {
+        fn read(&self, _service: &str, _account: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn write(&self, _service: &str, _account: &str, _value: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _service: &str, _account: &str) -> Result<()> {
+            anyhow::bail!("delete failed")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MismatchingKeychain;
+
+    impl Keychain for MismatchingKeychain {
+        fn read(&self, _service: &str, _account: &str) -> Result<Option<String>> {
+            Ok(Some(r#"{"source":"different"}"#.to_string()))
+        }
+
+        fn write(&self, _service: &str, _account: &str, _value: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self, _service: &str, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn temp_auth_path(dir: &tempfile::TempDir, name: &str) -> String {
         dir.path().join(name).to_string_lossy().to_string()
     }
@@ -715,6 +769,93 @@ mod tests {
     }
 
     #[test]
+    fn keychain_file_store_migrates_verified_file_and_removes_primary_last() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+
+        let keychain = MockKeychain::default();
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file.clone(),
+            legacy.clone(),
+            "svc",
+            "acct",
+            true,
+            keychain.clone(),
+        );
+
+        assert!(store.migrate_file_to_keychain().unwrap());
+        assert_eq!(store.path(), "macOS Keychain");
+        assert!(!std::path::Path::new(&file).exists());
+        assert!(!std::path::Path::new(&legacy).exists());
+        let stored = keychain.raw("svc", "acct").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap()["source"],
+            json!("legacy")
+        );
+    }
+
+    #[test]
+    fn keychain_file_store_keeps_file_when_migration_write_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&file, &json!({"source": "file"})).unwrap();
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file.clone(),
+            legacy,
+            "svc",
+            "acct",
+            true,
+            ReadOnlyKeychain::default(),
+        );
+
+        assert!(store.migrate_file_to_keychain().is_err());
+        assert_eq!(store.load().unwrap().unwrap()["source"], json!("file"));
+        assert!(std::path::Path::new(&file).exists());
+    }
+
+    #[test]
+    fn keychain_file_store_keeps_file_when_migration_verification_differs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&file, &json!({"source": "file"})).unwrap();
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file.clone(),
+            legacy,
+            "svc",
+            "acct",
+            true,
+            MismatchingKeychain,
+        );
+
+        assert!(store.migrate_file_to_keychain().is_err());
+        assert_eq!(store.load().unwrap().unwrap()["source"], json!("file"));
+        assert!(std::path::Path::new(&file).exists());
+    }
+
+    #[test]
+    fn keychain_file_store_clears_file_even_when_keychain_delete_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&file, &json!({"source": "file"})).unwrap();
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file.clone(),
+            legacy,
+            "svc",
+            "acct",
+            true,
+            DeleteFailingKeychain,
+        );
+
+        assert!(store.clear().is_err());
+        assert!(!std::path::Path::new(&file).exists());
+    }
+
+    #[test]
     fn keychain_file_store_keeps_an_existing_file_authoritative_on_save() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = temp_auth_path(&temp, "auth.json");
@@ -752,7 +893,7 @@ mod tests {
         store.save(json!({"source": "file-fallback"})).unwrap();
         assert_eq!(
             store.path(),
-            format!("File fallback: {file} (macOS Keychain write unavailable)")
+            format!("File fallback: {file} (macOS Keychain write or verification unavailable)")
         );
         assert_eq!(
             store.load().unwrap().unwrap()["source"],

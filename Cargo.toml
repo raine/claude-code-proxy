@@ -55,6 +55,10 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 libc = "0.2"
 signal-hook = { version = "0.3", features = ["extended-siginfo"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+security-framework-sys = "2.17"
+
 [dev-dependencies]
 tempfile = "3.14"
 assert_cmd = "2"
