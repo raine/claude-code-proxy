@@ -300,9 +300,9 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains(
             "\"tools\":[\"Read\",\"Glob\",\"Grep\"]",
         ))
-        .stdout(contains("\"effortLevel\":\"xhigh\""))
+        .stdout(contains("\"effortLevel\":\"high\""))
         .stdout(contains("\"model\":\"gpt-5.6-sol\""))
-        .stdout(contains("\"ultracode\":true"))
+        .stdout(contains("\"ultracode\":false"))
         .stdout(contains("arg=<--effort>"))
         .stdout(contains("arg=<max>"))
         .stdout(contains("arg=<hello world>"))
