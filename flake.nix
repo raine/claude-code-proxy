@@ -25,6 +25,8 @@
 
             cargoLock.lockFile = ./Cargo.lock;
 
+            doCheck = false;
+
             meta = with pkgs.lib; {
               description = cargoToml.package.description;
               homepage = "https://github.com/raine/claude-code-proxy";

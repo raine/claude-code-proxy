@@ -17,7 +17,7 @@ jobs:
       - name: Build package
         run: |
           for attempt in 1 2 3 4 5; do
-            if nix build --no-link --print-build-logs --option sandbox false --option max-jobs 1; then
+            if nix build --no-link --print-build-logs --option max-jobs 1; then
               exit 0
             fi
             if [ "$attempt" = 5 ]; then
