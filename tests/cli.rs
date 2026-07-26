@@ -277,6 +277,10 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
         .stdout(contains("tool_search=true"))
+        .stdout(contains(
+            "custom_headers=x-ccproxy-compaction-model: gpt-5.6-terra",
+        ))
+        .stdout(contains("custom_headers=x-existing: keep").not())
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
         .stdout(contains(
@@ -304,7 +308,6 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("arg=<--effort>"))
         .stdout(contains("arg=<max>"))
         .stdout(contains("arg=<hello world>"))
-        .stdout(contains("custom_headers=x-existing: keep"))
         .stdout(contains("x-ccproxy-codex-xhigh-as-max").not());
     Ok(())
 }

@@ -191,6 +191,11 @@ agent files:
 | `general-purpose` | GPT-5.6 Sol / `high` | Grok 4.5 High / `high` |
 | `Plan` | GPT-5.6 Terra / `high` | Grok 4.5 High / `high` |
 
+The `co` profile also routes recognized automatic and manual compaction to
+GPT-5.6 Terra. Codex compaction uses `medium` reasoning independently of the
+main session effort. The session-scoped override replaces an inherited
+compaction header, while `cg` keeps its existing main-loop compaction behavior.
+
 The special built-in `claude` catch-all remains untouched because Claude Code
 adds a private background-job and Agent View protocol that public `--agents`
 definitions cannot preserve. It therefore inherits the current main-session
@@ -278,6 +283,7 @@ ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol \
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
+ANTHROPIC_CUSTOM_HEADERS='x-ccproxy-compaction-model: gpt-5.6-terra' \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
@@ -299,12 +305,13 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 
 ```
 
-Claude Code sends automatic and manual compaction with the main-loop model. To
-route only its recognized compaction summary request to another proxy model,
-add a custom header to the Claude Code environment:
+Claude Code sends automatic and manual compaction with the main-loop model.
+The `co` profile already routes recognized compaction to GPT-5.6 Terra. For a
+manual Claude Code environment, or to choose a different proxy model, add a
+custom header:
 
 ```sh
-ANTHROPIC_CUSTOM_HEADERS='x-ccproxy-compaction-model: grok-4.5-high'
+ANTHROPIC_CUSTOM_HEADERS='x-ccproxy-compaction-model: gpt-5.6-terra'
 ```
 
 The header is ignored for ordinary prompts. An unknown override model returns

@@ -125,6 +125,7 @@ struct ClaudeProfileConfig {
     opus_model: &'static str,
     sonnet_model: &'static str,
     haiku_model: &'static str,
+    compaction_model: Option<&'static str>,
     context_tokens: &'static str,
     effort_level: &'static str,
     ultracode: bool,
@@ -151,6 +152,7 @@ impl ClaudeProfile {
                 opus_model: "gpt-5.6-sol",
                 sonnet_model: "gpt-5.6-terra",
                 haiku_model: "gpt-5.6-luna",
+                compaction_model: Some("gpt-5.6-terra"),
                 context_tokens: "272000",
                 // Default to high (not ultracode/xhigh) so ordinary co sessions
                 // start at a calmer effort; users can still raise /effort later.
@@ -177,6 +179,7 @@ impl ClaudeProfile {
                 opus_model: "grok-4.5-high",
                 sonnet_model: "grok-4.5-high",
                 haiku_model: "grok-4.5-medium",
+                compaction_model: None,
                 context_tokens: "500000",
                 effort_level: "high",
                 ultracode: false,
@@ -1423,7 +1426,7 @@ fn claude_profile_environment(
     base_url: &str,
     profile_config_directory: &Path,
 ) -> Vec<(&'static str, String)> {
-    vec![
+    let mut environment = vec![
         (CLAUDE_PROFILE_MANAGED_ENV, "1".to_string()),
         (
             "CLAUDE_CONFIG_DIR",
@@ -1483,7 +1486,14 @@ fn claude_profile_environment(
         ("CLAUDE_CODE_MAX_RETRIES", "1".to_string()),
         ("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "10".to_string()),
         ("ENABLE_TOOL_SEARCH", "true".to_string()),
-    ]
+    ];
+    if let Some(model) = profile.compaction_model {
+        environment.push((
+            "ANTHROPIC_CUSTOM_HEADERS",
+            format!("x-ccproxy-compaction-model: {model}"),
+        ));
+    }
+    environment
 }
 
 fn proxy_client_url(bind_address: &str, port: u16) -> String {
@@ -2170,7 +2180,14 @@ mod tests {
             command_env(&command, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             "272000"
         );
-        assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
+        assert_eq!(
+            command_env(&command, "ANTHROPIC_CUSTOM_HEADERS"),
+            "x-ccproxy-compaction-model: gpt-5.6-terra"
+        );
+        assert_eq!(
+            settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
+            "x-ccproxy-compaction-model: gpt-5.6-terra"
+        );
     }
 
     #[test]
