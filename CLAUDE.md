@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`claude-code-proxy` is a Rust 2024 CLI and Axum server that accepts the Anthropic Messages API shape used by Claude Code, routes requests by model ID, and translates them to Codex, Kimi, Grok, or Cursor protocols. The process also owns provider authentication, streaming translation, process-local session state, logging, traffic capture, and the terminal monitor.
+`claude-code-proxy` is a Rust 2024 CLI and Axum server that accepts the Anthropic Messages API shape used by Claude Code and routes public HTTP model requests only to Codex or Grok. Kimi and Cursor provider/auth implementations remain in the tree, but their models are not catalogued or routable through the HTTP API. The process also owns provider authentication, streaming translation, process-local session state, logging, traffic capture, and the terminal monitor.
 
 ## Development commands
 
@@ -58,20 +58,20 @@ For an in-module unit test, use Cargo's name filter: `cargo test <test_name>`.
 
 ### Model routing and process-local state
 
-- `src/registry.rs` is the routing authority and model catalog. Concrete Codex, Kimi, and Grok IDs route by exact match. `cursor:`, `cursor-plan:`, and `cursor-ask:` accept dynamic Cursor model IDs. The optional `[1m]` suffix is removed before routing.
-- Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, and `claude-*` route through the configured alias provider. Only Codex and Kimi can be alias providers.
-- `src/session.rs` tracks request sequence and alias affinity by `x-claude-code-session-id`. A concrete Codex or Kimi request can pin later alias requests to that provider; an alias request does not establish the pin. Entries expire after 30 idle minutes and the store is capped at 10,000 sessions.
-- Session affinity, Codex continuation state, the Codex WebSocket circuit, and Cursor's tool bridge are separate process-local stores. Deployments with multiple proxy processes need sticky routing for features that depend on them; do not assume all stores share the session store's TTL or capacity.
+- `src/registry.rs` is the routing authority and public model catalog. Only Codex/Grok routes and their active Anthropic-compatible aliases appear in the CLI model list or `/v1/models`; concrete Kimi and Cursor IDs must remain unroutable. The optional `[1m]` suffix is removed before routing.
+- Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, and `claude-*` route to Codex by default. `aliasProvider: "codex"` is the only active configured alias provider. The legacy `kimi` value remains parseable solely to fail closed: when no supported Codex/Grok session affinity applies, aliases return unknown-model HTTP 400 instead of falling back to Codex.
+- `src/session.rs` tracks request sequence and alias affinity by `x-claude-code-session-id`. A concrete Codex or Grok request can pin the session, but only `claude-opus-5` currently follows Grok affinity; other aliases route to Codex. An alias request does not establish the pin. Entries expire after 30 idle minutes and the store is capped at 10,000 sessions.
+- Session affinity, Codex continuation state, and the Codex WebSocket circuit are separate process-local stores. Cursor's tool bridge remains in the inactive provider implementation. Deployments with multiple proxy processes need sticky routing for active features that depend on local state; do not assume all stores share the session store's TTL or capacity.
 - Unknown models intentionally return an Anthropic-shaped HTTP 400. There is no implicit fallback provider.
 
 ### Provider and translation layer
 
-- `src/provider.rs` defines the `Provider` trait, provider CLI hooks, and `RequestContext`. `src/providers/mod.rs` exposes the concrete backends, while `Registry::new` in `src/registry.rs` instantiates and wires them.
+- `src/provider.rs` defines the `Provider` trait, provider CLI hooks, and `RequestContext`. `src/providers/mod.rs` exposes the concrete backends. `Registry::new` keeps all provider handlers available to their existing auth CLI, but its public model map contains only Codex and Grok.
 - `src/anthropic/` contains the inbound schema and Anthropic error/SSE shapes. `src/providers/translate_shared.rs` contains normalization shared across backends; keep provider-specific wire formats, retry behavior, token counting, error mapping, and auth behavior inside that provider.
 - `src/providers/codex/` is the largest backend. Request/model translation is under `translate/`; HTTP and WebSocket transport live in `client.rs` and `websocket.rs`; append-only `previous_response_id` state lives in `continuation.rs`; live upstream events are reduced into Anthropic SSE incrementally.
-- `src/providers/kimi/` translates to OpenAI-style chat completions. `src/providers/grok/` translates to a Responses-style API with an incremental stream reducer.
-- `src/providers/cursor/` implements Cursor's Connect/HTTP2 protocol. `request.rs`, `response.rs`, `connect.rs`, and the hand-written wire types in `proto.rs` form the bridge; `tool_bridge.rs` correlates Cursor-native tool calls with later Claude tool results. Current stateful Cursor behavior is the tool bridge, not a server-side conversation-ID map; verify implementation rather than relying on older README resume descriptions. Cursor model catalog discovery can consult an installed Cursor Agent bundle or `CCP_CURSOR_AGENT_BUNDLE`.
-- Adding a provider requires a `Provider` implementation plus registry/model wiring; each provider owns its authentication and token refresh manager.
+- `src/providers/grok/` translates to a Responses-style API with an incremental stream reducer.
+- `src/providers/kimi/` still contains the OpenAI-style chat-completions implementation, and `src/providers/cursor/` still contains the Connect/HTTP2 bridge and tool bridge. They are retained implementation/auth surfaces, not active HTTP routes. Do not add their model IDs or dynamic Cursor prefixes back to the registry without an explicit product decision.
+- Adding or reactivating a provider requires a `Provider` implementation plus deliberate registry/model wiring and public-catalog tests; each provider owns its authentication and token refresh manager.
 
 ### Configuration, authentication, and paths
 

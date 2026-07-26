@@ -54,17 +54,22 @@ fn version_json_ignores_unrelated_non_utf8_environment_values()
 }
 
 #[test]
-fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
+fn models_prints_only_active_route_providers() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
-    assert!(out.contains("kimi:"));
-    assert!(out.contains("cursor:"));
+    assert!(out.contains("grok:"));
+    assert!(!out.contains("kimi:"));
+    assert!(!out.contains("cursor:"));
 
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["models", "--full"]);
-    cmd.output()?;
+    let out = String::from_utf8(cmd.output()?.stdout)?;
+    assert!(out.contains("codex:"));
+    assert!(out.contains("grok:"));
+    assert!(!out.contains("kimi:"));
+    assert!(!out.contains("cursor:"));
     Ok(())
 }
 
@@ -252,10 +257,10 @@ fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let output = cmd.output()?;
     let out = String::from_utf8(output.stdout)?;
     let codex_pos = out.find("codex:").unwrap_or(0);
-    let kimi_pos = out.find("kimi:").unwrap_or(0);
-    let cursor_pos = out.find("cursor:").unwrap_or(0);
-    assert!(codex_pos < kimi_pos);
-    assert!(kimi_pos < cursor_pos);
+    let grok_pos = out.find("grok:").unwrap_or(0);
+    assert!(codex_pos < grok_pos);
+    assert!(!out.contains("kimi:"));
+    assert!(!out.contains("cursor:"));
     Ok(())
 }
 

@@ -1398,6 +1398,7 @@ mod tests {
 
     const TEST_ENV_KEYS: &[&str] = &[
         "CCP_ALLOW_REMOTE_UNAUTHENTICATED",
+        "CCP_ALIAS_PROVIDER",
         "CCP_BIND_ADDRESS",
         "CCP_CODEX_TRANSPORT",
         "CCP_CONFIG_DIR",
@@ -1491,6 +1492,30 @@ mod tests {
         assert_eq!(load_config().bind_address, "192.0.2.10");
         let _bind_env = EnvGuard::set("CCP_BIND_ADDRESS", "0.0.0.0");
         assert_eq!(load_config().bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn alias_provider_defaults_to_codex_and_legacy_kimi_still_parses() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+
+        let default_config = tempfile::TempDir::new().unwrap();
+        let _default_config_env = EnvGuard::set("CCP_CONFIG_DIR", default_config.path());
+        assert_eq!(load_config().alias_provider, AliasProvider::Codex);
+
+        let file_config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            file_config.path().join("config.json"),
+            r#"{"aliasProvider":"kimi"}"#,
+        )
+        .unwrap();
+        let _file_config_env = EnvGuard::set("CCP_CONFIG_DIR", file_config.path());
+        assert_eq!(load_config().alias_provider, AliasProvider::Kimi);
+
+        let env_config = tempfile::TempDir::new().unwrap();
+        let _env_config_dir = EnvGuard::set("CCP_CONFIG_DIR", env_config.path());
+        let _alias_env = EnvGuard::set("CCP_ALIAS_PROVIDER", "kimi");
+        assert_eq!(load_config().alias_provider, AliasProvider::Kimi);
     }
 
     #[test]

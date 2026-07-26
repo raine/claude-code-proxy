@@ -18,7 +18,8 @@ use crate::providers::kimi::translate::accumulate::accumulate_response;
 use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, resolve_model};
 use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
 use crate::providers::kimi::translate::stream::translate_stream_bytes;
-use crate::registry::KIMI_MODELS;
+
+const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
 
 fn now_ms() -> u64 {
     SystemTime::now()

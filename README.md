@@ -1,6 +1,6 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI**, **Kimi**, **Grok**, or **Cursor**.
+Claude Code, powered by **ChatGPT/Codex** or **Grok**.
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
@@ -44,10 +44,11 @@ artifacts are published as `claude-code-proxy-windows-amd64.zip` and
 `claude-code-proxy-windows-arm64.zip`; extract the `.exe` somewhere on your
 `PATH`.
 
-### 2. Pick a provider and authenticate
+### 2. Authenticate a routed provider
 
-The proxy supports four upstream providers. Pick one and run its login flow; the
-proxy will refuse to start traffic until a token is stored.
+The public HTTP model registry supports two upstream providers: Codex and Grok.
+Authenticate whichever route you intend to use; requests for that provider
+return 401 until its token is stored.
 
 **Codex (ChatGPT Plus/Pro):**
 
@@ -58,15 +59,6 @@ claude-code-proxy codex auth device    # device-code flow
 ```
 
 Sign in with your **ChatGPT Plus/Pro account**, not an OpenAI API account.
-
-**Kimi (kimi.com Kimi Code):**
-
-```sh
-claude-code-proxy kimi auth login      # device-code flow (prints URL + code)
-```
-
-Sign in with your **kimi.com account**. The verification URL is displayed; open
-it in any browser, confirm the code, and the CLI polls until done.
 
 **Grok (grok.com):**
 
@@ -81,34 +73,24 @@ OAuth session and does not use the official Grok CLI credential file. On a
 headless host, `grok auth device` prints a verification URL and code to enter on
 any other device, then polls until authorization completes.
 
-**Cursor Agent:**
-
-```sh
-claude-code-proxy cursor auth login
-claude-code-proxy cursor auth status
-```
-
-Cursor authentication uses Cursor's browser login, but the proxy stores its own
-tokens. It does not read Cursor Agent's Keychain/auth.json. You can also set
-`CCP_CURSOR_AUTH_TOKEN` for the proxy process.
-
-Codex and Cursor prefer macOS Keychain, but fall back to a mode-0600 provider
-file when non-interactive Keychain writes are unavailable; auth commands report
-the backend actually in use. Kimi and Grok use provider files on every platform.
-Windows stores them under `%APPDATA%\claude-code-proxy\<provider>\auth.json`;
-Linux and macOS file fallbacks use
+Codex prefers macOS Keychain and falls back to a mode-0600 provider file when
+non-interactive Keychain writes are unavailable; Grok uses a provider file on
+every platform. Windows stores file credentials under
+`%APPDATA%\claude-code-proxy\<provider>\auth.json`; Linux and macOS file
+fallbacks use
 `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`.
-Set `CCP_CONFIG_DIR` before `cursor auth login` to store a separate Cursor login
-at `$CCP_CONFIG_DIR/cursor/auth.json`.
 
 Verify:
 
 ```sh
 claude-code-proxy codex auth status
-claude-code-proxy kimi auth status
 claude-code-proxy grok auth status
-claude-code-proxy cursor auth status
 ```
+
+The Kimi and Cursor provider implementations and auth subcommands remain in the
+binary for compatibility and development, but their model IDs are deliberately
+absent from the HTTP registry. Authenticating either one does not make it
+routable through `/v1/messages`.
 
 ### 3. Start the proxy
 
@@ -119,10 +101,10 @@ CCP_BIND_ADDRESS=0.0.0.0 claude-code-proxy serve --allow-remote-unauthenticated
 claude-code-proxy serve --no-monitor   # plain logs instead of the monitor TUI
 ```
 
-Binds to `127.0.0.1` by default. One `serve` process handles all providers —
-the upstream for each request is chosen from `ANTHROPIC_MODEL`. When stdout is
-a terminal, `serve` opens a monitor TUI with sessions, active requests, recent
-requests, and error events. Use `--no-monitor` for plain terminal output.
+Binds to `127.0.0.1` by default. One `serve` process handles both routed
+providers—the upstream for each request is chosen from `ANTHROPIC_MODEL`. When
+stdout is a terminal, `serve` opens a monitor TUI with sessions, active requests,
+recent requests, and error events. Use `--no-monitor` for plain terminal output.
 The proxy does not authenticate incoming clients. Non-loopback binds are rejected
 unless you explicitly pass `--allow-remote-unauthenticated` (or set the matching
 config acknowledgement), and must be protected with a firewall or an
@@ -166,19 +148,32 @@ by the Homebrew launch service.
 `ANTHROPIC_MODEL` selects the provider:
 
 - `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
-- `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
 - `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.5-medium`, `grok-4.5-high` → **grok**
-- `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
 An unknown model returns a 400 listing the supported ids. There is no
 implicit default provider.
 
-Claude Code also issues background requests (session title generation, token
-counts) against its built-in "small/fast" haiku model id. Those requests
-would 400 because no provider claims it, so set
-`ANTHROPIC_DEFAULT_HAIKU_MODEL` to a concrete id too. Claude Code 2.1.212 still
-prefers its deprecated `ANTHROPIC_SMALL_FAST_MODEL` variable when both are set,
-so gateways supporting that version should set both to the same value.
+`claude-code-proxy models` and `GET /v1/models` expose this same two-provider
+catalog. `models --full` remains accepted, but it does not reveal inactive Kimi
+or Cursor IDs.
+
+Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, and `claude-*`
+route to Codex by default. A concrete Grok request with an
+`x-claude-code-session-id` establishes Grok affinity for that process-local
+session; a later `claude-opus-5` request with the same ID follows that affinity
+to Grok. With the active `codex` alias configuration, other generic aliases do
+not follow Grok affinity and continue to use Codex. The legacy `aliasProvider` /
+`CCP_ALIAS_PROVIDER` setting supports `codex` as the only active value; the old
+`kimi` value is accepted only as a fail-closed compatibility setting. When no
+supported Codex/Grok session affinity applies, it makes generic aliases return
+unknown model/HTTP 400 instead of silently falling back to GPT.
+
+Claude Code also issues background requests (session title generation and token
+counts) against its small/fast model. Set `ANTHROPIC_DEFAULT_HAIKU_MODEL` to a
+concrete active ID so those requests stay in the intended GPT or Grok family
+instead of relying on generic-alias routing. Claude Code 2.1.212 still prefers
+its deprecated `ANTHROPIC_SMALL_FAST_MODEL` variable when both are set, so
+gateways supporting that version should set both to the same value.
 
 For day-to-day GPT/Grok use, the proxy has launch profiles that keep the main
 model, Claude model aliases used by subagents, and context window coherent. Pass
@@ -302,15 +297,6 @@ CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
-# Kimi
-ANTHROPIC_BASE_URL=http://localhost:18765 \
-ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=kimi-for-coding[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=kimi-for-coding[1m] \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
-  claude
-
 # Grok
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
@@ -324,14 +310,6 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
-# Cursor Agent
-ANTHROPIC_BASE_URL=http://localhost:18765 \
-ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=cursor \
-ANTHROPIC_SMALL_FAST_MODEL=cursor \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
-  claude
 ```
 
 Claude Code sends automatic and manual compaction with the main-loop model. To
@@ -511,24 +489,15 @@ Auth:
 | `codex auth status` | Show account ID + token expiry             |
 | `codex auth logout` | Delete stored credentials                  |
 
-### Kimi (Kimi Code)
+### Kimi (HTTP routing disabled)
 
-Upstream: `https://api.kimi.com/coding/v1/chat/completions` (OpenAI-style
-chat-completions).
+The Kimi provider implementation and auth CLI are retained for compatibility
+and development, but the HTTP registry does not expose or route
+`kimi-for-coding`, `kimi-k2.6`, or `k2.6`. Requests using those IDs return the
+same unknown-model HTTP 400 as any unsupported model. Stored Kimi credentials
+do not enable the route.
 
-Only one wire model is exposed: `kimi-for-coding` (its display name in kimi-cli
-is **Kimi-k2.6**, 256k context, supports reasoning + image input + video input).
-`kimi-k2.6` and `k2.6` are accepted as aliases for the same wire id.
-
-Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
-the UI as `◐ medium · /effort`) is forwarded as Kimi's `reasoning_effort` (`low`
-/ `medium` / `high`); `xhigh`, `max`, and `ultra` are capped at `high`. Thinking
-blocks from the upstream model are forwarded to
-Claude Code and rendered as thinking content. If Claude Code disables thinking,
-the proxy drops both `reasoning_effort` and the `thinking: {type: "enabled"}`
-flag before forwarding.
-
-Auth:
+Retained auth commands:
 
 | Command            | What it does                          |
 | ------------------ | ------------------------------------- |
@@ -589,57 +558,16 @@ refreshes them five minutes before expiry, and does not use `~/.grok/auth.json`.
 | `grok auth status` | Show token expiry and storage path    |
 | `grok auth logout` | Delete proxy-owned credentials        |
 
-### Cursor Agent
+### Cursor Agent (HTTP routing disabled)
 
-Upstream: `https://api2.cursor.sh/agent.v1.AgentService/Run` (Cursor Agent's
-HTTP/2 full-duplex Connect protocol). The captured HTTP/1 fallback is
-`RunSSE` plus `/aiserver.v1.BidiService/BidiAppend`; the provider now uses the
-primary HTTP/2 stream.
+The Cursor provider implementation and auth CLI are retained for compatibility
+and development, but the HTTP registry does not expose or route legacy Cursor
+IDs, `composer-2.5`, or any `cursor:`, `cursor-plan:`, or `cursor-ask:` dynamic
+form. Those requests return unknown-model HTTP 400, and Cursor models never
+appear in `claude-code-proxy models` or `/v1/models`. Stored Cursor credentials
+do not enable the route.
 
-Supported proxy model ids:
-
-- `cursor`, `cursor-agent`: Cursor default model selection
-- `cursor-plan`: Cursor default model selection with `AGENT_MODE_PLAN`
-- `cursor-ask`: Cursor default model selection with `AGENT_MODE_ASK`
-- `cursor-composer`, `composer-2.5`: Cursor Composer 2.5
-- `cursor-composer-fast`, `composer-2.5-fast`: Cursor Composer 2.5 fast mode
-- `cursor:<model-id>`: force any Cursor Agent model id through Cursor
-- `cursor-plan:<model-id>`: same model with Cursor `AGENT_MODE_PLAN`
-- `cursor-ask:<model-id>`: same model with Cursor `AGENT_MODE_ASK`
-
-The prefixed forms are the recommended way to select Cursor's full model
-catalog. They avoid collisions with other proxy providers, for example
-`gpt-5.2` can remain a Codex model while `cursor:gpt-5.2` forces Cursor.
-The catalog advertised by `/v1/models` is generated from
-`cursor-agent --list-models`; unknown future ids are still accepted with
-`cursor:<raw-model>`.
-
-Claude Code's `/effort` setting is mapped onto Cursor catalog ids when the
-selected Cursor model exposes matching effort variants. For example,
-`ANTHROPIC_MODEL=cursor:gpt-5.5` plus `/effort high` requests
-`gpt-5.5-high`, while `/effort max` picks the strongest available catalog
-variant such as `xhigh`, `extra-high`, or `high`. Explicit effort model ids
-such as `cursor:gpt-5.5-low` are respected as-is, `-fast` is preserved when
-available, and models without effort variants (for example
-`cursor:gemini-3.1-pro` in the captured catalog) are left unchanged.
-
-Plan mode can also be selected per request with metadata:
-
-```json
-{
-  "metadata": {
-    "cursor_mode": "plan"
-  }
-}
-```
-
-Cursor continuation maps Claude Code's `x-claude-code-session-id` to a Cursor
-conversation id in memory. To resume an existing Cursor chat explicitly, set
-`metadata.cursor_chat_id`, `metadata.cursorChatId`, `metadata.cursor_resume`, or
-`metadata.cursorResume` to the Cursor chat id. The observed Cursor session id is
-recorded back into the session map when Cursor returns it.
-
-Auth:
+Retained auth commands:
 
 | Command              | What it does                                                |
 | -------------------- | ----------------------------------------------------------- |
@@ -655,7 +583,7 @@ sequenceDiagram
     participant CC as Claude Code
     participant P as claude-code-proxy
     participant AUTH as OAuth host / credential store
-    participant U as Upstream API<br/>(Codex, Kimi, or Cursor)
+    participant U as Upstream API<br/>(Codex or Grok)
 
     Note over P,AUTH: One-time: PKCE / device OAuth<br/>tokens cached locally for reuse
 
@@ -668,7 +596,7 @@ sequenceDiagram
 
     P->>P: translate request<br/>• strip Anthropic-only fields<br/>• system blocks → instructions / system message<br/>• tool_use / tool_result ↔ provider-specific shapes<br/>• prompt_cache_key = session id
     P->>U: POST upstream<br/>Bearer + provider-specific headers
-    U-->>P: provider stream<br/>(Codex/Kimi SSE, Cursor Connect frames)
+    U-->>P: provider Responses stream
     P->>P: reducer: typed events<br/>(thinking / text / tool start/delta/stop, finish)
     P-->>CC: Anthropic SSE<br/>(message_start, content_block_*, message_delta, message_stop)
 ```
@@ -681,9 +609,11 @@ sequenceDiagram
 | [`demo`](#demo)                                     | Open the TUI with mock data |
 | [`diagnostics`](#diagnostics)                       | Collect or upload metadata-only diagnostics |
 | `claude gpt -- <args>` / `claude grok -- <args>`    | Launch a coherent GPT or Grok Claude Code profile |
+| `models` / `models --full`                          | List active Codex and Grok HTTP model routes |
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management      |
-| `kimi  auth login` / `status` / `logout`            | Kimi OAuth management       |
-| `cursor auth login` / `status` / `logout`           | Cursor OAuth management     |
+| `grok auth login` / `device` / `status` / `logout`  | Grok OAuth management       |
+| `kimi auth login` / `status` / `logout`             | Retained Kimi auth management; no HTTP routing |
+| `cursor auth login` / `status` / `logout`           | Retained Cursor auth management; no HTTP routing |
 
 ---
 
@@ -716,10 +646,10 @@ claude-code-proxy serve --no-monitor
 CCP_LOG_STDERR=1 claude-code-proxy serve --no-monitor
 ```
 
-The plain server banner prints the supported model to provider mapping on
-startup. One `serve` process dispatches to any provider based on the `model`
-field in each request. Requests whose model isn't registered with any provider
-are rejected with HTTP 400 listing the supported ids.
+The plain server banner prints the active Codex/Grok model-to-provider mapping
+on startup. One `serve` process dispatches to either active provider based on
+the `model` field in each request. Requests whose model is not in that public
+registry are rejected with HTTP 400 listing the supported IDs.
 
 ---
 
@@ -730,7 +660,7 @@ a port or start the proxy server. Requests advance through each active lifecycle
 status, token totals and throughput update continuously, completed requests enter
 the recent and event panes, and new sessions appear over time. The baseline data
 also covers successful and failed requests, sessions with and without project
-names, all providers, throughput fallbacks, HTTP errors, and optional request
+names, both routed providers, throughput fallbacks, HTTP errors, and optional request
 details.
 
 ```sh
@@ -889,6 +819,9 @@ Run `codex auth login` again to re-authenticate.
 
 ### Kimi auth commands
 
+These commands maintain credentials for the retained inactive provider
+implementation. They do not add Kimi models to the HTTP registry.
+
 #### `kimi auth login`
 
 Runs a device-code OAuth flow (RFC 8628) against `auth.kimi.com` using the
@@ -929,6 +862,9 @@ re-authenticate.
 ---
 
 ### Cursor auth commands
+
+These commands maintain credentials for the retained inactive provider
+implementation. They do not add Cursor models to the HTTP registry.
 
 #### `cursor auth login`
 
@@ -972,6 +908,8 @@ The proxy speaks enough of the Anthropic API for Claude Code:
   logic. GPT and Grok share a two-slot blocking admission gate, and the work
   runs through Tokio's blocking pool. A request waiting more than 30 seconds
   for an admission slot receives retryable HTTP 503 overload.
+- `GET /v1/models`: the active Codex and Grok catalog; inactive Kimi and Cursor
+  models are not advertised
 - `GET /healthz`: liveness check
 - `GET /version`: build SHA, binary SHA-256, PID, executable path, startup time,
   and a non-secret configuration fingerprint
@@ -987,6 +925,8 @@ The file lives at `~/.config/claude-code-proxy/config.json` on macOS
 Windows, and at
 `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux. Set
 `CCP_CONFIG_DIR` to use a separate config and auth directory for that process.
+The example retains Kimi and Cursor provider settings for compatibility and
+development; those sections do not enable their HTTP model routes.
 
 ```json
 {
@@ -1059,7 +999,7 @@ Windows, and at
 | `CCP_BIND_ADDRESS`               | `bindAddress`              | `127.0.0.1`                                       | Proxy listen IP address; use `0.0.0.0` only when remote access is required and protected                                                                                          |
 | `CCP_ALLOW_REMOTE_UNAUTHENTICATED` | `server.allowRemoteUnauthenticated` | `false`                                | Explicit acknowledgement required for non-loopback binds; accepts `1`, `true`, or `yes`, and does not add authentication                                                          |
 | `PORT`                           | `port`                     | `18765`                                           | Proxy listen port                                                                                                                                                                 |
-| `CCP_CONFIG_DIR`                 | unset                      | platform config dir                               | Per-process config directory; Cursor auth uses it for file storage                                                                                                                |
+| `CCP_CONFIG_DIR`                 | unset                      | platform config dir                               | Per-process configuration and provider-auth directory                                                                                                                             |
 | `XDG_STATE_HOME`                 | —                          | `~/.local/state`                                  | Linux/macOS base dir for `proxy.log`                                                                                                                                              |
 | `CCP_LOG_STDERR`                 | `log.stderr`               | unset                                             | Also mirror log lines to stderr; any env value enables it                                                                                                                         |
 | `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                                                                              |
@@ -1068,7 +1008,7 @@ Windows, and at
 | `CCP_TRAFFIC_MAX_CAPTURE_BYTES`  | —                          | `67108864`                                        | Charged-byte ceiling for one request capture; exceeding it skips that artifact and the remainder of that capture without affecting the proxied request                             |
 | `CCP_TRAFFIC_MAX_TOTAL_FILES`    | —                          | `65536`                                           | Admission ceiling for regular files across the traffic root; existing files count after restart and symbolic links are never followed                                             |
 | `CCP_TRAFFIC_MAX_CAPTURE_FILES`  | —                          | `4096`                                            | Regular-file ceiling for one request capture, bounding inode use even when captured events are individually small                                                                  |
-| `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
+| `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | `codex` is the only active alias route. Legacy `kimi` remains accepted only to disable alias routing with unknown-model HTTP 400; it never falls back to GPT                       |
 | `CCP_MAX_REQUEST_BODY_BYTES`     | `server.maxRequestBodyBytes` | `33554432`                                      | Hard cap for both Anthropic request endpoints; declared and streamed overflows return 413                                                                                         |
 | `CCP_MAX_BUFFERED_REQUEST_BYTES` | `server.maxBufferedRequestBytes` | `268435456`                                  | Process-wide budget for buffered request bodies and initial replay material; long-lived Codex continuation capture has a separate bounded pool; saturation returns retryable 429   |
 | `CCP_MAX_CONCURRENT_REQUESTS`    | `server.maxConcurrentRequests` | `64`                                            | Global in-flight request limit; saturated requests are shed immediately instead of entering an unbounded wait queue                                                               |
@@ -1076,8 +1016,8 @@ Windows, and at
 | `CCP_MAX_CONCURRENT_PER_SESSION` | `server.maxConcurrentPerSession` | `24`                                            | Per-session in-flight limit; checked before the global limit so one child-agent wave cannot occupy every global slot                                                              |
 | `CCP_REQUEST_BODY_IDLE_TIMEOUT_MS` | `server.requestBodyIdleTimeoutMs` | `5000`                                       | Maximum pause while reading a local request body                                                                                                                                  |
 | `CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS` | `server.requestBodyTotalTimeoutMs` | `30000`                                    | Absolute request-body read budget; timeout returns 408 and releases all reservations                                                                                              |
-| `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
-| `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
+| `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override the retained Kimi auth implementation's OAuth host; does not enable HTTP model routing                                                                                  |
+| `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Retained Kimi provider setting for development; does not enable HTTP model routing                                                                                                |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`; `ultra` is sent as wire-level `max`)                                  |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
@@ -1100,7 +1040,7 @@ Windows, and at
 | `CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE` | `codex.unsafeSalvageToolCallOnClose` | `false` | **Dangerous compatibility switch.** Literal `true` restores the legacy heuristic that treats complete-looking tool JSON as committed after upstream closes without authoritative terminal events; this can execute an uncommitted tool call |
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
-| `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                                                                                     |
+| `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Retained Kimi provider setting for development; does not enable HTTP model routing                                                                                                |
 | `CCP_GROK_BASE_URL`              | `grok.baseUrl`             | `https://cli-chat-proxy.grok.com/v1`              | Override the Grok Responses API base URL                                                                                                                                          |
 | `CCP_GROK_CLIENT_VERSION`        | `grok.clientVersion`       | `0.2.93`                                          | Override the Grok client version header                                                                                                                                           |
 | `CCP_GROK_CONNECT_TIMEOUT_MS`    | `grok.connectTimeoutMs`    | `10000`                                           | Maximum time to establish the Grok TCP/TLS connection                                                                                                                             |
@@ -1109,16 +1049,21 @@ Windows, and at
 | `CCP_GROK_BODY_IDLE_TIMEOUT_MS`  | `grok.bodyIdleTimeoutMs`   | `300000`                                          | Maximum gap between Grok response body chunks; this per-gap limit cannot extend the total request deadline                                                                         |
 | `CCP_GROK_TOTAL_TIMEOUT_MS`      | `grok.totalTimeoutMs`      | `540000`                                          | Total wall-clock budget across authentication, all physical attempts, backoff, stream rebuilds, and response-body streaming                                                        |
 | `CCP_GROK_STREAM_HEARTBEAT_MS`   | `grok.streamHeartbeatMs`   | `5000`                                            | Emit Anthropic `ping` events during downstream silence; configured values are clamped to 1 through 60 seconds and do not extend the total deadline                                 |
-| `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                                                                    |
-| `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                                                                            |
-| `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                                                                          |
-| `CCP_CURSOR_AUTH_TOKEN`          | —                          | unset                                             | Use this Cursor bearer token instead of local claude-code-proxy Cursor auth storage                                                                                               |
+| `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Retained Cursor auth/provider setting; does not enable HTTP model routing                                                                                                         |
+| `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Retained Cursor provider setting for development; does not enable HTTP model routing                                                                                              |
+| `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Retained Cursor implementation's protobuf schema bundle; does not enable HTTP model routing                                                                                       |
+| `CCP_CURSOR_AUTH_TOKEN`          | —                          | unset                                             | Use this Cursor bearer token for retained auth/provider development; does not enable HTTP model routing                                                                           |
 | `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                                                                               |
 | `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT` and `CCP_KIMI_USER_AGENT`                                                                                                                     |
 
 A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
+
+Kimi and Cursor configuration and credentials are retained for compatibility
+and provider development. No config key or successful auth command can add
+their models to the HTTP registry; reactivation requires a code change plus
+catalog and routing tests.
 
 Codex uses `auto` transport by default. Without a system proxy, `auto` starts
 with live WebSocket streaming while the connection is healthy. It falls back
@@ -1343,14 +1288,16 @@ CCP_TRAFFIC_LOG=1`.
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json` and
   reports that backend. Linux uses the same file path; Windows uses
   `%APPDATA%\claude-code-proxy\codex\auth.json`.
-- Kimi tokens — stored in
+- Inactive Kimi provider tokens — stored in
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/auth.json` on macOS
   and Linux, or `%APPDATA%\claude-code-proxy\kimi\auth.json` on Windows.
-- Kimi device ID — persistent UUID bound into the Kimi JWT at login. Linux uses
+- Inactive Kimi provider device ID — persistent UUID bound into the Kimi JWT at
+  login. Linux uses
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/device_id`; Windows
   uses `%APPDATA%\claude-code-proxy\kimi\device_id`. Reused for the lifetime
   of the install.
-- Cursor tokens — macOS prefers Keychain service `claude-code-proxy.cursor` and
+- Inactive Cursor provider tokens — macOS prefers Keychain service
+  `claude-code-proxy.cursor` and
   falls back to
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/cursor/auth.json` when
   writes are unavailable. Linux uses the same file path; Windows uses
@@ -1364,15 +1311,16 @@ CCP_TRAFFIC_LOG=1`.
 Claude Code binds the API base URL and auth when the process starts. Switching
 **backends** (proxy vs direct Anthropic, or a different Anthropic-compatible
 host) is a launch-time concern. The proxy can route many model ids in one
-`serve` process, but a Claude Code client process has one context window and
-one set of model aliases. In-session `/model` changes are therefore safe only
-within a compatible profile family. Exit and relaunch with `co` or `cg` when
-switching between GPT and Grok.
+`serve` process, but its public registry contains only GPT/Codex and Grok
+models. A Claude Code client process has one context window and one set of model
+aliases. In-session `/model` changes are therefore safe only within a compatible
+profile family. Exit and relaunch with `co` or `cg` when switching between GPT
+and Grok.
 
 For the common GPT and Grok paths, use the built-in `claude gpt` and
 `claude grok` launch profiles (or the `co`/`cg` executable-name shortcuts).
-Use process env, a shell wrapper, or Claude Code's own `/model` for other
-backends and custom combinations.
+Use process env, a shell wrapper, or Claude Code's own `/model` for custom
+GPT/Grok combinations.
 
 ### Choose a pattern
 
@@ -1431,10 +1379,6 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
         main_model="gpt-5.5[1m]"
         small_model="gpt-5.4-mini[1m]"
         ;;
-      kimi|kimi-for-coding|kimi-for-coding\[1m\])
-        main_model="kimi-for-coding[1m]"
-        small_model="kimi-for-coding[1m]"
-        ;;
       grok|grok-4.5|grok-4.5-high)
         main_model="grok-4.5"
         small_model="grok-4.5-medium"
@@ -1443,9 +1387,9 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
         main_model="grok-4.5-medium"
         small_model="grok-4.5-medium"
         ;;
-      composer|composer-2.5-fast)
-        main_model="composer-2.5-fast"
-        small_model="composer-2.5-fast"
+      grok-composer-2.5-fast)
+        main_model="grok-composer-2.5-fast"
+        small_model="grok-composer-2.5-fast"
         ;;
       *)
         small_model="$main_model"
@@ -1532,7 +1476,6 @@ Examples:
 claude-proxy-toggle                 # proxy on/off for new sessions
 claude-proxy-model grok-4.5-high    # sticky default while proxy is on
 claude-proxy-model gpt-5.6-sol
-claude-proxy-model kimi-for-coding[1m]
 ```
 
 New Claude sessions pick up flag/model changes. A session that is already
@@ -1547,12 +1490,12 @@ process can change the request model without restarting the proxy server:
 - pass `claude --model <id>`
 - use Claude Code's `/model` command in-session
 
-The proxy chooses the upstream provider from the model id on each request, so
-`gpt-5.6-sol`, `kimi-for-coding`, `grok-4.5`, and `cursor:...` can share one
-`serve` process. The client process still has only one context window and one
-set of model aliases. With `co` and `cg`, use `/model` or `--model` only within
-the models offered by that profile; exit and relaunch with the other command
-to switch between GPT and Grok.
+The proxy chooses Codex or Grok from the model ID on each request, so
+`gpt-5.6-sol` and `grok-4.5` can share one `serve` process. Kimi and Cursor IDs
+return unknown-model HTTP 400. The client process still has only one context
+window and one set of model aliases. With `co` and `cg`, use `/model` or
+`--model` only within the models offered by that profile; exit and relaunch
+with the other command to switch between GPT and Grok.
 
 To populate Claude Code's model picker from the proxy's `/v1/models` catalog,
 enable gateway discovery when launching:
@@ -1595,16 +1538,16 @@ within the active profile family.
 
 - **Terms of service:** OpenAI has [publicly welcomed using Codex through other
   coding harnesses](https://x.com/thsottiaux/status/2075830097488249060), though
-  this does not guarantee future policy or account enforcement. Using the Kimi
-  or Cursor backends from an unofficial client may carry account risk.
-- **Rate limits:** shared across all clients of your upstream account. Codex's
-  `codex.rate_limits.limit_reached` and Kimi's HTTP 429 are both surfaced as
-  HTTP 429 with `retry-after`.
+  this does not guarantee future policy or account enforcement.
+- **Rate limits:** shared across all clients of your upstream account. Codex and
+  Grok upstream rate-limit responses are surfaced with their retry metadata.
+- **Inactive providers:** Kimi and Cursor auth commands and implementation code
+  remain available for credential maintenance and development, but their model
+  IDs are not accepted by `/v1/messages` and are not advertised by
+  `/v1/models`.
 - **Codex — image inputs in tool results:** valid URL and base64 image blocks are
   forwarded as structured Responses `input_image` content. Malformed or unsupported
   blocks are replaced with an explicit omission marker.
-- **Kimi — image inputs in tool results:** pass through as `image_url` parts
-  (Kimi accepts them in `role:"tool"` content).
 - **Codex — reasoning blocks:** visible reasoning summaries are forwarded as
   Anthropic `thinking` blocks. Encrypted reasoning is carried in a namespaced
   thinking signature and replayed on later turns; the proxy never decrypts it.
@@ -1623,9 +1566,6 @@ within the active profile family.
 - **Codex — HTTP transport:** live requests are translated incrementally and
   support prompt cancellation. Non-streaming Anthropic requests still accumulate
   the upstream SSE response before returning one JSON document.
-- **Kimi — reasoning blocks:** forwarded as Anthropic `thinking` content blocks
-  and rendered by Claude Code. Disable by setting
-  `thinking: {"type":"disabled"}` in your Anthropic request.
 - **Session title generation:** Claude Code's parallel title-gen request is
   forwarded upstream like any other structured-output request. This costs a
   handful of tokens per session rather than being stubbed.
@@ -1666,19 +1606,11 @@ within the active profile family.
   receiving those Anthropic fields verbatim.
 - **Grok — `output_config.format`:** translated to Responses API `text.format`
   for structured background requests such as session title generation.
-- **Cursor — protobuf bundle dependency:** the provider speaks Cursor's
-  underlying protocol directly, but reuses the installed Cursor Agent bundle's
-  generated protobuf classes. Set `CCP_CURSOR_AGENT_BUNDLE` if auto-detection
-  cannot find `cursor-agent`.
-- **Cursor — tool round-trips:** text, thinking, plan mode, ask mode, auth, and
-  session continuation are implemented. Full Cursor workspace/tool callbacks are
-  captured and documented under `history/`, but not yet implemented as Claude
-  tool round-trips.
 
 ## Development
 
 ```sh
-cargo run -- serve                         # run locally (routes all providers)
+cargo run -- serve                         # run locally (routes Codex and Grok)
 cargo test --all                           # run tests
 cargo fmt --all --check                    # check formatting
 cargo clippy --all-targets -- -D warnings  # lint

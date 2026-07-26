@@ -1,5 +1,4 @@
-use crate::config::AliasProvider;
-use crate::registry::normalize_incoming_model;
+use crate::registry::{SessionAffinityProvider, normalize_incoming_model};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
@@ -9,7 +8,7 @@ pub const MAX_SESSIONS: usize = 10_000;
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub seq: u64,
-    pub affinity_provider: Option<AliasProvider>,
+    pub affinity_provider: Option<SessionAffinityProvider>,
     pub last_seen: u64,
 }
 
@@ -50,7 +49,7 @@ pub fn route_session_request<T>(
     session_id: Option<&str>,
     model: &str,
     now: u64,
-    route: impl FnOnce(Option<&AliasProvider>) -> Option<SessionRoute<T>>,
+    route: impl FnOnce(Option<&SessionAffinityProvider>) -> Option<SessionRoute<T>>,
 ) -> (Option<T>, Option<SessionState>) {
     let Some(id) = session_id else {
         return (route(None).map(|route| route.value), None);
@@ -81,14 +80,10 @@ pub fn route_session_request<T>(
     });
     next.seq += 1;
     next.last_seen = next.last_seen.max(now);
-    if is_alias_routable_provider(selected.provider_name)
-        && !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
+    if !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
+        && let Some(provider) = session_affinity_provider(selected.provider_name)
     {
-        next.affinity_provider = match selected.provider_name {
-            "codex" => Some(AliasProvider::Codex),
-            "kimi" => Some(AliasProvider::Kimi),
-            _ => next.affinity_provider,
-        };
+        next.affinity_provider = Some(provider);
     }
 
     if !store.map.contains_key(id) {
@@ -107,8 +102,12 @@ pub fn route_session_request<T>(
     (Some(selected.value), Some(next))
 }
 
-fn is_alias_routable_provider(name: &str) -> bool {
-    matches!(name, "codex" | "kimi")
+fn session_affinity_provider(name: &str) -> Option<SessionAffinityProvider> {
+    match name {
+        "codex" => Some(SessionAffinityProvider::Codex),
+        "grok" => Some(SessionAffinityProvider::Grok),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -158,16 +157,42 @@ mod tests {
     fn routing_and_affinity_update_are_atomic() {
         let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
         reset_sessions_for_test();
-        let (_, first) = route_session_request(Some("affinity-session"), "kimi-k2.6", 1, |_| {
-            Some(SessionRoute::new((), "kimi"))
+        let (_, first) = route_session_request(Some("affinity-session"), "gpt-5.6-sol", 1, |_| {
+            Some(SessionRoute::new((), "codex"))
         });
-        assert_eq!(first.unwrap().affinity_provider, Some(AliasProvider::Kimi));
+        assert_eq!(
+            first.unwrap().affinity_provider,
+            Some(SessionAffinityProvider::Codex)
+        );
 
         let (seen, second) =
             route_session_request(Some("affinity-session"), "sonnet", 2, |affinity| {
-                Some(SessionRoute::new(affinity.copied(), "kimi"))
+                Some(SessionRoute::new(affinity.copied(), "codex"))
             });
-        assert_eq!(seen, Some(Some(AliasProvider::Kimi)));
+        assert_eq!(seen, Some(Some(SessionAffinityProvider::Codex)));
+        assert_eq!(second.unwrap().seq, 2);
+    }
+
+    #[test]
+    fn explicit_grok_model_establishes_alias_affinity() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        let (_, first) =
+            route_session_request(Some("grok-affinity-session"), "grok-4.5", 1, |_| {
+                Some(SessionRoute::new((), "grok"))
+            });
+        assert_eq!(
+            first.unwrap().affinity_provider,
+            Some(SessionAffinityProvider::Grok)
+        );
+
+        let (seen, second) = route_session_request(
+            Some("grok-affinity-session"),
+            "claude-opus-5",
+            2,
+            |affinity| Some(SessionRoute::new(affinity.copied(), "grok")),
+        );
+        assert_eq!(seen, Some(Some(SessionAffinityProvider::Grok)));
         assert_eq!(second.unwrap().seq, 2);
     }
 
@@ -215,8 +240,8 @@ mod tests {
     fn rejected_route_does_not_advance_sequence_or_change_affinity() {
         let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
         reset_sessions_for_test();
-        let (_, first) = route_session_request(Some("gate-session"), "kimi-k2.6", 1, |_| {
-            Some(SessionRoute::new((), "kimi"))
+        let (_, first) = route_session_request(Some("gate-session"), "gpt-5.6-sol", 1, |_| {
+            Some(SessionRoute::new((), "codex"))
         });
         let prior = first.unwrap();
 

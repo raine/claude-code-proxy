@@ -2,7 +2,7 @@ use claude_code_proxy::anthropic::{
     encode_sse_event, parse_sse_events, parse_sse_events_with_stats, schema::MessagesRequest,
 };
 use claude_code_proxy::auth::{AuthStorage, InMemoryAuthStore};
-use claude_code_proxy::config::{AliasProvider, load_config};
+use claude_code_proxy::config::load_config;
 use claude_code_proxy::logging::{create_logger, flush, log_file, redact_value};
 use claude_code_proxy::paths::{self, DirResolverEnv};
 use claude_code_proxy::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
@@ -251,19 +251,6 @@ fn config_env_precedence_and_defaults() {
             env::remove_var("PORT");
         }
     }
-
-    unsafe {
-        env::set_var("CCP_ALIAS_PROVIDER", "kimi");
-    }
-    assert!(matches!(load_config().alias_provider, AliasProvider::Kimi));
-    unsafe {
-        env::remove_var("CCP_ALIAS_PROVIDER");
-    }
-}
-
-#[test]
-fn alias_provider_has_expected_default() {
-    assert!(matches!(load_config().alias_provider, AliasProvider::Codex));
 }
 
 #[test]

@@ -200,8 +200,56 @@ async fn models_returns_anthropic_catalog_contract() {
     assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(ids.contains(&"gpt-5.6-sol"));
     assert!(ids.contains(&"grok-4.5"));
+    assert!(!ids.iter().any(|model| model.starts_with("kimi")));
+    assert!(!ids.iter().any(|model| model.starts_with("cursor")));
+    assert!(!ids.contains(&"composer-2.5"));
+    assert!(!ids.contains(&"composer-2.5-fast"));
     assert_eq!(body["first_id"].as_str(), ids.first().copied());
     assert_eq!(body["last_id"].as_str(), ids.last().copied());
+}
+
+#[tokio::test]
+async fn inactive_kimi_and_cursor_models_return_unknown_model() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    for model in ["kimi-for-coding", "cursor:gpt-5.5"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "max_tokens": 64,
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{model} response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&format!("Unknown model \"{model}\""))),
+            "{model} response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 }
 
 #[tokio::test]
@@ -534,6 +582,62 @@ async fn count_tokens_routes_to_provider() {
     assert!(
         status != StatusCode::NOT_IMPLEMENTED,
         "count_tokens should no longer return 501 for codex models"
+    );
+}
+
+#[tokio::test]
+async fn count_tokens_opus_5_uses_grok_session_affinity() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+
+    for model in ["grok-4.5", "claude-opus-5"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .header("x-claude-code-session-id", "server-opus-5-grok-affinity")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model} response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let snapshot = monitor.snapshot();
+    assert_eq!(snapshot.recent.len(), 2);
+    assert!(
+        snapshot
+            .recent
+            .iter()
+            .all(|request| request.provider.as_deref() == Some("grok"))
+    );
+    assert!(
+        snapshot
+            .recent
+            .iter()
+            .any(|request| request.model.as_deref() == Some("claude-opus-5"))
     );
 }
 
@@ -896,22 +1000,29 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
 #[tokio::test]
 async fn invalid_compaction_override_model_is_rejected() {
     let app = app(Arc::new(Registry::with_default_alias()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages/count_tokens")
-                .header("content-type", "application/json")
-                .header("x-ccproxy-compaction-model", "not-a-model")
-                .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    for model in ["not-a-model", "kimi-for-coding", "cursor:gpt-5.5"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .header("x-ccproxy-compaction-model", model)
+                    .body(body_string(
+                        r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{model} must not bypass the model route allowlist"
+        );
+    }
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-// End-to-end tests for local server health, provider routing, Kimi, Codex HTTP,
+// End-to-end tests for local server health, Codex/Grok routing, Codex HTTP,
 // and Codex WebSocket through in-process mock upstreams with isolated auth.
 
 use axum::body::Body;
@@ -6,6 +6,7 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
+use claude_code_proxy::providers::grok::auth::login::{CANONICAL_ISSUER, CLIENT_ID};
 use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -39,10 +40,18 @@ fn write_auth(config_dir: &std::path::Path, provider: &str) {
     let dir = config_dir.join(provider);
     std::fs::create_dir_all(&dir).unwrap();
     let expires: i64 = 4102444800000;
-    let auth = if provider == "codex" {
-        json!({"access":"test-access","refresh":"test-refresh","expires":expires,"account_id":"acct_test"})
-    } else {
-        json!({"access":"test-access","refresh":"test-refresh","expires":expires,"scope":"openid","userId":"user_test"})
+    let auth = match provider {
+        "codex" => {
+            json!({"access":"test-access","refresh":"test-refresh","expires":expires,"account_id":"acct_test"})
+        }
+        "grok" => json!({
+            "access": "test-access",
+            "refresh": "test-refresh",
+            "expires_at_ms": expires,
+            "issuer": CANONICAL_ISSUER,
+            "client_id": CLIENT_ID
+        }),
+        other => panic!("unsupported auth fixture provider: {other}"),
     };
     std::fs::write(dir.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
 }
@@ -85,16 +94,18 @@ async fn call_messages(model: &str) -> Response {
 
 async fn call_messages_body(body: Value) -> Response {
     app(Arc::new(Registry::with_default_alias()))
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(messages_request(body))
         .await
+        .unwrap()
+}
+
+fn messages_request(body: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "smoke-session")
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -870,70 +881,6 @@ async fn smoke_codex_model_routes_to_real_provider() {
     );
 }
 
-#[test]
-fn smoke_kimi_model_is_registered() {
-    // Kimi uses reqwest::blocking::Client internally, which panics when
-    // dropped from an async context (it joins a dedicated runtime thread).
-    // Test routing at the Registry level instead of through the HTTP stack.
-    let registry = Registry::with_default_alias();
-    let provider = registry.provider_for_model("kimi-for-coding", None);
-    assert!(
-        provider.is_some(),
-        "kimi-for-coding must resolve to a registered provider"
-    );
-    assert_eq!(
-        provider.unwrap().name(),
-        "kimi",
-        "kimi-for-coding must route to the kimi provider"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Kimi smoke: mock upstream verifies request shape and returns a valid
-// streaming response. Uses multi-thread runtime because KimiHttpClient uses
-// reqwest::blocking::Client internally.
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn smoke_kimi_messages_uses_mock_upstream() {
-    let _guard = env_lock().await;
-    let config = TempDir::new().unwrap();
-    write_auth(config.path(), "kimi");
-
-    let captured = Arc::new(Mutex::new(None));
-    let upstream = spawn_http_upstream({
-        let captured = captured.clone();
-        move |body: Value| {
-            let _ = captured.lock().map(|mut g| *g = Some(body));
-            concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"kimi ok\"}}]}\n\n",
-                "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
-                "data: [DONE]\n\n"
-            )
-            .as_bytes()
-            .to_vec()
-        }
-    })
-    .await;
-
-    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-    let _base_url_env = EnvGuard::set("CCP_KIMI_BASE_URL", &upstream);
-    let response = call_messages("kimi-for-coding").await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["content"][0]["text"], "kimi ok");
-
-    let sent = captured.lock().unwrap().clone().unwrap();
-    assert_eq!(sent["model"], "kimi-for-coding");
-    assert_eq!(sent["stream"], true);
-}
-
 // ---------------------------------------------------------------------------
 // Codex HTTP smoke: mock upstream verifies request shape and returns
 // Responses SSE events.
@@ -1232,6 +1179,70 @@ async fn smoke_grok_zero_max_tokens_is_rejected_without_upstream_dispatch() {
         0,
         "max_tokens=0 must fail before Grok dispatch"
     );
+}
+
+#[tokio::test]
+async fn smoke_opus_5_uses_grok_session_affinity() {
+    let _guard = env_lock().await;
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "grok");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"grok affinity ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_GROK_BASE_URL", &upstream);
+    let app = app(Arc::new(Registry::with_default_alias()));
+    for model in ["grok-4.5", "claude-opus-5"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-claude-code-session-id", "smoke-opus-5-grok-affinity")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "max_tokens": 64,
+                            "messages": [{"role":"user","content":"hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model} response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0]["model"], "grok-4.5");
+    assert_eq!(captured[1]["model"], "grok-4.5");
 }
 
 #[tokio::test]
@@ -1767,17 +1778,19 @@ async fn smoke_codex_auto_stream_falls_back_after_websocket_handshake_rejection(
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+    let proxy = app(Arc::new(Registry::with_default_alias()));
     let response = tokio::time::timeout(
         Duration::from_secs(1),
-        call_messages_body(json!({
+        proxy.oneshot(messages_request(json!({
             "model": "gpt-5.5",
             "max_tokens": 64,
             "stream": true,
             "messages": [{"role":"user","content":"hello"}]
-        })),
+        }))),
     )
     .await
-    .expect("auto should fall back without waiting for WebSocket retry backoff");
+    .expect("auto should fall back without waiting for WebSocket retry backoff")
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
