@@ -8,7 +8,7 @@ use claude_code_proxy::{
     logging,
     monitor::MonitorHandle,
     paths,
-    registry::{ANTHROPIC_STYLE_ALIASES, Registry},
+    registry::Registry,
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
 };
@@ -1399,7 +1399,12 @@ fn blocked_claude_profile_option(argument: &str) -> Option<&'static str> {
         "--advisor",
     ]
     .into_iter()
-    .find(|option| argument == *option || argument.starts_with(&format!("{option}=")))
+    .find(|option| {
+        argument == *option
+            || argument
+                .strip_prefix(*option)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    })
 }
 
 fn validate_profile_model(profile: ClaudeProfileConfig, model: &str, option: &str) -> Result<()> {
@@ -1630,11 +1635,6 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     println!("  export ANTHROPIC_MODEL=\"gpt-5.6-sol\"");
     println!("  export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-5.6-luna\"");
     println!("  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
-}
-
-#[allow(dead_code)]
-fn alias_names() -> usize {
-    ANTHROPIC_STYLE_ALIASES.len()
 }
 
 #[cfg(test)]

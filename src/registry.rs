@@ -17,6 +17,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-fable-5",
 ];
 
+/// Canonical Codex base models used by routing, translation, and diagnostics.
 pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.2",
     "gpt-5.3-codex",
@@ -29,6 +30,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.6-terra",
 ];
 
+/// Canonical Grok base models used by routing, translation, and diagnostics.
 pub(crate) const GROK_MODELS: &[&str] = &[
     "grok-composer-2.5-fast",
     "grok-4.5",

@@ -216,21 +216,16 @@ pub(crate) fn accumulate_response_with_traffic_schema_tool_policy_and_metadata(
         let BlockKind::Text { text } = &blocks[block_index].kind else {
             unreachable!("text block index was selected above")
         };
-        let (normalized_text, elided_null_properties) = {
-            let normalized = bridge.normalize_completed_text(text).map_err(|error| {
-                anyhow::anyhow!("Codex structured output validation failed: {error}")
-            })?;
-            (
-                normalized.text.into_owned(),
-                normalized.elided_null_properties,
-            )
-        };
+        let normalized_text = bridge
+            .normalize_completed_text(text)
+            .map_err(|error| anyhow::anyhow!("Codex structured output validation failed: {error}"))?
+            .text
+            .into_owned();
         if let BlockKind::Text { text } = &mut blocks[block_index].kind {
             *text = normalized_text.clone();
         }
         deferred_text_parts.clear();
         deferred_text_parts.push(normalized_text);
-        let _ = elided_null_properties;
     }
 
     let text_from_deferred: String = deferred_text_parts.join("");

@@ -182,11 +182,6 @@ where
     }
 
     fn save(&self, value: T) -> Result<()> {
-        let path = std::path::Path::new(&self.file);
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-            set_mode(dir, 0o700);
-        }
         write_atomically(&self.file, &value)
     }
 

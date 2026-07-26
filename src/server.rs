@@ -425,7 +425,7 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
                 "type": "model",
                 "id": model,
                 "display_name": display_name,
-                "created_at": created_at.clone(),
+                "created_at": created_at,
             })
         })
         .collect();
@@ -438,15 +438,19 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
-fn model_catalog_created_at() -> String {
-    let timestamp = env!("CCPROXY_BUILD_UNIX_EPOCH")
-        .parse::<i64>()
-        .ok()
-        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-    timestamp
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+static MODEL_CATALOG_CREATED_AT: OnceLock<String> = OnceLock::new();
+
+fn model_catalog_created_at() -> &'static str {
+    MODEL_CATALOG_CREATED_AT.get_or_init(|| {
+        let timestamp = env!("CCPROXY_BUILD_UNIX_EPOCH")
+            .parse::<i64>()
+            .ok()
+            .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        timestamp
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    })
 }
 
 struct ProcessIdentity {
@@ -665,9 +669,13 @@ async fn dispatch_request_with_id(
 ) -> Response {
     let started_at = Instant::now();
     let log = create_logger("server");
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let (parts, request_body) = req.into_parts();
+    let http::request::Parts {
+        method,
+        uri,
+        headers,
+        ..
+    } = parts;
     let path = uri.path().to_string();
     let query = redacted_query(&uri);
     let endpoint = if count_tokens {
@@ -684,8 +692,7 @@ async fn dispatch_request_with_id(
             ("query".to_string(), json!(&query)),
         ])),
     );
-    let session_id = req
-        .headers()
+    let session_id = headers
         .get("x-claude-code-session-id")
         .and_then(|value| value.to_str().ok())
         .map(std::string::ToString::to_string);
@@ -749,7 +756,7 @@ async fn dispatch_request_with_id(
     }
 
     let body_bytes = match read_bounded_request_body(
-        req.into_body(),
+        request_body,
         state.limits.max_request_body_bytes,
         state.admission.request_bytes.clone(),
         state.limits.request_body_idle_timeout,

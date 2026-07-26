@@ -97,8 +97,7 @@ pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
                     .get(&index)
                     .and_then(|position| blocks.get_mut(*position))
                 {
-                    block["text"] =
-                        Value::String(format!("{}{}", block["text"].as_str().unwrap_or(""), text));
+                    append_string_delta(&mut block["text"], text);
                 }
             }
             ReducerEvent::ToolStart(index, id, name) => {
@@ -110,12 +109,7 @@ pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
                     .get(&index)
                     .and_then(|position| blocks.get_mut(*position))
                 {
-                    let raw = format!(
-                        "{}{}",
-                        block.get("_args").and_then(Value::as_str).unwrap_or(""),
-                        text
-                    );
-                    block["_args"] = Value::String(raw);
+                    append_string_delta(&mut block["_args"], text);
                 }
             }
             ReducerEvent::ToolStop(index) => {
@@ -207,6 +201,13 @@ pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
         finish_capture(Some(capture), traffic, "completed", reported_usage.as_ref());
     }
     Ok(response)
+}
+
+fn append_string_delta(value: &mut Value, delta: String) {
+    match value {
+        Value::String(value) => value.push_str(&delta),
+        _ => *value = Value::String(delta),
+    }
 }
 
 fn finish_capture(

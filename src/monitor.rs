@@ -946,10 +946,18 @@ fn session_summaries(
         if request.status == RequestStatus::Failed {
             entry.failure_count += 1;
         }
-        entry.project = request.project.clone().or(entry.project.clone());
-        entry.provider = request.provider.clone().or(entry.provider.clone());
-        entry.model = request.model.clone().or(entry.model.clone());
-        entry.effort = request.effort.clone().or(entry.effort.clone());
+        if let Some(project) = &request.project {
+            entry.project = Some(project.clone());
+        }
+        if let Some(provider) = &request.provider {
+            entry.provider = Some(provider.clone());
+        }
+        if let Some(model) = &request.model {
+            entry.model = Some(model.clone());
+        }
+        if let Some(effort) = &request.effort {
+            entry.effort = Some(effort.clone());
+        }
         entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
         entry.input_tokens = entry
             .input_tokens
@@ -994,10 +1002,18 @@ fn session_summaries(
             });
         entry.active_count += 1;
         entry.request_count += 1;
-        entry.project = request.project.clone().or(entry.project.clone());
-        entry.provider = request.provider.clone().or(entry.provider.clone());
-        entry.model = request.model.clone().or(entry.model.clone());
-        entry.effort = request.effort.clone().or(entry.effort.clone());
+        if let Some(project) = &request.project {
+            entry.project = Some(project.clone());
+        }
+        if let Some(provider) = &request.provider {
+            entry.provider = Some(provider.clone());
+        }
+        if let Some(model) = &request.model {
+            entry.model = Some(model.clone());
+        }
+        if let Some(effort) = &request.effort {
+            entry.effort = Some(effort.clone());
+        }
         entry.last_seen = max_system_time(entry.last_seen, request.started_at);
         entry.input_tokens = entry
             .input_tokens

@@ -1,5 +1,15 @@
+use std::sync::LazyLock;
+
 use base64::Engine as _;
 use serde_json::Value;
+
+static MARKDOWN_LINK_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r#"\[([^\]\n]+)\]\((https?://[^)\s]+)\)"#)
+        .expect("markdown link regex must compile")
+});
+static BARE_URL_REGEX: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+    regex_lite::Regex::new(r"https?://[^\s<>()|]+").expect("bare URL regex must compile")
+});
 
 pub struct WebSearchCompatBlock {
     pub index: usize,
@@ -53,8 +63,7 @@ fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
     let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Match markdown links [title](url)
-    let re = regex_lite::Regex::new(r#"\[([^\]\n]+)\]\((https?://[^)\s]+)\)"#).unwrap();
-    for cap in re.captures_iter(text) {
+    for cap in MARKDOWN_LINK_REGEX.captures_iter(text) {
         let title = clean_title(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
         let url = clean_url(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
         if url.is_empty() || seen_urls.contains(&url) {
@@ -73,8 +82,7 @@ fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
     }
 
     // Match bare URLs
-    let re2 = regex_lite::Regex::new(r"https?://[^\s<>()|]+").unwrap();
-    for cap in re2.captures_iter(text) {
+    for cap in BARE_URL_REGEX.captures_iter(text) {
         let raw_url = cap.get(0).map(|m| m.as_str()).unwrap_or("");
         let url = clean_url(raw_url);
         if url.is_empty() || seen_urls.contains(&url) {

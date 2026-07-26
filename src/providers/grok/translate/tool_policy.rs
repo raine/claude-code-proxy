@@ -57,34 +57,33 @@ impl ToolCallPolicy {
     }
 
     pub(crate) fn from_request(request: &GrokResponsesRequest) -> Self {
-        let declared_functions: HashSet<String> = request
-            .tools
-            .iter()
-            .flatten()
-            .filter(|tool| tool.kind == "function")
-            .filter_map(|tool| tool.name.clone())
-            .collect();
-        let declared_hosted: HashSet<String> = request
-            .tools
-            .iter()
-            .flatten()
-            .filter(|tool| matches!(tool.kind.as_str(), "web_search" | "x_search"))
-            .map(|tool| tool.kind.clone())
-            .collect();
-        let hosted_limits: HashMap<String, u64> = request
-            .tools
-            .iter()
-            .flatten()
-            .filter(|tool| matches!(tool.kind.as_str(), "web_search" | "x_search"))
-            .filter_map(|tool| tool.max_uses.map(|limit| (tool.kind.clone(), limit)))
-            .collect();
+        let mut declared_functions = HashSet::new();
+        let mut declared_hosted = HashSet::new();
+        let mut hosted_limits = HashMap::new();
+        for tool in request.tools.iter().flatten() {
+            match tool.kind.as_str() {
+                "function" => {
+                    if let Some(name) = &tool.name {
+                        declared_functions.insert(name.clone());
+                    }
+                }
+                "web_search" | "x_search" => {
+                    let kind = tool.kind.clone();
+                    declared_hosted.insert(kind.clone());
+                    if let Some(limit) = tool.max_uses {
+                        hosted_limits.insert(kind, limit);
+                    }
+                }
+                _ => {}
+            }
+        }
         let single_tool_only = request.parallel_tool_calls == Some(false);
 
         match request.tool_choice.as_ref() {
             Some(GrokToolChoice::None(_)) => Self {
                 function_rule: FunctionRule::Forbidden,
                 hosted_rule: HostedRule::Forbidden,
-                hosted_limits: hosted_limits.clone(),
+                hosted_limits,
                 terminal_requirement: TerminalRequirement::None,
                 single_tool_only,
             },
@@ -95,14 +94,14 @@ impl ToolCallPolicy {
                     FunctionRule::Forbidden
                 },
                 hosted_rule: HostedRule::Forbidden,
-                hosted_limits: hosted_limits.clone(),
+                hosted_limits,
                 terminal_requirement: TerminalRequirement::NamedFunction(name.clone()),
                 single_tool_only,
             },
             Some(GrokToolChoice::Required(_)) => Self {
                 function_rule: FunctionRule::Declared(declared_functions),
                 hosted_rule: HostedRule::Declared(declared_hosted),
-                hosted_limits: hosted_limits.clone(),
+                hosted_limits,
                 terminal_requirement: TerminalRequirement::AnyTool,
                 single_tool_only,
             },

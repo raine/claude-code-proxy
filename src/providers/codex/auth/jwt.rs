@@ -90,6 +90,14 @@ pub fn extract_account_id(tokens: &TokenResponse) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use serde_json::json;
+
+    fn token_with_claims(claims: serde_json::Value) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        format!("header.{payload}.signature")
+    }
 
     #[test]
     fn extract_account_id_from_access_token() {
@@ -115,6 +123,23 @@ mod tests {
             expires_in: Some(3600),
         };
         assert_eq!(extract_account_id(&token), Some("id_acct".into()));
+    }
+
+    #[test]
+    fn invalid_id_token_email_falls_back_to_access_token() {
+        let token = TokenResponse {
+            id_token: Some(token_with_claims(json!({
+                "chatgpt_account_id": "id_acct",
+                "email": 123,
+            }))),
+            access_token: token_with_claims(json!({
+                "chatgpt_account_id": "access_acct",
+            })),
+            refresh_token: "r".into(),
+            expires_in: Some(3600),
+        };
+
+        assert_eq!(extract_account_id(&token), Some("access_acct".into()));
     }
 
     #[test]

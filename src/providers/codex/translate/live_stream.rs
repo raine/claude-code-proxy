@@ -1063,15 +1063,17 @@ impl LiveStreamTranslator {
 
         // Prefer authoritative snapshots. A cached repair is committed only
         // after output_item.done, or by the explicit unsafe-close caller.
-        let mut arguments = done_snapshot
+        let arguments = done_snapshot
             .as_deref()
             .or(final_args)
             .or(repair_candidate.as_deref())
             .unwrap_or(args_accum)
             .to_string();
-        if !arguments.is_empty() {
-            arguments = sanitize_read_args(name, &arguments, Some(call_id.as_str()));
-        }
+        let arguments = if name == "Read" && !arguments.is_empty() {
+            sanitize_read_args(name, &arguments, Some(call_id.as_str()))
+        } else {
+            arguments
+        };
         validate_tool_arguments(name, call_id, &arguments)?;
 
         Ok(Some(PreparedToolArguments {
@@ -1109,10 +1111,10 @@ impl LiveStreamTranslator {
         else {
             return None;
         };
-        *args_accum = prepared.arguments.clone();
+        *args_accum = prepared.arguments;
         if prepared.emit {
             *emitted_args = true;
-            Some((prepared.index, prepared.arguments))
+            Some((prepared.index, std::mem::take(args_accum)))
         } else {
             None
         }
@@ -1334,17 +1336,12 @@ impl LiveStreamTranslator {
                 self.deferred_text.len()
             ));
         }
-        let (normalized_text, elided_null_properties) = {
-            let normalized = bridge
-                .normalize_completed_text(&self.deferred_text[0].1)
-                .map_err(|error| format!("Codex structured output validation failed: {error}"))?;
-            (
-                normalized.text.into_owned(),
-                normalized.elided_null_properties,
-            )
-        };
+        let normalized_text = bridge
+            .normalize_completed_text(&self.deferred_text[0].1)
+            .map_err(|error| format!("Codex structured output validation failed: {error}"))?
+            .text
+            .into_owned();
         self.deferred_text[0].1 = normalized_text;
-        let _ = elided_null_properties;
         Ok(())
     }
 

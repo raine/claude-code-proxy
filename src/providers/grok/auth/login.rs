@@ -51,7 +51,6 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
     open_browser(&auth_url);
     let code = wait_for_callback(&listener, &state, LOGIN_TIMEOUT)?;
     let tokens = exchange_code(&client, &discovery, &code, &pkce, &redirect_uri)?;
-    validate_tokens(&tokens)?;
     let refresh = tokens
         .refresh_token
         .as_ref()

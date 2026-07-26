@@ -79,7 +79,6 @@ impl SchemaBridge {
         if self.original_validator.is_valid(&value) {
             return Ok(NormalizedStructuredText {
                 text: Cow::Borrowed(raw),
-                elided_null_properties: 0,
             });
         }
 
@@ -92,7 +91,7 @@ impl SchemaBridge {
         }
 
         let mut normalized = value;
-        let elided_null_properties = self.null_elision.apply(&mut normalized);
+        self.null_elision.apply(&mut normalized);
         if !self.original_validator.is_valid(&normalized) {
             return Err(validation_error(
                 &self.original_validator,
@@ -105,7 +104,6 @@ impl SchemaBridge {
             .map_err(|error| StructuredOutputError::Serialization(error.to_string()))?;
         Ok(NormalizedStructuredText {
             text: Cow::Owned(text),
-            elided_null_properties,
         })
     }
 }
@@ -113,7 +111,6 @@ impl SchemaBridge {
 #[derive(Debug)]
 pub(crate) struct NormalizedStructuredText<'a> {
     pub(crate) text: Cow<'a, str>,
-    pub(crate) elided_null_properties: usize,
 }
 
 #[derive(Debug, Error)]
@@ -224,11 +221,19 @@ impl NullElisionPlan {
         build_plan(root, root, "#", &mut active_refs)
     }
 
-    fn apply(&self, instance: &mut Value) -> usize {
+    fn apply(&self, instance: &mut Value) {
         match instance {
-            Value::Object(object) => self.object.as_ref().map_or(0, |plan| plan.apply(object)),
-            Value::Array(array) => self.array.as_ref().map_or(0, |plan| plan.apply(array)),
-            _ => 0,
+            Value::Object(object) => {
+                if let Some(plan) = &self.object {
+                    plan.apply(object);
+                }
+            }
+            Value::Array(array) => {
+                if let Some(plan) = &self.array {
+                    plan.apply(array);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -239,19 +244,16 @@ struct ObjectPlan {
 }
 
 impl ObjectPlan {
-    fn apply(&self, instance: &mut serde_json::Map<String, Value>) -> usize {
-        let mut elided = 0;
+    fn apply(&self, instance: &mut serde_json::Map<String, Value>) {
         for (name, property) in &self.properties {
             if property.elide_when_null && instance.get(name).is_some_and(Value::is_null) {
                 instance.remove(name);
-                elided += 1;
                 continue;
             }
             if let Some(value) = instance.get_mut(name) {
-                elided += property.nested.apply(value);
+                property.nested.apply(value);
             }
         }
-        elided
     }
 }
 
@@ -267,16 +269,14 @@ struct ArrayPlan {
 }
 
 impl ArrayPlan {
-    fn apply(&self, instance: &mut [Value]) -> usize {
-        let mut elided = 0;
+    fn apply(&self, instance: &mut [Value]) {
         for (index, value) in instance.iter_mut().enumerate() {
             if let Some(plan) = self.prefix_items.get(index) {
-                elided += plan.apply(value);
+                plan.apply(value);
             } else if let Some(plan) = self.items.as_deref() {
-                elided += plan.apply(value);
+                plan.apply(value);
             }
         }
-        elided
     }
 }
 
@@ -742,7 +742,6 @@ mod tests {
         let normalized = bridge.normalize_completed_text(raw).unwrap();
         assert!(matches!(normalized.text, Cow::Borrowed(_)));
         assert_eq!(normalized.text, raw);
-        assert_eq!(normalized.elided_null_properties, 0);
     }
 
     #[test]
@@ -761,7 +760,6 @@ mod tests {
             .normalize_completed_text(r#"{"ok":true,"reason":null}"#)
             .unwrap();
         assert_eq!(normalized.text, r#"{"ok":true}"#);
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]
@@ -783,7 +781,6 @@ mod tests {
             .normalize_completed_text(r#"{"value":null}"#)
             .unwrap();
         assert_eq!(normalized.text, "{}");
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]
@@ -805,7 +802,6 @@ mod tests {
             .normalize_completed_text(r#"{"value":null}"#)
             .unwrap();
         assert_eq!(normalized.text, "{}");
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]
@@ -827,7 +823,6 @@ mod tests {
                 .normalize_completed_text(r#"{"value":null}"#)
                 .unwrap();
             assert_eq!(normalized.text, r#"{"value":null}"#);
-            assert_eq!(normalized.elided_null_properties, 0);
         }
     }
 
@@ -846,7 +841,6 @@ mod tests {
             .normalize_completed_text(r#"{"free":null,"removed":null}"#)
             .unwrap();
         assert_eq!(normalized.text, r#"{"free":null}"#);
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]
@@ -869,7 +863,6 @@ mod tests {
             .normalize_completed_text(r#"{"metadata":{"short":null}}"#)
             .unwrap();
         assert_eq!(normalized.text, r#"{"metadata":{}}"#);
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]
@@ -892,7 +885,6 @@ mod tests {
             .normalize_completed_text(r#"[{"prefix":null},{"rest":null}]"#)
             .unwrap();
         assert_eq!(normalized.text, "[{},{}]");
-        assert_eq!(normalized.elided_null_properties, 2);
     }
 
     #[test]
@@ -910,7 +902,6 @@ mod tests {
 
         let normalized = bridge.normalize_completed_text(r#"{"note":null}"#).unwrap();
         assert_eq!(normalized.text, "{}");
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]
@@ -929,7 +920,6 @@ mod tests {
             .normalize_completed_text(r#"{"kept":null,"removed":null}"#)
             .unwrap();
         assert_eq!(normalized.text, r#"{"kept":null}"#);
-        assert_eq!(normalized.elided_null_properties, 1);
     }
 
     #[test]

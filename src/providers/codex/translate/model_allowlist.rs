@@ -1,20 +1,9 @@
-use std::collections::HashSet;
-
 use crate::config;
+use crate::registry::CODEX_MODELS;
 
 use super::request::ServiceTier;
 
-pub const ALLOWED_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-];
+pub const ALLOWED_MODELS: &[&str] = CODEX_MODELS;
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("haiku", "gpt-5.6-luna"),
@@ -37,14 +26,14 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+fn fast_model_base(model: &str) -> Option<&str> {
+    model
+        .strip_suffix("-fast")
+        .filter(|base| ALLOWED_MODELS.contains(base))
 }
 
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        let base = model.trim_end_matches("-fast");
+    if let Some(base) = fast_model_base(model) {
         ResolvedModel {
             model: base.to_string(),
             service_tier: Some(ServiceTier::Priority),
@@ -114,14 +103,9 @@ pub fn uses_responses_lite(model: &str) -> bool {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
-        return true;
-    }
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        return true;
-    }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    ALLOWED_MODELS.contains(&model)
+        || fast_model_base(model).is_some()
+        || MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
 }
 
 #[cfg(test)]
@@ -177,6 +161,15 @@ mod tests {
         let r = resolve_model_request("gpt-5.6-sol-fast");
         assert_eq!(r.model, "gpt-5.6-sol");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+    }
+
+    #[test]
+    fn repeated_fast_suffixes_remain_unresolved() {
+        let resolved = resolve_model_request("gpt-5.6-sol-fast-fast");
+        assert_eq!(resolved.model, "gpt-5.6-sol-fast-fast");
+        assert_eq!(resolved.service_tier, None);
+        assert!(!is_valid_model_for_codex("gpt-5.6-sol-fast-fast"));
+        assert!(!is_valid_model_for_codex("unknown-fast-fast"));
     }
 
     #[test]

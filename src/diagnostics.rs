@@ -26,6 +26,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::registry::{CODEX_MODELS, GROK_MODELS};
+
 pub const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EVENT_LINES: usize = 50_000;
 pub const DEFAULT_EVENT_LINES: usize = 10_000;
@@ -42,21 +44,6 @@ const MAX_METADATA_ENTRY_BYTES: u64 = 64 * 1024;
 const MAX_VERIFIED_TOTAL_BYTES: u64 = MAX_EVENTS_BYTES + 2 * MAX_METADATA_ENTRY_BYTES;
 
 static CURRENT_BINARY_SHA256: OnceLock<Option<String>> = OnceLock::new();
-const DIAGNOSTIC_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "grok-composer-2.5-fast",
-    "grok-4.5",
-    "grok-4.5-medium",
-    "grok-4.5-high",
-];
 
 #[derive(Debug, Clone)]
 pub struct CollectOptions {
@@ -1186,8 +1173,9 @@ fn is_short_hex(value: &str) -> bool {
 }
 
 fn diagnostic_model(value: &str) -> &'static str {
-    DIAGNOSTIC_MODELS
+    CODEX_MODELS
         .iter()
+        .chain(GROK_MODELS.iter())
         .copied()
         .find(|model| *model == value)
         .unwrap_or("other")

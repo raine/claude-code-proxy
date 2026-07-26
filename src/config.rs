@@ -586,25 +586,43 @@ pub fn allow_remote_unauthenticated() -> bool {
         .unwrap_or(false)
 }
 
+fn positive_u64_setting(
+    env_key: &str,
+    file_value: impl FnOnce(&FileConfig) -> Option<u64>,
+    default: u64,
+    maximum: Option<u64>,
+) -> u64 {
+    let apply_maximum = |value: u64| maximum.map_or(value, |maximum| value.min(maximum));
+
+    if let Ok(raw) = std::env::var(env_key)
+        && let Ok(value) = raw.parse::<u64>()
+        && value > 0
+    {
+        return apply_maximum(value);
+    }
+
+    let file = read_file_config(&paths::config_dir());
+    if let Some(value) = file.as_ref().and_then(file_value)
+        && value > 0
+    {
+        return apply_maximum(value);
+    }
+
+    default
+}
+
 fn server_positive_u64(
     env_key: &str,
     file_value: impl FnOnce(&ServerResourceConfig) -> Option<u64>,
     default: u64,
     maximum: u64,
 ) -> u64 {
-    if let Ok(raw) = std::env::var(env_key)
-        && let Ok(value) = raw.parse::<u64>()
-        && value > 0
-    {
-        return value.min(maximum);
-    }
-    if let Some(server) = read_file_config(&paths::config_dir()).and_then(|file| file.server)
-        && let Some(value) = file_value(&server)
-        && value > 0
-    {
-        return value.min(maximum);
-    }
-    default
+    positive_u64_setting(
+        env_key,
+        |file| file.server.as_ref().and_then(file_value),
+        default,
+        Some(maximum),
+    )
 }
 
 pub fn max_request_body_bytes(default: usize) -> usize {
@@ -701,19 +719,12 @@ fn grok_positive_u64(
     file_value: impl FnOnce(&GrokConfig) -> Option<u64>,
     default: u64,
 ) -> u64 {
-    if let Ok(raw) = std::env::var(env_key)
-        && let Ok(value) = raw.parse::<u64>()
-        && value > 0
-    {
-        return value;
-    }
-    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|file| file.grok)
-        && let Some(value) = file_value(&grok)
-        && value > 0
-    {
-        return value;
-    }
-    default
+    positive_u64_setting(
+        env_key,
+        |file| file.grok.as_ref().and_then(file_value),
+        default,
+        None,
+    )
 }
 
 pub fn grok_connect_timeout_ms(default: u64) -> u64 {
@@ -943,19 +954,12 @@ fn codex_positive_u64(
     file_value: impl FnOnce(&CodexConfig) -> Option<u64>,
     default: u64,
 ) -> u64 {
-    if let Ok(raw) = std::env::var(env_key)
-        && let Ok(value) = raw.parse::<u64>()
-        && value > 0
-    {
-        return value;
-    }
-    if let Some(codex) = read_file_config(&paths::config_dir()).and_then(|file| file.codex)
-        && let Some(value) = file_value(&codex)
-        && value > 0
-    {
-        return value;
-    }
-    default
+    positive_u64_setting(
+        env_key,
+        |file| file.codex.as_ref().and_then(file_value),
+        default,
+        None,
+    )
 }
 
 pub fn codex_websocket_response_start_timeout_ms(default: u64) -> u64 {

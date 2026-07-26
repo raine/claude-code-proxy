@@ -136,10 +136,11 @@ fn estimate_image_tokens_from_dimensions(width: u64, height: u64) -> u64 {
 }
 
 fn validate_image_dimensions(width: u64, height: u64) -> Result<(), Base64ImageError> {
-    if width < 8 || height < 8 || width.saturating_mul(height) < 512 {
+    let pixels = width.saturating_mul(height);
+    if width < 8 || height < 8 || pixels < 512 {
         return Err(Base64ImageError::TooSmall);
     }
-    if width.saturating_mul(height) > MAX_IMAGE_PIXELS {
+    if pixels > MAX_IMAGE_PIXELS {
         return Err(Base64ImageError::TooLarge);
     }
     Ok(())

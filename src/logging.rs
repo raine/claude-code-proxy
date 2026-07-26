@@ -124,9 +124,7 @@ impl Logger {
             let _ = writeln!(io::stderr(), "{line}");
         }
 
-        if enqueue_log_line(line).is_err() && mirror_to_stderr {
-            // swallow logging errors intentionally
-        }
+        let _ = enqueue_log_line(line);
     }
 }
 

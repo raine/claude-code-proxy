@@ -663,10 +663,12 @@ fn read_output_format(req: &MessagesRequest) -> anyhow::Result<Option<GrokTextFo
 }
 
 fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
-    *instructions = Some(match instructions.take() {
-        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{guidance}"),
-        _ => guidance.into(),
-    });
+    if let Some(existing) = instructions.as_mut().filter(|value| !value.is_empty()) {
+        existing.push_str("\n\n");
+        existing.push_str(guidance);
+    } else {
+        *instructions = Some(guidance.to_string());
+    }
 }
 
 fn prepend_guidance(instructions: &mut Option<String>, guidance: &str) {
@@ -1592,7 +1594,6 @@ fn append_tool_result_json(
     image_payload_bytes: usize,
     value: &serde_json::Map<String, Value>,
 ) -> anyhow::Result<()> {
-    append_tool_result_segment(rendered, image_payload_bytes, "")?;
     let separator = !rendered.is_empty()
         && !std::str::from_utf8(rendered)
             .expect("tool result buffer is UTF-8")

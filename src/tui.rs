@@ -538,13 +538,14 @@ fn model_cell(value: Option<&str>, width: usize) -> Cell<'static> {
     text_cell(ellipsize(value.unwrap_or("-"), width))
 }
 
-fn table_column_width(area: Rect, widths: &[Constraint], column: usize) -> usize {
+fn table_column_widths(area: Rect, widths: &[Constraint]) -> Vec<usize> {
     let table_width = area.width.saturating_sub(2);
     Layout::horizontal(widths.to_vec())
         .spacing(1)
         .split(Rect::new(0, 0, table_width, 1))
-        .get(column)
-        .map_or(0, |rect| usize::from(rect.width))
+        .iter()
+        .map(|rect| usize::from(rect.width))
+        .collect()
 }
 
 fn ellipsize(value: &str, width: usize) -> String {
@@ -850,13 +851,14 @@ fn render_sessions(
     let show_full_sparkline = tier == LayoutTier::Wide && area.width >= SESSION_SPARKLINE_MIN_WIDTH;
     let columns = session_columns(tier, show_full_sparkline);
     let widths = column_constraints(&columns);
+    let column_widths = table_column_widths(area, &widths);
     let now = SystemTime::now();
     let rows = sessions.iter().enumerate().map(|(index, session)| {
         let cells = columns
             .iter()
             .enumerate()
             .map(|(column_index, column)| {
-                let width = table_column_width(area, &widths, column_index);
+                let width = column_widths.get(column_index).copied().unwrap_or(0);
                 match column.key {
                     SessionColumn::Marker => {
                         let marker = if focused && index == selected {
@@ -997,13 +999,14 @@ fn render_active(
 
     let columns = active_columns(LayoutTier::for_outer_width(area.width));
     let widths = column_constraints(&columns);
+    let column_widths = table_column_widths(area, &widths);
     let rows = active.iter().map(|request| {
         let status = format!("{} {}", spinner(tick), request.status.label());
         let cells = columns
             .iter()
             .enumerate()
             .map(|(column_index, column)| {
-                let width = table_column_width(area, &widths, column_index);
+                let width = column_widths.get(column_index).copied().unwrap_or(0);
                 match column.key {
                     ActiveColumn::Started => muted_cell(format_system_time(request.started_at)),
                     ActiveColumn::Status => Cell::from(Span::styled(
@@ -1154,12 +1157,13 @@ fn render_recent(
 
     let columns = recent_columns(LayoutTier::for_outer_width(area.width));
     let widths = column_constraints(&columns);
+    let column_widths = table_column_widths(area, &widths);
     let rows = recent.iter().enumerate().map(|(index, request)| {
         let cells = columns
             .iter()
             .enumerate()
             .map(|(column_index, column)| {
-                let width = table_column_width(area, &widths, column_index);
+                let width = column_widths.get(column_index).copied().unwrap_or(0);
                 match column.key {
                     RecentColumn::Finished => muted_cell(format_system_time(request.finished_at)),
                     RecentColumn::Code => http_code_cell(request.http_status),
@@ -1268,6 +1272,7 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
 
     let columns = event_columns(LayoutTier::for_outer_width(area.width));
     let widths = column_constraints(&columns);
+    let column_widths = table_column_widths(area, &widths);
     let rows = events.iter().map(|request| {
         let message = request
             .error
@@ -1278,7 +1283,7 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
             .iter()
             .enumerate()
             .map(|(column_index, column)| {
-                let width = table_column_width(area, &widths, column_index);
+                let width = column_widths.get(column_index).copied().unwrap_or(0);
                 match column.key {
                     EventColumn::Time => muted_cell(format_system_time(request.finished_at)),
                     EventColumn::Code => http_code_cell(request.http_status),

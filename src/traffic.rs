@@ -89,10 +89,13 @@ fn traffic_quota_cell(root: &Path) -> Arc<TrafficQuotaCell> {
     let mut quotas = TRAFFIC_QUOTAS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    quotas
-        .entry(root.to_path_buf())
-        .or_insert_with(|| Arc::new(TrafficQuotaCell::default()))
-        .clone()
+    if let Some(cell) = quotas.get(root) {
+        return cell.clone();
+    }
+
+    let cell = Arc::new(TrafficQuotaCell::default());
+    quotas.insert(root.to_path_buf(), cell.clone());
+    cell
 }
 
 fn initialize_traffic_quota(root: &Path, cell: &TrafficQuotaCell) -> Arc<TrafficQuota> {
@@ -664,18 +667,7 @@ fn write_file_bytes(path: PathBuf, value: &[u8]) -> Result<(), TrafficWriteFailu
             residual_bytes: 0,
             file_created: false,
         })?;
-        if let Ok(meta) = fs::metadata(parent) {
-            set_mode(parent, 0o700);
-            if meta.is_dir() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perm = meta.permissions();
-                    perm.set_mode(0o700);
-                    let _ = fs::set_permissions(parent, perm);
-                }
-            }
-        }
+        set_mode(parent, 0o700);
     }
     let mut out = OpenOptions::new()
         .write(true)
@@ -858,7 +850,7 @@ impl StreamTrafficCapture {
 }
 
 pub fn sanitize_path_part(input: &str) -> String {
-    let cleaned: String = input
+    let mut cleaned: String = input
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
@@ -869,15 +861,11 @@ pub fn sanitize_path_part(input: &str) -> String {
         })
         .collect();
 
-    let truncated = if cleaned.len() > 160 {
-        &cleaned[..160]
-    } else {
-        &cleaned
-    };
-    if truncated.is_empty() {
+    cleaned.truncate(160);
+    if cleaned.is_empty() {
         "unknown".to_string()
     } else {
-        truncated.to_string()
+        cleaned
     }
 }
 
@@ -935,7 +923,6 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
 fn redact_traffic_value(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
-        Value::Object(_) | Value::Array(_) => Value::String("[redacted]".to_string()),
         _ => Value::String("[redacted]".to_string()),
     }
 }

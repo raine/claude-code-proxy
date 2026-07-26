@@ -601,15 +601,6 @@ pub(super) fn event_error_status(payload: &serde_json::Value) -> Option<u16> {
     super::events::classify_event_failure(payload).and_then(|failure| failure.explicit_status)
 }
 
-#[allow(dead_code)]
-fn extract_retry_after(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("error")
-        .and_then(|e| e.get("retry_after"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Main request function
 // ---------------------------------------------------------------------------

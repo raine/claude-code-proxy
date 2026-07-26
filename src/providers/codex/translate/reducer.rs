@@ -551,8 +551,6 @@ enum BlockState {
     },
     Tool {
         index: usize,
-        #[allow(dead_code)]
-        output_index: usize,
         call_id: String,
         name: String,
         args_accum: String,
@@ -986,7 +984,6 @@ pub(crate) fn reduce_upstream_bytes_with_tool_policy(
                     output_index,
                     BlockState::Tool {
                         index: idx,
-                        output_index,
                         call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
