@@ -985,6 +985,9 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
+        if err.detail.as_deref() == Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
+            return false;
+        }
         return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
     }
     matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
@@ -1561,6 +1564,19 @@ mod tests {
         };
 
         assert!(retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn live_start_proxy_tunnel_rejection_is_not_retryable() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket proxy tunnel was rejected".to_string(),
+            detail: Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(!retryable_live_start_codex_error(&err));
     }
 
     #[test]

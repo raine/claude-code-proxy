@@ -11,8 +11,9 @@ pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-pub const REDACT_KEYS: [&str; 14] = [
+pub const REDACT_KEYS: [&str; 15] = [
     "authorization",
+    "proxy-authorization",
     "access",
     "access_token",
     "refresh",
@@ -258,5 +259,16 @@ mod tests {
 
         drop(outer);
         assert!(should_mirror_to_stderr("warn"));
+    }
+
+    #[test]
+    fn redacts_proxy_authorization_case_insensitively() {
+        let redacted = redact_value(serde_json::json!({
+            "Proxy-Authorization": "Basic dXNlcjpwYXNz",
+            "safe": "kept"
+        }));
+
+        assert_eq!(redacted["safe"], "kept");
+        assert_eq!(redacted["Proxy-Authorization"], "[redacted len=18]");
     }
 }

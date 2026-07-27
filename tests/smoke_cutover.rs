@@ -85,6 +85,7 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()

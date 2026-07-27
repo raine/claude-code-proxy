@@ -5,6 +5,10 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex WebSocket connections honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  and `NO_PROXY`, restoring standard non-TUN HTTP proxy support for both plain
+  WebSocket Upgrade requests and WSS CONNECT tunnels.
+
 ## v0.1.26 (2026-07-28)
 
 - Standard OpenAI clients can use Codex through the optional

@@ -249,17 +249,172 @@ const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 
-fn native_http_client() -> reqwest::Client {
+#[derive(Clone)]
+struct ProxyEnvironment {
+    http_proxy: Option<String>,
+    https_proxy: Option<String>,
+    all_proxy: Option<String>,
+    no_proxy: Option<reqwest::NoProxy>,
+    no_proxy_value: Option<String>,
+}
+
+impl ProxyEnvironment {
+    fn from_env() -> Self {
+        if std::env::var_os("REQUEST_METHOD").is_some() {
+            return Self {
+                http_proxy: None,
+                https_proxy: None,
+                all_proxy: None,
+                no_proxy: None,
+                no_proxy_value: None,
+            };
+        }
+
+        let no_proxy_value = std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .ok();
+        Self {
+            http_proxy: proxy_env_value("HTTP_PROXY", "http_proxy")
+                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+            https_proxy: proxy_env_value("HTTPS_PROXY", "https_proxy")
+                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+            all_proxy: proxy_env_value("ALL_PROXY", "all_proxy")
+                .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
+            no_proxy: no_proxy_value
+                .as_deref()
+                .and_then(reqwest::NoProxy::from_string),
+            no_proxy_value,
+        }
+    }
+
+    fn websocket_proxy_config(&self) -> super::websocket::WebSocketProxyConfig {
+        super::websocket::WebSocketProxyConfig::new(
+            self.http_proxy.as_deref(),
+            self.https_proxy.as_deref(),
+            self.all_proxy.as_deref(),
+            self.no_proxy_value.as_deref(),
+        )
+    }
+
+    fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder = builder.no_proxy();
+        if let Some(proxy) = self.http_proxy.as_deref() {
+            builder = builder.proxy(
+                reqwest::Proxy::http(proxy)
+                    .expect("validated HTTP_PROXY URL")
+                    .no_proxy(self.no_proxy.clone()),
+            );
+        }
+        if let Some(proxy) = self.https_proxy.as_deref() {
+            builder = builder.proxy(
+                reqwest::Proxy::https(proxy)
+                    .expect("validated HTTPS_PROXY URL")
+                    .no_proxy(self.no_proxy.clone()),
+            );
+        }
+        if let Some(proxy) = self.all_proxy.as_deref() {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .expect("validated ALL_PROXY URL")
+                    .no_proxy(self.no_proxy.clone()),
+            );
+        }
+        builder
+    }
+}
+
+fn native_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
+    proxy_environment
+        .apply(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .expect("failed to create native Responses HTTP client")
+}
+
+fn proxy_env_value(
+    uppercase: &'static str,
+    lowercase: &'static str,
+) -> Result<Option<String>, &'static str> {
+    let Some(raw) = std::env::var_os(uppercase).or_else(|| std::env::var_os(lowercase)) else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| uppercase)?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    normalize_proxy_url(raw).map(Some).ok_or(uppercase)
+}
+
+fn normalize_proxy_url(raw: &str) -> Option<String> {
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    if !matches!(
+        parsed.scheme(),
+        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+    ) || parsed.host_str().is_none()
+        || matches!(parsed.scheme(), "socks4" | "socks4a")
+            && (!parsed.username().is_empty() || parsed.password().is_some())
+    {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
+    proxy_environment
+        .apply(
+            reqwest::Client::builder()
+                .http1_only()
+                .redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .expect("failed to create Codex WebSocket HTTP client")
+}
+
+fn custom_client_auto_http_fallback_enabled(
+    base_url: &str,
+    proxy_config: &super::websocket::WebSocketProxyConfig,
+) -> bool {
+    let Ok(websocket_url) = super::websocket::to_websocket_url(base_url) else {
+        return false;
+    };
+    !proxy_config.uses_proxy_for(&websocket_url)
+}
+
+#[cfg(test)]
+fn test_native_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
-        .expect("failed to create native Responses HTTP client")
+        .expect("failed to create test native Responses HTTP client")
+}
+
+#[cfg(test)]
+fn test_websocket_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .expect("failed to create test WebSocket HTTP client")
 }
 
 pub struct CodexHttpClient {
     client: reqwest::Client,
     native_client: reqwest::Client,
+    websocket_client: reqwest::Client,
+    websocket_proxy_config: super::websocket::WebSocketProxyConfig,
+    auto_http_fallback_enabled: bool,
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     base_url: String,
     header_timeout_ms: u64,
@@ -277,12 +432,16 @@ impl Default for CodexHttpClient {
 impl CodexHttpClient {
     pub fn new() -> Self {
         let timeout_ms = 60_000;
+        let proxy_environment = ProxyEnvironment::from_env();
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
+            client: proxy_environment
+                .apply(reqwest::Client::builder().connect_timeout(Duration::from_secs(15)))
                 .build()
                 .expect("failed to create HTTP client"),
-            native_client: native_http_client(),
+            native_client: native_http_client(&proxy_environment),
+            websocket_client: websocket_http_client(&proxy_environment),
+            websocket_proxy_config: proxy_environment.websocket_proxy_config(),
+            auto_http_fallback_enabled: true,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
@@ -296,8 +455,15 @@ impl CodexHttpClient {
         auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
         base_url: String,
     ) -> Self {
+        let proxy_environment = ProxyEnvironment::from_env();
+        let websocket_proxy_config = proxy_environment.websocket_proxy_config();
+        let auto_http_fallback_enabled =
+            custom_client_auto_http_fallback_enabled(&base_url, &websocket_proxy_config);
         Self {
-            native_client: native_http_client(),
+            native_client: native_http_client(&proxy_environment),
+            websocket_client: websocket_http_client(&proxy_environment),
+            websocket_proxy_config,
+            auto_http_fallback_enabled,
             client,
             auth_manager,
             base_url,
@@ -316,7 +482,10 @@ impl CodexHttpClient {
         header_timeout_retries: u32,
     ) -> Self {
         Self {
-            native_client: native_http_client(),
+            native_client: test_native_http_client(),
+            websocket_client: test_websocket_http_client(),
+            websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
+            auto_http_fallback_enabled: true,
             client,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
@@ -486,6 +655,8 @@ impl CodexHttpClient {
                     let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
                     super::websocket::codex_websocket_request(
+                        &self.websocket_client,
+                        &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
                         &ws_body,
@@ -506,6 +677,8 @@ impl CodexHttpClient {
 
                     // Try WebSocket first
                     let ws_result = super::websocket::codex_websocket_request(
+                        &self.websocket_client,
+                        &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
                         &ws_body,
@@ -520,7 +693,9 @@ impl CodexHttpClient {
 
                     match ws_result {
                         Ok(response) => Ok(response),
-                        Err(err) if should_fallback_to_http(&err) => {
+                        Err(err)
+                            if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
+                        {
                             // Fall back to HTTP only if WebSocket failed before sending
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
@@ -835,6 +1010,8 @@ impl CodexHttpClient {
             };
             let ws_body = build_websocket_request(&body, continuation.as_ref());
             let start = super::websocket::codex_websocket_event_stream(
+                &self.websocket_client,
+                &self.websocket_proxy_config,
                 &self.base_url,
                 &ws_headers,
                 &ws_body,
@@ -1326,6 +1503,9 @@ fn log_buffered_retry_exhausted(
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
+        if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
+            return false;
+        }
         return err.status == 0 || should_retry_codex_status(err.status);
     }
     if err.detail.as_deref() == Some("websocket_pre_request") {
@@ -1377,6 +1557,8 @@ fn should_refresh_after_unauthorized(
 
 fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
+        && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
+        && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
 }
 
 fn should_retry_without_continuation(
@@ -1448,6 +1630,56 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn normalizes_supported_proxy_urls() {
+        assert_eq!(
+            normalize_proxy_url("127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080/")
+        );
+        assert_eq!(
+            normalize_proxy_url("https://user:pass@proxy.example:8443").as_deref(),
+            Some("https://user:pass@proxy.example:8443/")
+        );
+        for scheme in ["socks4", "socks4a"] {
+            let proxy = format!("{scheme}://proxy.example:1080");
+            assert_eq!(normalize_proxy_url(&proxy), Some(proxy));
+        }
+        for scheme in ["socks5", "socks5h"] {
+            let proxy = format!("{scheme}://user:pass@proxy.example:1080");
+            assert_eq!(normalize_proxy_url(&proxy), Some(proxy));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_proxy_urls() {
+        assert!(normalize_proxy_url("http://").is_none());
+        assert!(normalize_proxy_url("ftp://proxy.example:21").is_none());
+        assert!(normalize_proxy_url("socks4://user@proxy.example:1080").is_none());
+        assert!(normalize_proxy_url("socks4a://user:pass@proxy.example:1080").is_none());
+    }
+
+    #[test]
+    fn custom_client_auto_fallback_tracks_effective_proxy_route() {
+        let proxy = "http://proxy.example:8080";
+        let proxied =
+            super::super::websocket::WebSocketProxyConfig::new(None, Some(proxy), None, None);
+        assert!(!custom_client_auto_http_fallback_enabled(
+            "https://codex.invalid/responses",
+            &proxied
+        ));
+
+        let bypassed = super::super::websocket::WebSocketProxyConfig::new(
+            None,
+            Some(proxy),
+            None,
+            Some("codex.invalid"),
+        );
+        assert!(custom_client_auto_http_fallback_enabled(
+            "https://codex.invalid/responses",
+            &bypassed
+        ));
+    }
+
     fn http_test_auth() -> StoredAuth {
         StoredAuth {
             access: "test".into(),
@@ -1470,7 +1702,7 @@ mod tests {
 
     fn http_test_client(base_url: String, body_idle_timeout_ms: u64) -> CodexHttpClient {
         CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url,
             100,
             body_idle_timeout_ms,
@@ -1687,7 +1919,11 @@ mod tests {
             let mut request = [0_u8; 16 * 1024];
             let read = websocket.read(&mut request).await.unwrap();
             assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .to_ascii_lowercase()
+                    .contains("upgrade: websocket")
+            );
             websocket
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 13\r\nconnection: close\r\n\r\npolicy denied",
@@ -1918,6 +2154,22 @@ mod tests {
         };
 
         assert!(is_retryable_transport_error(&err));
+    }
+
+    #[test]
+    fn proxy_tunnel_rejection_is_not_retried_or_used_for_http_fallback() {
+        let err = CodexError {
+            status: 0,
+            message: "WebSocket proxy tunnel was rejected".to_string(),
+            detail: Some(
+                super::super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string(),
+            ),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+
+        assert!(!is_retryable_transport_error(&err));
+        assert!(!should_fallback_to_http(&err));
     }
 
     #[test]

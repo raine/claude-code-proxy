@@ -51,6 +51,19 @@ Set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` for Claude Code. Retrying a pa
 
 ## Codex WebSocket fails
 
+For a non-TUN local HTTP proxy, set both destination-scheme variables before starting the proxy:
+
+| Variable | Value |
+| --- | --- |
+| `HTTP_PROXY` | `http://127.0.0.1:7890` |
+| `HTTPS_PROXY` | `http://127.0.0.1:7890` |
+
+Set them through the operating system, service manager, or shell, then start `claude-code-proxy serve` in the same environment.
+
+The default `wss://chatgpt.com` connection uses `HTTPS_PROXY`; a working proxy should show `CONNECT chatgpt.com:443`. The `http://` value is normal: it describes how to reach the proxy, while `HTTPS_PROXY` describes which destinations use it. Restart claude-code-proxy after changing these variables because the client and pooled WebSocket route are created at startup.
+
+Check `NO_PROXY` when the proxy sees no request. Proxy connection, authentication, or CONNECT failure is returned as an error and never retried directly. Environment variables are supported; OS proxy settings and PAC/WPAD discovery are not automatic.
+
 Use HTTP SSE to isolate transport behavior:
 
 ```sh
