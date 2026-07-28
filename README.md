@@ -211,9 +211,10 @@ way to lock high effort regardless of the UI setting; the model picker also
 offers `grok-composer-2.5-fast` as an explicit speed-first option.
 
 The `co` launcher defaults to Claude Code `high` effort with Ultracode off.
-Later `/effort` changes remain one-to-one for Codex: `xhigh` stays `xhigh`, and
-only an explicit `max` request uses wire-level `max`. The `cg` profile keeps its
-existing Grok effort behavior.
+Ordinary `/effort` changes remain one-to-one for Codex, so standalone `xhigh`
+stays wire-level `xhigh`. When Claude Code activates Ultracode, the proxy
+recognizes its session marker and promotes only those `xhigh` requests to
+wire-level `max`. The `cg` profile keeps its existing Grok effort behavior.
 
 The generic Claude aliases are not broad family entries in the model picker.
 `--model` and `--fallback-model` remain available for concrete models in the
@@ -413,14 +414,15 @@ rejected before dispatch instead of being silently ignored. An empty
 `stop_sequences` array is accepted as a no-op.
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
-the UI as `◐ medium · /effort`) is forwarded one-to-one as Codex
-`reasoning.effort` (`low` / `medium` / `high` / `xhigh` / `max`); `co` does not
-elevate `xhigh` to `max`. Claude Code's `ultrathink` keyword leaves the request
-effort unchanged, while Ultracode uses `xhigh` reasoning and keeps its workflow
-orchestration client-side. When Claude Code omits effort for a Haiku request,
-the mapped `gpt-5.6-luna` model defaults to `medium`. An explicit
-`codex.effort` / `CCP_CODEX_EFFORT` override still takes precedence, and the
-global override can also force `none`.
+the UI as `◐ medium · /effort`) is normally forwarded one-to-one as Codex
+`reasoning.effort` (`low` / `medium` / `high` / `xhigh` / `max`). Standalone
+`xhigh` therefore remains `xhigh`, and Claude Code's `ultrathink` keyword leaves
+the request effort unchanged. Ultracode keeps its workflow orchestration
+client-side, while the proxy recognizes Claude Code's generated Ultracode
+session marker and sends that mode's `xhigh` turns as wire-level `max`. When
+Claude Code omits effort for a Haiku request, the mapped `gpt-5.6-luna` model
+defaults to `medium`. An explicit `codex.effort` / `CCP_CODEX_EFFORT` override
+still takes precedence, and the global override can also force `none`.
 
 Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
 Codex for `reasoning.summary: "auto"` and translates returned summary deltas

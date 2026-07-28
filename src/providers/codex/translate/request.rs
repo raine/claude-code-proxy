@@ -28,6 +28,10 @@ const MAX_CODEX_IMAGE_DECODE_BYTES: usize = 64 * 1024 * 1024;
 const INVALID_CODEX_IMAGE: &str =
     "does not match source.media_type or is not a complete decodable image";
 const CODEX_IMAGE_DECODE_LIMIT: &str = "exceeds the image decode limit";
+const CLAUDE_CODE_AGENT_LIST_PREFIX: &str = "Available agent types for the Agent tool:\n";
+const CLAUDE_CODE_ULTRACODE_MARKER: &str =
+    "Ultracode is on: optimize for the most exhaustive, correct answer";
+const CLAUDE_CODE_ULTRACODE_OFF_MARKER: &str = "Ultracode is off";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -327,6 +331,43 @@ fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     }
 }
 
+fn for_each_message_text(content: &Value, mut visit: impl FnMut(&str)) {
+    match content {
+        Value::String(text) => visit(text),
+        Value::Array(blocks) => {
+            for text in blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+            {
+                visit(text);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_claude_code_ultracode_request(req: &MessagesRequest) -> bool {
+    // Claude Code adds this generated note to the current agent-list reminder
+    // when Ultracode starts. If the session later leaves Ultracode, the old
+    // marker remains in history and a newer generated system message turns it
+    // off, so replay the control messages in order instead of scanning for any
+    // historical match.
+    let mut active = false;
+    for message in &req.messages {
+        for_each_message_text(&message.content, |text| {
+            if message.role == "system" && text.starts_with(CLAUDE_CODE_ULTRACODE_OFF_MARKER) {
+                active = false;
+            } else if text.contains(CLAUDE_CODE_ULTRACODE_MARKER)
+                && (message.role == "system"
+                    || message.role == "user" && text.starts_with(CLAUDE_CODE_AGENT_LIST_PREFIX))
+            {
+                active = true;
+            }
+        });
+    }
+    active
+}
+
 fn resolve_effort(
     effort: Option<Effort>,
     override_effort: Option<&str>,
@@ -622,11 +663,15 @@ pub fn translate_request_with_overrides(
     let effort = read_effort(req)?;
     // Compaction is a structured summary pass, so max reasoning only adds
     // latency. Claude Code also omits effort for Haiku; default Luna to medium.
-    let codex_effort = if is_claude_code_compaction_request(req) {
+    let mut codex_effort = if is_claude_code_compaction_request(req) {
         Some(Effort::Medium)
     } else {
         to_codex_effort(effort).or_else(|| (out.model == "gpt-5.6-luna").then_some(Effort::Medium))
     };
+    if matches!(codex_effort.as_ref(), Some(Effort::Xhigh)) && is_claude_code_ultracode_request(req)
+    {
+        codex_effort = Some(Effort::Max);
+    }
     let resolved_effort = resolve_effort(codex_effort, overrides.effort.as_deref())?;
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
@@ -3847,6 +3892,120 @@ mod tests {
             out.include,
             Some(vec!["reasoning.encrypted_content".to_string()])
         );
+    }
+
+    #[test]
+    fn translate_ultracode_xhigh_maps_to_max() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "Available agent types for the Agent tool:\n- claude: general purpose\n\nUltracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest."
+                }]
+            }],
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn ordinary_user_ultracode_text_does_not_promote_xhigh() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": "Ultracode is on: optimize for the most exhaustive, correct answer"
+            }],
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Xhigh)));
+    }
+
+    #[test]
+    fn later_ultracode_off_marker_restores_xhigh() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Available agent types for the Agent tool:\n- claude: general purpose\n\nUltracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest."
+                },
+                {"role": "assistant", "content": "Earlier answer"},
+                {
+                    "role": "system",
+                    "content": "Ultracode is off — the Workflow tool's standard opt-in rule applies again."
+                },
+                {"role": "user", "content": "Continue normally"}
+            ],
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+
+        assert!(!is_claude_code_ultracode_request(&req));
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Xhigh)));
+    }
+
+    #[test]
+    fn later_ultracode_on_marker_reactivates_max() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Available agent types for the Agent tool:\n- claude: general purpose\n\nUltracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest."
+                },
+                {
+                    "role": "system",
+                    "content": "Ultracode is off — the Workflow tool's standard opt-in rule applies again."
+                },
+                {
+                    "role": "system",
+                    "content": "Ultracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest."
+                },
+                {"role": "user", "content": "Use Ultracode again"}
+            ],
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+
+        assert!(is_claude_code_ultracode_request(&req));
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn explicit_effort_override_wins_over_ultracode_promotion() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "system",
+                "content": "Ultracode is on: optimize for the most exhaustive, correct answer"
+            }],
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+
+        assert!(is_claude_code_ultracode_request(&req));
+        let out = translate_request_with_overrides(
+            &req,
+            opts(),
+            TranslationOverrides {
+                service_tier: None,
+                effort: Some("xhigh".to_string()),
+                reasoning_summary: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Xhigh)));
     }
 
     #[test]

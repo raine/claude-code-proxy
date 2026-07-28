@@ -1250,20 +1250,20 @@ async fn smoke_opus_5_uses_grok_session_affinity() {
 }
 
 #[tokio::test]
-async fn smoke_codex_xhigh_reaches_wire_unchanged() {
+async fn smoke_codex_distinguishes_xhigh_from_ultracode_wire_effort() {
     let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
 
-    let captured = Arc::new(Mutex::new(None));
+    let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_http_upstream({
         let captured = captured.clone();
         move |body: Value| {
-            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            let _ = captured.lock().map(|mut guard| guard.push(body));
             concat!(
                 "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"wire xhigh ok\"}\n\n",
-                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"wire xhigh ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"wire effort ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"wire effort ok\"}\n\n",
                 "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
             )
@@ -1276,38 +1276,54 @@ async fn smoke_codex_xhigh_reaches_wire_unchanged() {
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let response = app(Arc::new(Registry::with_default_alias()))
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "gpt-5.6-sol",
-                        "max_tokens": 64,
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "output_config": {"effort": "xhigh"}
-                    })
-                    .to_string(),
-                ))
+    for messages in [
+        json!([{"role": "user", "content": "hello"}]),
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "Available agent types for the Agent tool:\n- claude: general purpose\n\nUltracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest."
+            }]
+        }]),
+        json!([
+            {
+                "role": "system",
+                "content": "Available agent types for the Agent tool:\n- claude: general purpose\n\nUltracode is on: optimize for the most exhaustive, correct answer — not the fastest or cheapest."
+            },
+            {"role": "assistant", "content": "Earlier answer"},
+            {
+                "role": "system",
+                "content": "Ultracode is off — the Workflow tool's standard opt-in rule applies again."
+            },
+            {"role": "user", "content": "Continue normally"}
+        ]),
+    ] {
+        let response = call_messages_body(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "messages": messages,
+            "output_config": {"effort": "xhigh"}
+        }))
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
                 .unwrap(),
         )
-        .await
         .unwrap();
+        assert_eq!(value["content"][0]["text"], "wire effort ok");
+    }
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["content"][0]["text"], "wire xhigh ok");
-
-    let sent = captured.lock().unwrap().clone().unwrap();
-    assert_eq!(sent["model"], "gpt-5.6-sol");
-    assert_eq!(sent["reasoning"]["effort"], "xhigh");
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 3);
+    assert_eq!(captured[0]["model"], "gpt-5.6-sol");
+    assert_eq!(captured[0]["reasoning"]["effort"], "xhigh");
+    assert_eq!(captured[1]["model"], "gpt-5.6-sol");
+    assert_eq!(captured[1]["reasoning"]["effort"], "max");
+    assert_eq!(captured[2]["model"], "gpt-5.6-sol");
+    assert_eq!(captured[2]["reasoning"]["effort"], "xhigh");
 }
 
 #[tokio::test]
