@@ -44,12 +44,28 @@ Claude Code hosted search tools map to Grok-native tools:
 
 ## Multimodal support
 
-Grok support in claude-code-proxy focuses on text, reasoning, function tools, and hosted search. Treat image and other media behavior as unsupported unless the current source and tests explicitly cover it.
+`CCP_GROK_TOOL_IMAGE` controls image blocks in user messages and tool results:
+
+- `omit`, the default, replaces each image with an `[image omitted: ...]`
+  placeholder. The model does not receive the pixels.
+- `reattach` keeps the placeholder in each tool result and sends accepted images
+  in a following user message.
+- `inline` sends accepted tool-result images alongside text as `input_image`
+  parts. Text-only outputs retain their string shape.
+- `reject` returns the image validation error used by older versions.
+
+Vision modes accept base64 PNG, JPEG, and GIF images with a minimum side of 8
+pixels, a minimum area of 512 square pixels, and a decoded size up to 5 MB. At
+most the last four accepted images in a request are sent. Images that fail a
+gate, WebP images, and remote URL sources degrade to placeholders with a reason.
+
+Traffic captures redact Anthropic image data and upstream image data URLs.
 
 ## Configuration
 
 - `CCP_GROK_BASE_URL` or `grok.baseUrl` changes the API base URL.
 - `CCP_GROK_CLIENT_VERSION` or `grok.clientVersion` changes the client version header.
+- `CCP_GROK_TOOL_IMAGE` selects `omit`, `reattach`, `inline`, or `reject`.
 
 See [Configuration](/reference/configuration/) for defaults.
 

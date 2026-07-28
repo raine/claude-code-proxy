@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Grok handles images in user messages and tool results without failing requests.
+  Images are omitted by default, with opt-in vision through
+  `CCP_GROK_TOOL_IMAGE`. Traffic captures redact image payloads.
+
 ## v0.1.25 (2026-07-24)
 
 - Kimi users can select Kimi K3 with the `kimi-k3` or `k3` model name, including
@@ -51,30 +57,6 @@ description: Release notes for claude-code-proxy.
 - Codex compaction requests cap reasoning effort at `low` to reduce latency and
   reasoning-token usage. `CCP_COMPACT_EFFORT` can choose a different cap or
   disable the behavior. ([#67](https://github.com/raine/claude-code-proxy/pull/67))
-
-## Unreleased
-
-- Grok gains opt-in real vision via `CCP_GROK_TOOL_IMAGE`: `reattach` keeps
-  the omit marker in the tool output and re-sends image blocks that pass the
-  upstream gates (min side 8px, min area 512px², decoded size ≤5MB, last 4
-  per request) as a following user message carrying `input_image` data URLs;
-  `inline` instead sends the tool output itself as an array of `input_text` +
-  `input_image` parts (string-only outputs still serialize as plain strings,
-  byte-identical to before). Images that fail a gate — or lose the
-  per-request cap — degrade to the omit marker with a reason; well-formed
-  images never cause a request-level 400. URL-source images cannot be gated
-  and always degrade in `reattach` mode. Top-level user-message images become
-  real `input_image` parts in both modes. WebP blocks always degrade (their
-  dimensions are not parsed). `reject` restores the pre-L1 hard error. Data
-  URLs and Anthropic image `source.data` payloads are redacted from traffic
-  captures; this redaction now covers `image_url` keys for all providers.
-- Grok no longer fails requests whose `tool_result` contains image blocks (for
-  example Claude Code `Read` of a PNG): image children degrade to
-  `[image omitted: <media_type>]` / `[image omitted: url]` placeholders joined
-  with text children, matching the Codex translator. Top-level user-message
-  image blocks degrade to the same placeholder instead of erroring.
-- Grok multi-part text `tool_result` content is now joined with `\n` between
-  parts (previously concatenated without a separator), mirroring Codex.
 
 ## v0.1.21 (2026-07-15)
 

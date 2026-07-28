@@ -407,7 +407,7 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
 
 fn is_data_url(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.starts_with("data:image/") && text.contains(";base64,")
+    lower.starts_with("data:image/") && lower.contains(";base64,")
 }
 
 /// An object shaped like an Anthropic image source: `type: "base64"` and
@@ -416,7 +416,11 @@ fn is_data_url(text: &str) -> bool {
 /// an image: the capture is written before translation, so a malformed block
 /// that the translator would reject must still not persist its payload.
 fn looks_like_image_source(map: &Map<String, Value>) -> bool {
-    if map.get("type").and_then(Value::as_str) != Some("base64") {
+    if !map
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|source_type| source_type.eq_ignore_ascii_case("base64"))
+    {
         return false;
     }
     match map.get("media_type").and_then(Value::as_str) {
@@ -575,6 +579,19 @@ mod tests {
     }
 
     #[test]
+    fn redact_traffic_strips_uppercase_image_source_type() {
+        let value = serde_json::json!({
+            "source": {"type": "BASE64", "media_type": "image/png", "data": "QUJDREVGRw=="}
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("QUJDREVGRw"),
+            "payload leaked: {rendered}"
+        );
+    }
+
+    #[test]
     fn redact_traffic_strips_image_source_without_media_type() {
         // A malformed block the translator would reject must still be redacted
         // in the pre-translation capture.
@@ -607,7 +624,7 @@ mod tests {
         // Kimi-style object image_url: redact the payload but keep the object
         // structure so captures stay parseable.
         let value = serde_json::json!({
-            "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg"}
+            "image_url": {"url": "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAANSUhEUg"}
         });
         let redacted = redact_traffic(&value);
         assert!(redacted["image_url"].is_object(), "shape lost: {redacted}");

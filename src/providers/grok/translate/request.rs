@@ -910,8 +910,10 @@ fn gate_image(source: &ImageSource) -> Result<(), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(source.data.as_bytes())
         .map_err(|_| "undecodable base64".to_string())?;
-    let (width, height) = image_dimensions(&bytes, &source.media_type)
+    let raster = image_raster(&bytes, &source.media_type)
         .ok_or_else(|| format!("unreadable dimensions for {}", source.media_type))?;
+    let width = raster.width;
+    let height = raster.height;
     let min_side = width.min(height);
     if min_side < MIN_IMAGE_SIDE_PX {
         return Err(format!(
@@ -924,9 +926,7 @@ fn gate_image(source: &ImageSource) -> Result<(), String> {
             "{width}x{height} below minimum area {MIN_IMAGE_AREA_PX}px"
         ));
     }
-    // Worst-case raster is 8 bytes per pixel (RGBA, 16-bit channels).
-    // Over-estimating is the safe direction for a pre-flight gate.
-    let decoded = area.saturating_mul(8);
+    let decoded = area.saturating_mul(raster.bytes_per_pixel);
     if decoded > MAX_IMAGE_DECODED_BYTES {
         return Err(format!(
             "{width}x{height} too large (decoded ~{}MB > {}MB cap)",
@@ -953,45 +953,77 @@ fn cap_reason() -> String {
     format!("only the last {MAX_REATTACHED_IMAGES} images are attached per request")
 }
 
-/// Extract pixel dimensions from the encoded image header. Supports PNG, JPEG
-/// and GIF only — other formats (e.g. WebP) always degrade to the omit
-/// marker; `None` also covers unknown/corrupt data.
-fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
+/// Extract raster dimensions and a conservative decoded byte width from the
+/// encoded image header. PNG accounting reserves alpha when the format may
+/// carry transparency. GIF accounting reserves an RGBA output pixel.
+#[derive(Clone, Copy)]
+struct ImageRaster {
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u64,
+}
+
+fn image_raster(bytes: &[u8], media_type: &str) -> Option<ImageRaster> {
     match media_type {
-        "image/png" => png_dimensions(bytes),
-        "image/jpeg" => jpeg_dimensions(bytes),
-        "image/gif" => gif_dimensions(bytes),
-        _ => sniff_dimensions(bytes),
+        "image/png" => png_raster(bytes),
+        "image/jpeg" => jpeg_raster(bytes),
+        "image/gif" => gif_raster(bytes),
+        _ => sniff_raster(bytes),
     }
 }
 
-fn sniff_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    png_dimensions(bytes)
-        .or_else(|| jpeg_dimensions(bytes))
-        .or_else(|| gif_dimensions(bytes))
+fn sniff_raster(bytes: &[u8]) -> Option<ImageRaster> {
+    png_raster(bytes)
+        .or_else(|| jpeg_raster(bytes))
+        .or_else(|| gif_raster(bytes))
 }
 
-fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    // Signature (8) + IHDR length (4) + "IHDR" (4) + width (4) + height (4).
-    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+fn png_raster(bytes: &[u8]) -> Option<ImageRaster> {
+    // Signature (8) + IHDR length (4) + "IHDR" (4) + IHDR fields.
+    if bytes.len() < 26
+        || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+        || u32::from_be_bytes(bytes[8..12].try_into().ok()?) != 13
+        || &bytes[12..16] != b"IHDR"
+    {
         return None;
     }
     let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-    Some((width, height))
+    let bit_depth = bytes[24];
+    let color_type = bytes[25];
+    let bytes_per_channel = match bit_depth {
+        1 | 2 | 4 | 8 => 1,
+        16 => 2,
+        _ => return None,
+    };
+    let channels = match color_type {
+        // Grayscale and RGB may carry transparency in a tRNS chunk.
+        0 | 4 => 2,
+        2 | 3 | 6 => 4,
+        _ => return None,
+    };
+    Some(ImageRaster {
+        width,
+        height,
+        bytes_per_pixel: bytes_per_channel * channels,
+    })
 }
 
-fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+fn gif_raster(bytes: &[u8]) -> Option<ImageRaster> {
     // "GIF87a"/"GIF89a" (6) + width (2 LE) + height (2 LE).
     if bytes.len() < 10 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
         return None;
     }
     let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
     let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
-    Some((width, height))
+    Some(ImageRaster {
+        width,
+        height,
+        bytes_per_pixel: 4,
+    })
 }
 
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+fn jpeg_raster(bytes: &[u8]) -> Option<ImageRaster> {
     // Walk SOI-delimited segments to the first SOF0..SOF15 frame header.
     if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
         return None;
@@ -1017,13 +1049,23 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
         );
         if is_sof {
-            // Segment: length (2) + precision (1) + height (2) + width (2).
-            if segment_len < 7 {
+            // Segment: length (2), precision (1), dimensions (4), components (1).
+            if segment_len < 8 {
                 return None;
             }
+            let precision = bytes[cursor + 4];
             let height = u16::from_be_bytes(bytes[cursor + 5..cursor + 7].try_into().ok()?) as u32;
             let width = u16::from_be_bytes(bytes[cursor + 7..cursor + 9].try_into().ok()?) as u32;
-            return Some((width, height));
+            let components = bytes[cursor + 9] as usize;
+            if components == 0 || segment_len < 8 + 3 * components {
+                return None;
+            }
+            let bytes_per_channel = u64::from(precision).div_ceil(8);
+            return Some(ImageRaster {
+                width,
+                height,
+                bytes_per_pixel: bytes_per_channel.saturating_mul(components as u64),
+            });
         }
         cursor += 2 + segment_len;
     }
@@ -1369,6 +1411,16 @@ mod tests {
         .unwrap()
     }
 
+    fn translated_with_mode(
+        request: &MessagesRequest,
+        image_mode: crate::config::GrokToolImageMode,
+    ) -> Value {
+        serde_json::to_value(
+            translate_request_with_mode(request, "grok-4.5".into(), image_mode).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn grok_translation_rejects_unknown_tool_block_fields() {
         let mut request = request_with_blocks(serde_json::json!([
@@ -1390,8 +1442,7 @@ mod tests {
                 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
             ]}
         ]));
-        let translated =
-            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let translated = translated_with_mode(&request, crate::config::GrokToolImageMode::Omit);
         assert_eq!(translated["input"][1]["type"], "function_call_output");
         assert_eq!(
             translated["input"][1]["output"],
@@ -1406,8 +1457,7 @@ mod tests {
                 {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}
             ]}
         ]));
-        let translated =
-            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let translated = translated_with_mode(&request, crate::config::GrokToolImageMode::Omit);
         assert_eq!(translated["input"][1]["output"], "[image omitted: url]");
     }
 
@@ -1420,8 +1470,7 @@ mod tests {
                 {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}
             ]}
         ]));
-        let translated =
-            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let translated = translated_with_mode(&request, crate::config::GrokToolImageMode::Omit);
         assert_eq!(
             translated["input"][1]["output"],
             "caption\n[image omitted: image/png]\n[image omitted: url]"
@@ -1451,8 +1500,7 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let translated =
-            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let translated = translated_with_mode(&request, crate::config::GrokToolImageMode::Omit);
         assert_eq!(
             translated["input"][0]["content"],
             serde_json::json!([
@@ -1690,10 +1738,36 @@ mod tests {
     }
 
     #[test]
+    fn reattach_accepts_rgb_image_under_decoded_size_cap() {
+        // The 8-bit RGB raster is 2.1MB. A format-independent 8-byte estimate
+        // would incorrectly reject this common screenshot size.
+        let image = solid_rgb_png_base64(1000, 700);
+        let request = request_with_blocks(serde_json::json!([
+            {"type":"tool_result","tool_use_id":"call_1","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":image}}
+            ]}
+        ]));
+        let translated = serde_json::to_value(
+            translate_request_with_mode(
+                &request,
+                "grok-4.5".into(),
+                crate::config::GrokToolImageMode::Reattach,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            translated["input"][1]["output"],
+            "[image omitted: image/png]"
+        );
+        assert_eq!(translated["input"][2]["content"][0]["type"], "input_image");
+    }
+
+    #[test]
     fn reattach_degrades_oversized_image_to_omit_with_reason() {
-        // 6000x6000 solid PNG: decoded raw size ~108MB > 5MB cap. Deflate of a
+        // 6000x6000 solid PNG: decoded raw size is at least 108MB. Deflate of a
         // solid scanline is tiny, so the base64 fixture stays small.
-        let big = oversized_png_base64(6000, 6000);
+        let big = solid_rgb_png_base64(6000, 6000);
         let request = request_with_blocks(serde_json::json!([
             {"type":"tool_result","tool_use_id":"call_1","content":[
                 {"type":"image","source":{"type":"base64","media_type":"image/png","data":big}}
@@ -1888,10 +1962,8 @@ mod tests {
         );
     }
 
-    /// Build a solid-color PNG of the given size, returned as base64. Used to
-    /// create dimension-valid but decoded-size-oversized fixtures without a
-    /// large test file.
-    fn oversized_png_base64(width: u32, height: u32) -> String {
+    /// Build a solid 8-bit RGB PNG of the given size, returned as base64.
+    fn solid_rgb_png_base64(width: u32, height: u32) -> String {
         use base64::Engine;
         use std::io::Write as _;
         let mut png = Vec::new();
