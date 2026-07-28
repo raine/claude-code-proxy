@@ -160,6 +160,10 @@ pub enum ResponsesInputItem {
         summary: Vec<Value>,
         encrypted_content: String,
     },
+    #[serde(rename = "compaction")]
+    Compaction { encrypted_content: String },
+    #[serde(rename = "compaction_trigger")]
+    CompactionTrigger,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,13 +305,39 @@ fn reasoning_summary_requested(summary: Option<&str>) -> bool {
 // Compaction fast path
 // ---------------------------------------------------------------------------
 
-/// Stable marker Claude Code puts in the system prompt of every compaction
-/// request (both manual `/compact` and auto-compact use the same prompt).
 const COMPACT_SYSTEM_MARKER: &str =
     "You are a helpful AI assistant tasked with summarizing conversations";
+const COMPACT_MESSAGE_PREFIX: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
+const COMPACT_MESSAGE_TASK: &str =
+    "Your task is to create a detailed summary of the conversation so far";
 
-fn is_compact_request(instructions: Option<&str>) -> bool {
+pub(crate) fn is_compact_request(instructions: Option<&str>) -> bool {
     instructions.is_some_and(|text| text.contains(COMPACT_SYSTEM_MARKER))
+}
+
+pub(crate) fn is_compact_message_text(text: &str) -> bool {
+    text.contains(COMPACT_MESSAGE_PREFIX) && text.contains(COMPACT_MESSAGE_TASK)
+}
+
+fn is_compact_message_content(content: &Value) -> bool {
+    match content {
+        Value::String(text) => is_compact_message_text(text),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_compact_message_text)
+        }),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
+    is_compact_request(flatten_system_text(request.extra.get("system")).as_deref())
+        || request.messages.last().is_some_and(|message| {
+            message.role == "user" && is_compact_message_content(&message.content)
+        })
 }
 
 /// Reasoning-effort cap applied to compaction requests, or None when the
@@ -393,7 +423,7 @@ pub fn translate_request(
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
-    let is_compact = is_compact_request(instructions.as_deref());
+    let is_compact = is_compact_messages_request(req);
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
@@ -1431,6 +1461,74 @@ mod tests {
         )));
         assert!(!is_compact_request(Some("You are Claude Code.")));
         assert!(!is_compact_request(None));
+    }
+
+    #[test]
+    fn compact_request_detected_from_final_user_message() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "user", "content": "prior turn"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": "result"
+                        },
+                        {
+                            "type": "text",
+                            "text": concat!(
+                                "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+                                "Your task is to create a detailed summary of the conversation so far, ",
+                                "paying close attention to the user's explicit requests."
+                            )
+                        }
+                    ]
+                }
+            ],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+
+        assert!(is_compact_messages_request(&req));
+    }
+
+    #[test]
+    fn compact_message_markers_must_be_in_final_user_message() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": concat!(
+                        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n",
+                        "Your task is to create a detailed summary of the conversation so far."
+                    )
+                },
+                {"role": "user", "content": "continue normally"}
+            ],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+
+        assert!(!is_compact_messages_request(&req));
+    }
+
+    #[test]
+    fn compact_message_requires_both_markers() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": "Your task is to create a detailed summary of the conversation so far."
+            }],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+
+        assert!(!is_compact_messages_request(&req));
     }
 
     #[test]

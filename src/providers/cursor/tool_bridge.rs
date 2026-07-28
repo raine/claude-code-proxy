@@ -375,25 +375,14 @@ pub fn build_read_result_from_native(
     };
     let file_size = content.len().to_string();
 
-    let read_result = if result.is_error {
-        serde_json::json!({
-            "success": {
-                "path": path,
-                "content": content,
-                "totalLines": lines,
-                "fileSize": file_size
-            }
-        })
-    } else {
-        serde_json::json!({
-            "success": {
-                "path": path,
-                "content": content,
-                "totalLines": lines,
-                "fileSize": file_size
-            }
-        })
-    };
+    let read_result = serde_json::json!({
+        "success": {
+            "path": path,
+            "content": content,
+            "totalLines": lines,
+            "fileSize": file_size
+        }
+    });
 
     let mut map = serde_json::Map::new();
     map.insert("readResult".into(), read_result);

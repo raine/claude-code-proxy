@@ -1,4 +1,6 @@
-use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesRequest};
+use super::translate::request::{
+    GrokContentPart, GrokInputItem, GrokResponsesRequest, GrokToolOutput,
+};
 
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_OVERHEAD_TOKENS: u64 = 4;
@@ -37,20 +39,32 @@ pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
 
 fn count_input_item(item: &GrokInputItem) -> u64 {
     match item {
-        GrokInputItem::Message { content, .. } => content
-            .iter()
-            .map(|part| match part {
-                GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
-                    approx_token_count(text)
-                }
-            })
-            .sum(),
+        GrokInputItem::Message { content, .. } => count_parts(content),
         GrokInputItem::FunctionCall {
             name, arguments, ..
         } => approx_token_count(name) + approx_token_count(arguments),
-        GrokInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
+        GrokInputItem::FunctionCallOutput { output, .. } => match output {
+            GrokToolOutput::Text(text) => approx_token_count(text),
+            GrokToolOutput::Parts(parts) => count_parts(parts),
+        },
     }
 }
+
+fn count_parts(parts: &[GrokContentPart]) -> u64 {
+    parts
+        .iter()
+        .map(|part| match part {
+            GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
+                approx_token_count(text)
+            }
+            // Images count toward tokens; charge a flat per-image estimate
+            // instead of counting base64 payload characters.
+            GrokContentPart::InputImage { .. } => IMAGE_TOKEN_ESTIMATE,
+        })
+        .sum()
+}
+
+const IMAGE_TOKEN_ESTIMATE: u64 = 1_024;
 
 fn approx_token_count(text: &str) -> u64 {
     if text.is_empty() {

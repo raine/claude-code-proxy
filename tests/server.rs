@@ -3,7 +3,7 @@ use axum::http::{Method, Request, StatusCode};
 use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     registry::Registry,
-    server::{app, app_with_monitor, bind_proxy_listener},
+    server::{app, app_with_monitor, app_with_options, bind_proxy_listener},
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -229,6 +229,50 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn native_responses_route_is_disabled_by_default_option() {
+    let app = app_with_options(Arc::new(Registry::with_default_alias()), None, false);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string(r#"{"model":"gpt-5.4","input":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn enabled_native_responses_route_uses_openai_errors() {
+    let app = app_with_options(Arc::new(Registry::with_default_alias()), None, true);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(body_string("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert!(body.get("type").is_none());
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_json");
 }
 
 #[tokio::test]

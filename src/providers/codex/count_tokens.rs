@@ -55,7 +55,11 @@ fn count_input_item_tokens(item: &ResponsesInputItem) -> u64 {
         }
         ResponsesInputItem::Reasoning {
             encrypted_content, ..
-        } => approx_reasoning_token_count(encrypted_content),
+        }
+        | ResponsesInputItem::Compaction { encrypted_content } => {
+            approx_reasoning_token_count(encrypted_content)
+        }
+        ResponsesInputItem::CompactionTrigger => 0,
     }
 }
 

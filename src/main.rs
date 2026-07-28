@@ -29,7 +29,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Print version information
     Version,
+    /// Start the proxy server and monitor
     Serve {
         #[arg(long)]
         port: Option<u16>,
@@ -37,23 +39,29 @@ enum Commands {
         no_monitor: bool,
     },
     /// Open the monitor TUI with mock data and no proxy server
+    #[command(hide = true)]
     Demo,
+    /// List supported provider models
     Models {
         #[arg(long)]
         full: bool,
     },
+    /// Manage Codex authentication
     Codex {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Manage Kimi authentication
     Kimi {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Manage Cursor authentication
     Cursor {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+    /// Manage Grok authentication
     Grok {
         #[command(subcommand)]
         command: ProviderGroup,

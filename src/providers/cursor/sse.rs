@@ -523,13 +523,12 @@ mod tests {
         let mut current_event = String::new();
 
         for line in sse.lines() {
-            if line.starts_with("event: ") {
-                current_event = line["event: ".len()..].to_string();
-            } else if line.starts_with("data: ") {
-                let data_str = &line["data: ".len()..];
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-                    events.push((current_event.clone(), data));
-                }
+            if let Some(event) = line.strip_prefix("event: ") {
+                current_event = event.to_string();
+            } else if let Some(data_str) = line.strip_prefix("data: ")
+                && let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
+            {
+                events.push((current_event.clone(), data));
             }
         }
 

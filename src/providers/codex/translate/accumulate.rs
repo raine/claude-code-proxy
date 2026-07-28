@@ -419,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_in_format_args)]
     fn accumulate_reasoning_summary_as_thinking_before_text() {
         let upstream = format!(
             "{}{}{}{}{}{}{}",

@@ -1,4 +1,44 @@
-# Changelog
+---
+title: Changelog
+description: Release notes for claude-code-proxy.
+---
+
+## Unreleased
+
+- Grok handles images in user messages and tool results without failing requests.
+  Images are omitted by default, with opt-in vision through
+  `CCP_GROK_TOOL_IMAGE`. Traffic captures redact image payloads.
+
+## v0.1.25 (2026-07-24)
+
+- Kimi users can select Kimi K3 with the `kimi-k3` or `k3` model name, including
+  its one-million-token context window and `max` reasoning effort.
+  ([#79](https://github.com/raine/claude-code-proxy/pull/79))
+- The monitor shows active native Codex compaction requests with a dedicated
+  `compacting` status.
+- The new [documentation site](https://claude-code-proxy.raine.dev) provides
+  setup guides, provider details, configuration references, troubleshooting,
+  and an `llms.txt` version for coding agents.
+
+## v0.1.24 (2026-07-23)
+
+- Codex optionally preserves conversation continuity across Claude Code
+  compaction boundaries with native encrypted compaction artifacts. Enable it
+  with `codex.serverCompaction` or `CCP_CODEX_SERVER_COMPACTION`.
+- Native OpenAI Responses clients can use `POST /v1/responses` with existing
+  Codex authentication, including JSON responses, SSE streaming, and automatic
+  token refresh. Enable the endpoint with `codex.responsesApi` or
+  `CCP_CODEX_RESPONSES_API=1`; it is disabled by default.
+
+## v0.1.23 (2026-07-22)
+
+- Codex WebSocket streaming handles pooled connections and HTTP fallback more
+  reliably, preventing concurrent requests from blocking each other or sending
+  the same request twice.
+- Codex errors preserve upstream status codes and optional retry timing, with
+  clearer permission failures and safer WebSocket handshake diagnostics.
+- Codex streaming limits oversized events and error responses, preventing
+  malformed or stalled upstream responses from consuming unbounded memory.
 
 ## v0.1.22 (2026-07-20)
 

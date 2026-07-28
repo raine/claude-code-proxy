@@ -73,7 +73,7 @@ pub fn decode_reasoning_signature(signature: &str) -> Option<ReasoningReplay> {
 }
 
 fn encoded_id_len_limit() -> usize {
-    (MAX_ID_BYTES + 2) / 3 * 4
+    MAX_ID_BYTES.div_ceil(3) * 4
 }
 
 fn max_payload_len() -> usize {

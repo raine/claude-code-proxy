@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod client;
+pub mod compaction;
 pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
+pub mod native;
 pub mod request_summary;
 pub mod translate;
 pub mod websocket;
@@ -18,6 +20,7 @@ use std::sync::Arc;
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
+use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::registry;
@@ -28,6 +31,10 @@ use self::auth::device::DeviceAuthClient;
 use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
+use self::compaction::{
+    abort_compaction_attempt, activate_compaction, apply_compaction_replay, request_compaction,
+    store_compaction,
+};
 use self::continuation::{
     ContinuationCandidate, abort_continuation, continuation_candidate, record_continuation,
 };
@@ -35,10 +42,13 @@ use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, full_lane_web_search_model, resolve_model_request, uses_responses_lite,
+    assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
+    uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
-use self::translate::request::{TranslateOptions, has_hosted_web_search, translate_request};
+use self::translate::request::{
+    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+};
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 use self::translate::stream::translate_stream_bytes_with_traffic;
@@ -46,6 +56,10 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
+
+pub(crate) fn clear_session_compaction(session_id: &str) {
+    compaction::clear_compaction(session_id);
+}
 
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
@@ -93,7 +107,8 @@ impl Provider for CodexProvider {
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
 
-        let mut resolved = resolve_model_request(model);
+        let mut resolved =
+            resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -109,7 +124,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request(
+        let mut translated = match translate_request(
             &body,
             TranslateOptions {
                 session_id: ctx.session_id.clone(),
@@ -127,6 +142,62 @@ impl Provider for CodexProvider {
                 );
             }
         };
+
+        let compact_boundary = is_compact_messages_request(&body);
+        let server_compaction_enabled = config::codex_server_compaction();
+        if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
+            compaction::clear_compaction(session_id);
+        }
+        if server_compaction_enabled
+            && compact_boundary
+            && let Some(session_id) = ctx.session_id.as_deref()
+        {
+            compaction::clear_compaction(session_id);
+            log_compaction_event(
+                "server_compaction_triggered",
+                &ctx,
+                translated.input.len(),
+                None,
+            );
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.compaction_started(&ctx.req_id);
+            }
+            let mut compaction_ctx = ctx.clone();
+            compaction_ctx.monitor = None;
+            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
+                Ok(native_history) => {
+                    if store_compaction(session_id, &translated.model, native_history) {
+                        log_compaction_event(
+                            "server_compaction_completed",
+                            &ctx,
+                            translated.input.len(),
+                            None,
+                        );
+                    } else {
+                        log_compaction_event(
+                            "server_compaction_failed",
+                            &ctx,
+                            translated.input.len(),
+                            Some("compaction state exceeded the in-memory limit"),
+                        );
+                    }
+                }
+                Err(error) => {
+                    compaction::clear_compaction(session_id);
+                    log_compaction_event(
+                        "server_compaction_failed",
+                        &ctx,
+                        translated.input.len(),
+                        Some(&error.to_string()),
+                    );
+                }
+            }
+        } else if server_compaction_enabled
+            && !compact_boundary
+            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
+        {
+            translated = replay;
+        }
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
@@ -151,6 +222,7 @@ impl Provider for CodexProvider {
                 ctx,
                 stream_request,
                 continuation,
+                compact_boundary,
             )
             .await;
         }
@@ -161,6 +233,7 @@ impl Provider for CodexProvider {
         {
             Ok(r) => r,
             Err(e) => {
+                abort_compaction_attempt(ctx.session_id.as_deref(), compact_boundary, &translated);
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
                 return map_codex_error_to_response(&e);
             }
@@ -175,6 +248,11 @@ impl Provider for CodexProvider {
             ) {
                 Ok(b) => b,
                 Err(e) => {
+                    abort_compaction_attempt(
+                        ctx.session_id.as_deref(),
+                        compact_boundary,
+                        &translated,
+                    );
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_failure_to_response(&format!(
                         "Stream translation error: {e}"
@@ -196,6 +274,7 @@ impl Provider for CodexProvider {
                 turn_id,
                 &translated,
                 &upstream.body,
+                compact_boundary,
             );
 
             let headers = [
@@ -225,10 +304,16 @@ impl Provider for CodexProvider {
                         turn_id,
                         &translated,
                         &upstream.body,
+                        compact_boundary,
                     );
                     (StatusCode::OK, Json(json)).into_response()
                 }
                 Err(e) => {
+                    abort_compaction_attempt(
+                        ctx.session_id.as_deref(),
+                        compact_boundary,
+                        &translated,
+                    );
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     map_codex_failure_to_response(&format!("Accumulation error: {e}"))
                 }
@@ -238,7 +323,8 @@ impl Provider for CodexProvider {
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
-        let mut resolved = resolve_model_request(model);
+        let mut resolved =
+            resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -303,6 +389,33 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
+fn log_compaction_event(
+    event: &str,
+    ctx: &RequestContext,
+    input_items: usize,
+    error: Option<&str>,
+) {
+    let mut fields = serde_json::Map::new();
+    fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
+    fields.insert("inputItems".into(), serde_json::json!(input_items));
+    if let Some(error) = error {
+        fields.insert("error".into(), serde_json::json!(error));
+        create_logger("codex").warn(event, Some(fields));
+    } else {
+        create_logger("codex").info(event, Some(fields));
+    }
+}
+
+fn abort_request_state(
+    session_id: Option<&str>,
+    turn_id: Option<u64>,
+    compact_boundary: bool,
+    request: &translate::request::ResponsesRequest,
+) {
+    abort_compaction_attempt(session_id, compact_boundary, request);
+    abort_continuation(session_id, turn_id);
+}
+
 enum LiveStreamStart {
     Response(Response),
     Retry { error: client::CodexError },
@@ -315,6 +428,7 @@ async fn live_stream_response(
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
+    compact_boundary: bool,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -334,12 +448,22 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compact_boundary,
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&err);
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compact_boundary,
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&err);
                 }
                 attempt += 1;
@@ -347,7 +471,12 @@ async fn live_stream_response(
                 continue;
             }
             Err(err) => {
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    compact_boundary,
+                    &request_body,
+                );
                 return map_codex_error_to_response(&err);
             }
         };
@@ -359,6 +488,7 @@ async fn live_stream_response(
             ctx.clone(),
             turn_id,
             request_body.clone(),
+            compact_boundary,
         )
         .await
         {
@@ -370,12 +500,22 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compact_boundary,
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&error);
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compact_boundary,
+                        &request_body,
+                    );
                     return map_codex_error_to_response(&error);
                 }
                 attempt += 1;
@@ -392,6 +532,7 @@ async fn live_stream_response_once(
     ctx: RequestContext,
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
+    compact_boundary: bool,
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
@@ -404,7 +545,12 @@ async fn live_stream_response_once(
                 if retryable_live_start_codex_error(&err) {
                     return LiveStreamStart::Retry { error: err };
                 }
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    compact_boundary,
+                    &request_body,
+                );
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
@@ -452,7 +598,12 @@ async fn live_stream_response_once(
                         },
                     };
                 }
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_request_state(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    compact_boundary,
+                    &request_body,
+                );
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -464,6 +615,7 @@ async fn live_stream_response_once(
                     turn_id,
                     &request_body,
                     &upstream_sse_body,
+                    compact_boundary,
                 );
                 return LiveStreamStart::Response(single_live_stream_response(chunk));
             }
@@ -475,6 +627,7 @@ async fn live_stream_response_once(
                 turn_id,
                 request_body,
                 upstream_sse_body,
+                compact_boundary,
             ));
         }
         if terminal {
@@ -483,6 +636,7 @@ async fn live_stream_response_once(
                 turn_id,
                 &request_body,
                 &upstream_sse_body,
+                compact_boundary,
             );
             return LiveStreamStart::Response(empty_live_stream_response());
         }
@@ -539,6 +693,7 @@ fn empty_live_stream_response() -> Response {
     event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     mut translator: LiveStreamTranslator,
@@ -547,11 +702,17 @@ fn remaining_live_stream_response(
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
+    compact_boundary: bool,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_continuation(ctx.session_id.as_deref(), turn_id);
+            abort_request_state(
+                ctx.session_id.as_deref(),
+                turn_id,
+                compact_boundary,
+                &request_body,
+            );
             return;
         }
         while let Some(item) = upstream_events.recv().await {
@@ -562,7 +723,12 @@ fn remaining_live_stream_response(
                         match translate_live_stream_payload(&mut translator, &payload, &ctx) {
                             Ok(result) => result,
                             Err(message) => {
-                                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                                abort_request_state(
+                                    ctx.session_id.as_deref(),
+                                    turn_id,
+                                    compact_boundary,
+                                    &request_body,
+                                );
                                 let chunk = translator.error_chunk(
                                     &message,
                                     "api_error",
@@ -578,7 +744,12 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_continuation(ctx.session_id.as_deref(), turn_id);
+                            abort_request_state(
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                                compact_boundary,
+                                &request_body,
+                            );
                             return;
                         }
                     }
@@ -588,12 +759,18 @@ fn remaining_live_stream_response(
                             turn_id,
                             &request_body,
                             &upstream_sse_body,
+                            compact_boundary,
                         );
                         return;
                     }
                 }
                 Err(err) => {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        turn_id,
+                        compact_boundary,
+                        &request_body,
+                    );
                     let chunk =
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -616,7 +793,12 @@ fn remaining_live_stream_response(
             }
         }
 
-        abort_continuation(ctx.session_id.as_deref(), turn_id);
+        abort_request_state(
+            ctx.session_id.as_deref(),
+            turn_id,
+            compact_boundary,
+            &request_body,
+        );
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
@@ -745,9 +927,13 @@ fn update_continuation_from_upstream(
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
+    compact_boundary: bool,
 ) {
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
+            if compact_boundary {
+                activate_compaction(session_id, &request_body.model, &finish.output_items);
+            }
             record_continuation(
                 session_id,
                 turn_id,
@@ -756,7 +942,10 @@ fn update_continuation_from_upstream(
                 &finish.output_items,
             );
         }
-        _ => abort_continuation(session_id, turn_id),
+        _ => {
+            abort_compaction_attempt(session_id, compact_boundary, request_body);
+            abort_continuation(session_id, turn_id);
+        }
     }
 }
 
@@ -771,28 +960,29 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     }
 
     match err.status {
-        401 | 403 => json_error(
+        401 => json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             err.detail.as_deref().unwrap_or("Authentication failed"),
         ),
+        403 => json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            err.detail.as_deref().unwrap_or("Permission denied"),
+        ),
         429 => {
-            let retry_after = err.retry_after.as_deref().unwrap_or("5");
-            let resp = json_error(
+            let response = json_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 &err.message,
             );
-            let headers = [(http::header::RETRY_AFTER, retry_after)];
-            (headers, resp).into_response()
+            if let Some(retry_after) = err.retry_after.as_deref() {
+                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+            } else {
+                response
+            }
         }
-        status @ (500 | 502 | 503 | 504 | 529)
-            if matches!(
-                err.origin,
-                client::CodexErrorOrigin::BufferedHttp
-                    | client::CodexErrorOrigin::BufferedWebSocket
-            ) =>
-        {
+        status @ (400..=599) => {
             let response = json_error(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                 if status == 529 {
@@ -1068,6 +1258,23 @@ mod tests {
         let now = 946684810000; // 10s after
         let output = format_expiry(expires, now);
         assert!(output.starts_with("Expires: 2000-01-01T00:00:00.000Z (in -"));
+    }
+
+    #[tokio::test]
+    async fn live_upstream_status_and_retry_after_are_preserved() {
+        let err = client::CodexError {
+            status: 422,
+            message: "invalid request".to_string(),
+            detail: Some("invalid request".to_string()),
+            retry_after: Some("7".to_string()),
+            origin: client::CodexErrorOrigin::WebSocketHandshake,
+        };
+        let response = map_codex_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "7"
+        );
     }
 
     #[tokio::test]

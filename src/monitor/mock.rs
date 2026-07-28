@@ -402,9 +402,9 @@ fn advance_output_buckets(
         buckets,
         Some("57c7c914-ada4-4f40-9672-985f950fbb66".to_string()),
         current_bucket,
-        if tick % 2 == 0 { 10 } else { 25 },
+        if tick.is_multiple_of(2) { 10 } else { 25 },
     );
-    if tick % 4 == 0 {
+    if tick.is_multiple_of(4) {
         record_output_bucket(
             buckets,
             Some("terminal-refactor".to_string()),
@@ -412,7 +412,7 @@ fn advance_output_buckets(
             120,
         );
     }
-    if tick % 5 == 0 {
+    if tick.is_multiple_of(5) {
         record_output_bucket(
             buckets,
             Some("cursor-session".to_string()),
@@ -457,7 +457,7 @@ fn simulated_output_tokens(tick: u64) -> u64 {
     let pairs = tick / 2;
     pairs
         .saturating_mul(35)
-        .saturating_add(if tick % 2 == 0 { 0 } else { 10 })
+        .saturating_add(if tick.is_multiple_of(2) { 0 } else { 10 })
 }
 
 fn add_simulated_requests(
@@ -625,6 +625,7 @@ fn simulation_profile(cycle: u64) -> SimulationProfile {
     PROFILES[index]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn active_request(
     now: SystemTime,
     instant_now: Instant,
@@ -661,6 +662,7 @@ fn active_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn completed_request(
     now: SystemTime,
     request_id: &str,

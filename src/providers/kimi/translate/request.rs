@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::model_allowlist::{KIMI_DEFAULT_MODEL, assert_allowed_model, resolve_model};
+use super::model_allowlist::{KIMI_DEFAULT_MODEL, assert_allowed_model, is_k3, resolve_model};
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_block_to_url, image_source_to_url, normalize_content,
@@ -134,7 +134,8 @@ pub fn translate_request(
     let resolved = resolve_model(model);
     assert_allowed_model(&resolved).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let messages = build_messages(req)?;
+    let k3 = is_k3(&resolved);
+    let messages = build_messages(req, &resolved)?;
     let tools = read_tools(req)?;
     let tool_choice = read_tool_choice(req)?;
 
@@ -145,8 +146,8 @@ pub fn translate_request(
         stream_options: KimiStreamOptions {
             include_usage: true,
         },
-        max_tokens: clamp_max_tokens(req.max_tokens),
-        reasoning_effort: Some(map_reasoning_effort(read_effort(req)?)),
+        max_tokens: clamp_max_tokens(req.max_tokens, k3),
+        reasoning_effort: Some(map_reasoning_effort(read_effort(req)?, k3)),
         thinking: Some(KimiThinking {
             kind: "enabled".to_string(),
         }),
@@ -163,18 +164,35 @@ pub fn translate_request(
     Ok(out)
 }
 
-fn clamp_max_tokens(requested: Option<u32>) -> u32 {
-    match requested {
-        Some(v) if v > 0 => v.min(DEFAULT_MAX_TOKENS),
-        _ => DEFAULT_MAX_TOKENS,
+fn clamp_max_tokens(requested: Option<u32>, k3: bool) -> u32 {
+    if k3 {
+        // K3's context is 1M tokens. Kimi Code passes max_context_size as
+        // max_tokens and lets the server clamp to the remaining output budget.
+        // Pass through the requested value (or the full context window).
+        requested.filter(|v| *v > 0).unwrap_or(1_048_576)
+    } else {
+        match requested {
+            Some(v) if v > 0 => v.min(DEFAULT_MAX_TOKENS),
+            _ => DEFAULT_MAX_TOKENS,
+        }
     }
 }
 
-fn map_reasoning_effort(effort: Option<&str>) -> String {
-    match effort {
-        Some("max" | "xhigh") => "high".to_string(),
-        Some(v) => v.to_string(),
-        None => "medium".to_string(),
+fn map_reasoning_effort(effort: Option<&str>, k3: bool) -> String {
+    if k3 {
+        // k3 supports: low, high, max (default: high)
+        match effort {
+            Some("max") => "max".to_string(),
+            Some("xhigh" | "high") => "high".to_string(),
+            Some("low") => "low".to_string(),
+            _ => "high".to_string(),
+        }
+    } else {
+        match effort {
+            Some("max" | "xhigh") => "high".to_string(),
+            Some(v) => v.to_string(),
+            None => "medium".to_string(),
+        }
     }
 }
 
@@ -255,27 +273,143 @@ fn read_tools(req: &MessagesRequest) -> Result<Vec<KimiTool>, anyhow::Error> {
 // Message building
 // ---------------------------------------------------------------------------
 
-fn build_messages(req: &MessagesRequest) -> Result<Vec<KimiMessage>, anyhow::Error> {
+fn build_messages(req: &MessagesRequest, model: &str) -> Result<Vec<KimiMessage>, anyhow::Error> {
     let mut out: Vec<KimiMessage> = Vec::new();
+    let k3_mode = is_k3(model);
 
-    // System message
+    // For k3: collect system text and prepend to first user message
+    // For other models: emit as system role
+    let mut k3_system_parts: Vec<String> = Vec::new();
+
+    // System field
     if let Some(system) = flatten_system_text(req.extra.get("system")) {
-        out.push(KimiMessage::System {
-            role: "system".to_string(),
-            content: system,
-        });
+        if k3_mode {
+            k3_system_parts.push(system);
+        } else {
+            out.push(KimiMessage::System {
+                role: "system".to_string(),
+                content: system,
+            });
+        }
     }
 
     // Convert each message
     for msg in &req.messages {
         let blocks = normalize_content(&msg.content, serde_json::json!({}));
         match msg.role.as_str() {
-            "user" => push_user_messages(&mut out, &blocks),
+            "user" => {
+                if k3_mode && !k3_system_parts.is_empty() {
+                    let system_prefix = k3_system_parts.join("\n\n");
+                    k3_system_parts.clear();
+
+                    // Emit tool results as tool-role messages
+                    for block in &blocks {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = block
+                        {
+                            out.push(KimiMessage::Tool {
+                                role: "tool".to_string(),
+                                tool_call_id: tool_use_id.clone(),
+                                content: tool_result_content(content, *is_error),
+                            });
+                        }
+                    }
+
+                    // Build user content from text + image blocks, prepending system text
+                    let has_text = blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { .. }));
+                    let has_images = blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Image { .. }));
+
+                    if has_images {
+                        // Mixed content: build array with system prefix as first text part
+                        let mut parts: Vec<KimiUserContentPart> = Vec::new();
+                        parts.push(KimiUserContentPart::Text {
+                            text: system_prefix,
+                        });
+                        for block in &blocks {
+                            match block {
+                                ContentBlock::Text { text } if !text.is_empty() => {
+                                    parts.push(KimiUserContentPart::Text { text: text.clone() });
+                                }
+                                ContentBlock::Image { source } => {
+                                    parts.push(KimiUserContentPart::ImageUrl {
+                                        image_url: KimiImageUrl {
+                                            url: image_source_to_url(source),
+                                        },
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        out.push(KimiMessage::User {
+                            role: "user".to_string(),
+                            content: serde_json::to_value(parts).unwrap_or_default(),
+                        });
+                    } else if has_text {
+                        let user_text: String = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let merged = format!("{system_prefix}\n\n{user_text}");
+                        out.push(KimiMessage::User {
+                            role: "user".to_string(),
+                            content: serde_json::Value::String(merged),
+                        });
+                    } else {
+                        // Tool-result-only turn: emit system text as its own user message
+                        out.push(KimiMessage::User {
+                            role: "user".to_string(),
+                            content: serde_json::Value::String(system_prefix),
+                        });
+                    }
+                } else {
+                    push_user_messages(&mut out, &blocks);
+                }
+            }
             "assistant" => push_assistant_message(&mut out, &blocks),
+            "system" | "developer" => {
+                let text = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    if k3_mode {
+                        k3_system_parts.push(text);
+                    } else {
+                        out.push(KimiMessage::System {
+                            role: "system".to_string(),
+                            content: text,
+                        });
+                    }
+                }
+            }
             other => {
                 anyhow::bail!("unexpected message role: {other}");
             }
         }
+    }
+
+    // Flush any remaining system text (e.g. system-only conversation or trailing system messages)
+    if k3_mode && !k3_system_parts.is_empty() {
+        let text = k3_system_parts.join("\n\n");
+        out.push(KimiMessage::User {
+            role: "user".to_string(),
+            content: serde_json::Value::String(text),
+        });
     }
 
     Ok(out)
@@ -821,5 +955,158 @@ mod tests {
             assert!(!content.contains("x-anthropic-billing-header"));
             assert!(content.contains("helpful"));
         }
+    }
+
+    #[test]
+    fn k3_system_merged_into_user() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hello"}],
+            "system": "Be helpful."
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        assert_eq!(translated.model, "k3");
+        assert!(
+            !translated
+                .messages
+                .iter()
+                .any(|m| matches!(m, KimiMessage::System { .. }))
+        );
+        match &translated.messages[0] {
+            KimiMessage::User { content, .. } => {
+                let text = content.as_str().unwrap();
+                assert!(text.contains("Be helpful."));
+                assert!(text.contains("hello"));
+            }
+            _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn k3_system_with_images_preserves_image_blocks() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "system": "Describe images.",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+            ]}]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        match &translated.messages[0] {
+            KimiMessage::User { content, .. } => {
+                let parts = content
+                    .as_array()
+                    .expect("expected array for mixed content");
+                assert!(parts.len() >= 3);
+                assert!(
+                    parts.iter().any(|p| p.get("image_url").is_some()),
+                    "image block missing"
+                );
+                let texts: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                assert!(
+                    texts.iter().any(|t| t.contains("Describe images.")),
+                    "system text missing"
+                );
+                assert!(
+                    texts.iter().any(|t| t.contains("what is this?")),
+                    "user text missing"
+                );
+            }
+            _ => panic!("expected User message"),
+        }
+    }
+
+    #[test]
+    fn k3_system_not_lost_on_tool_result_only_turn() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "user", "content": "do something"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}}
+                ]},
+                {"role": "system", "content": [{"type": "text", "text": "reminder text"}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "output"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        let user_msgs: Vec<&KimiMessage> = translated
+            .messages
+            .iter()
+            .filter(|m| matches!(m, KimiMessage::User { .. }))
+            .collect();
+        let all_text: String = user_msgs
+            .iter()
+            .map(|m| match m {
+                KimiMessage::User { content, .. } => content.as_str().unwrap_or("").to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(
+            all_text.contains("reminder text"),
+            "system reminder lost on tool-result-only turn"
+        );
+        assert!(
+            translated
+                .messages
+                .iter()
+                .any(|m| matches!(m, KimiMessage::Tool { .. })),
+            "tool result missing"
+        );
+    }
+
+    #[test]
+    fn k3_effort_defaults_to_high() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        assert_eq!(translated.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn k3_effort_max_preserved() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "max"}
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        assert_eq!(translated.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn k3_max_tokens_passes_through() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "max_tokens": 500000,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        assert_eq!(translated.max_tokens, 500000);
+    }
+
+    #[test]
+    fn k3_max_tokens_defaults_to_context_window() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        assert_eq!(translated.max_tokens, 1_048_576);
     }
 }

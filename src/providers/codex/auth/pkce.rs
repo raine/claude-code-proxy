@@ -132,7 +132,7 @@ mod tests {
         let pkce = generate_pkce();
         let expected_hash = Sha256::digest(pkce.verifier.as_bytes());
         let expected_challenge =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected_hash);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_hash);
         assert_eq!(pkce.challenge, expected_challenge);
     }
 

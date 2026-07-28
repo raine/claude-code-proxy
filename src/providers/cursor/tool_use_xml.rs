@@ -171,10 +171,10 @@ impl CursorToolUseXmlParser {
         };
 
         // Check allowed tool names.
-        if let Some(ref allowed) = self.allowed_tool_names {
-            if !allowed.contains(name) {
-                return None;
-            }
+        if let Some(ref allowed) = self.allowed_tool_names
+            && !allowed.contains(name)
+        {
+            return None;
         }
 
         // Parse the JSON body.

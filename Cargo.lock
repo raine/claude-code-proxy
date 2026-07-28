@@ -316,7 +316,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-code-proxy"
-version = "0.1.22"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "assert_cmd",

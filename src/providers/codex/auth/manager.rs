@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::LazyLock;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +9,9 @@ use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
 use super::jwt::{TokenResponse, extract_account_id, validate_token_response};
 use super::token_store::{CodexTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
+
+static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
+    LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
@@ -28,7 +32,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             store,
             #[cfg(test)]
             test_auth: Arc::new(Mutex::new(None)),
-            refresh_lock: Arc::new(AsyncMutex::new(())),
+            refresh_lock: CODEX_REFRESH_LOCK.clone(),
             refresh_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(30))

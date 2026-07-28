@@ -4,6 +4,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
+use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_proxy::{registry::Registry, server::app};
@@ -565,6 +566,7 @@ async fn smoke_healthz_returns_ok() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn smoke_codex_model_routes_to_real_provider() {
     let _guard = env_lock();
     let response = call_messages("gpt-5.5").await;
@@ -624,6 +626,7 @@ async fn smoke_kimi_messages_uses_mock_upstream() {
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_KIMI_BASE_URL", &upstream);
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
     let response = call_messages("kimi-for-coding").await;
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -638,6 +641,8 @@ async fn smoke_kimi_messages_uses_mock_upstream() {
     let sent = captured.lock().unwrap().clone().unwrap();
     assert_eq!(sent["model"], "kimi-for-coding");
     assert_eq!(sent["stream"], true);
+    assert!(sent.get("input").is_none());
+    assert!(!sent.to_string().contains("compaction_trigger"));
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +695,7 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_auto_review_model_only_overrides_classifier_request() {
+async fn smoke_auto_review_uses_codex_default_and_configured_override() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -715,24 +720,35 @@ async fn smoke_auto_review_model_only_overrides_classifier_request() {
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let _review_model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+    let _codex_model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-5.6-sol");
+    let classifier_body = || {
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "stream": false,
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+            }],
+            "messages": [{"role":"user","content":"review this Bash command"}],
+            "tools": []
+        })
+    };
 
-    let classifier = call_messages_body(json!({
-        "model": "gpt-5.6-sol",
-        "max_tokens": 64,
-        "stream": false,
-        "system": [{
-            "type": "text",
-            "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
-        }],
-        "messages": [{"role":"user","content":"review this Bash command"}],
-        "tools": []
-    }))
-    .await;
+    let classifier = call_messages_body(classifier_body()).await;
     assert_eq!(classifier.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
         .await
         .unwrap();
+
+    {
+        let _review_model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+        let classifier = call_messages_body(classifier_body()).await;
+        assert_eq!(classifier.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
 
     let normal = call_messages("gpt-5.6-sol").await;
     assert_eq!(normal.status(), StatusCode::OK);
@@ -741,9 +757,186 @@ async fn smoke_auto_review_model_only_overrides_classifier_request() {
         .unwrap();
 
     let sent = captured.lock().unwrap();
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent[0]["model"], "gpt-5.6-terra");
-    assert_eq!(sent[1]["model"], "gpt-5.6-sol");
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[1]["model"], "gpt-5.6-terra");
+    assert_eq!(sent[2]["model"], "gpt-5.6-sol");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_server_compaction_replays_native_history() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let is_compaction = body["input"].as_array().is_some_and(|input| {
+                input.last().and_then(|item| item["type"].as_str())
+                    == Some("compaction_trigger")
+            });
+            let request_number = {
+                let mut requests = captured.lock().unwrap();
+                requests.push(body);
+                requests.len()
+            };
+            if is_compaction {
+                concat!(
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-history\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            } else {
+                let text = if request_number == 2 {
+                    "portable summary with enough detail to anchor the compacted conversation"
+                } else {
+                    "compacted ok"
+                };
+                format!(
+                    "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_up\"}}}}\n\n\
+                     data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"{text}\"}}\n\n\
+                     data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{request_number}\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
+                )
+                .into_bytes()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let compact_response = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"old conversation"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+            ]}
+        ]
+    }))
+    .await;
+    assert_eq!(compact_response.status(), StatusCode::OK);
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "current instructions",
+        "messages": [
+            {"role":"user","content":"<summary>portable summary with enough detail to anchor the compacted conversation</summary>"},
+            {"role":"user","content":"continue"}
+        ]
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "compacted ok");
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["model"], "gpt-5.6-sol");
+    assert!(requests[0].get("client_metadata").is_some());
+    assert_eq!(
+        requests[0]["input"].as_array().unwrap().last().unwrap()["type"],
+        "compaction_trigger"
+    );
+    assert!(
+        !requests[0]
+            .to_string()
+            .contains("Your task is to create a detailed summary")
+    );
+    assert!(
+        requests[1]
+            .to_string()
+            .contains("Your task is to create a detailed summary")
+    );
+    assert!(!requests[1].to_string().contains("opaque-history"));
+    let replay = requests[2]["input"].as_array().unwrap();
+    assert!(requests[2].get("client_metadata").is_some());
+    assert!(requests[2].to_string().contains("current instructions"));
+    let compaction = replay
+        .iter()
+        .find(|item| item["type"] == "compaction")
+        .unwrap();
+    assert_eq!(compaction["encrypted_content"], "opaque-history");
+    assert!(replay.iter().any(|item| item["role"] == "user"));
+    clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let is_compaction = body["input"].as_array().is_some_and(|input| {
+                input.last().and_then(|item| item["type"].as_str())
+                    == Some("compaction_trigger")
+            });
+            captured.lock().unwrap().push(body);
+            if is_compaction {
+                b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n".to_vec()
+            } else {
+                concat!(
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"portable fallback\"}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "system": "You are a helpful AI assistant tasked with summarizing conversations.",
+        "messages": [{"role":"user","content":"old conversation"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "portable fallback");
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].to_string().contains("old conversation"));
+    assert!(!requests[1].to_string().contains("opaque-history"));
 }
 
 #[allow(clippy::await_holding_lock)]

@@ -647,6 +647,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_in_format_args)]
     fn stream_omits_empty_reasoning_summary() {
         let upstream = format!(
             "{}{}{}{}{}",

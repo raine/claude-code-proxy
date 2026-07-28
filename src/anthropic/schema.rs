@@ -9,6 +9,8 @@ pub struct MessagesRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(skip)]
+    pub bypass_provider_model_override: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

@@ -38,6 +38,7 @@ pub struct GrokProvider {
 }
 impl GrokProvider {
     pub fn new() -> Self {
+        crate::config::warn_grok_tool_image_mode_once(&crate::logging::create_logger("grok"));
         Self {
             client: Arc::new(
                 client::GrokClient::new(

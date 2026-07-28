@@ -256,6 +256,7 @@ fn cursor_error_display_works() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::client::CursorHttpClient;
@@ -677,6 +678,7 @@ fn registry_provider_for_legacy_cursor_model() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
@@ -798,6 +800,7 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn cursor_provider_handle_messages_returns_anthropic_json() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
@@ -896,6 +899,7 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::connect::{
@@ -1525,13 +1529,12 @@ fn parse_sse_events(sse: &str) -> Vec<(String, serde_json::Value)> {
     let mut current_event = String::new();
 
     for line in sse.lines() {
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            let data_str = &line["data: ".len()..];
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-                events.push((current_event.clone(), data));
-            }
+        if let Some(event) = line.strip_prefix("event: ") {
+            current_event = event.to_string();
+        } else if let Some(data_str) = line.strip_prefix("data: ")
+            && let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
+        {
+            events.push((current_event.clone(), data));
         }
     }
 

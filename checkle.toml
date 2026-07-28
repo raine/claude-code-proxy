@@ -6,7 +6,15 @@ command = ["cargo", "fmt", "--all", "--", "--check"]
 [[check]]
 name = "clippy"
 mode = "cargo"
-command = ["cargo", "clippy", "--all-targets", "--message-format=json"]
+command = [
+  "cargo",
+  "clippy",
+  "--all-targets",
+  "--message-format=json",
+  "--",
+  "-D",
+  "warnings",
+]
 
 [[check]]
 name = "build"

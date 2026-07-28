@@ -1,0 +1,24 @@
+---
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+---
+
+<a class="llm-docs" href="/llms.txt">LLMs</a>
+<Default><slot /></Default>
+
+<style>
+  @layer starlight.core {
+    .llm-docs {
+      color: var(--sl-color-text-accent);
+      font-size: var(--sl-text-sm);
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .llm-docs:hover,
+    .llm-docs:focus-visible {
+      color: var(--sl-color-white);
+    }
+  }
+</style>

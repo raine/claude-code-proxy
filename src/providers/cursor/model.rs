@@ -7,7 +7,6 @@
 ///   `cursor-composer-fast`, `cursor-plan`, `cursor-ask`, `composer-2.5`,
 ///   `composer-2.5-fast` are recognized.
 /// - `cursor-agent:` is also supported for agent mode routing.
-
 pub const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor",
     "cursor-agent",

@@ -50,6 +50,7 @@ const GREEN: Color = Color::Rgb(120, 200, 120);
 const RED: Color = Color::Rgb(220, 120, 120);
 const YELLOW: Color = Color::Rgb(220, 200, 100);
 const BLUE: Color = Color::Rgb(120, 170, 230);
+const PURPLE: Color = Color::Rgb(190, 140, 240);
 const DIM: Color = Color::Rgb(100, 104, 114);
 const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
 const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
@@ -593,6 +594,7 @@ fn status_color(value: &str) -> Color {
     match value {
         "completed" => GREEN,
         "streaming" => TEAL,
+        "compacting" => PURPLE,
         "failed" => RED,
         "upstream" => BLUE,
         "selected" | "started" => YELLOW,
@@ -711,11 +713,9 @@ fn token_sparkline(samples: &[(SystemTime, u64)], width: usize, now: SystemTime)
                 return ' ';
             }
             let scaled = value.min(SESSION_SPARKLINE_MAX_TOKENS);
-            let level = ((u128::from(scaled) * LEVELS.len() as u128
-                + u128::from(SESSION_SPARKLINE_MAX_TOKENS)
-                - 1)
-                / u128::from(SESSION_SPARKLINE_MAX_TOKENS))
-            .saturating_sub(1) as usize;
+            let level = (u128::from(scaled) * LEVELS.len() as u128)
+                .div_ceil(u128::from(SESSION_SPARKLINE_MAX_TOKENS))
+                .saturating_sub(1) as usize;
             LEVELS[level]
         })
         .collect()
@@ -1001,7 +1001,11 @@ fn render_active(
     let columns = active_columns(LayoutTier::for_outer_width(area.width));
     let widths = column_constraints(&columns);
     let rows = active.iter().map(|request| {
-        let status = format!("{} {}", spinner(tick), request.status.label());
+        let status = if request.status == crate::monitor::RequestStatus::Compacting {
+            format!("{}{}", spinner(tick), request.status.label())
+        } else {
+            format!("{} {}", spinner(tick), request.status.label())
+        };
         let cells = columns
             .iter()
             .enumerate()
@@ -2205,6 +2209,22 @@ mod tests {
 
         let active_text = buffer_text(&active);
         assert!(active_text.contains("⠋ upstream"), "{active_text}");
+    }
+
+    #[test]
+    fn active_compacting_status_is_distinct_at_narrow_width() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.compaction_started("request-1");
+        let state = monitor.snapshot();
+
+        let active = draw(88, 6, |frame| {
+            render_active(frame, frame.area(), &state.active, 0)
+        });
+
+        let active_text = buffer_text(&active);
+        assert!(active_text.contains("⠋compacting"), "{active_text}");
+        assert_eq!(status_color("compacting"), PURPLE);
     }
 
     #[test]

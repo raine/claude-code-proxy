@@ -56,6 +56,10 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "serverCompaction")]
+    pub server_compaction: Option<bool>,
+    #[serde(rename = "responsesApi")]
+    pub responses_api: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(rename = "reasoningSummary")]
@@ -219,6 +223,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_LOG_STDERR") {
         out.push("log.stderr (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_RESPONSES_API") {
+        out.push("codex.responsesApi (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_OAUTH_HOST") {
         out.push("kimi.oauthHost (env)".to_string());
     }
@@ -245,6 +252,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         .is_some_and(|raw| !raw.is_empty())
     {
         out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
+        out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
@@ -276,11 +286,19 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 out.push(format!("log.stderr: {v}"));
             }
         }
-        if let Some(codex) = file_cfg.codex
-            && let Some(summary) = codex.reasoning_summary
-            && !summary.is_empty()
-        {
-            out.push("codex.reasoningSummary (config)".to_string());
+        if let Some(codex) = file_cfg.codex {
+            if codex
+                .reasoning_summary
+                .is_some_and(|value| !value.is_empty())
+            {
+                out.push("codex.reasoningSummary (config)".to_string());
+            }
+            if let Some(enabled) = codex.server_compaction {
+                out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if codex.responses_api == Some(true) {
+                out.push("codex.responsesApi: true".to_string());
+            }
         }
     }
     out
@@ -310,6 +328,62 @@ pub fn grok_client_version() -> String {
         return version;
     }
     "0.2.93".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Grok tool-image policy (CCP_GROK_TOOL_IMAGE)
+// ---------------------------------------------------------------------------
+
+/// How the Grok translator treats Anthropic `image` blocks (tool results and
+/// top-level user messages). `omit` is the safe default: degrade to the L1
+/// placeholder string. `reattach` keeps the placeholder in the tool output and
+/// additionally appends a user message carrying the images as `input_image`
+/// data URLs. `inline` sends the tool output itself as an array of
+/// `input_text` + `input_image` parts (string-only outputs still serialize as
+/// plain strings). `reject` restores the pre-L1 hard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokToolImageMode {
+    Omit,
+    Reattach,
+    Inline,
+    Reject,
+}
+
+pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
+    match raw.map(str::trim) {
+        Some("reattach") => GrokToolImageMode::Reattach,
+        Some("inline") => GrokToolImageMode::Inline,
+        Some("reject") => GrokToolImageMode::Reject,
+        // Any unknown/empty value degrades to the safe default.
+        _ => GrokToolImageMode::Omit,
+    }
+}
+
+pub fn grok_tool_image_mode() -> GrokToolImageMode {
+    parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
+}
+
+/// Warn once at startup when an unknown mode was requested. Called from the
+/// Grok provider constructor rather than per request.
+pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
+    match std::env::var("CCP_GROK_TOOL_IMAGE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(other) if !matches!(other, "" | "omit" | "reattach" | "inline" | "reject") => {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                "value".to_string(),
+                serde_json::Value::String(other.to_string()),
+            );
+            log.warn(
+                "unrecognized CCP_GROK_TOOL_IMAGE value; falling back to omit",
+                Some(fields),
+            );
+        }
+        _ => {}
+    }
 }
 
 pub fn is_verbose() -> bool {
@@ -430,6 +504,40 @@ pub fn codex_previous_response_id() -> bool {
         && let Some(val) = codex.previous_response_id
     {
         return val;
+    }
+    false
+}
+
+pub fn codex_server_compaction() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.server_compaction
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_responses_api() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.responses_api
+    {
+        return enabled;
     }
     false
 }
@@ -619,6 +727,8 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
+            std::env::remove_var("CCP_CODEX_RESPONSES_API");
             std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
     }
@@ -776,6 +886,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_responses_api_defaults_to_disabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_responses_api());
+    }
+
+    #[test]
+    fn codex_responses_api_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"responsesApi":true}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_responses_api());
+        let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", "false");
+        assert!(!codex_responses_api());
+    }
+
+    #[test]
+    fn codex_responses_api_accepts_enabled_env_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for value in ["1", "true", "TRUE", "yes"] {
+            let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", value);
+            assert!(codex_responses_api(), "{value}");
+        }
+    }
+
+    #[test]
     fn codex_reasoning_summary_reads_config() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
@@ -832,5 +982,27 @@ mod tests {
             let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "");
             assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         }
+    }
+
+    #[test]
+    fn codex_server_compaction_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_server_compaction());
+        {
+            let _enabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "on");
+            assert!(codex_server_compaction());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"serverCompaction":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_server_compaction());
+        let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
+        assert!(!codex_server_compaction());
     }
 }

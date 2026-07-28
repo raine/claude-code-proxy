@@ -81,29 +81,28 @@ impl Provider for CursorProvider {
             );
         }
 
-        if let Some(ref session_id) = ctx.session_id {
-            if let Some(pending) = BridgeRegistry::pending_tool(session_id) {
-                if let Some(result) = find_tool_result(&body, pending.tool_use_id()) {
-                    let (_result_messages, sse_bytes) =
-                        resume_cursor_tool_bridge(session_id, &message_id, model, result, &pending);
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                        monitor.stream_progress(
-                            &ctx.req_id,
-                            sse_bytes.len() as u64,
-                            count_sse_events(&sse_bytes),
-                            input_tokens,
-                            output_tokens,
-                        );
-                    }
-                    let headers = [
-                        (http::header::CONTENT_TYPE, "text/event-stream"),
-                        (http::header::CACHE_CONTROL, "no-cache"),
-                        (http::header::CONNECTION, "keep-alive"),
-                    ];
-                    return (headers, sse_bytes).into_response();
-                }
+        if let Some(ref session_id) = ctx.session_id
+            && let Some(pending) = BridgeRegistry::pending_tool(session_id)
+            && let Some(result) = find_tool_result(&body, pending.tool_use_id())
+        {
+            let (_result_messages, sse_bytes) =
+                resume_cursor_tool_bridge(session_id, &message_id, model, result, &pending);
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+                monitor.stream_progress(
+                    &ctx.req_id,
+                    sse_bytes.len() as u64,
+                    count_sse_events(&sse_bytes),
+                    input_tokens,
+                    output_tokens,
+                );
             }
+            let headers = [
+                (http::header::CONTENT_TYPE, "text/event-stream"),
+                (http::header::CACHE_CONTROL, "no-cache"),
+                (http::header::CONNECTION, "keep-alive"),
+            ];
+            return (headers, sse_bytes).into_response();
         }
 
         let auth = match load_cursor_auth() {
@@ -141,7 +140,7 @@ impl Provider for CursorProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match client.run_agent(&token, &prompt, &model, &images).await {
+        let upstream = match client.run_agent(&token, &prompt, model, &images).await {
             Ok(r) => r,
             Err(e) => {
                 return map_cursor_error_to_response(&e);

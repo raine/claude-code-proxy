@@ -111,7 +111,7 @@ impl CursorHttpClient {
             .body(body)
             .send()
             .await
-            .map_err(|e| CursorError::from_reqwest(e))?;
+            .map_err(CursorError::from_reqwest)?;
 
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
@@ -206,10 +206,10 @@ fn parse_error_body(body_bytes: &[u8], _headers: &reqwest::header::HeaderMap) ->
     }
 
     // Try plain text error
-    if let Ok(text) = String::from_utf8(body_bytes.to_vec()) {
-        if !text.is_empty() {
-            return Some(text);
-        }
+    if let Ok(text) = String::from_utf8(body_bytes.to_vec())
+        && !text.is_empty()
+    {
+        return Some(text);
     }
     None
 }
@@ -230,9 +230,8 @@ pub fn decode_frame_payload(
     frame: &ConnectFrame,
 ) -> Result<proto::AgentServerMessage, CursorError> {
     let payload = if frame.flags & FLAG_GZIP != 0 {
-        let decompressed = super::connect::decode_gzip_frame(&frame.payload)
-            .map_err(|e| CursorError::internal(format!("gzip decompress: {e}")))?;
-        decompressed
+        super::connect::decode_gzip_frame(&frame.payload)
+            .map_err(|e| CursorError::internal(format!("gzip decompress: {e}")))?
     } else {
         frame.payload.to_vec()
     };

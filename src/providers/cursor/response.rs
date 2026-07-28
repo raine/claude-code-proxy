@@ -64,10 +64,10 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
     for frame in &frames {
         if frame.flags & FLAG_END != 0 {
             // Check for Connect error in end frame
-            if !frame.payload.is_empty() {
-                if let Some(err) = parse_connect_error(&frame.payload) {
-                    return Err(CursorDecodeError::ConnectEnd(err));
-                }
+            if !frame.payload.is_empty()
+                && let Some(err) = parse_connect_error(&frame.payload)
+            {
+                return Err(CursorDecodeError::ConnectEnd(err));
             }
             events.push(CursorStreamEvent::End);
             continue;
@@ -141,33 +141,32 @@ fn estimate_input_tokens(_content: &str) -> u64 {
 
 fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEvent>) {
     // Check for exec_server_message with session info
-    if let Some(ref exec) = msg.exec_server_message {
-        if let Some(ref session_id) = exec.notes_session_id {
-            if !session_id.is_empty() {
-                events.push(CursorStreamEvent::Session {
-                    session_id: session_id.clone(),
-                });
-            }
-        }
+    if let Some(ref exec) = msg.exec_server_message
+        && let Some(ref session_id) = exec.notes_session_id
+        && !session_id.is_empty()
+    {
+        events.push(CursorStreamEvent::Session {
+            session_id: session_id.clone(),
+        });
     }
 
     if let Some(ref update) = msg.interaction_update {
         // Thinking delta
-        if let Some(ref td) = update.thinking_delta {
-            if !td.text.is_empty() {
-                events.push(CursorStreamEvent::ThinkingDelta {
-                    text: td.text.clone(),
-                });
-            }
+        if let Some(ref td) = update.thinking_delta
+            && !td.text.is_empty()
+        {
+            events.push(CursorStreamEvent::ThinkingDelta {
+                text: td.text.clone(),
+            });
         }
 
         // Text delta
-        if let Some(ref td) = update.text_delta {
-            if !td.text.is_empty() {
-                events.push(CursorStreamEvent::TextDelta {
-                    text: td.text.clone(),
-                });
-            }
+        if let Some(ref td) = update.text_delta
+            && !td.text.is_empty()
+        {
+            events.push(CursorStreamEvent::TextDelta {
+                text: td.text.clone(),
+            });
         }
 
         // Turn ended (usage + end)

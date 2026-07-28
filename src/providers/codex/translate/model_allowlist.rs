@@ -57,6 +57,13 @@ fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
 }
 
 pub fn resolve_model_request(model: &str) -> ResolvedModel {
+    resolve_model_request_with_config_override(model, true)
+}
+
+pub fn resolve_model_request_with_config_override(
+    model: &str,
+    apply_config_override: bool,
+) -> ResolvedModel {
     let alias = MODEL_ALIASES
         .iter()
         .find(|(alias, _)| *alias == model)
@@ -65,7 +72,7 @@ pub fn resolve_model_request(model: &str) -> ResolvedModel {
 
     let requested = resolve_fast_model_alias(alias);
 
-    let override_model = config::codex_model();
+    let override_model = apply_config_override.then(config::codex_model).flatten();
     let resolved = match override_model {
         Some(ref val) if !val.is_empty() => resolve_fast_model_alias(val),
         _ => requested.clone(),

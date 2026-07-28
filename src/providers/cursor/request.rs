@@ -30,30 +30,28 @@ pub fn render_cursor_prompt(req: &MessagesRequest) -> String {
     }
 
     // Tools block
-    if let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) {
-        if !tools.is_empty() {
-            let tool_lines: Vec<String> = tools
-                .iter()
-                .filter_map(|t| {
-                    let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                    let input_schema = t
-                        .get("input_schema")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    Some(format!(
-                        "{}",
-                        serde_json::json!({
-                            "name": name,
-                            "description": description,
-                            "input_schema": input_schema,
-                        })
-                    ))
+    if let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array())
+        && !tools.is_empty()
+    {
+        let tool_lines: Vec<String> = tools
+            .iter()
+            .map(|t| {
+                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                let input_schema = t
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                serde_json::json!({
+                    "name": name,
+                    "description": description,
+                    "input_schema": input_schema,
                 })
-                .collect();
-            if !tool_lines.is_empty() {
-                sections.push(format!("<tools>\n{}\n</tools>", tool_lines.join("\n")));
-            }
+                .to_string()
+            })
+            .collect();
+        if !tool_lines.is_empty() {
+            sections.push(format!("<tools>\n{}\n</tools>", tool_lines.join("\n")));
         }
     }
 
