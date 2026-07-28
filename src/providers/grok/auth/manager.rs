@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -15,6 +15,7 @@ use crate::oauth_rotation::{
     AuthMutationLock, clear_refresh_pending, generation_fingerprint, read_refresh_pending,
     write_refresh_pending,
 };
+use crate::timeutil::now_ms;
 
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -553,13 +554,6 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<String> {
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

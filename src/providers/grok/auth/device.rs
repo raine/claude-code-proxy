@@ -1,6 +1,6 @@
 //! Device-code login for headless hosts, using the same public client as browser login.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -8,6 +8,7 @@ use super::login::{CANONICAL_ISSUER, CLIENT_ID, SCOPES};
 use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 use crate::oauth_http::{MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_blocking};
+use crate::timeutil::now_ms;
 
 const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -57,10 +58,7 @@ impl DeviceRuntime for SystemRuntime {
     }
 
     fn unix_time_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        now_ms()
     }
 
     fn sleep(&self, duration: Duration) {

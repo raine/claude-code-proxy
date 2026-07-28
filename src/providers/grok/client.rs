@@ -1642,9 +1642,9 @@ mod tests {
         assert_eq!(context.req_id.as_deref(), Some("req-observed"));
         assert!(context.deadline_remaining_ms <= 60_000);
     }
+    use crate::timeutil::now_ms;
     use crate::traffic::test_capture;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1657,13 +1657,6 @@ mod tests {
             issuer: super::super::auth::login::CANONICAL_ISSUER.into(),
             client_id: super::super::auth::login::CLIENT_ID.into(),
         }
-    }
-
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
     }
 
     async fn test_client(base_url: &str, timeouts: GrokTimeouts) -> (GrokClient, TempDir) {

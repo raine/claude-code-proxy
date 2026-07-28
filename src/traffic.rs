@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
+use crate::fsutil;
 use crate::logging::REDACT_KEYS;
 use crate::paths;
 
@@ -667,7 +668,7 @@ fn write_file_bytes(path: PathBuf, value: &[u8]) -> Result<(), TrafficWriteFailu
             residual_bytes: 0,
             file_created: false,
         })?;
-        set_mode(parent, 0o700);
+        fsutil::set_mode(parent, 0o700);
     }
     let mut out = OpenOptions::new()
         .write(true)
@@ -924,18 +925,6 @@ fn redact_traffic_value(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
         _ => Value::String("[redacted]".to_string()),
-    }
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
     }
 }
 

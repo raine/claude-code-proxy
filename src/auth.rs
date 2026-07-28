@@ -4,8 +4,6 @@ use serde_json::to_string_pretty;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 pub trait AuthStorage<T>: Send + Sync
 where
@@ -443,7 +441,7 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid auth path"))?;
     fs::create_dir_all(dir)?;
-    set_mode(dir, 0o700);
+    crate::fsutil::set_mode(dir, 0o700);
 
     let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
     #[cfg(unix)]
@@ -468,19 +466,8 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     }
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
-    set_mode(std::path::Path::new(path), 0o600);
+    crate::fsutil::set_mode(std::path::Path::new(path), 0o600);
     Ok(())
-}
-
-fn set_mode(path: &std::path::Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        if let Ok(meta) = fs::metadata(path) {
-            let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            let _ = fs::set_permissions(path, permissions);
-        }
-    }
 }
 
 pub struct InMemoryAuthStore<T>

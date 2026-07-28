@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -19,7 +19,9 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+#[cfg(test)]
+use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::anthropic::{
     error::json_error,
@@ -27,8 +29,12 @@ use crate::anthropic::{
 };
 use crate::monitor::MonitorHandle;
 use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
+use crate::providers::downstream_queue::{
+    self, BudgetedChunk, ByteBudget, SendOutcome as GrokChunkSendOutcome,
+};
 use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::retry::sleep;
+use crate::timeutil::now_ms;
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
 use self::auth::token_store::file_store_with_migration;
@@ -641,7 +647,7 @@ where
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
-            .map(|chunk: GrokBudgetedChunk| (Ok::<Bytes, Infallible>(chunk.bytes), rx))
+            .map(|chunk: BudgetedChunk| (Ok::<Bytes, Infallible>(chunk.into_bytes()), rx))
     });
     (
         [
@@ -653,61 +659,29 @@ where
         .into_response()
 }
 
-struct GrokBudgetedChunk {
-    bytes: Bytes,
-    _permit: Option<OwnedSemaphorePermit>,
-}
-
-enum GrokChunkSendOutcome {
-    Sent,
-    Closed,
-    Deadline,
-    Stalled,
-    TooLarge,
-}
-
 async fn send_grok_chunk(
-    tx: &mpsc::Sender<GrokBudgetedChunk>,
-    budget: &Arc<Semaphore>,
+    tx: &mpsc::Sender<BudgetedChunk>,
+    budget: &ByteBudget,
     bytes: Vec<u8>,
     deadline: tokio::time::Instant,
 ) -> GrokChunkSendOutcome {
-    if bytes.len() > GROK_DOWNSTREAM_QUEUE_BYTES {
-        return GrokChunkSendOutcome::TooLarge;
-    }
-    let stall_deadline = tokio::time::Instant::now() + GROK_DOWNSTREAM_STALL_TIMEOUT;
-    let permit = tokio::select! {
-        biased;
-        _ = tokio::time::sleep_until(deadline) => return GrokChunkSendOutcome::Deadline,
-        _ = tokio::time::sleep_until(stall_deadline) => return GrokChunkSendOutcome::Stalled,
-        _ = tx.closed() => return GrokChunkSendOutcome::Closed,
-        permit = budget.clone().acquire_many_owned(bytes.len() as u32) => match permit {
-            Ok(permit) => permit,
-            Err(_) => return GrokChunkSendOutcome::Closed,
-        },
-    };
-    tokio::select! {
-        biased;
-        _ = tokio::time::sleep_until(deadline) => GrokChunkSendOutcome::Deadline,
-        _ = tokio::time::sleep_until(stall_deadline) => GrokChunkSendOutcome::Stalled,
-        _ = tx.closed() => GrokChunkSendOutcome::Closed,
-        result = tx.send(GrokBudgetedChunk {
-            bytes: Bytes::from(bytes),
-            _permit: Some(permit),
-        }) => if result.is_ok() {
-            GrokChunkSendOutcome::Sent
-        } else {
-            GrokChunkSendOutcome::Closed
-        },
-    }
+    downstream_queue::send_before_deadline(
+        tx,
+        budget,
+        bytes,
+        deadline,
+        GROK_DOWNSTREAM_STALL_TIMEOUT,
+        std::convert::identity,
+    )
+    .await
 }
 
-async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<GrokBudgetedChunk>) {
+async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<BudgetedChunk>) {
     let mut terminal_permit = match tx.clone().try_reserve_owned() {
         Ok(permit) => Some(permit),
         Err(_) => return,
     };
-    let budget = Arc::new(Semaphore::new(GROK_DOWNSTREAM_QUEUE_BYTES));
+    let budget = ByteBudget::new(GROK_DOWNSTREAM_QUEUE_BYTES);
     loop {
         let output = tokio::select! {
             biased;
@@ -755,14 +729,11 @@ async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<G
 }
 
 fn send_reserved_grok_terminal(
-    terminal_permit: &mut Option<mpsc::OwnedPermit<GrokBudgetedChunk>>,
+    terminal_permit: &mut Option<mpsc::OwnedPermit<BudgetedChunk>>,
     bytes: Vec<u8>,
 ) {
     if let Some(permit) = terminal_permit.take() {
-        let _ = permit.send(GrokBudgetedChunk {
-            bytes: Bytes::from(bytes),
-            _permit: None,
-        });
+        let _ = permit.send(BudgetedChunk::unbudgeted(bytes));
     }
 }
 
@@ -1564,13 +1535,6 @@ impl CliHandlers for GrokCli {
         Ok(())
     }
 }
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;

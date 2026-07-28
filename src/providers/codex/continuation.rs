@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::timeutil::now_ms;
+
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
@@ -40,13 +42,6 @@ pub struct ContinuationCandidate {
     pub input_delta: Option<Vec<ResponsesInputItem>>,
     pub input_delta_count: usize,
     pub disabled_reason: Option<String>,
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub fn continuation_candidate(

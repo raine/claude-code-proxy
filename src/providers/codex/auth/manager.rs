@@ -1,7 +1,7 @@
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
@@ -16,6 +16,7 @@ use crate::oauth_rotation::{
     write_refresh_pending,
 };
 use crate::providers::codex::dispatch_budget::CodexDispatchBudget;
+use crate::timeutil::now_ms;
 
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
@@ -128,13 +129,6 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         }
     }
 
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
-
     pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
         self.get_auth_inner(None).await
     }
@@ -168,7 +162,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             Err(error) => return Err(error),
         };
 
-        if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+        if stored.expires > now_ms() + REFRESH_MARGIN_MS {
             return Ok(stored);
         }
 
@@ -273,7 +267,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             .await?
             .ok_or_else(|| CodexAuthError::credentials_invalid("Not authenticated"))?;
 
-        if (!force && current.expires > Self::now_ms() + REFRESH_MARGIN_MS)
+        if (!force && current.expires > now_ms() + REFRESH_MARGIN_MS)
             || rejected_access.is_some_and(|access| current.access != access)
         {
             return Ok(current);
@@ -366,7 +360,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             refresh_outcome_unknown(format!("the token response was incomplete: {error}"))
         })?;
         let account_id = extract_account_id(&tokens).or_else(|| current.account_id.clone());
-        let expires = Self::now_ms() + (tokens.expires_in.unwrap_or(3600) * 1000);
+        let expires = now_ms() + (tokens.expires_in.unwrap_or(3600) * 1000);
         let next = StoredAuth {
             access: tokens.access_token,
             refresh: tokens.refresh_token,
@@ -435,7 +429,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     ) -> Result<StoredAuth, anyhow::Error> {
         validate_token_response(tokens)?;
         let account_id = extract_account_id(tokens);
-        let expires = Self::now_ms() + (tokens.expires_in.unwrap_or(3600) * 1000);
+        let expires = now_ms() + (tokens.expires_in.unwrap_or(3600) * 1000);
         let auth = StoredAuth {
             access: tokens.access_token.clone(),
             refresh: tokens.refresh_token.clone(),

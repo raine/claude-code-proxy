@@ -14,6 +14,7 @@ use tokio_tungstenite::{
 };
 
 use crate::provider::RequestContext;
+use crate::timeutil::now_ms;
 use crate::traffic::TrafficCapture;
 
 use super::client::{CodexError, CodexErrorOrigin, CodexResponse};
@@ -299,13 +300,6 @@ impl WebSocketCircuitBreaker {
 
 static WS_CIRCUIT_BREAKER: once_cell::sync::Lazy<Mutex<WebSocketCircuitBreaker>> =
     once_cell::sync::Lazy::new(|| Mutex::new(WebSocketCircuitBreaker::default()));
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 pub fn clear_codex_websocket_pool_for_tests() {
     let mut guard = WS_POOL.lock().unwrap();

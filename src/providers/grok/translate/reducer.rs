@@ -260,6 +260,10 @@ impl GrokReductionError {
         Self { source, usage }
     }
 
+    pub(crate) fn malformed_event() -> Self {
+        Self::new(anyhow::anyhow!("malformed Grok SSE event"), None)
+    }
+
     pub fn usage(&self) -> Option<&GrokUsage> {
         self.usage.as_ref()
     }
@@ -1612,6 +1616,18 @@ pub fn reduce_upstream_bytes(bytes: &[u8]) -> Result<Vec<ReducerEvent>, GrokRedu
     reduce_upstream_bytes_with_tool_policy(bytes, &ToolCallPolicy::permissive())
 }
 
+pub(crate) fn reduce_decoded_values_with_tool_policy(
+    values: impl IntoIterator<Item = Value>,
+    tool_policy: &ToolCallPolicy,
+) -> Result<Vec<ReducerEvent>, GrokReductionError> {
+    let mut reducer = Reducer::with_tool_policy(tool_policy.clone());
+    let out = reducer
+        .push_batch(values)
+        .map_err(|error| GrokReductionError::new(error, reducer.usage().cloned()))?;
+    ensure_reducer_finished(&reducer)?;
+    Ok(out)
+}
+
 pub(crate) fn reduce_upstream_bytes_with_tool_policy(
     bytes: &[u8],
     tool_policy: &ToolCallPolicy,
@@ -1623,24 +1639,28 @@ pub(crate) fn reduce_upstream_bytes_with_tool_policy(
         .map_err(|error| GrokReductionError::new(error, None))?
         .into_iter()
         .map(|event| {
-            serde_json::from_str(&event.data)
-                .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))
+            serde_json::from_str(&event.data).map_err(|_| GrokReductionError::malformed_event())
         })
-        .collect::<anyhow::Result<Vec<Value>>>()
-        .map_err(|error| GrokReductionError::new(error, None))?;
+        .collect::<Result<Vec<Value>, GrokReductionError>>()?;
     let out = reducer
         .push_batch(values)
         .map_err(|error| GrokReductionError::new(error, reducer.usage().cloned()))?;
     decoder
         .finish()
         .map_err(|error| GrokReductionError::new(error, reducer.usage().cloned()))?;
-    if !reducer.finished() {
-        return Err(GrokReductionError::new(
+    ensure_reducer_finished(&reducer)?;
+    Ok(out)
+}
+
+fn ensure_reducer_finished(reducer: &Reducer) -> Result<(), GrokReductionError> {
+    if reducer.finished() {
+        Ok(())
+    } else {
+        Err(GrokReductionError::new(
             anyhow::anyhow!("Grok stream ended without completion"),
             reducer.usage().cloned(),
-        ));
+        ))
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -3783,5 +3803,66 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(9));
         assert_eq!(usage.output_tokens, Some(1));
         assert_eq!(error.upstream_failure().unwrap().status, 503);
+    }
+
+    #[test]
+    fn byte_and_decoded_value_reduction_are_equivalent() {
+        let values = vec![
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "delta":"answer"
+            }),
+            serde_json::json!({"type":"response.output_text.done"}),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"usage":{"input_tokens":7,"output_tokens":2}}
+            }),
+        ];
+        let wire = values
+            .iter()
+            .map(|value| format!("data: {value}\n\n"))
+            .collect::<String>();
+
+        let from_bytes = reduce_upstream_bytes(wire.as_bytes()).unwrap();
+        let from_values =
+            reduce_decoded_values_with_tool_policy(values, &ToolCallPolicy::permissive()).unwrap();
+
+        assert_eq!(format!("{from_bytes:#?}"), format!("{from_values:#?}"));
+    }
+
+    #[test]
+    fn decoded_value_reduction_remains_fail_closed_after_terminal() {
+        let error = reduce_decoded_values_with_tool_policy(
+            [
+                serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"usage":{}}
+                }),
+                serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "delta":"must not escape"
+                }),
+            ],
+            &ToolCallPolicy::permissive(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("event after terminal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn byte_reduction_keeps_usage_on_incomplete_decoder_tail() {
+        let error = reduce_upstream_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\ndata: {",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("incomplete frame"), "{error}");
+        let usage = error.usage().expect("decoded terminal usage must survive");
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(2));
     }
 }

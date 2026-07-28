@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use url::Url;
@@ -10,6 +10,7 @@ use super::pkce::{PkceCodes, generate_pkce, generate_state};
 use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 use crate::oauth_http::{MAX_OAUTH_JSON_BYTES, read_json_blocking};
+use crate::timeutil::now_ms;
 
 pub const CANONICAL_ISSUER: &str = "https://auth.x.ai";
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -286,13 +287,6 @@ fn open_browser(url: &str) {
             .args(command.1)
             .spawn();
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use super::reducer::{
-    GrokUsage, ReducerEvent, parse_function_arguments, reduce_upstream_bytes_with_tool_policy,
+    GrokReductionError, GrokUsage, ReducerEvent, parse_function_arguments,
+    reduce_decoded_values_with_tool_policy,
 };
 use super::stream::anthropic_usage;
 use super::tool_policy::ToolCallPolicy;
@@ -50,11 +51,26 @@ pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
             return Err(error);
         }
     };
-    if let Some(capture) = capture.as_mut() {
-        for event in events {
-            match serde_json::from_str::<Value>(&event.data) {
-                Ok(value) => capture.upstream_event(event.event.as_deref(), &value),
-                Err(_) => capture.malformed("json", "malformed_event"),
+    let mut values = Vec::with_capacity(events.len());
+    let mut malformed_event = false;
+    for event in events {
+        match serde_json::from_str::<Value>(&event.data) {
+            Ok(value) => {
+                if let Some(capture) = capture.as_mut() {
+                    capture.upstream_event(event.event.as_deref(), &value);
+                }
+                if !malformed_event {
+                    values.push(value);
+                }
+            }
+            Err(_) => {
+                malformed_event = true;
+                values.clear();
+                if let Some(capture) = capture.as_mut() {
+                    capture.malformed("json", "malformed_event");
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -65,14 +81,12 @@ pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
         finish_capture(capture.take(), traffic, "error", None);
         return Err(error);
     }
-    let mut blocks: Vec<Value> = Vec::new();
-    let mut block_positions = HashMap::new();
-    let mut stop = "end_turn".to_string();
-    let mut input = 0;
-    let mut output = 0;
-    let mut reported_usage: Option<GrokUsage> = None;
-    let mut web_search_requests = 0;
-    let reduced = match reduce_upstream_bytes_with_tool_policy(upstream, tool_policy) {
+    let reduced = if malformed_event {
+        Err(GrokReductionError::malformed_event())
+    } else {
+        reduce_decoded_values_with_tool_policy(values, tool_policy)
+    };
+    let reduced = match reduced {
         Ok(events) => events,
         Err(error) => {
             let usage = error.usage().cloned();
@@ -83,6 +97,13 @@ pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
             return Err(error.into());
         }
     };
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut block_positions = HashMap::new();
+    let mut stop = "end_turn".to_string();
+    let mut input = 0;
+    let mut output = 0;
+    let mut reported_usage: Option<GrokUsage> = None;
+    let mut web_search_requests = 0;
     for event in reduced {
         match event {
             ReducerEvent::ThinkingStart(_)
@@ -412,5 +433,14 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    #[test]
+    fn accumulate_malformed_json_keeps_reduction_error_contract() {
+        let error =
+            accumulate_response(b"data: {bad json}\n\n", "message", "grok-4.5").unwrap_err();
+
+        assert_eq!(error.to_string(), "malformed Grok SSE event");
+        assert!(error.downcast_ref::<GrokReductionError>().is_some());
     }
 }

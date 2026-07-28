@@ -22,6 +22,9 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
+use crate::providers::downstream_queue::{
+    self, BudgetedChunk, ByteBudget, SendOutcome as LiveChunkSendOutcome,
+};
 use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::providers::translate_shared::{
     ImageDecodeAdmissionError, acquire_image_decode_slot, is_claude_code_compaction_request,
@@ -29,6 +32,7 @@ use crate::providers::translate_shared::{
 };
 use crate::registry;
 use crate::retry::{ModelRetryBackoff, sleep};
+use crate::timeutil::now_ms;
 
 use self::auth::browser_login::run_browser_login;
 use self::auth::device::DeviceAuthClient;
@@ -1377,66 +1381,26 @@ fn empty_live_stream_response() -> Response {
     event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveChunkSendOutcome {
-    Sent,
-    Closed,
-    Deadline,
-    Stalled,
-    TooLarge,
-}
-
-struct BudgetedLiveChunk {
-    bytes: Bytes,
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
-}
-
 async fn send_live_chunk_before_deadline(
-    tx: &tokio::sync::mpsc::Sender<Result<BudgetedLiveChunk, std::io::Error>>,
-    byte_budget: &Arc<tokio::sync::Semaphore>,
+    tx: &tokio::sync::mpsc::Sender<Result<BudgetedChunk, std::io::Error>>,
+    byte_budget: &ByteBudget,
     chunk: Vec<u8>,
     deadline: client::CodexRequestDeadline,
 ) -> LiveChunkSendOutcome {
-    if chunk.len() > MAX_DOWNSTREAM_QUEUE_BYTES {
-        return LiveChunkSendOutcome::TooLarge;
-    }
-    if tokio::time::Instant::now() >= deadline.at() {
-        return LiveChunkSendOutcome::Deadline;
-    }
-    let stall_deadline = tokio::time::Instant::now() + DOWNSTREAM_STALL_TIMEOUT;
-    let byte_permit = tokio::select! {
-        biased;
-        _ = tokio::time::sleep_until(deadline.at()) => return LiveChunkSendOutcome::Deadline,
-        _ = tokio::time::sleep_until(stall_deadline) => return LiveChunkSendOutcome::Stalled,
-        _ = tx.closed() => return LiveChunkSendOutcome::Closed,
-        permit = byte_budget.clone().acquire_many_owned(chunk.len() as u32) => {
-            match permit {
-                Ok(permit) => permit,
-                Err(_) => return LiveChunkSendOutcome::Closed,
-            }
-        }
-    };
-    tokio::select! {
-        biased;
-        _ = tokio::time::sleep_until(deadline.at()) => LiveChunkSendOutcome::Deadline,
-        _ = tokio::time::sleep_until(stall_deadline) => LiveChunkSendOutcome::Stalled,
-        _ = tx.closed() => LiveChunkSendOutcome::Closed,
-        result = tx.send(Ok(BudgetedLiveChunk {
-            bytes: Bytes::from(chunk),
-            _permit: Some(byte_permit),
-        })) => {
-            if result.is_ok() {
-                LiveChunkSendOutcome::Sent
-            } else {
-                LiveChunkSendOutcome::Closed
-            }
-        }
-    }
+    downstream_queue::send_before_deadline(
+        tx,
+        byte_budget,
+        chunk,
+        deadline.at(),
+        DOWNSTREAM_STALL_TIMEOUT,
+        Ok,
+    )
+    .await
 }
 
 fn finish_live_stream_after_downstream_stall(
     terminal_permit: &mut Option<
-        tokio::sync::mpsc::OwnedPermit<Result<BudgetedLiveChunk, std::io::Error>>,
+        tokio::sync::mpsc::OwnedPermit<Result<BudgetedChunk, std::io::Error>>,
     >,
     translator: &mut LiveStreamTranslator,
     ctx: &RequestContext,
@@ -1451,17 +1415,14 @@ fn finish_live_stream_after_downstream_stall(
     if !chunk.is_empty() {
         record_live_stream_progress(ctx, &chunk);
         if let Some(permit) = terminal_permit.take() {
-            let _ = permit.send(Ok(BudgetedLiveChunk {
-                bytes: Bytes::from(chunk),
-                _permit: None,
-            }));
+            let _ = permit.send(Ok(BudgetedChunk::unbudgeted(chunk)));
         }
     }
 }
 
 fn finish_live_stream_at_deadline(
     terminal_permit: &mut Option<
-        tokio::sync::mpsc::OwnedPermit<Result<BudgetedLiveChunk, std::io::Error>>,
+        tokio::sync::mpsc::OwnedPermit<Result<BudgetedChunk, std::io::Error>>,
     >,
     translator: &mut LiveStreamTranslator,
     ctx: &RequestContext,
@@ -1477,10 +1438,7 @@ fn finish_live_stream_at_deadline(
         // One channel slot is reserved before ordinary streaming begins, so the
         // terminal deadline event cannot be displaced by a slow/full downstream.
         if let Some(permit) = terminal_permit.take() {
-            let _ = permit.send(Ok(BudgetedLiveChunk {
-                bytes: Bytes::from(chunk),
-                _permit: None,
-            }));
+            let _ = permit.send(Ok(BudgetedChunk::unbudgeted(chunk)));
         }
     }
 }
@@ -1525,10 +1483,10 @@ fn remaining_live_stream_response_with_heartbeat(
     mut generation_started: bool,
     heartbeat_interval: Duration,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedLiveChunk, std::io::Error>>(
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedChunk, std::io::Error>>(
         LIVE_EVENT_CHANNEL_CAPACITY,
     );
-    let byte_budget = Arc::new(tokio::sync::Semaphore::new(MAX_DOWNSTREAM_QUEUE_BYTES));
+    let byte_budget = ByteBudget::new(MAX_DOWNSTREAM_QUEUE_BYTES);
     tokio::spawn(async move {
         let mut terminal_permit = match tx.clone().try_reserve_owned() {
             Ok(permit) => Some(permit),
@@ -1572,10 +1530,7 @@ fn remaining_live_stream_response_with_heartbeat(
                             ctx.traffic.as_deref(),
                         );
                         if let Some(permit) = terminal_permit.take() {
-                            let _ = permit.send(Ok(BudgetedLiveChunk {
-                                bytes: Bytes::from(chunk),
-                                _permit: None,
-                            }));
+                            let _ = permit.send(Ok(BudgetedChunk::unbudgeted(chunk)));
                         }
                         return;
                     }
@@ -1753,7 +1708,7 @@ fn remaining_live_stream_response_with_heartbeat(
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| {
-            let item = item.map(|chunk| chunk.bytes);
+            let item = item.map(BudgetedChunk::into_bytes);
             (item, rx)
         })
     });
@@ -2087,13 +2042,6 @@ pub(crate) static CODEX_CLI: CodexCli = CodexCli;
 // ---------------------------------------------------------------------------
 // CLI helpers
 // ---------------------------------------------------------------------------
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 fn format_expiry(expires: u64, now: u64) -> String {
     let remaining = (i128::from(expires) - i128::from(now)).div_euclid(1000);
@@ -3403,7 +3351,7 @@ mod tests {
     #[tokio::test]
     async fn live_chunk_byte_budget_is_held_until_the_consumer_drops_the_chunk() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let byte_budget = Arc::new(tokio::sync::Semaphore::new(4));
+        let byte_budget = ByteBudget::new(4);
         let deadline = client::CodexRequestDeadline::from_timeout_ms(1_000);
 
         assert_eq!(
@@ -3430,7 +3378,7 @@ mod tests {
     #[tokio::test]
     async fn live_chunk_larger_than_the_queue_budget_is_rejected_without_enqueueing() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let byte_budget = Arc::new(tokio::sync::Semaphore::new(MAX_DOWNSTREAM_QUEUE_BYTES));
+        let byte_budget = ByteBudget::new(MAX_DOWNSTREAM_QUEUE_BYTES);
 
         assert_eq!(
             send_live_chunk_before_deadline(
