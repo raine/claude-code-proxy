@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
+use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
@@ -595,7 +596,7 @@ async fn live_stream_response_once(
             generation_started = true;
         }
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
-        let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
+        let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
             Err(message) => {
@@ -651,6 +652,7 @@ async fn live_stream_response_once(
             };
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
+            record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
@@ -684,6 +686,7 @@ async fn live_stream_response_once(
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
             }
+            record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
             return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
         }
@@ -720,11 +723,29 @@ fn codex_generation_event(payload: &serde_json::Value) -> bool {
 fn translate_live_stream_payload(
     translator: &mut LiveStreamTranslator,
     payload: &serde_json::Value,
-    ctx: &RequestContext,
+    traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
-    let chunk = translator.accept(payload, ctx.traffic.as_deref())?;
+    let chunk = translator.accept(payload, traffic)?;
     let terminal = is_codex_terminal_event(payload) || translator.is_finished();
     Ok((chunk, terminal))
+}
+
+fn record_live_stream_downstream_capture(ctx: &RequestContext, chunk: &[u8]) {
+    let Some(traffic) = ctx.traffic.as_ref() else {
+        return;
+    };
+    for event in parse_sse_events(chunk) {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+            continue;
+        };
+        traffic.write_json_event(
+            "050-downstream-event",
+            &serde_json::json!({
+                "event": event.event.as_deref().unwrap_or("message"),
+                "data": data,
+            }),
+        );
+    }
 }
 
 fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
@@ -776,28 +797,31 @@ fn remaining_live_stream_response(
             match item {
                 Ok(payload) => {
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
-                    let (chunk, terminal) =
-                        match translate_live_stream_payload(&mut translator, &payload, &ctx) {
-                            Ok(result) => result,
-                            Err(message) => {
-                                abort_request_state(
-                                    ctx.session_id.as_deref(),
-                                    turn_id,
-                                    compact_boundary,
-                                    &request_body,
-                                );
-                                let chunk = translator.error_chunk(
-                                    &message,
-                                    "api_error",
-                                    ctx.traffic.as_deref(),
-                                );
-                                if !chunk.is_empty() {
-                                    record_live_stream_progress(&ctx, &chunk);
-                                    let _ = tx.send(Ok(Bytes::from(chunk))).await;
-                                }
-                                return;
+                    let (chunk, terminal) = match translate_live_stream_payload(
+                        &mut translator,
+                        &payload,
+                        ctx.traffic.as_deref(),
+                    ) {
+                        Ok(result) => result,
+                        Err(message) => {
+                            abort_request_state(
+                                ctx.session_id.as_deref(),
+                                turn_id,
+                                compact_boundary,
+                                &request_body,
+                            );
+                            let chunk = translator.error_chunk(
+                                &message,
+                                "api_error",
+                                ctx.traffic.as_deref(),
+                            );
+                            if !chunk.is_empty() {
+                                record_live_stream_progress(&ctx, &chunk);
+                                let _ = tx.send(Ok(Bytes::from(chunk))).await;
                             }
-                        };
+                            return;
+                        }
+                    };
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {

@@ -1879,6 +1879,7 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
 async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full_context() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
@@ -1886,6 +1887,8 @@ async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full
     let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_websocket_empty_completion_then_retry_upstream(captured.clone()).await;
 
+    let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
@@ -1924,6 +1927,22 @@ async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full
         String::from_utf8_lossy(&second_body)
     );
 
+    let downstream_end_turns = traffic_files(state.path())
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("050-downstream-event.json"))
+        })
+        .filter_map(|path| std::fs::read(path).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|event| event["data"]["delta"]["stop_reason"] == "end_turn")
+        .count();
+    assert_eq!(
+        downstream_end_turns, 2,
+        "discarded empty attempts must not be captured as downstream events"
+    );
+
     let guard = captured.lock().unwrap();
     assert_eq!(guard.len(), 3, "expected full-context retry request");
     assert!(guard[0].get("previous_response_id").is_none());
@@ -1937,23 +1956,6 @@ async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full
 
     clear_all_continuations_for_tests();
     clear_codex_websocket_pool_for_tests();
-}
-
-/// Resets the retry-delay override even when the test panics, so later tests
-/// in this process keep real backoff behavior.
-struct ZeroRetryDelayGuard;
-
-impl ZeroRetryDelayGuard {
-    fn enable() -> Self {
-        claude_code_proxy::retry::set_zero_retry_delay_for_tests(true);
-        ZeroRetryDelayGuard
-    }
-}
-
-impl Drop for ZeroRetryDelayGuard {
-    fn drop(&mut self) {
-        claude_code_proxy::retry::set_zero_retry_delay_for_tests(false);
-    }
 }
 
 #[allow(clippy::await_holding_lock)]
