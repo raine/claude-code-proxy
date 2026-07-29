@@ -64,11 +64,22 @@ pub struct LiveStreamTranslator {
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
     semantic_output_started: bool,
+    // Seeds Claude Code's live subagent counter until the provider returns
+    // authoritative usage in the terminal message_delta.
+    estimated_input_tokens: u64,
     finished: bool,
 }
 
 impl LiveStreamTranslator {
     pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_estimated_input_tokens(message_id, model, 0)
+    }
+
+    pub fn with_estimated_input_tokens(
+        message_id: impl Into<String>,
+        model: impl Into<String>,
+        estimated_input_tokens: u64,
+    ) -> Self {
         Self {
             message_id: message_id.into(),
             model: model.into(),
@@ -84,6 +95,7 @@ impl LiveStreamTranslator {
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
             semantic_output_started: false,
+            estimated_input_tokens,
             finished: false,
         }
     }
@@ -231,7 +243,7 @@ impl LiveStreamTranslator {
                     "stop_reason": null,
                     "stop_sequence": null,
                     "usage": {
-                        "input_tokens": 0,
+                        "input_tokens": self.estimated_input_tokens,
                         "output_tokens": 0
                     }
                 }
@@ -1169,6 +1181,7 @@ fn error_message(payload: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::sse::parse_sse_events;
     use serde_json::json;
 
     fn render(events: Vec<serde_json::Value>) -> String {
@@ -1200,6 +1213,57 @@ mod tests {
         assert!(out.contains("hello"));
         assert!(!out.contains("message_stop"));
         assert!(translator.has_semantic_output());
+    }
+
+    #[test]
+    fn estimated_input_is_visible_at_start_and_provider_usage_is_exact_at_finish() {
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 321);
+
+        let started = translator
+            .accept(
+                &json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "abcdefgh"
+                }),
+                None,
+            )
+            .unwrap();
+        let started = parse_sse_events(&started)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_start")
+            })
+            .unwrap();
+        assert_eq!(
+            started.pointer("/message/usage/input_tokens"),
+            Some(&json!(321))
+        );
+
+        let finished = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "usage": {"input_tokens": 300, "output_tokens": 9}
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+        let finished = parse_sse_events(&finished)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_delta")
+            })
+            .unwrap();
+        assert_eq!(finished.pointer("/usage/input_tokens"), Some(&json!(300)));
+        assert_eq!(finished.pointer("/usage/output_tokens"), Some(&json!(9)));
     }
 
     #[test]

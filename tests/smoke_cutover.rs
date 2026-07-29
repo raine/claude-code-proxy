@@ -1012,6 +1012,10 @@ async fn smoke_codex_http_stream_retries_empty_completion() {
         body_text.contains("buffered stream retry ok"),
         "expected retried text in SSE body: {body_text}"
     );
+    assert!(
+        !body_text.contains(r#""input_tokens":0"#),
+        "message_start should expose the request token estimate: {body_text}"
+    );
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
@@ -1635,6 +1639,10 @@ async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
     assert!(read.is_ok(), "stream did not yield an early text delta");
     let text = String::from_utf8_lossy(&collected);
     assert!(text.contains("early chunk"), "stream body: {text}");
+    assert!(
+        !text.contains(r#""input_tokens":0"#),
+        "message_start should expose the request token estimate: {text}"
+    );
     assert!(
         !text.contains("message_stop"),
         "stream finished too early: {text}"

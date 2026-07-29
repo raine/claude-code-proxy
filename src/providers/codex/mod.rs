@@ -353,10 +353,12 @@ impl Provider for CodexProvider {
         };
 
         if want_stream {
+            let estimated_input_tokens = count_translated_tokens(&translated);
             let sse_bytes = match translate_stream_bytes_with_traffic(
                 &upstream.body,
                 &message_id,
                 model,
+                estimated_input_tokens,
                 ctx.traffic.as_deref(),
             ) {
                 Ok(b) => b,
@@ -647,7 +649,12 @@ async fn live_stream_response_once(
     request_body: translate::request::ResponsesRequest,
     compact_boundary: bool,
 ) -> LiveStreamStart {
-    let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
+    let estimated_input_tokens = count_translated_tokens(&request_body);
+    let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
+        message_id,
+        model.to_string(),
+        estimated_input_tokens,
+    );
     let mut upstream_sse_body = Vec::new();
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.

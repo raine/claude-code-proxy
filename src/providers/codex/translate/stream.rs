@@ -15,6 +15,12 @@ enum OpenBlock {
     Tool { id: String, name: String },
 }
 
+struct MessageMetadata<'a> {
+    id: &'a str,
+    model: &'a str,
+    estimated_input_tokens: u64,
+}
+
 fn emit(
     out: &mut Vec<u8>,
     traffic: Option<&TrafficCapture>,
@@ -37,23 +43,22 @@ fn ensure_message_start(
     out: &mut Vec<u8>,
     traffic: Option<&TrafficCapture>,
     message_started: &mut bool,
-    message_id: &str,
-    model: &str,
+    message: &MessageMetadata<'_>,
 ) {
     if !*message_started {
         *message_started = true;
         let data = serde_json::json!({
             "type": "message_start",
             "message": {
-                "id": message_id,
+                "id": message.id,
                 "type": "message",
                 "role": "assistant",
-                "model": model,
+                "model": message.model,
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": 0,
+                    "input_tokens": message.estimated_input_tokens,
                     "output_tokens": 0,
                 }
             }
@@ -67,13 +72,12 @@ fn emit_content_event(
     traffic: Option<&TrafficCapture>,
     message_started: &mut bool,
     open_blocks: &mut BTreeMap<usize, OpenBlock>,
-    message_id: &str,
-    model: &str,
+    message: &MessageMetadata<'_>,
     event: &ReducerEvent,
 ) -> bool {
     match event {
         ReducerEvent::ThinkingStart { index } => {
-            ensure_message_start(out, traffic, message_started, message_id, model);
+            ensure_message_start(out, traffic, message_started, message);
             open_blocks.insert(*index, OpenBlock::Thinking);
             emit(
                 out,
@@ -127,7 +131,7 @@ fn emit_content_event(
             true
         }
         ReducerEvent::TextStart { index } => {
-            ensure_message_start(out, traffic, message_started, message_id, model);
+            ensure_message_start(out, traffic, message_started, message);
             open_blocks.insert(*index, OpenBlock::Text);
             emit(
                 out,
@@ -168,7 +172,7 @@ fn emit_content_event(
             true
         }
         ReducerEvent::ToolStart { index, id, name } => {
-            ensure_message_start(out, traffic, message_started, message_id, model);
+            ensure_message_start(out, traffic, message_started, message);
             open_blocks.insert(
                 *index,
                 OpenBlock::Tool {
@@ -250,13 +254,14 @@ pub fn translate_stream_bytes(
     message_id: &str,
     model: &str,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    translate_stream_bytes_with_traffic(upstream, message_id, model, None)
+    translate_stream_bytes_with_traffic(upstream, message_id, model, 0, None)
 }
 
 pub fn translate_stream_bytes_with_traffic(
     upstream: &[u8],
     message_id: &str,
     model: &str,
+    estimated_input_tokens: u64,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let events = match reduce_upstream_bytes(upstream) {
@@ -276,6 +281,11 @@ pub fn translate_stream_bytes_with_traffic(
     let mut open_blocks: BTreeMap<usize, OpenBlock> = BTreeMap::new();
     let mut web_search_events: Vec<ReducerEvent> = Vec::new();
     let mut deferred_content_events: Vec<ReducerEvent> = Vec::new();
+    let message = MessageMetadata {
+        id: message_id,
+        model,
+        estimated_input_tokens,
+    };
 
     for event in &events {
         if matches!(event, ReducerEvent::WebSearch { .. }) {
@@ -292,8 +302,7 @@ pub fn translate_stream_bytes_with_traffic(
             traffic,
             &mut message_started,
             &mut open_blocks,
-            message_id,
-            model,
+            &message,
             event,
         ) {
             continue;
@@ -326,8 +335,7 @@ pub fn translate_stream_bytes_with_traffic(
                                     &mut out,
                                     traffic,
                                     &mut message_started,
-                                    message_id,
-                                    model,
+                                    &message,
                                 );
                                 emit(
                                     &mut out,
@@ -416,13 +424,12 @@ pub fn translate_stream_bytes_with_traffic(
                         traffic,
                         &mut message_started,
                         &mut open_blocks,
-                        message_id,
-                        model,
+                        &message,
                         deferred,
                     );
                 }
 
-                ensure_message_start(&mut out, traffic, &mut message_started, message_id, model);
+                ensure_message_start(&mut out, traffic, &mut message_started, &message);
 
                 let mapped = map_codex_usage_to_anthropic(usage, Some(*web_search_requests));
                 emit(
@@ -515,11 +522,15 @@ mod tests {
             ),
         );
         let out = String::from_utf8(
-            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+            translate_stream_bytes_with_traffic(upstream.as_bytes(), "msg_1", "gpt-5.5", 321, None)
+                .unwrap(),
         )
         .unwrap();
         assert!(out.contains("message_start"));
+        assert!(out.contains(r#""input_tokens":321"#));
         assert!(out.contains("text_delta"));
+        assert!(out.contains(r#""input_tokens":5"#));
+        assert!(out.contains(r#""output_tokens":1"#));
         assert!(out.contains("message_stop"));
     }
 
