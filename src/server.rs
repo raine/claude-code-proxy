@@ -6,6 +6,11 @@ use crate::{
     provider::RequestContext,
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
+        images::{
+            CodexImagesBackend, ImageOperation, ImageRequestError, MAX_EDIT_REQUEST_BYTES,
+            MAX_GENERATION_REQUEST_BYTES, MultipartEditInput, UploadedImage, image_error_response,
+            prepare_json_request, prepare_multipart_edit,
+        },
         native::{
             CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
         },
@@ -17,7 +22,7 @@ use crate::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
     http::{Request, StatusCode},
     response::Response,
     routing::{get, post},
@@ -160,11 +165,31 @@ pub async fn serve_listener(
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
-    app_with_options(registry, None, crate::config::codex_responses_api())
+    app_with_features(
+        registry,
+        None,
+        AppFeatures {
+            responses_api: crate::config::codex_responses_api(),
+            images_api: crate::config::codex_images_api(),
+        },
+    )
 }
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
-    app_with_options(registry, monitor, crate::config::codex_responses_api())
+    app_with_features(
+        registry,
+        monitor,
+        AppFeatures {
+            responses_api: crate::config::codex_responses_api(),
+            images_api: crate::config::codex_images_api(),
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppFeatures {
+    pub responses_api: bool,
+    pub images_api: bool,
 }
 
 pub fn app_with_options(
@@ -172,23 +197,67 @@ pub fn app_with_options(
     monitor: Option<MonitorHandle>,
     responses_api: bool,
 ) -> Router {
-    let native_responses = responses_api.then(|| Arc::new(CodexNativeBackend::new()));
-    let chat_completions = responses_api.then(|| Arc::new(ChatCompletionsBackend::new()));
+    app_with_features(
+        registry,
+        monitor,
+        AppFeatures {
+            responses_api,
+            images_api: false,
+        },
+    )
+}
+
+pub fn app_with_features(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    features: AppFeatures,
+) -> Router {
+    let native_responses = features
+        .responses_api
+        .then(|| Arc::new(CodexNativeBackend::new()));
+    let chat_completions = features
+        .responses_api
+        .then(|| Arc::new(ChatCompletionsBackend::new()));
+    let images = if features.images_api {
+        match CodexImagesBackend::new() {
+            Ok(backend) => Some(Arc::new(backend)),
+            Err(error) => {
+                create_logger("server").warn(
+                    "codex images backend disabled by invalid configuration",
+                    Some(Map::from_iter([("error".to_string(), json!(error))])),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
         registry,
         monitor,
         native_responses,
         chat_completions,
+        images,
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
-    let router = if responses_api {
+    let router = if features.responses_api {
         router
             .route("/v1/responses", post(handler_responses))
             .route("/v1/chat/completions", post(handler_chat_completions))
+    } else {
+        router
+    };
+    let router = if features.images_api {
+        router
+            .route("/v1/images/generations", post(handler_image_generation))
+            .route(
+                "/v1/images/edits",
+                post(handler_image_edit).layer(DefaultBodyLimit::max(MAX_EDIT_REQUEST_BYTES)),
+            )
     } else {
         router
     };
@@ -201,6 +270,7 @@ struct AppState {
     monitor: Option<MonitorHandle>,
     native_responses: Option<Arc<CodexNativeBackend>>,
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
+    images: Option<Arc<CodexImagesBackend>>,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -251,6 +321,265 @@ async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>
 
 async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     dispatch_request(state, req, true).await
+}
+
+async fn handler_image_generation(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> Response {
+    dispatch_image_request(state, req, ImageOperation::Generation).await
+}
+
+async fn handler_image_edit(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    dispatch_image_request(state, req, ImageOperation::Edit).await
+}
+
+async fn dispatch_image_request(
+    state: Arc<AppState>,
+    req: Request<Body>,
+    operation: ImageOperation,
+) -> Response {
+    let started_at = Instant::now();
+    let log = create_logger("server");
+    let req_id = Uuid::new_v4().to_string();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    let path = uri.path().to_string();
+    log.info(
+        "request",
+        Some(Map::from_iter([
+            ("reqId".to_string(), json!(&req_id)),
+            ("method".to_string(), json!("POST")),
+            ("path".to_string(), json!(&path)),
+            ("query".to_string(), json!(redacted_query(&uri))),
+        ])),
+    );
+    let session_id = native_session_id(&headers);
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Images);
+    }
+    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+
+    if uri.query().is_some() {
+        let response = image_error_response(ImageRequestError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Image endpoints do not accept query parameters".to_string(),
+            param: None,
+            code: Some("invalid_request"),
+        });
+        log_native_request_completed(
+            &log,
+            &req_id,
+            operation.label(),
+            None,
+            response.status(),
+            started_at,
+        );
+        return monitor_response_body(response, request_guard);
+    }
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let prepared = if content_type.starts_with("application/json") {
+        let limit = match operation {
+            ImageOperation::Generation => MAX_GENERATION_REQUEST_BYTES,
+            ImageOperation::Edit => MAX_EDIT_REQUEST_BYTES,
+        };
+        let body = match axum::body::to_bytes(req.into_body(), limit).await {
+            Ok(body) => body,
+            Err(_) => {
+                let response = image_error_response(ImageRequestError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    message: "Image request exceeded the size limit".to_string(),
+                    param: None,
+                    code: Some("request_too_large"),
+                });
+                log_native_request_completed(
+                    &log,
+                    &req_id,
+                    operation.label(),
+                    None,
+                    response.status(),
+                    started_at,
+                );
+                return monitor_response_body(response, request_guard);
+            }
+        };
+        prepare_json_request(operation, &body)
+    } else if operation == ImageOperation::Edit && content_type.starts_with("multipart/form-data") {
+        let multipart = match Multipart::from_request(req, &()).await {
+            Ok(multipart) => multipart,
+            Err(_) => {
+                let response = image_error_response(ImageRequestError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "Invalid multipart image edit request".to_string(),
+                    param: None,
+                    code: Some("invalid_multipart"),
+                });
+                log_native_request_completed(
+                    &log,
+                    &req_id,
+                    operation.label(),
+                    None,
+                    response.status(),
+                    started_at,
+                );
+                return monitor_response_body(response, request_guard);
+            }
+        };
+        parse_multipart_image_edit(multipart).await
+    } else {
+        let response = image_error_response(ImageRequestError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: if operation == ImageOperation::Edit {
+                "Image edit request must use application/json or multipart/form-data".to_string()
+            } else {
+                "Image generation request must use application/json".to_string()
+            },
+            param: None,
+            code: Some("unsupported_media_type"),
+        });
+        log_native_request_completed(
+            &log,
+            &req_id,
+            operation.label(),
+            None,
+            response.status(),
+            started_at,
+        );
+        return monitor_response_body(response, request_guard);
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let response = image_error_response(error);
+            log_native_request_completed(
+                &log,
+                &req_id,
+                operation.label(),
+                None,
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
+        }
+    };
+    let model = prepared.model.clone();
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.provider_selected(&req_id, "codex", &model, None);
+    }
+    let context = RequestContext {
+        req_id: req_id.clone(),
+        session_id,
+        session_seq: None,
+        provider: "codex".to_string(),
+        traffic: None,
+        monitor: state.monitor.clone(),
+    };
+    let response = match state.images.as_ref() {
+        Some(backend) => backend.handle(operation, prepared, context).await,
+        None => image_error_response(ImageRequestError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Codex Images API is unavailable".to_string(),
+            param: None,
+            code: Some("images_api_unavailable"),
+        }),
+    };
+    log_native_request_completed(
+        &log,
+        &req_id,
+        operation.label(),
+        Some(&model),
+        response.status(),
+        started_at,
+    );
+    monitor_response_body(response, request_guard)
+}
+
+async fn parse_multipart_image_edit(
+    mut multipart: Multipart,
+) -> Result<crate::providers::codex::images::PreparedImageRequest, ImageRequestError> {
+    let mut input = MultipartEditInput::default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| ImageRequestError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid multipart image edit request".to_string(),
+            param: None,
+            code: Some("invalid_multipart"),
+        })?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "image" | "image[]" => {
+                let bytes = field.bytes().await.map_err(|_| ImageRequestError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "Failed to read uploaded image".to_string(),
+                    param: Some("image"),
+                    code: Some("invalid_image"),
+                })?;
+                input.images.push(UploadedImage {
+                    bytes, // EFFICIENCY: field.bytes() already returns owned Bytes, avoid to_vec() copy
+                });
+            }
+            "prompt" => {
+                input.prompt = Some(multipart_text(field, "prompt").await?);
+            }
+            "model" => {
+                input.model = Some(multipart_text(field, "model").await?);
+            }
+            "background" => {
+                input.background = Some(multipart_text(field, "background").await?);
+            }
+            "quality" => {
+                input.quality = Some(multipart_text(field, "quality").await?);
+            }
+            "size" => {
+                input.size = Some(multipart_text(field, "size").await?);
+            }
+            "n" => {
+                let raw = multipart_text(field, "n").await?;
+                input.n = Some(raw.parse::<u8>().map_err(|_| ImageRequestError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "'n' must be an integer between 1 and 10".to_string(),
+                    param: Some("n"),
+                    code: Some("invalid_request"),
+                })?);
+            }
+            "mask" => {
+                return Err(ImageRequestError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "Image masks are not supported by the Codex image backend".to_string(),
+                    param: Some("mask"),
+                    code: Some("unsupported_parameter"),
+                });
+            }
+            _ => {
+                return Err(ImageRequestError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: format!("Unsupported multipart field '{name}'"),
+                    param: None,
+                    code: Some("unsupported_parameter"),
+                });
+            }
+        }
+    }
+    prepare_multipart_edit(input)
+}
+
+async fn multipart_text(
+    field: axum::extract::multipart::Field<'_>,
+    param: &'static str,
+) -> Result<String, ImageRequestError> {
+    field.text().await.map_err(|_| ImageRequestError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("Invalid multipart '{param}' field"),
+        param: Some(param),
+        code: Some("invalid_multipart"),
+    })
 }
 
 async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {

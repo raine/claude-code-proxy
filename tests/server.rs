@@ -3,7 +3,10 @@ use axum::http::{Method, Request, StatusCode};
 use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     registry::Registry,
-    server::{app, app_with_monitor, app_with_options, bind_proxy_listener},
+    server::{
+        AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
+        bind_proxy_listener,
+    },
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -249,6 +252,188 @@ async fn opus_5_alias_routes_to_provider() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
+    let features = AppFeatures {
+        responses_api: false,
+        images_api: true,
+    };
+    let variation = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        features,
+    )
+    .oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/variations")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(variation.status(), StatusCode::NOT_FOUND);
+
+    let wrong_media = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        features,
+    )
+    .oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .header("content-type", "multipart/form-data; boundary=x")
+            .body(Body::from("--x--\r\n"))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrong_media.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let oversized = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        features,
+    )
+    .oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/images/generations")
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b'x'; 256 * 1024 + 1]))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn monitor_tracks_image_endpoint_without_session_affinity() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+        AppFeatures {
+            responses_api: false,
+            images_api: true,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(body_string("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(state.recent[0].endpoint.label(), "images");
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    assert!(state.recent[0].session_seq.is_none());
+    assert!(state.recent[0].traffic_capture_path.is_none());
+}
+
+#[tokio::test]
+async fn image_edit_accepts_multipart_and_validates_fields() {
+    let app = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: false,
+            images_api: true,
+        },
+    );
+    let boundary = "ccp-image-test";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/edits")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["param"], "prompt");
+}
+
+#[tokio::test]
+async fn image_routes_are_independently_opt_in() {
+    let disabled = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: false,
+            images_api: false,
+        },
+    );
+    let response = disabled
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(body_string("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let enabled = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: false,
+            images_api: true,
+        },
+    );
+    let response = enabled
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(body_string("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

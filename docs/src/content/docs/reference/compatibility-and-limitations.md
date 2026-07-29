@@ -27,6 +27,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Claude Code title generation and other structured background requests are forwarded and consume provider tokens.
 - Anthropic-specific fields without a provider mapping can be dropped.
 - Native OpenAI Responses passthrough is opt-in and limited to registered Codex models and response creation.
+- Codex Images passthrough is separately opt-in, restricted to `gpt-image-2`, and supports generation plus JSON or multipart edits. Variations, masks, remote image URLs, and URL-formatted outputs are unsupported.
 
 ## Models and context
 
@@ -73,7 +74,8 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 - Structured logs redact known credential keys, but user-provided strings can still contain secrets.
 - Error captures contain complete redacted failed responses.
-- Traffic captures intentionally preserve prompts and tool content.
+- Traffic captures intentionally preserve prompts and tool content for message/Responses diagnostics.
+- Image generation and edit routes never create traffic captures or persist prompts, uploads, data URLs, generated base64, or upstream error bodies.
 - Verbose logging and traffic capture should be scoped to a focused local investigation.
 
 For provider-specific behavior, use the [provider pages](/providers/choosing-a-provider/). For released changes, see the [Changelog](/reference/changelog/).

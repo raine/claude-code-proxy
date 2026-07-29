@@ -82,6 +82,33 @@ A buffered response uses the standard `chat.completion` object. A streaming resp
 
 Function calls, hosted tools, images, audio, log probabilities, multiple choices, storage, and output token limits are outside this compatibility surface. Unsupported fields, including `max_tokens` and `max_completion_tokens`, return an OpenAI `invalid_request_error` with the field in `error.param`.
 
+## `POST /v1/images/generations`
+
+This route exists only when `CCP_CODEX_IMAGES_API=1` or `codex.imagesApi` is true. It reuses the proxy-owned ChatGPT/Codex OAuth session and forwards a bounded JSON request to the Codex image service:
+
+```json
+{
+  "prompt": "A paper-cut fox in a moonlit forest",
+  "model": "gpt-image-2",
+  "background": "auto",
+  "quality": "auto",
+  "size": "auto"
+}
+```
+
+`prompt` is required. `model` defaults to and is restricted to `gpt-image-2`; `background`, `quality`, and `size` default to `auto`. Optional `n` must be between 1 and 10. Unknown fields and URL response formats are rejected rather than silently forwarded. Successful responses contain `data[].b64_json`; the proxy never writes generated image data to traffic captures.
+
+## `POST /v1/images/edits`
+
+This route uses the same opt-in gate and accepts either:
+
+- Codex JSON with `images: [{"image_url":"data:image/png;base64,..."}]`; or
+- OpenAI-style `multipart/form-data` with one to five repeated `image` or `image[]` files and text fields `prompt`, `model`, `background`, `quality`, `size`, and `n`.
+
+Multipart PNG, JPEG, WebP, and GIF signatures are validated and translated to Codex data URLs. The internal Codex edit contract is JSON, so multipart is an ingress compatibility adapter. Masks, remote image URLs, variations, unsupported fields, and other media types return a 4xx OpenAI error. Request bodies, individual files, aggregate inputs, responses, and concurrency are bounded to protect the proxy process.
+
+The Images API is an internal ChatGPT Codex integration, not the public OpenAI Platform Images API. It consumes the signed-in ChatGPT account's entitlement and quota, and the internal contract can change independently of the public API.
+
 ## `POST /v1/responses`
 
 This route exists only when `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi` is true. It accepts a native OpenAI Responses request for a registered Codex model.
@@ -94,7 +121,7 @@ The proxy:
 - preserves native JSON responses and SSE bodies
 - records the request in the monitor and optional traffic capture
 
-It does not implement Images API, stored response retrieval or deletion, or WebSocket client ingress.
+It does not implement stored response retrieval or deletion, image variations, or WebSocket client ingress.
 
 ## Other routes
 

@@ -202,6 +202,49 @@ pub fn build_codex_search_headers(
     Ok(headers)
 }
 
+pub fn build_codex_image_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        header_value("content-type", "application/json")?,
+    );
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        header_value("authorization", &format!("Bearer {}", auth.access))?,
+    );
+    headers.insert(
+        "originator",
+        header_value("originator", &config::codex_originator(ORIGINATOR))?,
+    );
+    if let Some(account_id) = auth.account_id.as_deref() {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            header_value("ChatGPT-Account-Id", account_id)?,
+        );
+    }
+    if let Some(session_id) = ctx.session_id.as_deref() {
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", session_id)?,
+        );
+    }
+    let user_agent = config::codex_user_agent(&default_user_agent(false));
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
 fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError> {
     http::HeaderValue::from_str(value).map_err(|e| CodexError {
         status: 500,
@@ -278,6 +321,7 @@ pub struct CodexResponse {
 const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
+const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Clone)]
 struct ProxyEnvironment {
@@ -533,6 +577,91 @@ impl CodexHttpClient {
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
+    }
+
+    pub(crate) async fn post_image_json(
+        &self,
+        base_url: &str,
+        operation: super::images::ImageOperation,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+    ) -> Result<reqwest::Response, CodexError> {
+        let body_json = serde_json::to_vec(body).map_err(|error| CodexError {
+            status: 500,
+            message: "Failed to serialize image request".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?;
+        let url = format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            operation.upstream_path()
+        );
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let mut refresh_attempted = false;
+
+        loop {
+            let headers = build_codex_image_headers(&auth, ctx)?;
+            let response = self
+                .attempt_image_json(&url, &headers, body_json.clone())
+                .await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                refresh_attempted = true;
+                drop(response);
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            return Ok(response);
+        }
+    }
+
+    async fn attempt_image_json(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        body_json: Vec<u8>,
+    ) -> Result<reqwest::Response, CodexError> {
+        let mut request = self.native_client.post(url);
+        for (key, value) in headers {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        tokio::time::timeout(
+            Duration::from_millis(IMAGE_HEADER_TIMEOUT_MS),
+            request.body(body_json).send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex image response headers",
+                IMAGE_HEADER_TIMEOUT_MS
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|error| CodexError {
+            status: 0,
+            message: format!("Codex image transport error: {error}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })
     }
 
     pub async fn post_native_responses(
@@ -1960,6 +2089,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_request_refreshes_once_after_unauthorized() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let server_client = client.clone();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                if attempt == 0 {
+                    assert!(request.contains("authorization: Bearer test"));
+                    server_client.auth_manager().set_test_auth(StoredAuth {
+                        access: "rotated".into(),
+                        refresh: "rotated-refresh".into(),
+                        account_id: Some("acct-rotated".into()),
+                        expires: u64::MAX,
+                    });
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request.contains("authorization: Bearer rotated"));
+                    assert!(request.contains("chatgpt-account-id: acct-rotated"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let response = client
+            .post_image_json(
+                &format!("http://{addr}"),
+                super::super::images::ImageOperation::Generation,
+                &serde_json::json!({"model":"gpt-image-2","prompt":"draw"}),
+                &http_test_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_request_does_not_retry_server_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let response = client
+            .post_image_json(
+                &format!("http://{addr}"),
+                super::super::images::ImageOperation::Generation,
+                &serde_json::json!({"model":"gpt-image-2","prompt":"draw"}),
+                &http_test_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_request_uses_fixed_path_oauth_and_json_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /root/images/generations HTTP/1.1"));
+            assert!(headers.contains("authorization: Bearer test"));
+            assert!(headers.contains("chatgpt-account-id: acct"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end + 4..]).unwrap();
+            assert_eq!(body["model"], "gpt-image-2");
+            assert_eq!(body["prompt"], "draw a fox");
+            let response = br#"{"created":1,"data":[{"b64_json":"aW1n"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(response).await.unwrap();
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let response = client
+            .post_image_json(
+                &format!("http://{addr}/root"),
+                super::super::images::ImageOperation::Generation,
+                &serde_json::json!({"model":"gpt-image-2","prompt":"draw a fox"}),
+                &http_test_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_responses_replaces_auth_and_preserves_json_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2502,6 +2760,33 @@ mod tests {
         };
 
         assert!(is_retryable_transport_error(&err));
+    }
+
+    #[test]
+    fn image_headers_reuse_oauth_without_responses_beta_headers() {
+        let auth = StoredAuth {
+            access: "tok".into(),
+            refresh: String::new(),
+            account_id: Some("acct".into()),
+            expires: u64::MAX,
+        };
+        let headers = build_codex_image_headers(&auth, &http_test_context()).unwrap();
+
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acct");
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            headers.get(http::header::ACCEPT).unwrap(),
+            "application/json"
+        );
+        assert!(headers.get("openai-beta").is_none());
+        assert!(headers.get("x-codex-beta-features").is_none());
     }
 
     #[test]

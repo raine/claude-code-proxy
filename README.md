@@ -66,6 +66,17 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 See [Getting started](https://claude-code-proxy.raine.dev/getting-started/)
 for the complete first session.
 
+Optional Codex image generation and editing can reuse the same ChatGPT login:
+
+```sh
+CCP_CODEX_IMAGES_API=1 claude-code-proxy serve
+curl http://127.0.0.1:18765/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A paper-cut fox","model":"gpt-image-2"}'
+```
+
+The opt-in Images API returns base64 image data and consumes the signed-in account's image quota. Image prompts and payloads are excluded from traffic captures. See the [HTTP API](https://claude-code-proxy.raine.dev/reference/http-api/) for generation and edit schemas.
+
 ## Providers
 
 | Provider     | Account                        | Model selection                                 |

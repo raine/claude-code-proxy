@@ -60,6 +60,10 @@ struct CodexConfig {
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
+    #[serde(rename = "imagesApi")]
+    pub images_api: Option<bool>,
+    #[serde(rename = "imagesBaseUrl")]
+    pub images_base_url: Option<String>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(rename = "reasoningSummary")]
@@ -226,6 +230,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_IMAGES_API") {
+        out.push("codex.imagesApi (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_IMAGES_BASE_URL") {
+        out.push("codex.imagesBaseUrl (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_OAUTH_HOST") {
         out.push("kimi.oauthHost (env)".to_string());
     }
@@ -298,6 +308,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
+            }
+            if codex.images_api == Some(true) {
+                out.push("codex.imagesApi: true".to_string());
+            }
+            if codex.images_base_url.is_some() {
+                out.push("codex.imagesBaseUrl (config)".to_string());
             }
         }
     }
@@ -542,6 +558,36 @@ pub fn codex_responses_api() -> bool {
     false
 }
 
+pub fn codex_images_api() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.images_api
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_images_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(url) = codex.images_base_url
+    {
+        return url;
+    }
+    "https://chatgpt.com/backend-api/codex".to_string()
+}
+
 pub fn codex_service_tier() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
@@ -749,6 +795,8 @@ mod tests {
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
+            std::env::remove_var("CCP_CODEX_IMAGES_API");
+            std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
             std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
     }
@@ -943,6 +991,35 @@ mod tests {
             let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", value);
             assert!(codex_responses_api(), "{value}");
         }
+    }
+
+    #[test]
+    fn codex_images_api_defaults_to_disabled_and_env_overrides_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"imagesApi":true,"imagesBaseUrl":"https://chatgpt.com/backend-api/codex-custom"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_images_api());
+        assert_eq!(
+            codex_images_base_url(),
+            "https://chatgpt.com/backend-api/codex-custom"
+        );
+        let _enabled_env = EnvGuard::set("CCP_CODEX_IMAGES_API", "false");
+        let _base_env = EnvGuard::set(
+            "CCP_CODEX_IMAGES_BASE_URL",
+            "https://chatgpt.com/backend-api/codex",
+        );
+        assert!(!codex_images_api());
+        assert_eq!(
+            codex_images_base_url(),
+            "https://chatgpt.com/backend-api/codex"
+        );
     }
 
     #[test]

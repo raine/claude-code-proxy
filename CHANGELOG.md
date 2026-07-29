@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Optional Codex Images API routes reuse the existing ChatGPT OAuth session for
+  `gpt-image-2` generation and JSON or multipart image edits, with strict size,
+  concurrency, upstream-host, header, and diagnostic privacy boundaries.
+
 ## v0.1.27 (2026-07-29)
 
 - Grok streams remain reliable during long responses, keepalive events, and
