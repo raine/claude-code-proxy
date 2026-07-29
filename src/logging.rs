@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +15,8 @@ pub const LOG_QUEUE_CAPACITY: usize = 4_096;
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LOG_WRITER: OnceLock<Option<LogWriter>> = OnceLock::new();
+static LOG_DIRECTORY_PERMISSION_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+static LOG_FILE_PERMISSION_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub const REDACT_KEYS: [&str; 14] = [
     "authorization",
@@ -311,11 +313,37 @@ fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
         create_dir(dir, 0o700)?;
     }
 
-    if fs::metadata(file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
+    let existing_metadata = fs::metadata(file).ok();
+    if existing_metadata.is_some()
+        && let Err(error) = fsutil::set_mode_checked(file, 0o600)
+    {
+        warn_log_permission_error(
+            &LOG_FILE_PERMISSION_WARNING_EMITTED,
+            "log file",
+            file,
+            &error,
+        );
+    }
+    if existing_metadata.is_some_and(|meta| meta.len() > MAX_LOG_BYTES) {
         rotate_file(file)?;
     }
 
-    let mut out = OpenOptions::new().create(true).append(true).open(file)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = options.open(file)?;
+    if let Err(error) = fsutil::set_mode_checked(file, 0o600) {
+        warn_log_permission_error(
+            &LOG_FILE_PERMISSION_WARNING_EMITTED,
+            "log file",
+            file,
+            &error,
+        );
+    }
     let mut record = Vec::with_capacity(line.len() + 1);
     record.extend_from_slice(line.as_bytes());
     record.push(b'\n');
@@ -333,9 +361,34 @@ fn rotate_file(path: &Path) -> io::Result<()> {
 }
 
 fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    fsutil::set_mode(path, mode);
-    Ok(())
+    match fsutil::create_dir_all_with_mode(path, mode) {
+        Ok(()) => Ok(()),
+        // Permission tightening is best-effort for ordinary redacted logs.
+        // If the directory is usable, surface the failure without stopping
+        // the logging worker or the proxy.
+        Err(error) if path.is_dir() => {
+            warn_log_permission_error(
+                &LOG_DIRECTORY_PERMISSION_WARNING_EMITTED,
+                "log directory",
+                path,
+                &error,
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn warn_log_permission_error(emitted: &AtomicBool, target: &str, path: &Path, error: &io::Error) {
+    if emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        eprintln!(
+            "ccproxy warning: could not restrict {target} permissions at {}: {error}",
+            path.display()
+        );
+    }
 }
 
 fn now_iso8601() -> String {
@@ -588,6 +641,60 @@ mod tests {
         let mut successful_sink = |_file: &Path, _line: &str| Ok(());
         write_dropped_summary(&dropped, 8, Path::new("proxy.log"), &mut successful_sink).unwrap();
         assert_eq!(dropped.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_writer_tightens_directory_and_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("logs");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let file = directory.join("proxy.log");
+        fs::write(&file, b"existing\n").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_log_line_to(&file, r#"{"msg":"redacted"}"#).unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_rotation_makes_existing_artifact_private_before_rename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("proxy.log");
+        let existing = fs::File::create(&file).unwrap();
+        existing.set_len(MAX_LOG_BYTES + 1).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_log_line_to(&file, r#"{"msg":"after rotation"}"#).unwrap();
+
+        let rotated = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path != &file)
+            .expect("oversized log should be rotated");
+        assert_eq!(
+            fs::metadata(rotated).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

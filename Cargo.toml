@@ -3,6 +3,7 @@ name = "claude-code-proxy"
 version = "0.1.25"
 description = "Anthropic-compatible proxy for Claude Code provider backends"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Claude Code Proxy contributors"]
 license = "MIT"
 publish = false
@@ -47,8 +48,8 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 url = "2"
 flate2 = "1.0"
 tar = "0.4"
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30.2"
+crossterm = "0.29"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 
 [target.'cfg(unix)'.dependencies]

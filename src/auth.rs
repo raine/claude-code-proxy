@@ -436,14 +436,42 @@ pub fn delete_auth_file(primary: &std::path::Path, legacy: &std::path::Path) -> 
     Ok(())
 }
 
+struct TemporaryAuthFile {
+    path: std::path::PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TemporaryAuthFile {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            remove_on_drop: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for TemporaryAuthFile {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
+    // Serialize before touching the filesystem so serialization failures
+    // cannot leave an empty credential temp file or a newly-created directory.
+    let payload = to_string_pretty(value)?;
     let dir = std::path::Path::new(path)
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid auth path"))?;
-    fs::create_dir_all(dir)?;
-    crate::fsutil::set_mode(dir, 0o700);
+    crate::fsutil::create_dir_all_with_mode(dir, 0o700)?;
 
-    let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+    let tmp = std::path::PathBuf::from(format!("{path}.tmp-{}", uuid::Uuid::new_v4()));
     #[cfg(unix)]
     let mut out = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -458,15 +486,17 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&tmp)?;
-    out.write_all(to_string_pretty(value)?.as_bytes())?;
+    let mut temporary = TemporaryAuthFile::new(tmp.clone());
+    out.write_all(payload.as_bytes())?;
     out.sync_all()?;
-    if let Err(err) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err.into());
-    }
+    drop(out);
+    fs::rename(&tmp, path)?;
+    // From this point on the credential lives at its final path. A directory
+    // fsync error means durability is uncertain, but must not remove the file
+    // that was already published by rename.
+    temporary.disarm();
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
-    crate::fsutil::set_mode(std::path::Path::new(path), 0o600);
     Ok(())
 }
 
@@ -655,6 +685,68 @@ mod tests {
 
     fn temp_auth_path(dir: &tempfile::TempDir, name: &str) -> String {
         dir.path().join(name).to_string_lossy().to_string()
+    }
+
+    struct SerializationFailure;
+
+    impl Serialize for SerializationFailure {
+        fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("simulated serialization failure"))
+        }
+    }
+
+    #[test]
+    fn atomic_write_serializes_before_touching_the_filesystem() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let auth_dir = temp.path().join("not-created");
+        let file = auth_dir.join("auth.json");
+
+        assert!(write_atomically(file.to_str().unwrap(), &SerializationFailure).is_err());
+        assert!(!auth_dir.exists());
+    }
+
+    #[test]
+    fn atomic_write_removes_temp_file_when_rename_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let destination = temp.path().join("auth.json");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(
+            write_atomically(destination.to_str().unwrap(), &json!({"token": "secret"})).is_err()
+        );
+        assert!(destination.is_dir());
+        assert!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("auth.json.tmp-"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_private_directory_and_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let auth_dir = temp.path().join("credentials");
+        let file = auth_dir.join("auth.json");
+        write_atomically(file.to_str().unwrap(), &json!({"token": "secret"})).unwrap();
+
+        assert_eq!(
+            fs::metadata(&auth_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

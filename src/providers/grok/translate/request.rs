@@ -2775,15 +2775,34 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_accepts_claude_code_context_management() {
+    fn grok_translation_rejects_non_empty_context_management() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-composer-2.5-fast",
             "messages":[{"role":"user","content":"hello"}],
             "context_management":{"edits":[{"type":"clear_tool_uses_20250919","trigger":{"type":"input_tokens","value":100000}}]}
         }))
         .unwrap();
-        let translated = translate_request(&request, "grok-composer-2.5-fast".into()).unwrap();
-        assert_eq!(translated.input.len(), 1);
+        let error = translate_request(&request, "grok-composer-2.5-fast".into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("non-empty context_management.edits"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn grok_translation_rejects_standard_only_service_tier() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}],
+            "service_tier":"standard_only"
+        }))
+        .unwrap();
+        let error = translate_request(&request, "grok-4.5".into())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("service_tier=standard_only"), "{error}");
     }
 
     #[test]

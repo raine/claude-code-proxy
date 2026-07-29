@@ -147,6 +147,10 @@ enum FileConfigFingerprint {
         len: u64,
         modified: Option<SystemTime>,
     },
+    Inaccessible {
+        kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
 }
 
 #[derive(Clone)]
@@ -156,60 +160,206 @@ struct CachedFileConfig {
     value: Option<FileConfig>,
     checked_at: Instant,
     generation: u64,
+    accepted: bool,
 }
 
 #[derive(Default)]
 struct FileConfigCache {
     current: Option<CachedFileConfig>,
+    last_reported_invalid: Option<(PathBuf, FileConfigFingerprint)>,
     #[cfg(test)]
     filesystem_checks: u64,
     #[cfg(test)]
     parse_attempts: u64,
+    #[cfg(test)]
+    warnings: u64,
 }
 
 impl FileConfigCache {
+    #[cfg(test)]
     fn load(&mut self, path: &Path, now: Instant, recheck_interval: Duration) -> CachedFileConfig {
+        self.load_with_fallback(path, None, now, recheck_interval)
+    }
+
+    fn load_with_fallback(
+        &mut self,
+        primary_path: &Path,
+        legacy_path: Option<&Path>,
+        now: Instant,
+        recheck_interval: Duration,
+    ) -> CachedFileConfig {
         if let Some(cached) = self.current.as_ref()
-            && cached.path == path
+            && (cached.path == primary_path
+                || legacy_path.is_some_and(|legacy| cached.path == legacy))
             && now.saturating_duration_since(cached.checked_at) < recheck_interval
         {
             return cached.clone();
         }
 
-        #[cfg(test)]
-        {
-            self.filesystem_checks += 1;
-        }
-        let fingerprint = file_config_fingerprint(path);
+        let (primary_fingerprint, primary_error) = self.fingerprint(primary_path);
+        let (path, fingerprint, metadata_error) =
+            if primary_fingerprint == FileConfigFingerprint::Missing {
+                if let Some(legacy_path) = legacy_path {
+                    let (legacy_fingerprint, legacy_error) = self.fingerprint(legacy_path);
+                    if legacy_fingerprint != FileConfigFingerprint::Missing {
+                        (legacy_path.to_path_buf(), legacy_fingerprint, legacy_error)
+                    } else {
+                        (
+                            primary_path.to_path_buf(),
+                            primary_fingerprint,
+                            primary_error,
+                        )
+                    }
+                } else {
+                    (
+                        primary_path.to_path_buf(),
+                        primary_fingerprint,
+                        primary_error,
+                    )
+                }
+            } else {
+                (
+                    primary_path.to_path_buf(),
+                    primary_fingerprint,
+                    primary_error,
+                )
+            };
+
         if let Some(cached) = self.current.as_mut()
             && cached.path == path
             && cached.fingerprint == fingerprint
+            && cached.accepted
         {
             cached.checked_at = now;
             return cached.clone();
         }
 
+        let load = match fingerprint {
+            FileConfigFingerprint::Missing => FileConfigLoad::Missing,
+            FileConfigFingerprint::Inaccessible { .. } => FileConfigLoad::Invalid(
+                metadata_error.unwrap_or_else(|| "metadata is inaccessible".to_string()),
+            ),
+            FileConfigFingerprint::Present { .. } => {
+                #[cfg(test)]
+                {
+                    self.parse_attempts += 1;
+                }
+                match fs::read_to_string(&path) {
+                    Ok(raw) => match serde_json::from_str(&raw) {
+                        Ok(value) => FileConfigLoad::Valid(Box::new(value)),
+                        Err(error) => FileConfigLoad::Invalid(format!("invalid JSON: {error}")),
+                    },
+                    Err(error) => FileConfigLoad::Invalid(format!("could not read file: {error}")),
+                }
+            }
+        };
+
+        match load {
+            FileConfigLoad::Missing => self.accept(path, fingerprint, None, now),
+            FileConfigLoad::Valid(value) => self.accept(path, fingerprint, Some(*value), now),
+            FileConfigLoad::Invalid(error) => self.reject(path, fingerprint, error, now),
+        }
+    }
+
+    fn fingerprint(&mut self, path: &Path) -> (FileConfigFingerprint, Option<String>) {
         #[cfg(test)]
         {
-            self.parse_attempts += 1;
+            self.filesystem_checks += 1;
         }
-        let value = fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok());
+        match fs::metadata(path) {
+            Ok(metadata) => (
+                FileConfigFingerprint::Present {
+                    len: metadata.len(),
+                    modified: metadata.modified().ok(),
+                },
+                None,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (FileConfigFingerprint::Missing, None)
+            }
+            Err(error) => (
+                FileConfigFingerprint::Inaccessible {
+                    kind: error.kind(),
+                    raw_os_error: error.raw_os_error(),
+                },
+                Some(format!("could not inspect file: {error}")),
+            ),
+        }
+    }
+
+    fn accept(
+        &mut self,
+        path: PathBuf,
+        fingerprint: FileConfigFingerprint,
+        value: Option<FileConfig>,
+        now: Instant,
+    ) -> CachedFileConfig {
         let generation = self
             .current
             .as_ref()
             .map_or(1, |cached| cached.generation.saturating_add(1));
         let loaded = CachedFileConfig {
-            path: path.to_path_buf(),
+            path,
             fingerprint,
             value,
             checked_at: now,
             generation,
+            accepted: true,
+        };
+        self.last_reported_invalid = None;
+        self.current = Some(loaded.clone());
+        loaded
+    }
+
+    fn reject(
+        &mut self,
+        path: PathBuf,
+        fingerprint: FileConfigFingerprint,
+        error: String,
+        now: Instant,
+    ) -> CachedFileConfig {
+        let invalid_identity = (path.clone(), fingerprint);
+        if self.last_reported_invalid.as_ref() != Some(&invalid_identity) {
+            let disposition = if self
+                .current
+                .as_ref()
+                .is_some_and(|cached| cached.value.is_some())
+            {
+                "keeping the last known good configuration"
+            } else {
+                "ignoring the file and using defaults"
+            };
+            eprintln!(
+                "warning: failed to load config {}: {error}; {disposition}",
+                path.display()
+            );
+            self.last_reported_invalid = Some(invalid_identity);
+            #[cfg(test)]
+            {
+                self.warnings += 1;
+            }
+        }
+
+        let (value, generation) = self.current.as_ref().map_or((None, 0), |cached| {
+            (cached.value.clone(), cached.generation)
+        });
+        let loaded = CachedFileConfig {
+            path,
+            fingerprint,
+            value,
+            checked_at: now,
+            generation,
+            accepted: false,
         };
         self.current = Some(loaded.clone());
         loaded
     }
+}
+
+enum FileConfigLoad {
+    Missing,
+    Valid(Box<FileConfig>),
+    Invalid(String),
 }
 
 // File edits remain hot-reloadable, but request and logging hot paths only
@@ -223,23 +373,19 @@ const FILE_CONFIG_RECHECK_INTERVAL: Duration = Duration::ZERO;
 
 static FILE_CONFIG_CACHE: OnceLock<Mutex<FileConfigCache>> = OnceLock::new();
 
-fn file_config_fingerprint(path: &Path) -> FileConfigFingerprint {
-    match fs::metadata(path) {
-        Ok(metadata) => FileConfigFingerprint::Present {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        },
-        Err(_) => FileConfigFingerprint::Missing,
-    }
-}
-
 fn read_file_config_snapshot(config_dir: &Path) -> CachedFileConfig {
     let path = config_dir.join("config.json");
+    let legacy_path = paths::legacy_config_file();
     FILE_CONFIG_CACHE
         .get_or_init(|| Mutex::new(FileConfigCache::default()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .load(&path, Instant::now(), FILE_CONFIG_RECHECK_INTERVAL)
+        .load_with_fallback(
+            &path,
+            legacy_path.as_deref(),
+            Instant::now(),
+            FILE_CONFIG_RECHECK_INTERVAL,
+        )
 }
 
 fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
@@ -267,10 +413,8 @@ pub fn load_config() -> LoadedConfig {
         out.bind_address = bind_address;
     }
 
-    if let Some(raw) = env.get("PORT") {
-        if let Ok(port) = raw.parse::<u16>() {
-            out.port = port;
-        }
+    if let Some(port) = env.get("PORT").and_then(|raw| raw.parse::<u16>().ok()) {
+        out.port = port;
     } else if let Some(port) = file.as_ref().and_then(|f| f.port) {
         out.port = port;
     }
@@ -1255,6 +1399,7 @@ mod tests {
         "CCP_MAX_CONCURRENT_PER_SESSION",
         "CCP_REQUEST_BODY_IDLE_TIMEOUT_MS",
         "CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS",
+        "PORT",
     ];
 
     struct ClearedEnvGuard {
@@ -1398,6 +1543,203 @@ mod tests {
         assert_eq!(refreshed.generation, first.generation + 1);
         assert_eq!(cache.filesystem_checks, 2);
         assert_eq!(cache.parse_attempts, 2);
+    }
+
+    #[test]
+    fn malformed_reload_keeps_last_known_good_until_valid_rewrite() {
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        std::fs::write(&path, r#"{"port":1876}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let start = Instant::now();
+        let refresh_interval = Duration::from_secs(1);
+        let first = cache.load(&path, start, refresh_interval);
+        assert_eq!(first.value.as_ref().and_then(|file| file.port), Some(1876));
+        assert_eq!(first.generation, 1);
+        assert!(first.accepted);
+
+        // Keep the invalid and recovered contents at the same length and force
+        // the same mtime to prove that rejected snapshots are revalidated
+        // after the bounded recheck interval.
+        let rejected_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::write(&path, r#"{"port":"xx"}"#).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(rejected_mtime))
+            .unwrap();
+        let invalid = cache.load(&path, start + refresh_interval, refresh_interval);
+        assert_eq!(
+            invalid.value.as_ref().and_then(|file| file.port),
+            Some(1876)
+        );
+        assert_eq!(invalid.generation, first.generation);
+        assert!(!invalid.accepted);
+        assert_eq!(cache.warnings, 1);
+
+        let parse_attempts = cache.parse_attempts;
+        // Requests within the recheck window stay on the cached LKG snapshot.
+        let cached = cache.load(
+            &path,
+            start + refresh_interval + Duration::from_millis(1),
+            refresh_interval,
+        );
+        assert_eq!(cached.generation, first.generation);
+        assert_eq!(cache.warnings, 1);
+        assert_eq!(cache.parse_attempts, parse_attempts);
+
+        // Once the interval expires, the same rejected fingerprint is retried
+        // without repeating its warning or advancing the generation.
+        let retried = cache.load(
+            &path,
+            start + refresh_interval + refresh_interval,
+            refresh_interval,
+        );
+        assert_eq!(retried.generation, first.generation);
+        assert_eq!(cache.warnings, 1);
+        assert_eq!(cache.parse_attempts, parse_attempts + 1);
+
+        std::fs::write(&path, r#"{"port":2876}"#).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(rejected_mtime))
+            .unwrap();
+        let recovered = cache.load(
+            &path,
+            start + refresh_interval + refresh_interval + refresh_interval,
+            refresh_interval,
+        );
+        assert_eq!(
+            recovered.value.as_ref().and_then(|file| file.port),
+            Some(2876)
+        );
+        assert_eq!(recovered.generation, first.generation + 1);
+        assert!(recovered.accepted);
+    }
+
+    #[test]
+    fn malformed_initial_config_is_reported_without_fake_generation() {
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        std::fs::write(&path, r#"{"port":"not-a-number"}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let loaded = cache.load(&path, Instant::now(), Duration::ZERO);
+
+        assert!(loaded.value.is_none());
+        assert_eq!(loaded.generation, 0);
+        assert!(!loaded.accepted);
+        assert_eq!(cache.warnings, 1);
+    }
+
+    #[test]
+    fn missing_config_is_an_accepted_state_distinct_from_invalid() {
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        std::fs::write(&path, r#"{"port":18765}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let start = Instant::now();
+        let valid = cache.load(&path, start, Duration::ZERO);
+        std::fs::remove_file(&path).unwrap();
+        let missing = cache.load(&path, start + Duration::from_millis(1), Duration::ZERO);
+
+        assert_eq!(valid.generation, 1);
+        assert!(missing.value.is_none());
+        assert_eq!(missing.generation, 2);
+        assert!(missing.accepted);
+        assert_eq!(cache.warnings, 0);
+    }
+
+    #[test]
+    fn primary_config_preempts_read_only_legacy_fallback() {
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let primary = primary_dir.path().join("config.json");
+        let legacy = legacy_dir.path().join("config.json");
+        std::fs::write(&legacy, r#"{"port":18765}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let start = Instant::now();
+        let fallback = cache.load_with_fallback(&primary, Some(&legacy), start, Duration::ZERO);
+        assert_eq!(fallback.path, legacy);
+        assert_eq!(
+            fallback.value.as_ref().and_then(|file| file.port),
+            Some(18765)
+        );
+
+        std::fs::write(&primary, r#"{"port":2876}"#).unwrap();
+        let preferred = cache.load_with_fallback(
+            &primary,
+            Some(&legacy),
+            start + Duration::from_millis(1),
+            Duration::ZERO,
+        );
+        assert_eq!(preferred.path, primary);
+        assert_eq!(
+            preferred.value.as_ref().and_then(|file| file.port),
+            Some(2876)
+        );
+        assert_eq!(preferred.generation, fallback.generation + 1);
+    }
+
+    #[test]
+    fn invalid_primary_config_does_not_fall_through_to_legacy() {
+        let primary_dir = tempfile::TempDir::new().unwrap();
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let primary = primary_dir.path().join("config.json");
+        let legacy = legacy_dir.path().join("config.json");
+        std::fs::write(&primary, r#"{"port":"invalid"}"#).unwrap();
+        std::fs::write(&legacy, r#"{"port":18765}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let loaded =
+            cache.load_with_fallback(&primary, Some(&legacy), Instant::now(), Duration::ZERO);
+
+        assert_eq!(loaded.path, primary);
+        assert!(loaded.value.is_none());
+        assert_eq!(loaded.generation, 0);
+        assert!(!loaded.accepted);
+        assert_eq!(cache.warnings, 1);
+    }
+
+    #[test]
+    fn recheck_interval_never_reuses_snapshot_across_config_directories() {
+        let first_dir = tempfile::TempDir::new().unwrap();
+        let second_dir = tempfile::TempDir::new().unwrap();
+        let first_path = first_dir.path().join("config.json");
+        let second_path = second_dir.path().join("config.json");
+        std::fs::write(&first_path, r#"{"port":18765}"#).unwrap();
+        std::fs::write(&second_path, r#"{"port":2876}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let start = Instant::now();
+        let first = cache.load(&first_path, start, Duration::from_secs(1));
+        let second = cache.load(
+            &second_path,
+            start + Duration::from_millis(1),
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(first.value.as_ref().and_then(|file| file.port), Some(18765));
+        assert_eq!(second.value.as_ref().and_then(|file| file.port), Some(2876));
+        assert_eq!(second.path, second_path);
+    }
+
+    #[test]
+    fn invalid_port_env_falls_back_to_file_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(config.path().join("config.json"), r#"{"port":24444}"#).unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _port_env = EnvGuard::set("PORT", "not-a-port");
+
+        assert_eq!(load_config().port, 24444);
     }
 
     #[test]

@@ -46,6 +46,7 @@ const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
+const INCOMPLETE_SSE_ERROR: &str = "SSE response ended before message_stop";
 
 fn compaction_model_override(
     headers: &HeaderMap,
@@ -1261,6 +1262,7 @@ fn monitor_response_body(
         sse_detector: is_event_stream.then(SseErrorDetector::default),
         open_tool_blocks: HashMap::new(),
         provisionally_closed_tool_blocks: HashMap::new(),
+        saw_message_stop: false,
         _permits: permits,
         terminal: false,
     };
@@ -1284,6 +1286,14 @@ fn monitor_response_body(
                     Some((Err(err), (body, lifecycle)))
                 }
                 None => {
+                    if lifecycle.sse_detector.is_some() && !lifecycle.saw_message_stop {
+                        lifecycle.failed(INCOMPLETE_SSE_ERROR.to_string(), false);
+                        let error = axum::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            INCOMPLETE_SSE_ERROR,
+                        ));
+                        return Some((Err(error), (body, lifecycle)));
+                    }
                     lifecycle.completed();
                     None
                 }
@@ -1317,6 +1327,7 @@ struct ResponseBodyLifecycle {
     sse_detector: Option<SseErrorDetector>,
     open_tool_blocks: HashMap<u64, ToolBlockTrace>,
     provisionally_closed_tool_blocks: HashMap<u64, ToolBlockTrace>,
+    saw_message_stop: bool,
     _permits: RequestPermits,
     terminal: bool,
 }
@@ -1386,6 +1397,7 @@ impl ResponseBodyLifecycle {
                 }
             }
             SseToolEvent::MessageStopped => {
+                self.saw_message_stop = true;
                 let completed = std::mem::take(&mut self.provisionally_closed_tool_blocks);
                 for (_, tool) in completed {
                     log_tool_block_event(&self.log_context, "tool_block_completed", &tool, None);
@@ -1839,7 +1851,21 @@ async fn record_failed_response(
         "bodyReadError": read.error.as_deref(),
     });
     let error_file = if should_capture_error_response(ctx.provider, status) {
-        write_error_capture(ctx.req_id, redact_error_value(document)).await
+        match write_error_capture(ctx.req_id, redact_error_value(document)).await {
+            Ok(path) => path,
+            Err(error) => {
+                log.warn(
+                    "error_capture_failed",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), json!(ctx.req_id)),
+                        ("provider".to_string(), json!(ctx.provider)),
+                        ("status".to_string(), json!(status.as_u16())),
+                        ("error".to_string(), json!(error)),
+                    ])),
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -1985,33 +2011,65 @@ fn should_capture_error_response(provider: Option<&str>, status: StatusCode) -> 
     provider.is_some() && status.is_server_error()
 }
 
-async fn write_error_capture(req_id: &str, document: Value) -> Option<PathBuf> {
+async fn write_error_capture(req_id: &str, document: Value) -> Result<Option<PathBuf>, String> {
     let gate = ERROR_CAPTURE_GATE
         .get_or_init(|| Arc::new(Semaphore::new(1)))
         .clone();
-    let permit = gate.try_acquire_owned().ok()?;
+    let permit = match gate.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return Ok(None),
+    };
     let req_id = req_id.to_string();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         write_error_capture_blocking(&req_id, &document)
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(|error| format!("error capture task failed: {error}"))?
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
-fn write_error_capture_blocking(req_id: &str, document: &Value) -> Option<PathBuf> {
+fn write_error_capture_blocking(req_id: &str, document: &Value) -> std::io::Result<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
-    fs::create_dir_all(&dir).ok()?;
-    crate::fsutil::set_mode(&dir, 0o700);
-    prune_error_captures(&dir);
+    write_error_capture_in_dir(&dir, req_id, document)
+}
+
+fn write_error_capture_in_dir(
+    dir: &Path,
+    req_id: &str,
+    document: &Value,
+) -> std::io::Result<PathBuf> {
+    let payload = serde_json::to_vec_pretty(document).map_err(std::io::Error::other)?;
+    crate::fsutil::create_dir_all_with_mode(dir, 0o700)?;
+    prune_error_captures(dir);
     let path = dir.join(format!("{}-{}.json", now_ms(), sanitize_path_part(req_id)));
-    let mut file = File::create(&path).ok()?;
-    crate::fsutil::set_mode(&path, 0o600);
-    let payload = serde_json::to_vec_pretty(document).ok()?;
-    file.write_all(&payload).ok()?;
-    file.write_all(b"\n").ok()?;
-    Some(path)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    if let Err(write_error) = file.write_all(&payload).and_then(|_| file.write_all(b"\n")) {
+        drop(file);
+        let cleanup_error = fs::remove_file(&path)
+            .err()
+            .filter(|error| error.kind() != std::io::ErrorKind::NotFound);
+        let detail = match cleanup_error {
+            Some(cleanup_error) => format!(
+                "failed to write error capture {}: {write_error}; failed to remove partial file: {cleanup_error}",
+                path.display()
+            ),
+            None => format!(
+                "failed to write error capture {}: {write_error}",
+                path.display()
+            ),
+        };
+        return Err(std::io::Error::new(write_error.kind(), detail));
+    }
+    Ok(path)
 }
 
 fn prune_error_captures(dir: &Path) {
@@ -2284,7 +2342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_body_stays_active_until_successful_eof() {
+    async fn response_body_stays_active_until_message_stop_and_eof() {
         let req_id = "stream-success";
         let monitor = started_monitor(req_id);
         let response = Response::builder()
@@ -2293,6 +2351,9 @@ mod tests {
             .body(Body::from_stream(stream::iter(vec![
                 Ok::<_, std::io::Error>(Bytes::from_static(
                     b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 )),
             ])))
             .unwrap();
@@ -2319,6 +2380,69 @@ mod tests {
             crate::monitor::RequestStatus::Completed
         );
         assert_eq!(state.recent[0].http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn aborted_sse_producer_surfaces_body_error_and_failed_request() {
+        let req_id = "stream-producer-aborted";
+        let monitor = started_monitor(req_id);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        let producer = tokio::spawn(async move {
+            tx.send(Ok(Bytes::from_static(
+                b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            )))
+            .await
+            .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let producer_stream = stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(producer_stream))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+            RequestPermits::default(),
+        );
+        let mut body = response.into_body();
+
+        let first = body
+            .frame()
+            .await
+            .expect("producer should emit its first frame")
+            .expect("first frame should be valid");
+        assert!(
+            first
+                .data_ref()
+                .is_some_and(|data| data.starts_with(b"event: ping"))
+        );
+        assert_eq!(monitor.snapshot().active.len(), 1);
+
+        producer.abort();
+        assert!(producer.await.unwrap_err().is_cancelled());
+
+        let error = body
+            .frame()
+            .await
+            .expect("abrupt producer exit must surface a body error")
+            .expect_err("missing message_stop must not be a successful EOF");
+        assert!(error.to_string().contains(INCOMPLETE_SSE_ERROR));
+        assert!(body.frame().await.is_none());
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Failed
+        );
+        assert_eq!(state.recent[0].http_status, Some(200));
+        assert_eq!(state.recent[0].error.as_deref(), Some(INCOMPLETE_SSE_ERROR));
     }
 
     #[tokio::test]
@@ -2515,6 +2639,7 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
                 sse_detector: Some(SseErrorDetector::default()),
                 open_tool_blocks: HashMap::new(),
                 provisionally_closed_tool_blocks: HashMap::new(),
+                saw_message_stop: false,
                 _permits: RequestPermits::default(),
                 terminal: false,
             }
@@ -2580,6 +2705,50 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             Some("codex"),
             StatusCode::BAD_GATEWAY
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn error_capture_directory_and_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("errors");
+        let path = write_error_capture_in_dir(
+            &directory,
+            "private-capture",
+            &json!({"error": {"message": "sensitive"}}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn error_capture_directory_failure_is_returned() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_directory = temp.path().join("not-a-directory");
+        fs::write(&not_a_directory, b"block directory creation").unwrap();
+
+        let error = write_error_capture_in_dir(
+            &not_a_directory,
+            "failed-capture",
+            &json!({"error": {"message": "sensitive"}}),
+        )
+        .unwrap_err();
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(&not_a_directory).unwrap(),
+            b"block directory creation"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions, create_dir_all};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -599,6 +599,13 @@ impl TrafficCapture {
             Ok(()) => reservation.commit(),
             Err(error) => {
                 reservation.retain_partial(error.residual_bytes, error.file_created);
+                if self
+                    .disabled
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    warn_traffic_write_failure(&error.error);
+                }
             }
         }
     }
@@ -658,53 +665,71 @@ pub(crate) fn test_capture(root: PathBuf) -> TrafficCapture {
 }
 
 struct TrafficWriteFailure {
+    error: io::Error,
     residual_bytes: u64,
     file_created: bool,
 }
 
 fn write_file_bytes(path: PathBuf, value: &[u8]) -> Result<(), TrafficWriteFailure> {
     if let Some(parent) = path.parent() {
-        create_dir_all(parent).map_err(|_| TrafficWriteFailure {
+        fsutil::create_dir_all_with_mode(parent, 0o700).map_err(|error| TrafficWriteFailure {
+            error,
             residual_bytes: 0,
             file_created: false,
         })?;
-        fsutil::set_mode(parent, 0o700);
     }
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|_| TrafficWriteFailure {
-            residual_bytes: 0,
-            file_created: false,
-        })?;
-    let result = (|| -> io::Result<()> {
-        out.write_all(value)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = out.metadata()?.permissions();
-            perm.set_mode(0o600);
-            let _ = fs::set_permissions(&path, perm);
-        }
-        Ok(())
-    })();
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut out = options.open(&path).map_err(|error| TrafficWriteFailure {
+        error,
+        residual_bytes: 0,
+        file_created: false,
+    })?;
+    let result = out.write_all(value);
     if result.is_ok() {
         return Ok(());
     }
 
     // Keep the no-deletion policy even for a newly-created partial artifact.
-    // Account its length from the still-open file handle; if metadata is not
-    // available, conservatively retain the full reservation.
+    // The file was private from the instant it was created. Account its length
+    // from the still-open handle; if metadata is unavailable, conservatively
+    // retain the full reservation.
     let residual_bytes = out
         .metadata()
         .map(|metadata| metadata.len())
         .unwrap_or_else(|_| u64::try_from(value.len()).unwrap_or(u64::MAX));
+    let error = result.expect_err("failed traffic write must carry an error");
     drop(out);
     Err(TrafficWriteFailure {
+        error,
         residual_bytes,
         file_created: true,
     })
+}
+
+fn warn_traffic_write_failure(error: &io::Error) {
+    #[cfg(not(test))]
+    {
+        let mut fields = Map::new();
+        fields.insert(
+            "errorKind".into(),
+            Value::String(format!("{:?}", error.kind())),
+        );
+        crate::logging::create_logger("traffic").warn(
+            "traffic_capture_write_failed; disabling this capture",
+            Some(fields),
+        );
+    }
+    #[cfg(test)]
+    {
+        let _ = error;
+    }
 }
 
 pub struct StreamTrafficCapture {
@@ -980,6 +1005,63 @@ mod quota_tests {
             artifact_counter: Mutex::new(0),
             event_counter: Mutex::new(0),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traffic_artifacts_are_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let request_root = traffic_root.join("request");
+        let capture = capture(
+            request_root.clone(),
+            quota(
+                &traffic_root,
+                10 * TRAFFIC_FILE_CHARGE_BYTES,
+                10 * TRAFFIC_FILE_CHARGE_BYTES,
+            ),
+        );
+
+        capture.write_bytes("artifact.bin", b"sensitive");
+
+        assert_eq!(
+            fs::metadata(&request_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(request_root.join("001-artifact.bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn filesystem_write_failure_disables_the_capture_and_refunds_quota() {
+        let temp = TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let request_root = traffic_root.join("request");
+        let quota = quota(
+            &traffic_root,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+        );
+        fs::create_dir_all(&traffic_root).unwrap();
+        fs::write(&request_root, b"not-a-directory").unwrap();
+        let capture = capture(request_root.clone(), quota.clone());
+
+        capture.write_bytes("artifact.bin", b"sensitive");
+
+        assert!(capture.disabled.load(Ordering::Acquire));
+        assert_eq!(quota.used_charged_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(quota.used_files.load(Ordering::Acquire), 0);
+        fs::remove_file(&request_root).unwrap();
+        capture.write_bytes("later.bin", b"must-not-be-written");
+        assert!(!request_root.exists());
     }
 
     #[test]

@@ -623,7 +623,6 @@ where
         terminal: false,
         error_sent: false,
         downstream_emitted: false,
-        semantic_output_pending_enqueue: false,
         hosted_side_effect_started: false,
         attempt_bytes: 0,
         usage: None,
@@ -700,7 +699,12 @@ async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<B
             return;
         }
         match send_grok_chunk(&tx, &budget, bytes, state.deadline.at()).await {
-            GrokChunkSendOutcome::Sent => state.output_enqueued(),
+            GrokChunkSendOutcome::Sent => {
+                if let Some(bytes) = state.output_enqueued() {
+                    send_reserved_grok_terminal(&mut terminal_permit, bytes);
+                    return;
+                }
+            }
             GrokChunkSendOutcome::Closed => return,
             GrokChunkSendOutcome::Deadline => {
                 if let Some(retry) = state.retry_state() {
@@ -775,7 +779,6 @@ struct GrokStreamState {
     terminal: bool,
     error_sent: bool,
     downstream_emitted: bool,
-    semantic_output_pending_enqueue: bool,
     /// Logical-request replay barrier. Unlike reducer state, this must survive any attempt reset:
     /// observing a hosted search means a retry could repeat a real external action and its cost.
     hosted_side_effect_started: bool,
@@ -804,17 +807,26 @@ impl GrokStreamState {
             .map(|reconnect| reconnect.retry.clone())
     }
 
-    /// Drop the large replay-only state as soon as the first semantic output has actually entered
-    /// the downstream queue. The retry state remains available for total-deadline and stalled
-    /// consumer accounting until the stream producer itself is dropped.
-    fn output_enqueued(&mut self) {
-        if !std::mem::take(&mut self.semantic_output_pending_enqueue) {
-            return;
-        }
+    /// Commit the logical response as soon as any bytes, including a heartbeat, actually enter the
+    /// downstream queue. The retry state remains available for total-deadline and stalled consumer
+    /// accounting until the stream producer itself is dropped, but the request body and its
+    /// admission lease are no longer needed because no later failure may replay the model request.
+    ///
+    /// A heartbeat can win while a retry is sleeping or waiting on response headers. Once that
+    /// heartbeat is observable downstream, cancel the pending replay and terminate the committed
+    /// stream with the original error instead.
+    fn output_enqueued(&mut self) -> Option<Vec<u8>> {
+        self.downstream_emitted = true;
         if let Some(reconnect) = self.reconnect.as_mut() {
             reconnect.replay.take();
             reconnect.request_byte_lease.take();
         }
+        let rebuild = self.rebuild.take()?;
+        Some(self.fail_mapped(
+            rebuild.original_error,
+            rebuild.fail_stage,
+            rebuild.fail_kind,
+        ))
     }
 
     fn observe_hosted_side_effects(&mut self, values: &[serde_json::Value]) {
@@ -994,7 +1006,6 @@ impl GrokStreamState {
                 }
                 _ => None,
             });
-            let semantic_output = reduced.iter().any(|event| event.is_semantic());
             let finished = self.reducer.finished();
             // A terminal event is the upstream protocol's commit point. All fully decoded events
             // from this push batch have already passed reducer validation, so a partial frame left
@@ -1022,10 +1033,6 @@ impl GrokStreamState {
             }
             if finished {
                 self.terminal = true;
-                if semantic_output {
-                    self.downstream_emitted = true;
-                    self.semantic_output_pending_enqueue = !out.is_empty();
-                }
                 let outcome = terminal_status
                     .map(translate::reducer::GrokTerminal::outcome)
                     .unwrap_or("completed");
@@ -1035,10 +1042,6 @@ impl GrokStreamState {
                 return (!out.is_empty()).then_some(out);
             }
             if !out.is_empty() {
-                if semantic_output {
-                    self.downstream_emitted = true;
-                    self.semantic_output_pending_enqueue = true;
-                }
                 self.capture_downstream(&out);
                 self.schedule_next_heartbeat();
                 return Some(out);
@@ -1098,6 +1101,7 @@ impl GrokStreamState {
         let retry = reconnect.retry.clone();
         let deadline = self.deadline;
         let attempt_bytes = self.attempt_bytes;
+        let original_error = error.clone();
         let future = Box::pin(async move {
             let wait_ms = {
                 let mut state = retry.lock().await;
@@ -1111,28 +1115,31 @@ impl GrokStreamState {
                 let transient = state.transient_failures();
                 let wire_attempt = state.wire_attempt();
                 let log_context = state.log_context();
-                if let Some(traffic) = traffic.as_ref() {
-                    traffic.write_json(
-                        "024-upstream-stream-rebuild",
-                        &serde_json::json!({
-                            "wait_ms": wait_ms,
-                            "origin": client::origin_name(error.origin),
-                            "error_stage": client::stage_name(error.stage),
-                            "status": error.status.as_u16(),
-                            "replay_safety": error.replay_safety.as_str(),
-                            "deadline_remaining_ms": deadline.remaining_ms(),
-                            "message": error.message,
-                            "stage": fail_stage,
-                            "kind": fail_kind,
-                            "attempt_bytes": attempt_bytes,
-                        }),
-                    );
-                }
                 client::log_retry(wire_attempt, transient, wait_ms, &error, &log_context);
                 wait_ms
             };
             client::run_before_deadline(deadline, retry.clone(), error.stage, sleep(wait_ms))
                 .await?;
+            // Record an actual rebuild attempt only after its backoff has completed. A downstream
+            // heartbeat can commit the response while this future is sleeping; in that case the
+            // future is dropped and must not leave an artifact claiming a replay was dispatched.
+            if let Some(traffic) = traffic.as_ref() {
+                traffic.write_json(
+                    "024-upstream-stream-rebuild",
+                    &serde_json::json!({
+                        "wait_ms": wait_ms,
+                        "origin": client::origin_name(error.origin),
+                        "error_stage": client::stage_name(error.stage),
+                        "status": error.status.as_u16(),
+                        "replay_safety": error.replay_safety.as_str(),
+                        "deadline_remaining_ms": deadline.remaining_ms(),
+                        "message": error.message,
+                        "stage": fail_stage,
+                        "kind": fail_kind,
+                        "attempt_bytes": attempt_bytes,
+                    }),
+                );
+            }
             client
                 .post_prepared_with_retry(&request, traffic, retry)
                 .await
@@ -1140,6 +1147,7 @@ impl GrokStreamState {
         });
         self.rebuild = Some(GrokPendingRebuild {
             future,
+            original_error,
             fail_stage,
             fail_kind,
         });
@@ -1391,6 +1399,7 @@ type GrokRebuildFuture =
 
 struct GrokPendingRebuild {
     future: GrokRebuildFuture,
+    original_error: GrokError,
     fail_stage: &'static str,
     fail_kind: &'static str,
 }
@@ -1824,19 +1833,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_stream_rebuild_emits_multiple_pings_then_honors_total_deadline() {
+    async fn grok_heartbeat_commit_closes_replay_window() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_complete_http_request(&mut stream).await;
-            let mut byte = [0_u8; 1];
-            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
-                .await
-                .expect("the total deadline must cancel the stalled rebuild socket")
-                .unwrap()
+            match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
+                Err(_) => 0,
+                Ok(Ok((mut stream, _))) => {
+                    let _ = read_complete_http_request(&mut stream).await;
+                    1
+                }
+                Ok(Err(error)) => panic!("replay listener failed: {error}"),
+            }
         });
-        let (client, _temp) = test_client(
+        let (client, temp) = test_client(
             &format!("http://{addr}/v1"),
             GrokTimeouts {
                 connect_ms: 1_000,
@@ -1846,51 +1856,64 @@ mod tests {
             },
         )
         .await;
-        let deadline = GrokRequestDeadline::after(Duration::from_millis(180));
+        let deadline = GrokRequestDeadline::after(Duration::from_millis(500));
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let capture_root = temp.path().join("traffic");
+        let traffic = Arc::new(test_capture(capture_root.clone()));
         let reconnect = Some(GrokReconnectContext::new(
             Arc::new(client),
             prepared_request(false),
-            None,
+            Some(traffic.clone()),
             retry.clone(),
             1,
         ));
-        // This test is specifically about a permitted rebuild waiting on a
-        // socket. Use an explicit upstream retry response rather than an
-        // outcome-unknown transport reset.
+        // Keep the permitted replay in its Retry-After sleep until the heartbeat is committed.
+        // The pending future must be cancelled before it can issue the second logical POST.
         let reset = client::GrokError::upstream_event(
             StatusCode::SERVICE_UNAVAILABLE,
-            Some("0".into()),
+            Some("0.25".into()),
             "synthetic retryable upstream event",
             true,
         );
 
         let response = stream_body_with_policy(
             futures_util::stream::iter(vec![Err(reset)]),
-            "msg_stalled_rebuild".into(),
+            "msg_heartbeat_commit".into(),
             "grok-4.5".into(),
             None,
-            "req_stalled_rebuild".into(),
-            None,
+            "req_heartbeat_commit".into(),
+            Some(traffic),
             reconnect,
             deadline,
             Duration::from_millis(25),
         );
         let body = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect())
             .await
-            .expect("the shared total deadline must terminate the rebuild")
+            .expect("the committed heartbeat must terminate the pending rebuild")
             .unwrap()
             .to_bytes();
         let body = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(body.matches("event: ping").count() >= 3, "{body}");
-        assert!(body.contains("total wall-clock timeout"), "{body}");
-        assert!(retry.lock().await.is_terminal());
-        assert_eq!(server.await.unwrap(), 0);
+        assert_eq!(body.matches("event: ping").count(), 1, "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(
+            body.contains("synthetic retryable upstream event"),
+            "{body}"
+        );
+        assert!(!body.contains("total wall-clock timeout"), "{body}");
+        assert_eq!(
+            server.await.unwrap(),
+            0,
+            "a committed heartbeat must prevent the replay POST"
+        );
+        assert!(
+            capture_contents_matching(capture_root, "024-upstream-stream-rebuild").is_empty(),
+            "a replay cancelled during backoff must not leave a rebuild artifact"
+        );
     }
 
     #[tokio::test]
-    async fn dropping_downstream_during_stalled_rebuild_cancels_socket_immediately() {
+    async fn heartbeat_during_inflight_rebuild_cancels_socket_and_emits_original_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
@@ -1899,9 +1922,9 @@ mod tests {
             let _ = read_complete_http_request(&mut stream).await;
             let _ = request_seen_tx.send(());
             let mut byte = [0_u8; 1];
-            tokio::time::timeout(Duration::from_millis(500), stream.read(&mut byte))
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
                 .await
-                .expect("dropping downstream must promptly cancel the rebuild socket")
+                .expect("the committed heartbeat must promptly cancel the rebuild socket")
                 .unwrap()
         });
         let (client, _temp) = test_client(
@@ -1938,45 +1961,31 @@ mod tests {
             None,
             reconnect,
             deadline,
-            Duration::from_millis(20),
+            Duration::from_millis(500),
         );
-        let mut body = response.into_body();
-        let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
+        tokio::time::timeout(Duration::from_secs(1), request_seen_rx)
             .await
-            .expect("rebuild wait must emit its first ping")
-            .expect("stream must remain open")
-            .unwrap();
-        assert!(String::from_utf8_lossy(first.data_ref().unwrap()).contains("event: ping"));
-        let mut request_seen_rx = request_seen_rx;
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                tokio::select! {
-                    seen = &mut request_seen_rx => {
-                        seen.expect("the rebuild server must observe the request");
-                        break;
-                    }
-                    frame = body.frame() => {
-                        let frame = frame
-                            .expect("stream must remain open while rebuilding")
-                            .expect("rebuild heartbeat must be valid");
-                        assert!(String::from_utf8_lossy(frame.data_ref().unwrap())
-                            .contains("event: ping"));
-                    }
-                }
-            }
-        })
-        .await
-        .expect("the stalled rebuild request must start while heartbeats are consumed");
-        let second = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .expect("the rebuild request must start before the heartbeat")
+            .expect("the rebuild server must observe the request");
+        let body = tokio::time::timeout(Duration::from_secs(2), response.into_body().collect())
             .await
-            .expect("rebuild wait must emit another ping")
-            .expect("stream must remain open")
-            .unwrap();
-        assert!(String::from_utf8_lossy(second.data_ref().unwrap()).contains("event: ping"));
+            .expect("the heartbeat must terminate the in-flight rebuild")
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
 
-        drop(body);
-
-        assert_eq!(server.await.unwrap(), 0);
+        assert_eq!(body.matches("event: ping").count(), 1, "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(
+            body.contains("synthetic retryable upstream event"),
+            "{body}"
+        );
+        assert!(!body.contains("total wall-clock timeout"), "{body}");
+        assert_eq!(
+            server.await.unwrap(),
+            0,
+            "the in-flight replay socket must close after heartbeat commit"
+        );
     }
 
     fn sample_request() -> GrokResponsesRequest {
@@ -3158,7 +3167,9 @@ mod tests {
                 None,
                 reconnect,
                 deadline,
-                Duration::from_millis(10),
+                // Keep this test focused on a replay that completes before any downstream
+                // heartbeat commits the response.
+                Duration::from_secs(1),
             )
             .into_body()
             .collect(),

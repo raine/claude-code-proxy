@@ -808,6 +808,13 @@ The file lives at `~/.config/claude-code-proxy/config.json` on macOS
 Windows, and at
 `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux. Set
 `CCP_CONFIG_DIR` to use a separate config and auth directory for that process.
+On macOS and Windows, if that platform's primary file does not exist, ccproxy
+also checks the historical `XDG_CONFIG_HOME/claude-code-proxy/config.json`
+location when `XDG_CONFIG_HOME` is set, otherwise the home-directory
+`.config/claude-code-proxy/config.json` location. Older releases used this
+generic path because of incorrect platform detection. This is a read-only
+fallback: creating the primary file takes precedence, and ccproxy does not move
+or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
 
 ```json
 {
@@ -918,9 +925,11 @@ Windows, and at
 | `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                                                                               |
 | `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT`                                                                                                                                               |
 
-A malformed `config.json` is reported on stderr and ignored; defaults are used
-in its place. Invalid types for individual keys are warned and skipped without
-affecting other keys.
+A malformed or unreadable `config.json` is reported on stderr. At startup it is
+ignored and defaults are used; during hot reload ccproxy keeps the last valid
+snapshot and generation until the file becomes valid again. Type errors reject
+the new snapshot as a whole so a partially applied configuration cannot mix old
+and new policy.
 
 Codex uses `auto` transport by default. Without a system proxy, `auto` starts
 with live WebSocket streaming while the connection is healthy. It falls back
@@ -1095,11 +1104,18 @@ not merely until response headers arrive.
 
 Request lifecycle logs distinguish response headers from a finished stream:
 `response_started` records the status returned by the provider,
-`request_completed` is written only after response-body EOF, `request_failed`
-captures HTTP or in-band SSE errors, and `request_abandoned` records downstream
-cancellation before completion.
+`request_completed` is written only after response-body EOF; successful SSE
+responses must first contain a complete Anthropic `message_stop`. A clean
+channel EOF without that terminal event is surfaced as a body error and recorded
+as `request_failed`. HTTP and in-band SSE errors are also recorded as failed,
+while `request_abandoned` records downstream cancellation before completion.
 
 ### Files
+
+On Unix, credential and diagnostic files are created as `0600` inside `0700`
+directories. Sensitive traffic/error capture fails closed if that boundary
+cannot be established; ordinary redacted logging reports a permission warning
+but remains available. Windows relies on the profile directories' ACLs.
 
 - `proxy.log` — JSON-lines log, rotated at 20 MiB. It lives at
   `$XDG_STATE_HOME/claude-code-proxy/proxy.log` on macOS/Linux and at
@@ -1139,17 +1155,21 @@ CCP_TRAFFIC_LOG=1`.
   `~/.config/claude-code-proxy/config.json` on macOS,
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux,
   and `%APPDATA%\claude-code-proxy\config.json` on Windows. `CCP_CONFIG_DIR`
-  replaces the platform config directory for the current process.
-- Codex tokens — macOS prefers Keychain service `claude-code-proxy.codex`; when
-  writes are unavailable it falls back to
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json` and
-  reports that backend. Linux uses the same file path; Windows uses
-  `%APPDATA%\claude-code-proxy\codex\auth.json`.
-- Grok tokens — macOS prefers Keychain service `claude-code-proxy.grok`; when
-  access is unavailable it falls back to
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json`. Linux
-  uses the same file path, and Windows uses
-  `%APPDATA%\claude-code-proxy\grok\auth.json`.
+  replaces the platform config directory for the current process. The macOS
+  and Windows legacy fallback described above is disabled for explicit config
+  directories.
+- Codex tokens — macOS prefers Keychain service `claude-code-proxy.codex`; its
+  file fallback writes `~/.config/claude-code-proxy/codex/auth.json` and reports
+  that backend. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json`;
+  Windows uses `%APPDATA%\claude-code-proxy\codex\auth.json`.
+- Grok tokens — macOS prefers Keychain service `claude-code-proxy.grok`; its
+  file fallback writes `~/.config/claude-code-proxy/grok/auth.json`. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json`, and
+  Windows uses `%APPDATA%\claude-code-proxy\grok\auth.json`.
+  On macOS and Windows, provider auth also reads the historical generic path
+  described above when it differs from the primary path; new writes stay on
+  the primary path.
 
 ## Switching models and backends
 
@@ -1441,9 +1461,11 @@ within the active profile family.
 - **GPT/Grok — request controls:** unknown fields, malformed compatibility
   metadata, fixed thinking budgets, disabled reasoning, sampling controls, and
   non-empty stop sequences fail before dispatch. Claude Code's current adaptive
-  thinking and shaped `context_management` metadata remain accepted; the
-  alternate providers own the actual context/reasoning policy rather than
-  receiving those Anthropic fields verbatim.
+  thinking plus null or empty `context_management.edits` remain accepted.
+  Non-empty context edits fail before dispatch because the alternate providers
+  cannot apply or report Anthropic context editing faithfully. Grok also rejects
+  `service_tier: "standard_only"` because it cannot guarantee that capacity
+  constraint; `auto` remains supported.
 - **Grok — `output_config.format`:** translated to Responses API `text.format`
   for structured background requests such as session title generation.
 

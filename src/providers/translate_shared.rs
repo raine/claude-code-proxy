@@ -75,7 +75,11 @@ pub fn validate_alternate_provider_fields(
 
     if let Some(service_tier) = req.extra.get("service_tier") {
         match service_tier.as_str() {
-            Some("auto" | "standard_only") => {}
+            Some("auto") => {}
+            Some("standard_only") if provider == "Grok" => anyhow::bail!(
+                "Grok cannot guarantee Anthropic service_tier=standard_only; the request was not sent upstream"
+            ),
+            Some("standard_only") => {}
             _ => anyhow::bail!("service_tier must be auto or standard_only"),
         }
     }
@@ -189,6 +193,11 @@ fn validate_context_management_shape(
         {
             anyhow::bail!("context_management.edits[{index}].type must be a non-empty string");
         }
+    }
+    if !edits.is_empty() {
+        anyhow::bail!(
+            "alternate providers do not support non-empty context_management.edits; the request was not sent upstream"
+        );
     }
     Ok(())
 }
@@ -1170,6 +1179,45 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "{field}: {error}");
         }
+    }
+
+    #[test]
+    fn alternate_provider_fields_reject_non_empty_context_edits() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"hello"}],
+            "context_management":{
+                "edits":[{
+                    "type":"clear_tool_uses_20250919",
+                    "trigger":{"type":"input_tokens","value":100000}
+                }]
+            }
+        }))
+        .unwrap();
+
+        let error = validate_alternate_provider_fields(&request, "Codex")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("non-empty context_management.edits"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn grok_rejects_standard_only_service_tier() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user", "content":"hello"}],
+            "service_tier":"standard_only"
+        }))
+        .unwrap();
+
+        let error = validate_alternate_provider_fields(&request, "Grok")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("service_tier=standard_only"), "{error}");
+        validate_alternate_provider_fields(&request, "Codex").unwrap();
     }
 
     #[test]
