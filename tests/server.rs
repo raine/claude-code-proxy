@@ -855,8 +855,12 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .header("x-ccproxy-compaction-model", "grok-4.5-high")
+                .header(
+                    "x-claude-code-session-id",
+                    "compaction-without-prior-affinity",
+                )
                 .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
                 ))
                 .unwrap(),
         )
@@ -874,8 +878,12 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .header("x-ccproxy-compaction-model", "grok-4.5-high")
+                .header(
+                    "x-claude-code-session-id",
+                    "compaction-without-prior-affinity",
+                )
                 .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"ordinary request"}]}"#,
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"ordinary request"}]}"#,
                 ))
                 .unwrap(),
         )
@@ -891,15 +899,94 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
     let compact = state
         .recent
         .iter()
-        .find(|request| request.model.as_deref() == Some("grok-4.5-high"))
+        .find(|request| request.session_seq == Some(1))
         .expect("compaction route must be recorded");
+    assert_eq!(compact.model.as_deref(), Some("grok-4.5-high"));
     assert_eq!(compact.provider.as_deref(), Some("grok"));
     let normal = state
         .recent
         .iter()
-        .find(|request| request.model.as_deref() == Some("gpt-5.4"))
+        .find(|request| request.session_seq == Some(2))
         .expect("ordinary route must be recorded");
+    assert!(
+        normal
+            .model
+            .as_deref()
+            .is_some_and(|model| model.starts_with("claude-opus-5"))
+    );
     assert_eq!(normal.provider.as_deref(), Some("codex"));
+}
+
+#[tokio::test]
+async fn codex_compaction_preserves_existing_grok_session_affinity() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let session_id = "codex-compaction-with-grok-affinity";
+    let requests = [
+        ("grok-4.5", None, "establish explicit Grok affinity"),
+        (
+            "claude-opus-5",
+            Some("gpt-5.6-terra"),
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far.",
+        ),
+        ("claude-opus-5", None, "ordinary alias request"),
+    ];
+
+    for (model, compaction_model, content) in requests {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", session_id);
+        if let Some(compaction_model) = compaction_model {
+            request = request.header("x-ccproxy-compaction-model", compaction_model);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": content}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model} response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 3);
+    let expected = [
+        (1, "grok-4.5", "grok"),
+        (2, "gpt-5.6-terra", "codex"),
+        (3, "claude-opus-5", "grok"),
+    ];
+    for (session_seq, model, provider) in expected {
+        let request = state
+            .recent
+            .iter()
+            .find(|request| request.session_seq == Some(session_seq))
+            .unwrap_or_else(|| panic!("session sequence {session_seq} must be recorded"));
+        assert_eq!(request.model.as_deref(), Some(model));
+        assert_eq!(request.provider.as_deref(), Some(provider));
+    }
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ pub struct SessionRoute<T> {
     pub value: T,
     pub provider_name: &'static str,
     commit: bool,
+    update_affinity: bool,
 }
 
 impl<T> SessionRoute<T> {
@@ -24,6 +25,16 @@ impl<T> SessionRoute<T> {
             value,
             provider_name,
             commit: true,
+            update_affinity: true,
+        }
+    }
+
+    pub fn preserving_affinity(value: T, provider_name: &'static str) -> Self {
+        Self {
+            value,
+            provider_name,
+            commit: true,
+            update_affinity: false,
         }
     }
 
@@ -32,6 +43,7 @@ impl<T> SessionRoute<T> {
             value,
             provider_name: "",
             commit: false,
+            update_affinity: false,
         }
     }
 }
@@ -80,7 +92,8 @@ pub fn route_session_request<T>(
     });
     next.seq += 1;
     next.last_seen = next.last_seen.max(now);
-    if !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
+    if selected.update_affinity
+        && !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
         && let Some(provider) = session_affinity_provider(selected.provider_name)
     {
         next.affinity_provider = Some(provider);
@@ -254,6 +267,31 @@ mod tests {
         assert_eq!(
             unchanged.and_then(|state| state.affinity_provider),
             prior.affinity_provider
+        );
+    }
+
+    #[test]
+    fn preserving_affinity_still_commits_sequence_and_last_seen() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        let (_, first) = route_session_request(Some("preserved-session"), "grok-4.5", 10, |_| {
+            Some(SessionRoute::new((), "grok"))
+        });
+        assert_eq!(
+            first.as_ref().and_then(|state| state.affinity_provider),
+            Some(SessionAffinityProvider::Grok)
+        );
+
+        let (_, second) =
+            route_session_request(Some("preserved-session"), "gpt-5.6-terra", 20, |_| {
+                Some(SessionRoute::preserving_affinity((), "codex"))
+            });
+        let second = second.expect("preserving route must commit session state");
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.last_seen, 20);
+        assert_eq!(
+            second.affinity_provider,
+            Some(SessionAffinityProvider::Grok)
         );
     }
 }

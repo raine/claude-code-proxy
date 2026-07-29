@@ -904,8 +904,9 @@ async fn dispatch_request_with_id(
         }
     };
 
-    let effective_model =
-        compaction_model_override(&headers, &body).unwrap_or_else(|| requested_model.clone());
+    let compaction_model = compaction_model_override(&headers, &body);
+    let uses_compaction_model_override = compaction_model.is_some();
+    let effective_model = compaction_model.unwrap_or_else(|| requested_model.clone());
     let normalized_model = normalize_incoming_model(&effective_model);
     if normalized_model != normalize_incoming_model(&requested_model) {
         log.info(
@@ -931,10 +932,14 @@ async fn dispatch_request_with_id(
                         .admission
                         .acquire(state.admission.provider(provider_name))
                     {
-                        Some(permit) => session::SessionRoute::new(
-                            ProviderRouteSelection::Admitted { provider, permit },
-                            provider_name,
-                        ),
+                        Some(permit) => {
+                            let selection = ProviderRouteSelection::Admitted { provider, permit };
+                            if uses_compaction_model_override {
+                                session::SessionRoute::preserving_affinity(selection, provider_name)
+                            } else {
+                                session::SessionRoute::new(selection, provider_name)
+                            }
+                        }
                         None => session::SessionRoute::without_commit(
                             ProviderRouteSelection::Saturated(provider_name),
                         ),
