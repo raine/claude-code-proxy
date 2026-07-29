@@ -296,6 +296,7 @@ pub enum ContentBlock {
         thinking: String,
         signature: Option<String>,
     },
+    RedactedThinking,
 }
 
 #[derive(Debug)]
@@ -1101,6 +1102,7 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
                 signature,
             })
         }
+        "redacted_thinking" => Some(ContentBlock::RedactedThinking),
         _ => None,
     }
 }
@@ -1108,6 +1110,23 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalization_recognizes_redacted_thinking_without_payload() {
+        let blocks = normalize_content(
+            &serde_json::json!([{
+                "type":"redacted_thinking",
+                "data":"sensitive reasoning"
+            }]),
+            Value::Null,
+        );
+
+        assert!(matches!(
+            blocks.as_slice(),
+            [ContentBlock::RedactedThinking]
+        ));
+        assert!(!format!("{blocks:?}").contains("sensitive reasoning"));
+    }
 
     #[test]
     fn alternate_provider_fields_reject_silent_generation_controls() {

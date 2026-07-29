@@ -2280,6 +2280,10 @@ fn build_input(
                                 arguments: args,
                             });
                         }
+                        CodexInputBlock::Native(ContentBlock::RedactedThinking) => {
+                            // Anthropic intentionally withholds this reasoning payload. It is
+                            // neither visible assistant text nor replayable Codex reasoning.
+                        }
                         CodexInputBlock::Native(ContentBlock::Thinking { signature, .. }) => {
                             let Some(replay) =
                                 signature.as_deref().and_then(decode_reasoning_signature)
@@ -4244,6 +4248,51 @@ mod tests {
         };
         assert!(text.contains("[Anthropic future_widget block]"));
         assert!(text.contains("\"answer\":42"));
+    }
+
+    #[test]
+    fn codex_redacted_thinking_is_omitted_before_visible_assistant_text() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"assistant", "content":[
+                    {"type":"redacted_thinking", "data":"sensitive-reasoning-payload"},
+                    {"type":"text", "text":"visible answer"}
+                ]},
+                {"role":"user", "content":"continue"}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let encoded = serde_json::to_string(&out.input).unwrap();
+        assert!(encoded.contains("visible answer"));
+        assert!(!encoded.contains("sensitive-reasoning-payload"));
+        assert!(!encoded.contains("redacted_thinking"));
+    }
+
+    #[test]
+    fn codex_redacted_only_assistant_content_emits_no_message() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"assistant", "content":[{
+                    "type":"redacted_thinking", "data":"sensitive-reasoning-payload"
+                }]},
+                {"role":"user", "content":"continue"}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(!out.input.iter().any(|item| {
+            matches!(item, ResponsesInputItem::Message { role, .. } if role == "assistant")
+        }));
+        assert!(
+            !serde_json::to_string(&out.input)
+                .unwrap()
+                .contains("sensitive-reasoning-payload")
+        );
     }
 
     #[test]
