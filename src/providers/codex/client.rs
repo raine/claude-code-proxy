@@ -369,11 +369,13 @@ fn normalize_proxy_url(raw: &str) -> Option<String> {
 }
 
 fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
+    let tls_config = super::websocket::websocket_tls_config();
     proxy_environment
         .apply(
             reqwest::Client::builder()
                 .http1_only()
-                .redirect(reqwest::redirect::Policy::none()),
+                .redirect(reqwest::redirect::Policy::none())
+                .use_preconfigured_tls((*tls_config).clone()),
         )
         .build()
         .expect("failed to create Codex WebSocket HTTP client")

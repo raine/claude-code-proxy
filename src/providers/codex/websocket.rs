@@ -21,6 +21,7 @@ use tokio_tungstenite::{
     },
 };
 
+use crate::logging::create_logger;
 use crate::provider::RequestContext;
 use crate::traffic::TrafficCapture;
 
@@ -141,16 +142,31 @@ impl WebSocketProxyConfig {
     }
 }
 
-fn websocket_tls_config() -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    roots.add_parsable_certificates(native.certs);
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+static WEBSOCKET_TLS_CONFIG: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> =
+    once_cell::sync::Lazy::new(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        let load_error_count = native.errors.len();
+        let (_, parse_error_count) = roots.add_parsable_certificates(native.certs);
+        if load_error_count > 0 || parse_error_count > 0 {
+            let mut fields = serde_json::Map::new();
+            fields.insert("loadErrorCount".into(), serde_json::json!(load_error_count));
+            fields.insert(
+                "parseErrorCount".into(),
+                serde_json::json!(parse_error_count),
+            );
+            create_logger("codex").warn("native_certificate_load_errors", Some(fields));
+        }
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
+
+pub(super) fn websocket_tls_config() -> Arc<rustls::ClientConfig> {
+    WEBSOCKET_TLS_CONFIG.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,6 +1956,13 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn websocket_tls_configuration_is_shared() {
+        let first = websocket_tls_config();
+        let second = websocket_tls_config();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
