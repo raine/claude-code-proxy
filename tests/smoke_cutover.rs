@@ -937,6 +937,112 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 }
 
 #[tokio::test]
+async fn smoke_codex_http_compaction_forces_text_only_wire_request() {
+    let _guard = env_lock().await;
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_compact\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_compact\",\"delta\":\"<analysis>kept</analysis><summary>compact</summary>\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_compact\",\"text\":\"<analysis>kept</analysis><summary>compact</summary>\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_compact\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"usage\":{\"input_tokens\":200000,\"output_tokens\":1000}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model":"gpt-5.6-sol",
+        "max_tokens":32000,
+        "messages":[
+            {"role":"user","content":"Earlier task"},
+            {"role":"assistant","content":[{
+                "type":"tool_use",
+                "id":"call_search",
+                "name":"ToolSearch",
+                "input":{"query":"deferred"}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result",
+                "tool_use_id":"call_search",
+                "content":[
+                    {"type":"text","text":"one match"},
+                    {"type":"tool_reference","tool_name":"DeferredTool"}
+                ]
+            }]},
+            {"role":"assistant","content":[{
+                "type":"tool_use",
+                "id":"call_read",
+                "name":"Read",
+                "input":{"file_path":"README.md"}
+            }]},
+            {"role":"user","content":[{
+                "type":"tool_result",
+                "tool_use_id":"call_read",
+                "content":"Earlier tool output"
+            }]},
+            {"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}
+        ],
+        "tools":[
+            {"name":"ToolSearch","input_schema":{"type":"object","properties":{}}},
+            {
+                "name":"DeferredTool",
+                "defer_loading":true,
+                "input_schema":{"type":"object","properties":{}}
+            },
+            {"name":"Glob","input_schema":{"type":"object","properties":{}}},
+            {"name":"Grep","input_schema":{"type":"object","properties":{}}},
+            {"name":"Read","input_schema":{"type":"object","properties":{}}},
+            {"name":"StructuredOutput","input_schema":{"type":"object","properties":{}}}
+        ],
+        "tool_choice":{"type":"auto"},
+        "output_config":{"effort":"max"}
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value["content"][0]["text"],
+        "<analysis>kept</analysis><summary>compact</summary>"
+    );
+    assert_eq!(value["stop_reason"], "end_turn");
+
+    let sent = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(sent["model"], "gpt-5.6-sol");
+    assert_eq!(sent["parallel_tool_calls"], false);
+    assert_eq!(sent["reasoning"]["effort"], "medium");
+    assert!(sent.get("tools").is_none());
+    assert!(sent.get("tool_choice").is_none());
+    let input = sent["input"].as_array().unwrap();
+    assert!(!input.iter().any(|item| item["type"] == "additional_tools"));
+    assert!(input.iter().any(|item| item["type"] == "function_call"));
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    );
+    assert!(!sent.to_string().contains("StructuredOutput"));
+}
+
+#[tokio::test]
 async fn smoke_codex_http_structured_output_projects_wire_schema_and_elides_synthetic_null() {
     let _guard = env_lock().await;
     let config = TempDir::new().unwrap();

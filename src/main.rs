@@ -44,11 +44,11 @@ const CLAUDE_SHARED_CONFIG_ENTRIES: &[&str] = &[
     "workflows",
 ];
 const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation.";
-const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches and exact paths, trace the relevant control flow, and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
+const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches, exact paths, and bounded line ranges over whole-file reads; trace the relevant control flow and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
 const GENERAL_PURPOSE_AGENT_DESCRIPTION: &str = "General-purpose agent for complex, multi-step work that may require investigation, reasoning, implementation, and verification. Use proactively for substantial tasks that do not fit a narrower specialist.";
 const GENERAL_PURPOSE_AGENT_PROMPT: &str = "You are a capable general-purpose engineering agent. Complete the delegated task end to end: inspect the relevant context, make focused changes when authorized, verify the result in proportion to risk, and return a concise evidence-backed summary. Preserve unrelated user changes and follow all applicable instructions.";
 const PLAN_AGENT_DESCRIPTION: &str = "Read-only planning and research agent. Use proactively to investigate architecture, constraints, risks, and verification needs before implementation.";
-const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
+const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, using targeted searches and bounded line ranges instead of ingesting whole large files. Identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,6 +127,8 @@ struct ClaudeProfileConfig {
     haiku_model: &'static str,
     compaction_model: Option<&'static str>,
     context_tokens: &'static str,
+    file_read_max_output_tokens: Option<&'static str>,
+    workflow_size_guideline: Option<&'static str>,
     effort_level: &'static str,
     ultracode: bool,
     explore_effort: &'static str,
@@ -154,6 +156,8 @@ impl ClaudeProfile {
                 haiku_model: "gpt-5.6-luna",
                 compaction_model: Some("gpt-5.6-terra"),
                 context_tokens: "272000",
+                file_read_max_output_tokens: Some("8000"),
+                workflow_size_guideline: Some("small"),
                 // Default to high (not ultracode/xhigh) so ordinary co sessions
                 // start at a calmer effort; users can still raise /effort later.
                 effort_level: "high",
@@ -182,6 +186,8 @@ impl ClaudeProfile {
                 haiku_model: "grok-4.5-medium",
                 compaction_model: None,
                 context_tokens: "500000",
+                file_read_max_output_tokens: None,
+                workflow_size_guideline: None,
                 effort_level: "high",
                 ultracode: false,
                 explore_effort: "medium",
@@ -1291,6 +1297,9 @@ fn build_claude_command_for_profile_config(
         "enforceAvailableModels": true,
         "fallbackModel": [],
     });
+    if let Some(guideline) = profile.workflow_size_guideline {
+        inline_settings["workflowSizeGuideline"] = serde_json::json!(guideline);
+    }
     if let Some((executable, destination)) = session_end_hook {
         inline_settings["hooks"] = session_end_hook_settings(executable, destination)?;
     }
@@ -1332,6 +1341,11 @@ fn build_claude_command_for_profile_config(
         .arg("--agents")
         .arg(inline_agents);
     command.args(args).envs(environment);
+    if profile.file_read_max_output_tokens.is_none() {
+        // Keep the Grok profile independent from a GPT-specific cap inherited
+        // from the parent shell or from a previously configured launcher.
+        command.env_remove("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS");
+    }
     Ok(command)
 }
 
@@ -1492,6 +1506,12 @@ fn claude_profile_environment(
         environment.push((
             "ANTHROPIC_CUSTOM_HEADERS",
             format!("x-ccproxy-compaction-model: {model}"),
+        ));
+    }
+    if let Some(tokens) = profile.file_read_max_output_tokens {
+        environment.push((
+            "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS",
+            tokens.to_string(),
         ));
     }
     environment
@@ -2132,6 +2152,7 @@ mod tests {
         assert_eq!(settings["model"], "fable");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
+        assert_eq!(settings["workflowSizeGuideline"], "small");
         assert_eq!(settings["enforceAvailableModels"], true);
         assert_eq!(settings["fallbackModel"], serde_json::json!([]));
         assert!(
@@ -2189,6 +2210,10 @@ mod tests {
             "272000"
         );
         assert_eq!(
+            command_env(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"),
+            "8000"
+        );
+        assert_eq!(
             command_env(&command, "ANTHROPIC_CUSTOM_HEADERS"),
             "x-ccproxy-compaction-model: gpt-5.6-terra"
         );
@@ -2209,6 +2234,7 @@ mod tests {
         assert_eq!(settings["model"], "grok-4.5");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
+        assert!(settings.get("workflowSizeGuideline").is_none());
         assert!(
             PathBuf::from(command_env(&command, "CLAUDE_CONFIG_DIR"))
                 .ends_with(".claude-ccproxy/grok")
@@ -2262,6 +2288,9 @@ mod tests {
         assert_eq!(
             command_env(&command, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
             "90"
+        );
+        assert!(
+            command_env_optional(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS").is_none()
         );
         assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
     }

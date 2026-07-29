@@ -288,6 +288,7 @@ ANTHROPIC_CUSTOM_HEADERS='x-ccproxy-compaction-model: gpt-5.6-terra' \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
+CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=8000 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
@@ -305,6 +306,12 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
 ```
+
+The managed `co` launcher additionally sets
+`workflowSizeGuideline: "small"` in Claude Code's inline settings. Together
+with the 8K `Read` cap, this keeps broad dynamic workflows from filling a
+272K GPT context with a few whole-file tool results. These GPT-specific
+guards are not applied to the 500K `cg` profile.
 
 Claude Code sends automatic and manual compaction with the main-loop model.
 The `co` profile already routes recognized compaction to GPT-5.6 Terra. For a
@@ -329,6 +336,7 @@ the same Claude config, put the env in `~/.claude/settings.json`:
 
 ```json
 {
+  "workflowSizeGuideline": "small",
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
     "ANTHROPIC_AUTH_TOKEN": "unused",
@@ -337,6 +345,7 @@ the same Claude config, put the env in `~/.claude/settings.json`:
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "272000",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "272000",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "8000",
     "CLAUDE_CODE_MAX_RETRIES": "2",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
@@ -1274,6 +1283,7 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
       export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-272000}"
       export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
       export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
+      export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-8000}"
       ;;
     grok-4.5|grok-4.5-high|grok-4.5-medium)
       export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-500000}"
@@ -1373,6 +1383,7 @@ ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
+CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=8000 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 ```

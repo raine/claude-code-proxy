@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Preserve Codex rate-limit and overload error types when an upstream failure
+  arrives after streaming output has already begun, without replaying the
+  partially emitted turn.
+- Omit Anthropic `redacted_thinking` blocks from Codex history without exposing
+  their withheld payload or synthesizing an empty assistant message.
+- Keep Codex compaction text-only by removing callable tools, including
+  Responses Lite `additional_tools`, so Claude Code receives a summary instead
+  of another `Read` or `StructuredOutput` call. The managed `co` profile also
+  caps each `Read` result at 8K tokens and guides dynamic workflows toward a
+  small agent count to preserve context headroom.
 - Keep ordinary Claude Code reasoning effort one-to-one under `co`, so
   standalone `xhigh` remains wire-level `xhigh`, while recognizing Claude
   Code's generated Ultracode session marker and promoting only that mode's

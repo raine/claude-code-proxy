@@ -255,6 +255,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .env("HOME", &fixture.home_dir)
         .env("PORT", "19876")
         .env("CCP_BIND_ADDRESS", "0.0.0.0")
+        .env("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "25000")
         .env("ANTHROPIC_CUSTOM_HEADERS", "x-existing: keep");
 
     cmd.assert()
@@ -276,6 +277,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("disable_1m=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("file_read_cap=8000"))
         .stdout(contains("tool_search=true"))
         .stdout(contains(
             "custom_headers=x-ccproxy-compaction-model: gpt-5.6-terra",
@@ -305,6 +307,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("\"effortLevel\":\"high\""))
         .stdout(contains("\"model\":\"fable\""))
         .stdout(contains("\"ultracode\":false"))
+        .stdout(contains("\"workflowSizeGuideline\":\"small\""))
         .stdout(contains("arg=<--effort>"))
         .stdout(contains("arg=<max>"))
         .stdout(contains("arg=<hello world>"))
@@ -323,6 +326,7 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .env("PATH", fixture.path_env())
         .env("HOME", &fixture.home_dir)
         .env("PORT", "19877")
+        .env("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "25000")
         .env("FAKE_CLAUDE_EXIT_CODE", "37");
 
     cmd.assert()
@@ -346,6 +350,7 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .stdout(contains("disable_1m=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("file_read_cap=\n"))
         .stdout(contains("tool_search=true"))
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
@@ -543,6 +548,7 @@ printf 'compact_pct=%s\n' "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 printf 'disable_1m=%s\n' "$CLAUDE_CODE_DISABLE_1M_CONTEXT"
 printf 'max_retries=%s\n' "$CLAUDE_CODE_MAX_RETRIES"
 printf 'tool_concurrency=%s\n' "$CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"
+printf 'file_read_cap=%s\n' "$CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"
 printf 'tool_search=%s\n' "$ENABLE_TOOL_SEARCH"
 printf 'custom_headers=%s\n' "$ANTHROPIC_CUSTOM_HEADERS"
 for arg in "$@"; do

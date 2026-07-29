@@ -513,41 +513,55 @@ pub fn translate_request_with_overrides(
     validate_codex_message_roles(req)?;
     validate_codex_image_inputs(req)?;
     validate_tool_contract(req)?;
+    let compaction = is_claude_code_compaction_request(req);
     let (output_format, schema_bridge) = read_output_format(req)?;
     let mut instructions = flatten_system_text(req.extra.get("system"));
     let tool_plan = read_tools(req)?;
-    let input = build_input(req, &tool_plan.deferred);
+    let mut input = build_input(req, &tool_plan.deferred);
     validate_effective_tool_choice(req, &tool_plan, &input)?;
-    let parallel_function_available = tool_plan.initial.as_ref().is_some_and(|tools| {
+    if compaction {
+        // Claude Code requires a plain-text compaction summary. Responses Lite
+        // represents callable tools as AdditionalTools input items, so dropping
+        // only top-level tools would still let the model call Read or
+        // StructuredOutput instead of returning the summary.
+        input.retain(|item| !matches!(item, ResponsesInputItem::AdditionalTools { .. }));
+    }
+    let parallel_function_available = (tool_plan.initial.as_ref().is_some_and(|tools| {
         tools
             .iter()
             .any(|tool| matches!(tool, ResponsesTool::Function(_)))
     }) || input.iter().any(|item| {
-        matches!(
-            item,
-            ResponsesInputItem::AdditionalTools { tools, .. }
-                if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
-        )
-    });
-    let hosted_web_search_available = tool_plan.initial.as_ref().is_some_and(|tools| {
+            matches!(
+                item,
+                ResponsesInputItem::AdditionalTools { tools, .. }
+                    if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+            )
+        }))
+        && !compaction;
+    let hosted_web_search_available = (tool_plan.initial.as_ref().is_some_and(|tools| {
         tools
             .iter()
             .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
     }) || input.iter().any(|item| {
-        matches!(
-            item,
-            ResponsesInputItem::AdditionalTools { tools, .. }
-                if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
-        )
-    });
+            matches!(
+                item,
+                ResponsesInputItem::AdditionalTools { tools, .. }
+                    if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
+            )
+        }))
+        && !compaction;
     let hosted_web_search_max_uses = hosted_web_search_available
         .then(|| effective_web_search_max_uses(req))
         .flatten();
     if hosted_web_search_available && hosted_tool_guidance_allowed(req) {
         append_web_search_request_guidance(req, &mut instructions);
     }
-    let tools = tool_plan.initial;
-    let tool_choice = map_tool_choice(req)?;
+    let tools = if compaction { None } else { tool_plan.initial };
+    let tool_choice = if compaction {
+        None
+    } else {
+        map_tool_choice(req)?
+    };
 
     let mut text = ResponsesText {
         verbosity: Some("low".to_string()),
@@ -564,7 +578,7 @@ pub fn translate_request_with_overrides(
         input,
         store: false,
         stream: true,
-        parallel_tool_calls: parallel_tool_calls_enabled(req),
+        parallel_tool_calls: !compaction && parallel_tool_calls_enabled(req),
         tool_choice,
         text,
         tools: None,
@@ -663,7 +677,7 @@ pub fn translate_request_with_overrides(
     let effort = read_effort(req)?;
     // Compaction is a structured summary pass, so max reasoning only adds
     // latency. Claude Code also omits effort for Haiku; default Luna to medium.
-    let mut codex_effort = if is_claude_code_compaction_request(req) {
+    let mut codex_effort = if compaction {
         Some(Effort::Medium)
     } else {
         to_codex_effort(effort).or_else(|| (out.model == "gpt-5.6-luna").then_some(Effort::Medium))
@@ -3774,25 +3788,104 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_compaction_caps_effort_at_medium() {
+    fn claude_code_compaction_is_text_only_and_caps_effort_at_medium() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "messages": [
                 {"role":"user", "content":"Earlier task"},
-                {"role":"assistant", "content":"Earlier response"},
+                {"role":"assistant", "content":[{
+                    "type":"tool_use",
+                    "id":"call_search",
+                    "name":"ToolSearch",
+                    "input":{"query":"deferred"}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call_search",
+                    "content":[
+                        {"type":"text", "text":"one match"},
+                        {"type":"tool_reference", "tool_name":"DeferredTool"}
+                    ]
+                }]},
+                {"role":"assistant", "content":[{
+                    "type":"tool_use",
+                    "id":"call_read",
+                    "name":"Read",
+                    "input":{"file_path":"README.md"}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call_read",
+                    "content":"Earlier tool output"
+                }]},
                 {"role":"user", "content":[{
                     "type":"text",
                     "text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."
                 }]}
             ],
+            "tools": [
+                {
+                    "name":"ToolSearch",
+                    "input_schema":{"type":"object","properties":{}}
+                },
+                {
+                    "name":"DeferredTool",
+                    "defer_loading":true,
+                    "input_schema":{"type":"object","properties":{}}
+                },
+                {
+                    "name":"Read",
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{"file_path":{"type":"string"}},
+                        "required":["file_path"]
+                    }
+                },
+                {
+                    "name":"StructuredOutput",
+                    "input_schema":{"type":"object","properties":{}}
+                }
+            ],
+            "tool_choice":{"type":"auto"},
             "output_config": {"effort": "max"}
         }))
         .unwrap();
-        let out = translate_request(&req, opts()).unwrap();
-        assert!(matches!(
-            out.reasoning.unwrap().effort,
-            Some(Effort::Medium)
-        ));
+        let tool_plan = read_tools(&req).unwrap();
+        assert!(
+            build_input(&req, &tool_plan.deferred)
+                .iter()
+                .any(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
+        );
+        for use_responses_lite in [false, true] {
+            let mut options = opts();
+            options.use_responses_lite = use_responses_lite;
+            let out = translate_request(&req, options).unwrap();
+            assert!(matches!(
+                out.reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.effort.as_ref()),
+                Some(Effort::Medium)
+            ));
+            assert!(out.tools.is_none());
+            assert!(out.tool_choice.is_none());
+            assert!(!out.parallel_tool_calls);
+            assert!(out.hosted_web_search_max_uses.is_none());
+            assert!(
+                !out.input
+                    .iter()
+                    .any(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
+            );
+            assert!(
+                out.input
+                    .iter()
+                    .any(|item| matches!(item, ResponsesInputItem::FunctionCall { .. }))
+            );
+            assert!(
+                out.input
+                    .iter()
+                    .any(|item| matches!(item, ResponsesInputItem::FunctionCallOutput { .. }))
+            );
+        }
     }
 
     #[test]
