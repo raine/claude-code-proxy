@@ -46,11 +46,11 @@ const CLAUDE_SHARED_CONFIG_ENTRIES: &[&str] = &[
     "workflows",
 ];
 const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation. Preserve this role's configured fast model; do not override it with the parent model.";
-const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches, exact paths, and bounded line ranges over whole-file reads; trace the relevant control flow and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
+const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches, exact paths, and bounded line ranges over whole-file reads; trace the relevant control flow and return concise findings with file and line references. Follow every tool's declared input schema exactly and never invent grep-style option fields; reformulate the pattern or use an available shell search when advanced matching is needed. Clearly separate confirmed evidence from inference.";
 const GENERAL_PURPOSE_AGENT_DESCRIPTION: &str = "General-purpose agent for complex, multi-step work that may require investigation, reasoning, implementation, and verification. Use proactively for substantial tasks that do not fit a narrower specialist.";
 const GENERAL_PURPOSE_AGENT_PROMPT: &str = "You are a capable general-purpose engineering agent. Complete the delegated task end to end: inspect the relevant context, make focused changes when authorized, verify the result in proportion to risk, and return a concise evidence-backed summary. Preserve unrelated user changes and follow all applicable instructions.";
 const PLAN_AGENT_DESCRIPTION: &str = "Read-only planning and research agent. Use proactively to investigate architecture, constraints, risks, and verification needs before implementation. Preserve this role's configured planning model; do not override it with the parent model.";
-const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, using targeted searches and bounded line ranges instead of ingesting whole large files. Identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
+const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, using targeted searches and bounded line ranges instead of ingesting whole large files. Follow every tool's declared input schema exactly and never invent grep-style option fields; reformulate the pattern or use an available shell search when advanced matching is needed. Identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -2758,6 +2758,12 @@ mod tests {
         for name in ["Explore", "Plan"] {
             assert_eq!(agents[name]["tools"], read_only_tools);
             assert_eq!(agents[name]["permissionMode"], "plan");
+            assert!(
+                agents[name]["prompt"]
+                    .as_str()
+                    .is_some_and(|prompt| prompt.contains("never invent grep-style option fields")),
+                "{name} must guard against unsupported search-tool fields"
+            );
         }
         assert!(agents["general-purpose"].get("tools").is_none());
         assert!(agents["general-purpose"].get("permissionMode").is_none());
