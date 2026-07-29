@@ -561,11 +561,10 @@ fn agent_model_policy_hook_output(input: impl Read) -> Result<Option<serde_json:
     {
         return Ok(None);
     }
-    if payload
-        .get("agent_id")
-        .and_then(|value| value.as_str())
-        .is_some_and(|agent_id| !agent_id.is_empty())
-    {
+    // Claude Code adds `agent_id` to hook input when the hook is running
+    // inside an agent. Treat even malformed values as nested so ambiguous
+    // provenance can never receive this helper's allow decision.
+    if payload.contains_key("agent_id") {
         return Ok(None);
     }
     if !matches!(
@@ -2158,22 +2157,29 @@ mod tests {
                 .is_none()
         );
 
-        let nested_agent = serde_json::json!({
-            "hook_event_name": "PreToolUse",
-            "agent_id": "nested-agent-id",
-            "tool_name": "Agent",
-            "tool_input": {
-                "subagent_type": "Plan",
-                "model": "fable",
-                "prompt": "delegate again",
-            },
-        })
-        .to_string();
-        assert!(
-            agent_model_policy_hook_output(nested_agent.as_bytes())
-                .unwrap()
-                .is_none()
-        );
+        for agent_id in [
+            serde_json::json!("nested-agent-id"),
+            serde_json::json!(""),
+            serde_json::Value::Null,
+            serde_json::json!({"unexpected": "shape"}),
+        ] {
+            let nested_agent = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "agent_id": agent_id,
+                "tool_name": "Agent",
+                "tool_input": {
+                    "subagent_type": "Plan",
+                    "model": "fable",
+                    "prompt": "delegate again",
+                },
+            })
+            .to_string();
+            assert!(
+                agent_model_policy_hook_output(nested_agent.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
