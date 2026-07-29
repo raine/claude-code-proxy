@@ -1461,11 +1461,13 @@ within the active profile family.
 - **GPT/Grok — request controls:** unknown fields, malformed compatibility
   metadata, fixed thinking budgets, disabled reasoning, sampling controls, and
   non-empty stop sequences fail before dispatch. Claude Code's current adaptive
-  thinking plus null or empty `context_management.edits` remain accepted.
-  Non-empty context edits fail before dispatch because the alternate providers
-  cannot apply or report Anthropic context editing faithfully. Grok also rejects
-  `service_tier: "standard_only"` because it cannot guarantee that capacity
-  constraint; `auto` remains supported.
+  thinking plus null or empty `context_management.edits` remain accepted. Its
+  exact `clear_thinking_20251015` marker with `keep: "all"` is also accepted
+  because it removes no history. Context edits that can modify conversation
+  history fail before dispatch because the alternate providers cannot apply or
+  report Anthropic context editing faithfully. Grok also rejects `service_tier:
+  "standard_only"` because it cannot guarantee that capacity constraint; `auto`
+  remains supported.
 - **Grok — `output_config.format`:** translated to Responses API `text.format`
   for structured background requests such as session title generation.
 

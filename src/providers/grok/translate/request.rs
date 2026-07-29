@@ -2785,10 +2785,7 @@ mod tests {
         let error = translate_request(&request, "grok-composer-2.5-fast".into())
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("non-empty context_management.edits"),
-            "{error}"
-        );
+        assert!(error.contains("modify conversation history"), "{error}");
     }
 
     #[test]

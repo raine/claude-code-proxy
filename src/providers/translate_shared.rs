@@ -182,21 +182,34 @@ fn validate_context_management_shape(
         .get("edits")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("context_management.edits must be an array"))?;
+    let mut has_effectful_edit = false;
     for (index, edit) in edits.iter().enumerate() {
         let edit = edit.as_object().ok_or_else(|| {
             anyhow::anyhow!("context_management.edits[{index}] must be an object")
         })?;
-        if edit
+        let edit_type = edit
             .get("type")
             .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-        {
-            anyhow::bail!("context_management.edits[{index}].type must be a non-empty string");
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("context_management.edits[{index}].type must be a non-empty string")
+            })?;
+        // Claude Code sends this exact marker whenever adaptive thinking is
+        // enabled. `keep: "all"` removes no history, so ignoring it is
+        // semantically equivalent. Every edit that can change conversation
+        // history remains fail-closed.
+        let is_noop_thinking_marker = edit_type == "clear_thinking_20251015"
+            && edit.get("keep").and_then(Value::as_str) == Some("all")
+            && edit
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "keep"));
+        if !is_noop_thinking_marker {
+            has_effectful_edit = true;
         }
     }
-    if !edits.is_empty() {
+    if has_effectful_edit {
         anyhow::bail!(
-            "alternate providers do not support non-empty context_management.edits; the request was not sent upstream"
+            "alternate providers do not support context_management edits that modify conversation history; the request was not sent upstream"
         );
     }
     Ok(())
@@ -1198,10 +1211,24 @@ mod tests {
         let error = validate_alternate_provider_fields(&request, "Codex")
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("non-empty context_management.edits"),
-            "{error}"
-        );
+        assert!(error.contains("modify conversation history"), "{error}");
+    }
+
+    #[test]
+    fn alternate_provider_fields_accept_claude_code_noop_thinking_marker() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"fable",
+            "messages":[{"role":"user", "content":"hello"}],
+            "context_management":{
+                "edits":[{
+                    "type":"clear_thinking_20251015",
+                    "keep":"all"
+                }]
+            }
+        }))
+        .unwrap();
+
+        validate_alternate_provider_fields(&request, "Codex").unwrap();
     }
 
     #[test]
