@@ -1603,9 +1603,10 @@ fn remaining_live_stream_response_with_heartbeat(
                             Ok(result) => result,
                             Err(message) => {
                                 abort_continuation(ctx.session_id.as_deref(), turn_id);
+                                let error_type = codex_stream_payload_error_type(&payload);
                                 let chunk = translator.error_chunk(
                                     &message,
-                                    "api_error",
+                                    error_type,
                                     ctx.traffic.as_deref(),
                                 );
                                 if !chunk.is_empty() {
@@ -1817,6 +1818,14 @@ fn retryable_live_start_payload(payload: &serde_json::Value, _message: &str) -> 
 
 fn retry_after_from_live_payload(payload: &serde_json::Value) -> Option<String> {
     events::classify_event_failure(payload).and_then(|failure| failure.retry_after)
+}
+
+fn codex_stream_payload_error_type(payload: &serde_json::Value) -> &'static str {
+    match events::classify_event_failure(payload).map(|failure| failure.kind) {
+        Some(events::CodexFailureKind::RateLimit) => "rate_limit_error",
+        Some(events::CodexFailureKind::Overloaded) => "overloaded_error",
+        _ => "api_error",
+    }
 }
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
@@ -2440,6 +2449,56 @@ mod tests {
         (translator, first_chunk)
     }
 
+    async fn post_output_failure_events(
+        payload: serde_json::Value,
+        ctx: RequestContext,
+        turn_id: Option<u64>,
+        continuation_capture: Option<LiveContinuationCapture>,
+    ) -> Vec<serde_json::Value> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type":"message", "id":"msg_up"}
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "hello"
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(payload)).await.unwrap();
+        drop(tx);
+
+        let response = match live_stream_response_once(
+            rx,
+            "msg_post_output_failure".to_string(),
+            "gpt-5.6-sol",
+            ctx,
+            turn_id,
+            continuation_capture,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(10_000),
+            DEFAULT_STREAM_HEARTBEAT,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => panic!("must not replay after streaming output"),
+        };
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        crate::anthropic::sse::try_parse_sse_events(&body)
+            .unwrap()
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.data).unwrap())
+            .collect()
+    }
+
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
             "model": "gpt-5.6-luna",
@@ -2868,6 +2927,140 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("hello"));
         assert!(body.contains("heartbeat timed out"));
+    }
+
+    #[tokio::test]
+    async fn post_output_failure_uses_codex_classifier_without_replay() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "limit_reached": true,
+                        "primary": {"reset_after_seconds": 1}
+                    }
+                }),
+                "rate_limit_error",
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {"type": "overloaded_error", "message": "busy"}
+                    }
+                }),
+                "overloaded_error",
+            ),
+            (
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {"status": 400, "message": "invalid request"}
+                    }
+                }),
+                "api_error",
+            ),
+        ];
+
+        for (payload, expected_error_type) in cases {
+            let events = post_output_failure_events(payload, live_test_context(), None, None).await;
+            assert!(events.iter().any(|event| {
+                event
+                    .pointer("/delta/text")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("hello")
+            }));
+            let error = events
+                .iter()
+                .find(|event| {
+                    event.get("type").and_then(serde_json::Value::as_str) == Some("error")
+                })
+                .expect("post-output failure must emit a terminal Anthropic error event");
+            assert_eq!(
+                error
+                    .pointer("/error/type")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_error_type)
+            );
+            assert_eq!(
+                events
+                    .last()
+                    .and_then(|event| event.get("type"))
+                    .and_then(serde_json::Value::as_str),
+                Some("error")
+            );
+            assert!(!events.iter().any(|event| {
+                event.get("type").and_then(serde_json::Value::as_str) == Some("message_stop")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_output_failure_aborts_continuation_and_captures_error_event() {
+        let _state_guard = CODEX_STATE_TEST_LOCK.lock().await;
+        continuation::clear_all_continuations_for_tests();
+        let session_id = "post-output-failure";
+        let request = live_test_request();
+        let candidate = continuation_candidate(Some(session_id), &request, true);
+        let turn_id = candidate
+            .turn_id
+            .expect("continuation turn should register");
+        assert!(continuation::is_current_turn(
+            Some(session_id),
+            Some(turn_id)
+        ));
+        let continuation_capture = LiveContinuationCapture::for_turn(Some(turn_id), &request, None);
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let traffic = Arc::new(crate::traffic::test_capture(
+            temp.path().join("post-output-failure-traffic"),
+        ));
+        let traffic_root = traffic.root().to_path_buf();
+        let mut ctx = live_test_context();
+        ctx.session_id = Some(session_id.to_string());
+        ctx.traffic = Some(traffic);
+
+        let events = post_output_failure_events(
+            serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"type": "overloaded_error", "message": "busy"}
+                }
+            }),
+            ctx,
+            Some(turn_id),
+            continuation_capture,
+        )
+        .await;
+        assert!(!continuation::is_current_turn(
+            Some(session_id),
+            Some(turn_id)
+        ));
+        assert_eq!(
+            events
+                .last()
+                .and_then(|event| event.pointer("/error/type"))
+                .and_then(serde_json::Value::as_str),
+            Some("overloaded_error")
+        );
+
+        let captured_error = std::fs::read_dir(traffic_root.join("events"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .find(|event| event.get("event").and_then(serde_json::Value::as_str) == Some("error"))
+            .expect("traffic capture must retain the downstream error event");
+        assert_eq!(
+            captured_error
+                .pointer("/data/error/type")
+                .and_then(serde_json::Value::as_str),
+            Some("overloaded_error")
+        );
+        continuation::clear_all_continuations_for_tests();
     }
 
     #[tokio::test]
