@@ -232,16 +232,13 @@ impl CodexImagesBackend {
             copy_safe_image_headers(&headers, response.headers_mut());
             return response;
         }
-        let body = match collect_image_response_body(
-            upstream,
-            self.client.body_idle_timeout_ms(),
-            &ctx,
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return image_error_response(error),
-        };
+        let body =
+            match collect_image_response_body(upstream, self.client.body_idle_timeout_ms(), &ctx)
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return image_error_response(error),
+            };
         let usage = match validate_success_response(&body) {
             Ok(usage) => usage,
             Err(error) => return image_error_response(error),
@@ -806,15 +803,12 @@ mod tests {
                 account_id: Some("acct".into()),
                 expires: u64::MAX,
             });
-        let backend = CodexImagesBackend::new_for_test(
-            std::sync::Arc::new(client),
-            format!("http://{addr}"),
-        );
+        let backend =
+            CodexImagesBackend::new_for_test(std::sync::Arc::new(client), format!("http://{addr}"));
         let response = backend
             .handle(
                 ImageOperation::Generation,
-                prepare_json_request(ImageOperation::Generation, br#"{"prompt":"x"}"#)
-                    .unwrap(),
+                prepare_json_request(ImageOperation::Generation, br#"{"prompt":"x"}"#).unwrap(),
                 crate::provider::RequestContext {
                     req_id: "oversized".into(),
                     session_id: None,

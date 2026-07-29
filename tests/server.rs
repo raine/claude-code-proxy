@@ -260,54 +260,42 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
         responses_api: false,
         images_api: true,
     };
-    let variation = app_with_features(
-        Arc::new(Registry::with_default_alias()),
-        None,
-        features,
-    )
-    .oneshot(
-        Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/variations")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let variation = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/variations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(variation.status(), StatusCode::NOT_FOUND);
 
-    let wrong_media = app_with_features(
-        Arc::new(Registry::with_default_alias()),
-        None,
-        features,
-    )
-    .oneshot(
-        Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/generations")
-            .header("content-type", "multipart/form-data; boundary=x")
-            .body(Body::from("--x--\r\n"))
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let wrong_media = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/generations")
+                .header("content-type", "multipart/form-data; boundary=x")
+                .body(Body::from("--x--\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(wrong_media.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
-    let oversized = app_with_features(
-        Arc::new(Registry::with_default_alias()),
-        None,
-        features,
-    )
-    .oneshot(
-        Request::builder()
-            .method(Method::POST)
-            .uri("/v1/images/generations")
-            .header("content-type", "application/json")
-            .body(Body::from(vec![b'x'; 256 * 1024 + 1]))
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let oversized = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b'x'; 256 * 1024 + 1]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
