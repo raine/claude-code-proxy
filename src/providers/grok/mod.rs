@@ -27,7 +27,7 @@ use crate::anthropic::{
     error::json_error,
     schema::{CountTokensResponse, MessagesRequest},
 };
-use crate::monitor::MonitorHandle;
+use crate::monitor::{MonitorHandle, anthropic_total_input_tokens};
 use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
 use crate::providers::downstream_queue::{
     self, BudgetedChunk, ByteBudget, SendOutcome as GrokChunkSendOutcome,
@@ -403,13 +403,12 @@ fn finish_non_streaming_message_with_tool_policy(
                 traffic.write_json("051-downstream-response", &value);
             }
             if let Some(monitor) = ctx.monitor.as_ref() {
+                let usage = value.pointer("/usage");
                 monitor.usage_updated(
                     &ctx.req_id,
-                    value
-                        .pointer("/usage/input_tokens")
-                        .and_then(|value| value.as_u64()),
-                    value
-                        .pointer("/usage/output_tokens")
+                    usage.and_then(anthropic_total_input_tokens),
+                    usage
+                        .and_then(|value| value.get("output_tokens"))
                         .and_then(|value| value.as_u64()),
                 );
             }
@@ -421,11 +420,7 @@ fn finish_non_streaming_message_with_tool_policy(
             let upstream_failure =
                 reduction_error.and_then(translate::reducer::GrokReductionError::upstream_failure);
             if let (Some(monitor), Some(usage)) = (ctx.monitor.as_ref(), usage) {
-                monitor.usage_updated(
-                    &ctx.req_id,
-                    usage.mapped_input_tokens(),
-                    usage.output_tokens,
-                );
+                monitor.usage_updated(&ctx.req_id, usage.input_tokens, usage.output_tokens);
             }
             write_non_streaming_error(
                 ctx.traffic.as_deref(),
@@ -1019,11 +1014,7 @@ impl GrokStreamState {
             let upstream_incomplete_reason = self.reducer.incomplete_reason().map(str::to_owned);
             if let Some(usage) = usage {
                 if let Some(monitor) = self.monitor.as_ref() {
-                    monitor.usage_updated(
-                        &self.req_id,
-                        usage.mapped_input_tokens(),
-                        usage.output_tokens,
-                    );
+                    monitor.usage_updated(&self.req_id, usage.input_tokens, usage.output_tokens);
                 }
                 self.usage = Some(usage);
             }
@@ -1223,11 +1214,7 @@ impl GrokStreamState {
         if self.usage.is_none() {
             self.usage = self.reducer.usage().cloned();
             if let (Some(monitor), Some(usage)) = (self.monitor.as_ref(), self.usage.as_ref()) {
-                monitor.usage_updated(
-                    &self.req_id,
-                    usage.mapped_input_tokens(),
-                    usage.output_tokens,
-                );
+                monitor.usage_updated(&self.req_id, usage.input_tokens, usage.output_tokens);
             }
         }
         let (error_type, stream_message) = match error {
@@ -2282,7 +2269,7 @@ mod tests {
             .iter()
             .find(|request| request.request_id == "req_1")
             .unwrap();
-        assert_eq!(request.input_tokens, Some(9));
+        assert_eq!(request.input_tokens, Some(12));
         assert_eq!(request.output_tokens, Some(3));
         assert!(request.streamed_bytes > 0);
         assert!(request.stream_chunks > 0);
@@ -2291,7 +2278,7 @@ mod tests {
             .iter()
             .find(|session| session.session_id.as_deref() == Some("session_1"))
             .unwrap();
-        assert_eq!(session.input_tokens, 9);
+        assert_eq!(session.input_tokens, 12);
         assert_eq!(session.output_tokens, 3);
     }
 
@@ -2965,7 +2952,7 @@ mod tests {
             .expect("failed request must be retained by the monitor");
         assert_eq!(request.status, crate::monitor::RequestStatus::Failed);
         assert_eq!(request.http_status, Some(502));
-        assert_eq!(request.input_tokens, Some(9));
+        assert_eq!(request.input_tokens, Some(12));
         assert_eq!(request.output_tokens, Some(2));
 
         let captured = capture_contents(temp.path().join("traffic"));

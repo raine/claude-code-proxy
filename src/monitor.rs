@@ -1092,6 +1092,27 @@ pub fn throughput(
     Throughput::None
 }
 
+pub fn anthropic_total_input_tokens(usage: &serde_json::Value) -> Option<u64> {
+    let uncached = usage.get("input_tokens").and_then(|value| value.as_u64());
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|value| value.as_u64());
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|value| value.as_u64());
+
+    if uncached.is_none() && cache_creation.is_none() && cache_read.is_none() {
+        return None;
+    }
+
+    Some(
+        uncached
+            .unwrap_or(0)
+            .saturating_add(cache_creation.unwrap_or(0))
+            .saturating_add(cache_read.unwrap_or(0)),
+    )
+}
+
 pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     let text = String::from_utf8_lossy(bytes);
     let mut input_tokens = None;
@@ -1111,7 +1132,7 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
         .into_iter()
         .flatten()
         {
-            if let Some(tokens) = usage.get("input_tokens").and_then(|value| value.as_u64()) {
+            if let Some(tokens) = anthropic_total_input_tokens(usage) {
                 input_tokens = Some(tokens);
             }
             if let Some(tokens) = usage.get("output_tokens").and_then(|value| value.as_u64()) {
@@ -1322,6 +1343,39 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
 "#;
         assert_eq!(usage_from_anthropic_sse(sse), (Some(12), Some(48)));
+    }
+
+    #[test]
+    fn sse_usage_includes_cache_creation_and_read_tokens() {
+        let sse = br#"event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":298,"cache_creation_input_tokens":1024,"cache_read_input_tokens":8192,"output_tokens":3}}}
+
+"#;
+        assert_eq!(usage_from_anthropic_sse(sse), (Some(9_514), Some(3)));
+    }
+
+    #[test]
+    fn anthropic_total_input_tokens_uses_every_input_bucket_and_saturates() {
+        assert_eq!(
+            anthropic_total_input_tokens(&serde_json::json!({
+                "input_tokens": 298,
+                "cache_creation_input_tokens": 1_024,
+                "cache_read_input_tokens": 8_192,
+            })),
+            Some(9_514)
+        );
+        assert_eq!(
+            anthropic_total_input_tokens(&serde_json::json!({
+                "input_tokens": u64::MAX,
+                "cache_creation_input_tokens": 1,
+                "cache_read_input_tokens": 1,
+            })),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            anthropic_total_input_tokens(&serde_json::json!({"output_tokens": 3})),
+            None
+        );
     }
 
     fn completed_request(
