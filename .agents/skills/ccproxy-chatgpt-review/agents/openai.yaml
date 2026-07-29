@@ -1,0 +1,4 @@
+interface:
+  display_name: "ccproxy ChatGPT Review Bundle"
+  short_description: "Export ccproxy for deep ChatGPT code review"
+  default_prompt: "Use $ccproxy-chatgpt-review to build a fresh sanitized ccproxy review bundle for ChatGPT Pro."
