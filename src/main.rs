@@ -147,7 +147,7 @@ impl ClaudeProfile {
         match self {
             Self::Gpt => ClaudeProfileConfig {
                 name: "GPT",
-                main_model: "gpt-5.6-sol",
+                main_model: "fable",
                 fable_model: "gpt-5.6-sol",
                 opus_model: "gpt-5.6-sol",
                 sonnet_model: "gpt-5.6-terra",
@@ -162,6 +162,7 @@ impl ClaudeProfile {
                 general_purpose_effort: "high",
                 plan_effort: "high",
                 available_models: &[
+                    "fable",
                     "gpt-5.6-sol",
                     "gpt-5.6-sol-fast",
                     "gpt-5.6-terra",
@@ -2128,7 +2129,7 @@ mod tests {
         let settings = command_inline_settings(&command);
         let agents = command_inline_agents(&command);
         assert_complete_inline_agents(&agents);
-        assert_eq!(settings["model"], "gpt-5.6-sol");
+        assert_eq!(settings["model"], "fable");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
         assert_eq!(settings["enforceAvailableModels"], true);
@@ -2156,6 +2157,13 @@ mod tests {
                 .any(|model| model == "gpt-5.6-terra")
         );
         assert!(
+            settings["availableModels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model == "fable")
+        );
+        assert!(
             !settings["availableModels"]
                 .as_array()
                 .unwrap()
@@ -2163,7 +2171,7 @@ mod tests {
                 .any(|model| model == "opus")
         );
         assert_eq!(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000");
-        assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "gpt-5.6-sol");
+        assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "fable");
         assert_eq!(
             command_env(&command, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
             "gpt-5.6-terra"
