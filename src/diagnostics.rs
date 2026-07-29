@@ -754,6 +754,9 @@ fn allowed_event(event: &str) -> bool {
             | "buffered_transport_retry"
             | "buffered_transport_retry_exhausted"
             | "live_transport_retry"
+            | "live_transport_retry_exhausted"
+            | "post_ping_replay_scheduled"
+            | "post_ping_replay_rejected"
             | "auto_transport_fallback"
             | "websocket_circuit_fallback"
             | "websocket_circuit_opened"
@@ -850,7 +853,9 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
             | "responsesLite"
             | "nativeWebSearch"
             | "parallelToolCalls"
+            | "promptCacheKeyPresent"
             | "generationStarted"
+            | "semanticEmitted"
             | "inBandSse"
             | "bodyTruncated"
             | "bodyTimedOut"
@@ -1061,6 +1066,7 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "responsesLite",
             "nativeWebSearch",
             "parallelToolCalls",
+            "promptCacheKeyPresent",
             "toolChoice",
             "functionToolCount",
             "hostedToolCount",
@@ -1072,9 +1078,12 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
         ],
         "native_web_search_phase" => &["reqId", "phase", "elapsedMs"],
         "upstream_first_event" => &["reqId", "event", "elapsedMs"],
-        "stream_committed_before_semantic" => {
-            &["reqId", "generationStarted", "heartbeatIntervalMs"]
-        }
+        "stream_committed_before_semantic" => &[
+            "reqId",
+            "generationStarted",
+            "semanticEmitted",
+            "heartbeatIntervalMs",
+        ],
         "terminal_resolution" => &["reqId", "authority", "sourceEvent"],
         "buffered_transport_retry" | "live_transport_retry" => &[
             "reqId",
@@ -1095,6 +1104,17 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "origin",
             "reason",
         ],
+        "live_transport_retry_exhausted" => &[
+            "reqId",
+            "transport",
+            "attempts",
+            "maxAttempts",
+            "status",
+            "replaySafety",
+        ],
+        "post_ping_replay_scheduled" | "post_ping_replay_rejected" => {
+            &["reqId", "transport", "status", "replaySafety", "delayMs"]
+        }
         "auto_transport_fallback" => &["reqId", "action", "origin", "status", "reason", "detail"],
         "websocket_circuit_fallback" => &["reqId", "cooldownMs", "fallbackTransport"],
         "websocket_circuit_opened" => &["reqId", "failures", "cooldownMs"],

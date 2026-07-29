@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::{anthropic_total_input_tokens, usage_from_anthropic_sse};
 use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
 use crate::providers::downstream_queue::{
     self, BudgetedChunk, ByteBudget, SendOutcome as LiveChunkSendOutcome,
@@ -262,11 +262,13 @@ impl Provider for CodexProvider {
         ) {
             Ok((json, finish_metadata)) => {
                 if let Some(monitor) = ctx.monitor.as_ref() {
+                    let usage = json.pointer("/usage");
                     monitor.usage_updated(
                         &ctx.req_id,
-                        json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                        json.pointer("/usage/output_tokens")
-                            .and_then(|v| v.as_u64()),
+                        usage.and_then(anthropic_total_input_tokens),
+                        usage
+                            .and_then(|value| value.get("output_tokens"))
+                            .and_then(|value| value.as_u64()),
                     );
                 }
                 update_continuation_from_finish_metadata(
@@ -498,7 +500,239 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
 
 enum LiveStreamStart {
     Response(Response),
-    Retry { error: client::CodexError },
+    Retry {
+        error: client::CodexError,
+        replay_state: Option<Box<LiveReplayState>>,
+    },
+}
+
+#[cfg(test)]
+type ScriptedLiveAttemptQueue = Arc<
+    std::sync::Mutex<
+        std::collections::VecDeque<
+            Result<websocket::CodexWebSocketEventReceiver, client::CodexError>,
+        >,
+    >,
+>;
+
+struct LiveReplayState {
+    client: Arc<CodexHttpClient>,
+    message_id: String,
+    model: String,
+    request_body: translate::request::ResponsesRequest,
+    request_byte_lease: Option<RequestByteLease>,
+    continuation: Option<ContinuationCandidate>,
+    dispatch_budget: dispatch_budget::CodexDispatchBudget,
+    attempt: u32,
+    model_retry_backoff: ModelRetryBackoff,
+    configured_transport: config::CodexTransport,
+    active_transport: config::CodexTransport,
+    circuit_key: String,
+    schema_bridge: Option<Arc<translate::schema_bridge::SchemaBridge>>,
+    tool_policy: ToolCallPolicy,
+    #[cfg(test)]
+    scripted_attempts: Option<ScriptedLiveAttemptQueue>,
+}
+
+impl LiveReplayState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        client: Arc<CodexHttpClient>,
+        message_id: String,
+        model: String,
+        request_body: translate::request::ResponsesRequest,
+        request_byte_lease: Option<RequestByteLease>,
+        continuation: ContinuationCandidate,
+    ) -> Self {
+        let configured_transport = client.transport();
+        let circuit_key = client.websocket_circuit_key().to_string();
+        let schema_bridge = request_body.schema_bridge.clone();
+        let tool_policy = ToolCallPolicy::from_request(&request_body);
+        Self {
+            client,
+            message_id,
+            model,
+            request_body,
+            request_byte_lease,
+            continuation: Some(continuation),
+            dispatch_budget: dispatch_budget::CodexDispatchBudget::new(),
+            attempt: 0,
+            model_retry_backoff: ModelRetryBackoff::default(),
+            configured_transport,
+            active_transport: configured_transport,
+            circuit_key,
+            schema_bridge,
+            tool_policy,
+            #[cfg(test)]
+            scripted_attempts: None,
+        }
+    }
+
+    fn turn_id(&self) -> Option<u64> {
+        self.continuation
+            .as_ref()
+            .and_then(|candidate| candidate.turn_id)
+    }
+
+    fn fresh_translator(&self) -> LiveStreamTranslator {
+        LiveStreamTranslator::with_schema_bridge_and_tool_policy(
+            self.message_id.clone(),
+            self.model.clone(),
+            self.schema_bridge.clone(),
+            self.tool_policy.clone(),
+        )
+    }
+
+    fn fresh_continuation_capture(&self) -> Option<LiveContinuationCapture> {
+        LiveContinuationCapture::for_turn(
+            self.turn_id(),
+            &self.request_body,
+            self.request_byte_lease.as_ref(),
+        )
+    }
+
+    async fn open_upstream(
+        &self,
+        ctx: &RequestContext,
+        deadline: client::CodexRequestDeadline,
+    ) -> Result<websocket::CodexWebSocketEventReceiver, client::CodexError> {
+        #[cfg(test)]
+        if let Some(scripted_attempts) = self.scripted_attempts.as_ref() {
+            self.dispatch_budget
+                .reserve_model()
+                .map_err(|error| client::CodexError {
+                    status: 503,
+                    message: error.to_string(),
+                    detail: Some(dispatch_budget::CODEX_DISPATCH_BUDGET_DETAIL.to_string()),
+                    retry_after: None,
+                    origin: client::CodexErrorOrigin::Http,
+                })?;
+            return scripted_attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .expect("scripted live replay attempt was not provided");
+        }
+
+        match self.active_transport {
+            config::CodexTransport::Http => {
+                self.client
+                    .stream_codex_http_events(
+                        &self.request_body,
+                        ctx,
+                        deadline,
+                        self.dispatch_budget.clone(),
+                    )
+                    .await
+            }
+            config::CodexTransport::WebSocket | config::CodexTransport::Auto => {
+                self.client
+                    .stream_codex_websocket_events(
+                        &self.request_body,
+                        ctx,
+                        self.continuation.as_ref(),
+                        self.dispatch_budget.clone(),
+                    )
+                    .await
+            }
+        }
+    }
+
+    fn plan_retry(
+        &mut self,
+        ctx: &RequestContext,
+        error: client::CodexError,
+    ) -> Result<u64, client::CodexError> {
+        let auto_websocket_attempt = self.configured_transport == config::CodexTransport::Auto
+            && !matches!(self.active_transport, config::CodexTransport::Http);
+        if auto_websocket_attempt {
+            client::record_auto_websocket_failure(ctx, &self.circuit_key, &error);
+        }
+        if !replayable_live_start_codex_error(&error) {
+            return Err(error);
+        }
+        if !self.dispatch_budget.can_reserve_model() {
+            let snapshot = self.dispatch_budget.snapshot();
+            crate::logging::create_logger("codex").warn(
+                "live_transport_retry_exhausted",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".into(), serde_json::json!(ctx.req_id)),
+                    (
+                        "transport".into(),
+                        serde_json::json!(self.active_transport.as_str()),
+                    ),
+                    ("attempts".into(), serde_json::json!(snapshot.model)),
+                    (
+                        "maxAttempts".into(),
+                        serde_json::json!(dispatch_budget::MAX_CODEX_MODEL_DISPATCHES),
+                    ),
+                    ("status".into(), serde_json::json!(error.status)),
+                    (
+                        "replaySafety".into(),
+                        serde_json::json!(error.replay_safety().as_str()),
+                    ),
+                ])),
+            );
+            return Err(error);
+        }
+        if auto_websocket_attempt && client::should_fallback_to_http(&error) {
+            client::log_auto_http_fallback(ctx, &error);
+            let Some(delay) =
+                client::auto_http_fallback_delay(&error, &mut self.model_retry_backoff)
+            else {
+                return Err(error);
+            };
+            if delay.exceeds_budget {
+                return Err(error);
+            }
+            drop_live_continuation_for_retry(&mut self.continuation);
+            self.active_transport = config::CodexTransport::Http;
+            return Ok(delay.wait_ms);
+        }
+        let dropped = drop_live_continuation_for_retry(&mut self.continuation);
+        if dropped && is_missing_previous_response_error(&error) {
+            self.attempt = self.attempt.saturating_add(1);
+            return Ok(0);
+        }
+        let max_retries = max_live_retries(&error);
+        if self.attempt >= max_retries {
+            return Err(error);
+        }
+        let Some(delay) = self
+            .model_retry_backoff
+            .next_delay(error.replay_safety(), error.retry_after.as_deref())
+        else {
+            return Err(error);
+        };
+        if delay.exceeds_budget {
+            return Err(error);
+        }
+        let failed_attempt = self.dispatch_budget.snapshot().model.max(1);
+        let max_attempts = (max_retries + 1).min(dispatch_budget::MAX_CODEX_MODEL_DISPATCHES);
+        client::log_live_transport_retry(
+            ctx,
+            self.active_transport,
+            failed_attempt,
+            max_attempts,
+            delay.wait_ms,
+            &error,
+        );
+        self.attempt = self.attempt.saturating_add(1);
+        Ok(delay.wait_ms)
+    }
+
+    #[cfg(test)]
+    fn with_scripted_attempts(
+        mut self,
+        attempts: std::collections::VecDeque<
+            Result<websocket::CodexWebSocketEventReceiver, client::CodexError>,
+        >,
+    ) -> Self {
+        self.configured_transport = config::CodexTransport::Http;
+        self.active_transport = config::CodexTransport::Http;
+        self.scripted_attempts = Some(Arc::new(std::sync::Mutex::new(attempts)));
+        self
+    }
 }
 
 struct LiveContinuationCapture {
@@ -638,192 +872,94 @@ async fn live_stream_response_inner(
     deadline: client::CodexRequestDeadline,
     stream_heartbeat: Duration,
 ) -> Response {
-    let model = model.to_string();
-    let turn_id = continuation.turn_id;
     let request_byte_lease = ctx.request_byte_lease.take();
-    let mut attempt = 0_u32;
-    let mut model_retry_backoff = ModelRetryBackoff::default();
-    let mut continuation = Some(continuation);
-    let circuit_key = client.websocket_circuit_key().to_string();
-    let transport = client.transport();
-    let dispatch_budget = dispatch_budget::CodexDispatchBudget::new();
+    let mut replay_state = LiveReplayState::new(
+        client,
+        message_id,
+        model.to_string(),
+        request_body,
+        request_byte_lease,
+        continuation,
+    );
+    let turn_id = replay_state.turn_id();
     // Auto may fall back once, but it never switches back to WebSocket within
     // the same logical request. This prevents retry multiplication.
-    let mut active_transport = transport;
-
-    if transport == config::CodexTransport::Auto
-        && websocket::codex_websocket_circuit_open(&circuit_key)
+    if replay_state.configured_transport == config::CodexTransport::Auto
+        && websocket::codex_websocket_circuit_open(&replay_state.circuit_key)
     {
         client::log_websocket_circuit_fallback(&ctx);
-        drop_live_continuation_for_retry(&mut continuation);
-        active_transport = config::CodexTransport::Http;
+        drop_live_continuation_for_retry(&mut replay_state.continuation);
+        replay_state.active_transport = config::CodexTransport::Http;
     }
 
     loop {
-        let upstream = match active_transport {
-            config::CodexTransport::Http => {
-                client
-                    .stream_codex_http_events(
-                        &request_body,
-                        &ctx,
-                        deadline,
-                        dispatch_budget.clone(),
-                    )
-                    .await
-            }
-            config::CodexTransport::WebSocket | config::CodexTransport::Auto => {
-                client
-                    .stream_codex_websocket_events(
-                        &request_body,
-                        &ctx,
-                        continuation.as_ref(),
-                        dispatch_budget.clone(),
-                    )
-                    .await
-            }
-        };
-        let upstream_events = match upstream {
+        let upstream_events = match replay_state.open_upstream(&ctx, deadline).await {
             Ok(events) => events,
-            Err(err) if replayable_live_start_codex_error(&err) => {
-                let auto_websocket_attempt = transport == config::CodexTransport::Auto
-                    && !matches!(active_transport, config::CodexTransport::Http);
-                if auto_websocket_attempt {
-                    client::record_auto_websocket_failure(&ctx, &circuit_key, &err);
-                }
-                if auto_websocket_attempt && client::should_fallback_to_http(&err) {
-                    client::log_auto_http_fallback(&ctx, &err);
-                    let delay = client::auto_http_fallback_delay(&err, &mut model_retry_backoff)
-                        .expect("replay-safe WebSocket fallback must have a retry delay");
-                    if delay.exceeds_budget {
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
-                        return map_codex_error_to_response(&err);
-                    }
-                    drop_live_continuation_for_retry(&mut continuation);
-                    active_transport = config::CodexTransport::Http;
-                    if delay.wait_ms > 0 {
-                        sleep(delay.wait_ms).await;
+            Err(error) => match replay_state.plan_retry(&ctx, error) {
+                Ok(wait_ms) => {
+                    if wait_ms > 0 {
+                        sleep(wait_ms).await;
                     }
                     continue;
                 }
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if dropped && is_missing_previous_response_error(&err) {
-                    attempt += 1;
-                    continue;
-                }
-                let max_retries = max_live_retries(&err);
-                if attempt >= max_retries {
+                Err(error) => {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    return map_codex_error_to_response(&err);
+                    return map_codex_error_to_response(&error);
                 }
-                let delay = model_retry_backoff
-                    .next_delay(err.replay_safety(), err.retry_after.as_deref())
-                    .expect("replayable live-start error must have a retry delay");
-                if delay.exceeds_budget {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    return map_codex_error_to_response(&err);
-                }
-                client::log_live_transport_retry(
-                    &ctx,
-                    active_transport,
-                    attempt + 1,
-                    max_retries + 1,
-                    delay.wait_ms,
-                    &err,
-                );
-                attempt += 1;
-                sleep(delay.wait_ms).await;
-                continue;
-            }
-            Err(err) => {
-                if transport == config::CodexTransport::Auto
-                    && !matches!(active_transport, config::CodexTransport::Http)
-                {
-                    // A post-dispatch failure must not replay this request, but
-                    // it still contributes to transport health so the next
-                    // logical request can avoid an unhealthy WebSocket path.
-                    client::record_auto_websocket_failure(&ctx, &circuit_key, &err);
-                }
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
-                return map_codex_error_to_response(&err);
-            }
+            },
         };
 
+        let message_id = replay_state.message_id.clone();
+        let model = replay_state.model.clone();
+        let schema_bridge = replay_state.schema_bridge.clone();
+        let tool_policy = replay_state.tool_policy.clone();
+        let continuation_capture = replay_state.fresh_continuation_capture();
+        let auto_websocket_attempt = replay_state.configured_transport
+            == config::CodexTransport::Auto
+            && replay_state.active_transport == config::CodexTransport::Auto;
+        let circuit_key = replay_state.circuit_key.clone();
         match live_stream_response_once_with_schema_and_tool_policy(
             upstream_events,
-            message_id.clone(),
+            message_id,
             &model,
             ctx.clone(),
             turn_id,
-            LiveContinuationCapture::for_turn(turn_id, &request_body, request_byte_lease.as_ref()),
+            continuation_capture,
             provider_started_at,
             deadline,
             stream_heartbeat,
-            request_body.schema_bridge.clone(),
-            ToolCallPolicy::from_request(&request_body),
+            schema_bridge,
+            tool_policy,
+            Some(Box::new(replay_state)),
         )
         .await
         {
             LiveStreamStart::Response(response) => {
-                if transport == config::CodexTransport::Auto
-                    && active_transport == config::CodexTransport::Auto
-                {
+                if auto_websocket_attempt {
                     websocket::record_codex_websocket_success(&circuit_key);
                 }
                 return response;
             }
-            LiveStreamStart::Retry { error } => {
-                let auto_websocket_attempt = transport == config::CodexTransport::Auto
-                    && !matches!(active_transport, config::CodexTransport::Http);
-                if auto_websocket_attempt {
-                    client::record_auto_websocket_failure(&ctx, &circuit_key, &error);
-                }
-                if auto_websocket_attempt && client::should_fallback_to_http(&error) {
-                    client::log_auto_http_fallback(&ctx, &error);
-                    let delay = client::auto_http_fallback_delay(&error, &mut model_retry_backoff)
-                        .expect("replay-safe WebSocket fallback must have a retry delay");
-                    if delay.exceeds_budget {
+            LiveStreamStart::Retry {
+                error,
+                replay_state: Some(state),
+            } => {
+                replay_state = *state;
+                match replay_state.plan_retry(&ctx, error) {
+                    Ok(wait_ms) => {
+                        if wait_ms > 0 {
+                            sleep(wait_ms).await;
+                        }
+                    }
+                    Err(error) => {
                         abort_continuation(ctx.session_id.as_deref(), turn_id);
                         return map_codex_error_to_response(&error);
                     }
-                    drop_live_continuation_for_retry(&mut continuation);
-                    active_transport = config::CodexTransport::Http;
-                    if delay.wait_ms > 0 {
-                        sleep(delay.wait_ms).await;
-                    }
-                    continue;
                 }
-                if !replayable_live_start_codex_error(&error) {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    return map_codex_error_to_response(&error);
-                }
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if dropped && is_missing_previous_response_error(&error) {
-                    attempt += 1;
-                    continue;
-                }
-                let max_retries = max_live_retries(&error);
-                if attempt >= max_retries {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    return map_codex_error_to_response(&error);
-                }
-                let delay = model_retry_backoff
-                    .next_delay(error.replay_safety(), error.retry_after.as_deref())
-                    .expect("replayable live-start error must have a retry delay");
-                if delay.exceeds_budget {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    return map_codex_error_to_response(&error);
-                }
-                client::log_live_transport_retry(
-                    &ctx,
-                    active_transport,
-                    attempt + 1,
-                    max_retries + 1,
-                    delay.wait_ms,
-                    &error,
-                );
-                attempt += 1;
-                sleep(delay.wait_ms).await;
             }
+            LiveStreamStart::Retry {
+                replay_state: None, ..
+            } => unreachable!("production live stream retry must return its replay state"),
         }
     }
 }
@@ -882,6 +1018,7 @@ async fn live_stream_response_once_with_schema(
         keepalive_delay,
         schema_bridge,
         ToolCallPolicy::permissive(),
+        None,
     )
     .await
 }
@@ -899,6 +1036,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
     keepalive_delay: Duration,
     schema_bridge: Option<Arc<translate::schema_bridge::SchemaBridge>>,
     tool_policy: ToolCallPolicy,
+    mut replay_state: Option<Box<LiveReplayState>>,
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::with_schema_bridge_and_tool_policy(
         message_id,
@@ -922,7 +1060,10 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                     // Once the model remains silent beyond it, establish downstream SSE so the
                     // active request does not look hung to Claude or an intermediary.
                     record_codex_stream_commit(&ctx, generation_started, keepalive_delay);
-                    return LiveStreamStart::Response(remaining_live_stream_response(
+                    if hosted_side_effect_started {
+                        replay_state = None;
+                    }
+                    return LiveStreamStart::Response(remaining_live_stream_response_with_replay(
                         upstream_events,
                         translator,
                         DOWNSTREAM_PING.to_vec(),
@@ -933,6 +1074,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                         deadline,
                         generation_started,
                         keepalive_delay,
+                        replay_state,
                     ));
                 },
                 item = upstream_events.recv() => item,
@@ -950,13 +1092,19 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                     && (retryable_live_start_codex_error(&err)
                         || err.origin == client::CodexErrorOrigin::WebSocketHandshake)
                 {
-                    return LiveStreamStart::Retry { error: err };
+                    return LiveStreamStart::Retry {
+                        error: err,
+                        replay_state,
+                    };
                 }
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
         hosted_side_effect_started |= events::starts_hosted_side_effect(&payload);
+        if hosted_side_effect_started {
+            replay_state = None;
+        }
         log_native_web_search_phase(&ctx, &payload, provider_started_at);
         record_codex_generation_start(&ctx, &payload, provider_started_at, &mut generation_started);
         if continuation_capture
@@ -971,37 +1119,20 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
             Ok(result) => result,
             Err(message) => {
                 if retryable_live_start_payload(&payload, &message) {
-                    let lower_message = message.to_ascii_lowercase();
-                    let status = websocket::event_error_status(&payload).unwrap_or_else(|| {
-                        let error = payload.get("error").or_else(|| {
-                            payload.get("response").and_then(|value| value.get("error"))
-                        });
-                        let overloaded = error.is_some_and(|error| {
-                            error.get("code").and_then(|value| value.as_str())
-                                == Some("overloaded_error")
-                                || error.get("type").and_then(|value| value.as_str())
-                                    == Some("overloaded_error")
-                        });
-                        if payload.get("type").and_then(|value| value.as_str())
-                            == Some("codex.rate_limits")
-                            || lower_message.contains("rate limit")
-                        {
-                            429
-                        } else if overloaded || lower_message.contains("overloaded") {
-                            529
-                        } else {
-                            503
-                        }
-                    });
-                    let error = client::CodexError {
-                        status,
-                        message: message.clone(),
-                        detail: Some(message),
-                        retry_after: retry_after_from_live_payload(&payload),
-                        origin: client::CodexErrorOrigin::WebSocket,
-                    };
+                    let error = live_payload_codex_error(
+                        &payload,
+                        message,
+                        replay_state
+                            .as_ref()
+                            .map_or(config::CodexTransport::WebSocket, |state| {
+                                state.active_transport
+                            }),
+                    );
                     if !hosted_side_effect_started {
-                        return LiveStreamStart::Retry { error };
+                        return LiveStreamStart::Retry {
+                            error,
+                            replay_state,
+                        };
                     }
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return LiveStreamStart::Response(map_codex_error_to_response(&error));
@@ -1011,6 +1142,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
             }
         };
         if !chunk.is_empty() {
+            replay_state = None;
             record_live_stream_progress(&ctx, &chunk);
             if terminal {
                 record_codex_terminal_resolution(
@@ -1025,7 +1157,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 );
                 return LiveStreamStart::Response(single_live_stream_response(chunk));
             }
-            return LiveStreamStart::Response(remaining_live_stream_response(
+            return LiveStreamStart::Response(remaining_live_stream_response_with_replay(
                 upstream_events,
                 translator,
                 chunk,
@@ -1036,6 +1168,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 deadline,
                 generation_started,
                 keepalive_delay,
+                replay_state,
             ));
         }
         if terminal {
@@ -1064,7 +1197,10 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
         abort_continuation(ctx.session_id.as_deref(), turn_id);
         LiveStreamStart::Response(map_codex_error_to_response(&error))
     } else {
-        LiveStreamStart::Retry { error }
+        LiveStreamStart::Retry {
+            error,
+            replay_state,
+        }
     }
 }
 
@@ -1180,6 +1316,10 @@ fn log_codex_request_configuration(
                 serde_json::json!(request.parallel_tool_calls),
             ),
             (
+                "promptCacheKeyPresent".to_string(),
+                serde_json::json!(request.prompt_cache_key.is_some()),
+            ),
+            (
                 "toolChoice".to_string(),
                 serde_json::json!(request.tool_choice),
             ),
@@ -1288,6 +1428,7 @@ fn record_codex_stream_commit(
                 "generationStarted".to_string(),
                 serde_json::json!(generation_started),
             ),
+            ("semanticEmitted".to_string(), serde_json::json!(false)),
             (
                 "heartbeatIntervalMs".to_string(),
                 serde_json::json!(heartbeat_interval.as_millis()),
@@ -1298,8 +1439,9 @@ fn record_codex_stream_commit(
         traffic.write_json_event(
             "stream-commit",
             &serde_json::json!({
-                "committedBeforeSemantic": !generation_started,
+                "committedBeforeSemantic": true,
                 "generationStarted": generation_started,
+                "semanticEmitted": false,
                 "heartbeatIntervalMs": heartbeat_interval.as_millis(),
             }),
         );
@@ -1443,6 +1585,159 @@ fn finish_live_stream_at_deadline(
     }
 }
 
+enum LiveHeartbeatWait<T> {
+    Ready(T),
+    Closed,
+    Deadline,
+    Stalled,
+    TooLarge,
+}
+
+async fn wait_live_future_with_heartbeat<T>(
+    future: impl std::future::Future<Output = T>,
+    heartbeat: &mut tokio::time::Interval,
+    tx: &tokio::sync::mpsc::Sender<Result<BudgetedChunk, std::io::Error>>,
+    byte_budget: &ByteBudget,
+    deadline: client::CodexRequestDeadline,
+) -> LiveHeartbeatWait<T> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tx.closed() => return LiveHeartbeatWait::Closed,
+            _ = tokio::time::sleep_until(deadline.at()) => {
+                return LiveHeartbeatWait::Deadline;
+            }
+            _ = heartbeat.tick() => {
+                match send_live_chunk_before_deadline(
+                    tx,
+                    byte_budget,
+                    DOWNSTREAM_PING.to_vec(),
+                    deadline,
+                ).await {
+                    LiveChunkSendOutcome::Sent => {}
+                    LiveChunkSendOutcome::Closed => return LiveHeartbeatWait::Closed,
+                    LiveChunkSendOutcome::Deadline => return LiveHeartbeatWait::Deadline,
+                    LiveChunkSendOutcome::Stalled => return LiveHeartbeatWait::Stalled,
+                    LiveChunkSendOutcome::TooLarge => return LiveHeartbeatWait::TooLarge,
+                }
+            }
+            result = &mut future => return LiveHeartbeatWait::Ready(result),
+        }
+    }
+}
+
+enum LiveReopenOutcome {
+    Opened(websocket::CodexWebSocketEventReceiver),
+    Rejected(client::CodexError),
+    Closed,
+    Deadline,
+    Stalled,
+    TooLarge,
+}
+
+async fn reopen_live_stream_after_commit(
+    mut error: client::CodexError,
+    replay_state: &mut LiveReplayState,
+    ctx: &RequestContext,
+    heartbeat: &mut tokio::time::Interval,
+    tx: &tokio::sync::mpsc::Sender<Result<BudgetedChunk, std::io::Error>>,
+    byte_budget: &ByteBudget,
+    deadline: client::CodexRequestDeadline,
+) -> LiveReopenOutcome {
+    loop {
+        let failed_transport = replay_state.active_transport;
+        let status = error.status;
+        let replay_safety = error.replay_safety();
+        let wait_ms = match replay_state.plan_retry(ctx, error) {
+            Ok(wait_ms) => {
+                record_post_ping_replay_decision(
+                    ctx,
+                    "post_ping_replay_scheduled",
+                    failed_transport,
+                    status,
+                    replay_safety,
+                    Some(wait_ms),
+                );
+                wait_ms
+            }
+            Err(error) => {
+                record_post_ping_replay_decision(
+                    ctx,
+                    "post_ping_replay_rejected",
+                    failed_transport,
+                    status,
+                    replay_safety,
+                    None,
+                );
+                return LiveReopenOutcome::Rejected(error);
+            }
+        };
+        if wait_ms > 0 {
+            match wait_live_future_with_heartbeat(
+                tokio::time::sleep(Duration::from_millis(wait_ms)),
+                heartbeat,
+                tx,
+                byte_budget,
+                deadline,
+            )
+            .await
+            {
+                LiveHeartbeatWait::Ready(()) => {}
+                LiveHeartbeatWait::Closed => return LiveReopenOutcome::Closed,
+                LiveHeartbeatWait::Deadline => return LiveReopenOutcome::Deadline,
+                LiveHeartbeatWait::Stalled => return LiveReopenOutcome::Stalled,
+                LiveHeartbeatWait::TooLarge => return LiveReopenOutcome::TooLarge,
+            }
+        }
+        if tx.is_closed() {
+            return LiveReopenOutcome::Closed;
+        }
+        match wait_live_future_with_heartbeat(
+            replay_state.open_upstream(ctx, deadline),
+            heartbeat,
+            tx,
+            byte_budget,
+            deadline,
+        )
+        .await
+        {
+            LiveHeartbeatWait::Ready(Ok(events)) => {
+                return LiveReopenOutcome::Opened(events);
+            }
+            LiveHeartbeatWait::Ready(Err(next_error)) => error = next_error,
+            LiveHeartbeatWait::Closed => return LiveReopenOutcome::Closed,
+            LiveHeartbeatWait::Deadline => return LiveReopenOutcome::Deadline,
+            LiveHeartbeatWait::Stalled => return LiveReopenOutcome::Stalled,
+            LiveHeartbeatWait::TooLarge => return LiveReopenOutcome::TooLarge,
+        }
+    }
+}
+
+fn record_post_ping_replay_decision(
+    ctx: &RequestContext,
+    event: &'static str,
+    transport: config::CodexTransport,
+    status: u16,
+    replay_safety: crate::retry::ReplaySafety,
+    delay_ms: Option<u64>,
+) {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".into(), serde_json::json!(ctx.req_id)),
+        ("transport".into(), serde_json::json!(transport.as_str())),
+        ("status".into(), serde_json::json!(status)),
+        (
+            "replaySafety".into(),
+            serde_json::json!(replay_safety.as_str()),
+        ),
+    ]);
+    if let Some(delay_ms) = delay_ms {
+        fields.insert("delayMs".into(), serde_json::json!(delay_ms));
+    }
+    crate::logging::create_logger("codex").warn(event, Some(fields));
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
     upstream_events: websocket::CodexWebSocketEventReceiver,
@@ -1470,8 +1765,37 @@ fn remaining_live_stream_response(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response_with_heartbeat(
+    upstream_events: websocket::CodexWebSocketEventReceiver,
+    translator: LiveStreamTranslator,
+    first_chunk: Vec<u8>,
+    ctx: RequestContext,
+    turn_id: Option<u64>,
+    continuation_capture: Option<LiveContinuationCapture>,
+    provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
+    generation_started: bool,
+    heartbeat_interval: Duration,
+) -> Response {
+    remaining_live_stream_response_with_replay(
+        upstream_events,
+        translator,
+        first_chunk,
+        ctx,
+        turn_id,
+        continuation_capture,
+        provider_started_at,
+        deadline,
+        generation_started,
+        heartbeat_interval,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remaining_live_stream_response_with_replay(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
@@ -1482,6 +1806,7 @@ fn remaining_live_stream_response_with_heartbeat(
     deadline: client::CodexRequestDeadline,
     mut generation_started: bool,
     heartbeat_interval: Duration,
+    mut replay_state: Option<Box<LiveReplayState>>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedChunk, std::io::Error>>(
         LIVE_EVENT_CHANNEL_CAPACITY,
@@ -1544,6 +1869,100 @@ fn remaining_live_stream_response_with_heartbeat(
             heartbeat_interval,
         );
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        macro_rules! reopen_or_stop {
+            ($error:expr) => {{
+                drop(continuation_capture.take());
+                drop(upstream_events);
+                let outcome = reopen_live_stream_after_commit(
+                    $error,
+                    replay_state
+                        .as_mut()
+                        .expect("open replay gate must retain replay state"),
+                    &ctx,
+                    &mut heartbeat,
+                    &tx,
+                    &byte_budget,
+                    deadline,
+                )
+                .await;
+                match outcome {
+                    LiveReopenOutcome::Opened(events) => {
+                        upstream_events = events;
+                        let state = replay_state
+                            .as_ref()
+                            .expect("opened replay must retain replay state");
+                        translator = state.fresh_translator();
+                        continuation_capture = state.fresh_continuation_capture();
+                        if continuation_capture.is_none() {
+                            abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        }
+                        continue;
+                    }
+                    LiveReopenOutcome::Rejected(error) => {
+                        drop(replay_state.take());
+                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        record_codex_terminal_resolution(
+                            &ctx,
+                            non_authoritative_close_authority(
+                                NonAuthoritativeClose::TransportError,
+                                false,
+                            ),
+                            None,
+                        );
+                        let error_type = codex_stream_error_type(&error);
+                        let chunk = translator.error_chunk(
+                            codex_error_message(&error),
+                            error_type,
+                            ctx.traffic.as_deref(),
+                        );
+                        if !chunk.is_empty() {
+                            record_live_stream_progress(&ctx, &chunk);
+                            send_chunk_or_stop!(chunk);
+                        }
+                        return;
+                    }
+                    LiveReopenOutcome::Closed => {
+                        drop(replay_state.take());
+                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        return;
+                    }
+                    LiveReopenOutcome::Deadline => {
+                        drop(replay_state.take());
+                        finish_live_stream_at_deadline(
+                            &mut terminal_permit,
+                            &mut translator,
+                            &ctx,
+                            turn_id,
+                            deadline,
+                        );
+                        return;
+                    }
+                    LiveReopenOutcome::Stalled => {
+                        drop(replay_state.take());
+                        finish_live_stream_after_downstream_stall(
+                            &mut terminal_permit,
+                            &mut translator,
+                            &ctx,
+                            turn_id,
+                        );
+                        return;
+                    }
+                    LiveReopenOutcome::TooLarge => {
+                        drop(replay_state.take());
+                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        let chunk = translator.error_chunk(
+                            "Codex translated stream chunk exceeded the queue byte limit",
+                            "api_error",
+                            ctx.traffic.as_deref(),
+                        );
+                        if let Some(permit) = terminal_permit.take() {
+                            let _ = permit.send(Ok(BudgetedChunk::unbudgeted(chunk)));
+                        }
+                        return;
+                    }
+                }
+            }};
+        }
         loop {
             if tokio::time::Instant::now() >= deadline.at() {
                 finish_live_stream_at_deadline(
@@ -1584,6 +2003,9 @@ fn remaining_live_stream_response_with_heartbeat(
             };
             match item {
                 Ok(payload) => {
+                    if events::starts_hosted_side_effect(&payload) {
+                        replay_state = None;
+                    }
                     log_native_web_search_phase(&ctx, &payload, provider_started_at);
                     record_codex_generation_start(
                         &ctx,
@@ -1602,6 +2024,17 @@ fn remaining_live_stream_response_with_heartbeat(
                         match translate_live_stream_payload(&mut translator, &payload, &ctx) {
                             Ok(result) => result,
                             Err(message) => {
+                                if retryable_live_start_payload(&payload, &message)
+                                    && replay_state.is_some()
+                                {
+                                    let transport = replay_state
+                                        .as_ref()
+                                        .expect("checked replay state")
+                                        .active_transport;
+                                    let error =
+                                        live_payload_codex_error(&payload, message, transport);
+                                    reopen_or_stop!(error);
+                                }
                                 abort_continuation(ctx.session_id.as_deref(), turn_id);
                                 let error_type = codex_stream_payload_error_type(&payload);
                                 let chunk = translator.error_chunk(
@@ -1617,6 +2050,7 @@ fn remaining_live_stream_response_with_heartbeat(
                             }
                         };
                     if !chunk.is_empty() {
+                        replay_state = None;
                         record_live_stream_progress(&ctx, &chunk);
                         send_chunk_or_stop!(chunk);
                     }
@@ -1635,6 +2069,10 @@ fn remaining_live_stream_response_with_heartbeat(
                     }
                 }
                 Err(err) => {
+                    if replay_state.is_some() {
+                        reopen_or_stop!(err);
+                    }
+                    drop(replay_state.take());
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     let chunk = translator.finish_after_closed_completed_tool_call(
                         config::codex_unsafe_salvage_tool_call_on_close(),
@@ -1818,6 +2256,43 @@ fn retryable_live_start_payload(payload: &serde_json::Value, _message: &str) -> 
 
 fn retry_after_from_live_payload(payload: &serde_json::Value) -> Option<String> {
     events::classify_event_failure(payload).and_then(|failure| failure.retry_after)
+}
+
+fn live_payload_codex_error(
+    payload: &serde_json::Value,
+    message: String,
+    transport: config::CodexTransport,
+) -> client::CodexError {
+    let lower_message = message.to_ascii_lowercase();
+    let status = websocket::event_error_status(payload).unwrap_or_else(|| {
+        let error = payload
+            .get("error")
+            .or_else(|| payload.get("response").and_then(|value| value.get("error")));
+        let overloaded = error.is_some_and(|error| {
+            error.get("code").and_then(|value| value.as_str()) == Some("overloaded_error")
+                || error.get("type").and_then(|value| value.as_str()) == Some("overloaded_error")
+        });
+        if payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits")
+            || lower_message.contains("rate limit")
+        {
+            429
+        } else if overloaded || lower_message.contains("overloaded") {
+            529
+        } else {
+            503
+        }
+    });
+    client::CodexError {
+        status,
+        message: message.clone(),
+        detail: Some(message),
+        retry_after: retry_after_from_live_payload(payload),
+        origin: if matches!(transport, config::CodexTransport::Http) {
+            client::CodexErrorOrigin::UpstreamHttp
+        } else {
+            client::CodexErrorOrigin::WebSocket
+        },
+    }
 }
 
 fn codex_stream_payload_error_type(payload: &serde_json::Value) -> &'static str {
@@ -2418,6 +2893,134 @@ mod tests {
             detail: Some(websocket::WEBSOCKET_HEARTBEAT_TIMEOUT_DETAIL.to_string()),
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocket,
+        }
+    }
+
+    fn scripted_event_receiver(
+        payloads: impl IntoIterator<Item = Result<serde_json::Value, client::CodexError>>,
+    ) -> websocket::CodexWebSocketEventReceiver {
+        let payloads: Vec<_> = payloads.into_iter().collect();
+        let (tx, rx) = tokio::sync::mpsc::channel(payloads.len().max(1));
+        for payload in payloads {
+            tx.try_send(payload).unwrap();
+        }
+        drop(tx);
+        rx
+    }
+
+    fn successful_text_receiver(
+        text: &str,
+        response_id: &str,
+    ) -> websocket::CodexWebSocketEventReceiver {
+        scripted_event_receiver([
+            Ok(serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"message", "id":"msg_replayed"}
+            })),
+            Ok(serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": "msg_replayed",
+                "delta": text
+            })),
+            Ok(serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type":"message", "id":"msg_replayed"}
+            })),
+            Ok(serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "incomplete_details": null,
+                    "usage": {"input_tokens": 4, "output_tokens": 2}
+                }
+            })),
+        ])
+    }
+
+    fn retryable_failure_payload() -> serde_json::Value {
+        serde_json::json!({
+            "type": "response.failed",
+            "retry_after_seconds": 0,
+            "response": {
+                "status": "failed",
+                "error": {
+                    "status": 503,
+                    "type": "server_error",
+                    "message": "temporarily unavailable; you can retry your request"
+                }
+            }
+        })
+    }
+
+    fn scripted_replay_state(
+        request: translate::request::ResponsesRequest,
+        continuation: ContinuationCandidate,
+        attempts: std::collections::VecDeque<
+            Result<websocket::CodexWebSocketEventReceiver, client::CodexError>,
+        >,
+    ) -> (
+        LiveReplayState,
+        dispatch_budget::CodexDispatchBudget,
+        ScriptedLiveAttemptQueue,
+    ) {
+        let state = LiveReplayState::new(
+            Arc::new(CodexHttpClient::new()),
+            "msg_replay_gate".to_string(),
+            "gpt-5.6-sol".to_string(),
+            request,
+            None,
+            continuation,
+        )
+        .with_scripted_attempts(attempts);
+        state
+            .dispatch_budget
+            .reserve_model()
+            .expect("the initial scripted attempt must fit the shared budget");
+        let budget = state.dispatch_budget.clone();
+        let attempts = state
+            .scripted_attempts
+            .as_ref()
+            .expect("scripted attempts were configured")
+            .clone();
+        (state, budget, attempts)
+    }
+
+    async fn start_scripted_heartbeat_response(
+        upstream_events: websocket::CodexWebSocketEventReceiver,
+        state: LiveReplayState,
+        ctx: RequestContext,
+        keepalive_delay: Duration,
+    ) -> Response {
+        let turn_id = state.turn_id();
+        let continuation_capture = state.fresh_continuation_capture();
+        let message_id = state.message_id.clone();
+        let model = state.model.clone();
+        let schema_bridge = state.schema_bridge.clone();
+        let tool_policy = state.tool_policy.clone();
+        match live_stream_response_once_with_schema_and_tool_policy(
+            upstream_events,
+            message_id,
+            &model,
+            ctx,
+            turn_id,
+            continuation_capture,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(3_000),
+            keepalive_delay,
+            schema_bridge,
+            tool_policy,
+            Some(Box::new(state)),
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => {
+                panic!("a silent scripted attempt should commit with a downstream ping")
+            }
         }
     }
 
@@ -3103,6 +3706,358 @@ mod tests {
             }
         };
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn live_retry_budget_exhaustion_preserves_the_original_upstream_error() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let mut state = LiveReplayState::new(
+            Arc::new(CodexHttpClient::new()),
+            "msg_budget_exhausted".to_string(),
+            "gpt-5.6-sol".to_string(),
+            request,
+            None,
+            continuation,
+        );
+        for _ in 0..dispatch_budget::MAX_CODEX_MODEL_DISPATCHES {
+            state
+                .dispatch_budget
+                .reserve_model()
+                .expect("test setup must fill the model dispatch budget");
+        }
+        let original_attempt = state.attempt;
+        let error = client::CodexError {
+            status: 503,
+            message: "temporarily unavailable".to_string(),
+            detail: Some("explicit upstream retry response".to_string()),
+            retry_after: Some("30".to_string()),
+            origin: client::CodexErrorOrigin::UpstreamHttp,
+        };
+
+        let rejected = state
+            .plan_retry(&live_test_context(), error)
+            .expect_err("an exhausted hard dispatch budget must reject before backoff");
+
+        assert_eq!(rejected.status, 503);
+        assert_eq!(rejected.retry_after.as_deref(), Some("30"));
+        assert_eq!(state.attempt, original_attempt);
+        assert_eq!(
+            state.dispatch_budget.snapshot().model,
+            dispatch_budget::MAX_CODEX_MODEL_DISPATCHES
+        );
+    }
+
+    #[test]
+    fn live_retry_drops_wire_continuation_before_redispatch() {
+        let request = live_test_request();
+        let continuation = ContinuationCandidate {
+            turn_id: Some(42),
+            previous_response_id: Some("resp_failed_attempt".to_string()),
+            input_delta: Some(request.input.clone()),
+            input_delta_count: request.input.len(),
+            disabled_reason: None,
+        };
+        let mut state = LiveReplayState::new(
+            Arc::new(CodexHttpClient::new()),
+            "msg_full_context_replay".to_string(),
+            "gpt-5.6-sol".to_string(),
+            request,
+            None,
+            continuation,
+        );
+        state
+            .dispatch_budget
+            .reserve_model()
+            .expect("test setup must account for the failed first dispatch");
+        let error = client::CodexError {
+            status: 503,
+            message: "temporarily unavailable".to_string(),
+            detail: Some("explicit upstream retry response".to_string()),
+            retry_after: Some("0".to_string()),
+            origin: client::CodexErrorOrigin::UpstreamHttp,
+        };
+
+        state
+            .plan_retry(&live_test_context(), error)
+            .expect("an explicit 503 should remain replayable");
+
+        let continuation = state.continuation.expect("turn identity must be retained");
+        assert_eq!(continuation.turn_id, Some(42));
+        assert!(continuation.previous_response_id.is_none());
+        assert!(continuation.input_delta.is_none());
+        assert_eq!(
+            continuation.disabled_reason.as_deref(),
+            Some("full_context_retry")
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_only_commit_replays_explicit_503_in_the_same_downstream_stream() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "recovered",
+            "resp_replayed",
+        ))]);
+        let (state, budget, _) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(2);
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the replayed response should finish")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: ping"), "{body}");
+        assert_eq!(body.matches("recovered").count(), 1, "{body}");
+        assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+        assert_eq!(budget.snapshot().model, 2);
+    }
+
+    #[tokio::test]
+    async fn non_ping_anthropic_bytes_close_the_committed_replay_gate() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_forbidden_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"message", "id":"msg_partial"}
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": "msg_partial",
+                "delta": "partial"
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("partial"), "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("must not appear"), "{body}");
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_side_effect_closes_committed_replay_gate_before_translation() {
+        let mut request = live_test_request();
+        request.tools = Some(vec![translate::request::ResponsesTool::WebSearch(
+            translate::request::ResponsesWebSearchTool {
+                kind: "web_search".to_string(),
+                external_web_access: true,
+                search_content_types: vec!["text".to_string()],
+                filters: None,
+                user_location: None,
+            },
+        )]);
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_forbidden_hosted_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(3);
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"web_search_call", "id":"ws_committed"}
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("must not appear"), "{body}");
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_after_heartbeat_is_never_replayed() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_forbidden_unknown_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        upstream_tx.send(Err(heartbeat_test_error())).await.unwrap();
+        drop(upstream_tx);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("heartbeat timed out"), "{body}");
+        assert!(!body.contains("must not appear"), "{body}");
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_backoff_keeps_heartbeats_and_downstream_drop_cancels_redispatch() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_cancelled_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        let mut body = response.into_body();
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.as_ref(), DOWNSTREAM_PING);
+
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+        let during_backoff = tokio::time::timeout(Duration::from_millis(80), body.frame())
+            .await
+            .expect("a heartbeat must be emitted while replay backoff is pending")
+            .expect("the response must remain open during replay backoff")
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(during_backoff.as_ref(), DOWNSTREAM_PING);
+        drop(body);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_replay_rebuilds_continuation_capture_for_the_current_turn() {
+        let _state_guard = CODEX_STATE_TEST_LOCK.lock().await;
+        continuation::clear_all_continuations_for_tests();
+        let session_id = "post-ping-replay-capture";
+        let request = live_test_request();
+        let continuation = continuation_candidate(Some(session_id), &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "captured",
+            "resp_second_attempt",
+        ))]);
+        let (state, budget, _) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
+        let mut ctx = live_test_context();
+        ctx.session_id = Some(session_id.to_string());
+        let response =
+            start_scripted_heartbeat_response(upstream_rx, state, ctx, Duration::from_millis(20))
+                .await;
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("captured"));
+        assert_eq!(budget.snapshot().model, 2);
+        assert!(continuation::has_continuation_for_tests(session_id));
+        continuation::clear_all_continuations_for_tests();
     }
 
     #[tokio::test]
