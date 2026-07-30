@@ -43,6 +43,6 @@ Claude Code sends `x-claude-code-session-id`. The proxy uses it for monitor grou
 
 ## Count tokens
 
-`POST /v1/messages/count_tokens` performs a local estimate with `gpt-tokenizer` and the `o200k_base` encoding. It supports Claude Code's compaction decisions without an upstream request.
+`POST /v1/messages/count_tokens` stays local and does not make an upstream request. Codex uses `o200k_base` for text plus estimates for images, encrypted reasoning, and protocol framing. Other providers use their own local estimators. The result supports Claude Code's compaction decisions but is not a provider billing count.
 
 See [HTTP API](/reference/http-api/) for route contracts and [Compatibility and limitations](/reference/compatibility-and-limitations/) for translation boundaries.

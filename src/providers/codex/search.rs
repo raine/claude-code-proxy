@@ -7,7 +7,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
-use super::count_tokens::approx_token_count;
+use super::count_tokens::{approx_token_count, truncate_to_token_budget};
 
 const SEARCH_OUTPUT_TOKEN_BUDGET: u64 = 2_500;
 const SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
@@ -364,7 +364,7 @@ fn search_input(req: &MessagesRequest) -> Option<Value> {
                 if assistant_budget == 0 {
                     return None;
                 }
-                let text = truncate_to_approx_tokens(&text, assistant_budget);
+                let text = truncate_to_token_budget(&text, assistant_budget);
                 assistant_budget = assistant_budget.saturating_sub(approx_token_count(&text));
                 ("output_text", text)
             } else {
@@ -380,33 +380,6 @@ fn search_input(req: &MessagesRequest) -> Option<Value> {
         })
         .collect();
     (!items.is_empty()).then_some(Value::Array(items))
-}
-
-fn truncate_to_approx_tokens(text: &str, max_tokens: u64) -> String {
-    if approx_token_count(text) <= max_tokens {
-        return text.to_string();
-    }
-
-    let mut tokens = 0_u64;
-    let mut in_word = false;
-    let mut end = 0;
-    for (index, ch) in text.char_indices() {
-        let word_char = ch.is_alphanumeric() || ch == '-' || ch == '_';
-        let starts_token = if word_char {
-            !in_word
-        } else {
-            !ch.is_whitespace()
-        };
-        if starts_token {
-            if tokens == max_tokens {
-                break;
-            }
-            tokens += 1;
-        }
-        in_word = word_char;
-        end = index + ch.len_utf8();
-    }
-    text[..end].to_string()
 }
 
 fn content_text(content: &Value) -> String {
