@@ -11,6 +11,7 @@ pub const MODEL_WIDE_WIDTH: u16 = 36;
 pub const PROJECT_MEDIUM_WIDTH: u16 = 12;
 pub const PROJECT_WIDE_WIDTH: u16 = 16;
 pub const EFFORT_WIDTH: u16 = 6;
+pub const MODE_WIDTH: u16 = 4;
 pub const ENDPOINT_WIDTH: u16 = 12;
 pub const STATUS_WIDTH: u16 = 11;
 pub const RATE_WIDTH: u16 = 12;

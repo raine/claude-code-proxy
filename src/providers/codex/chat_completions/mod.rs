@@ -43,7 +43,11 @@ impl ChatCompletionsBackend {
 
     pub async fn handle(&self, request: TranslatedRequest, ctx: RequestContext) -> Response {
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &request.model);
+            monitor.execution_resolved(
+                &ctx.req_id,
+                &request.model,
+                super::wire_service_tier_mode(request.upstream.get("service_tier")),
+            );
             monitor.upstream_started(&ctx.req_id);
         }
         let upstream = match self

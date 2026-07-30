@@ -75,14 +75,17 @@ impl Provider for CursorProvider {
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("cursor");
 
-        let resolved = resolve_cursor_model(model);
-        if let Err(e) = resolved {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Model \"{model}\" is not supported: {e}"),
-            );
-        }
+        let resolved = match resolve_cursor_model(model) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Model \"{model}\" is not supported: {e}"),
+                );
+            }
+        };
+        report_cursor_resolution(&ctx, &resolved);
 
         if let Some(ref session_id) = ctx.session_id
             && let Some(pending) = BridgeRegistry::pending_tool(session_id)
@@ -252,9 +255,7 @@ impl Provider for CursorProvider {
                 format!("Model \"{requested}\" is not supported: {error}"),
             )
         })?;
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model_id);
-        }
+        report_cursor_resolution(&ctx, &resolved);
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         if let Some(session_id) = ctx.session_id.as_deref()
             && let Some(pending) = BridgeRegistry::pending_tool(session_id)
@@ -344,6 +345,16 @@ impl Provider for CursorProvider {
             body: GenerationBody::BufferedSse(bytes.into()),
             resolved_model: resolved.model_id,
         })
+    }
+}
+
+fn report_cursor_resolution(ctx: &RequestContext, resolved: &model::CursorModelResolution) {
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.execution_resolved(
+            &ctx.req_id,
+            &resolved.model_id,
+            resolved.fast.then(|| "FAST".to_string()),
+        );
     }
 }
 
@@ -490,6 +501,33 @@ pub(crate) static CURSOR_CLI: CursorCli = CursorCli;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_resolution_reports_fast_execution_mode() {
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        monitor.request_started(
+            "request",
+            None,
+            None,
+            crate::monitor::EndpointKind::Responses,
+        );
+        monitor.provider_selected("request", "cursor", "cursor:composer-2.5-fast", None);
+        let context = RequestContext {
+            req_id: "request".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "cursor".to_string(),
+            traffic: None,
+            monitor: Some(monitor.clone()),
+        };
+        let resolved = resolve_cursor_model("cursor:composer-2.5-fast").unwrap();
+
+        report_cursor_resolution(&context, &resolved);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].model.as_deref(), Some("composer-2.5"));
+        assert_eq!(state.active[0].mode.as_deref(), Some("FAST"));
+    }
 
     #[test]
     fn supported_models_includes_legacy_and_agent() {

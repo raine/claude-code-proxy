@@ -524,6 +524,7 @@ fn simulated_active_request(
     if phase >= 3 {
         request.provider = Some(profile.provider.to_string());
         request.model = Some(profile.model.to_string());
+        request.mode = profile.mode.map(str::to_string);
         request.effort = profile.effort.map(str::to_string);
     }
     if phase >= 10 {
@@ -573,6 +574,7 @@ fn simulated_completed_request(
     request.project = Some(profile.project.to_string());
     request.provider = Some(profile.provider.to_string());
     request.model = Some(profile.model.to_string());
+    request.mode = profile.mode.map(str::to_string);
     request.effort = profile.effort.map(str::to_string);
     request.input_tokens = Some(1_800 + cycle.saturating_mul(137));
     if failed {
@@ -591,6 +593,7 @@ struct SimulationProfile {
     project: &'static str,
     provider: &'static str,
     model: &'static str,
+    mode: Option<&'static str>,
     effort: Option<&'static str>,
 }
 
@@ -600,24 +603,28 @@ fn simulation_profile(cycle: u64) -> SimulationProfile {
             project: "live-dashboard",
             provider: "codex",
             model: "gpt-5.6-sol",
+            mode: Some("FAST"),
             effort: Some("high"),
         },
         SimulationProfile {
             project: "api-client",
             provider: "kimi",
             model: "kimi-k2.6",
+            mode: None,
             effort: Some("medium"),
         },
         SimulationProfile {
             project: "editor-extension",
             provider: "cursor",
-            model: "cursor:composer-2.5-fast",
+            model: "composer-2.5",
+            mode: Some("FAST"),
             effort: None,
         },
         SimulationProfile {
             project: "agent-workbench",
             provider: "grok",
             model: "grok-4.5",
+            mode: None,
             effort: Some("low"),
         },
     ];
@@ -643,6 +650,7 @@ fn active_request(
         project: None,
         provider: None,
         model: None,
+        mode: None,
         effort: None,
         endpoint,
         started_at: now - elapsed,
@@ -682,6 +690,7 @@ fn completed_request(
         project: None,
         provider: None,
         model: None,
+        mode: None,
         effort: None,
         endpoint,
         started_at: finished_at - latency,

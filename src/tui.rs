@@ -2,7 +2,7 @@ mod layout;
 
 use layout::{
     CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, ENDPOINT_WIDTH, ERROR_WIDTH,
-    ID_WIDTH, LayoutTier, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH, MODEL_WIDE_WIDTH,
+    ID_WIDTH, LayoutTier, MODE_WIDTH, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH, MODEL_WIDE_WIDTH,
     PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH, STATUS_WIDTH, TIME_WIDTH,
     TOKEN_WIDTH,
 };
@@ -765,6 +765,7 @@ enum SessionColumn {
     Counts,
     Provider,
     Model,
+    Mode,
     Target,
     Effort,
     Input,
@@ -786,6 +787,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Failures, "F", Alignment::Right, COUNT_WIDTH),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Mode, "Mode", Alignment::Left, MODE_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
@@ -884,6 +886,7 @@ fn render_sessions(
                     )),
                     SessionColumn::Provider => provider_cell(session.provider.as_deref()),
                     SessionColumn::Model => model_cell(session.model.as_deref(), width),
+                    SessionColumn::Mode => text_cell(session.mode.as_deref().unwrap_or("-")),
                     SessionColumn::Target => {
                         target_cell(session.provider.as_deref(), session.model.as_deref(), width)
                     }
@@ -921,6 +924,7 @@ enum ActiveColumn {
     Session,
     Provider,
     Model,
+    Mode,
     Target,
     Effort,
     Endpoint,
@@ -940,6 +944,7 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Mode, "Mode", Alignment::Left, MODE_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::flex(C::Endpoint, "Endpoint", Alignment::Left, 1),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
@@ -1025,6 +1030,7 @@ fn render_active(
                     }
                     ActiveColumn::Provider => provider_cell(request.provider.as_deref()),
                     ActiveColumn::Model => model_cell(request.model.as_deref(), width),
+                    ActiveColumn::Mode => text_cell(request.mode.as_deref().unwrap_or("-")),
                     ActiveColumn::Target => {
                         target_cell(request.provider.as_deref(), request.model.as_deref(), width)
                     }
@@ -1053,6 +1059,7 @@ enum RecentColumn {
     Session,
     Provider,
     Model,
+    Mode,
     Target,
     Effort,
     Endpoint,
@@ -1074,6 +1081,7 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Mode, "Mode", Alignment::Left, MODE_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
@@ -1178,6 +1186,7 @@ fn render_recent(
                     }
                     RecentColumn::Provider => provider_cell(request.provider.as_deref()),
                     RecentColumn::Model => model_cell(request.model.as_deref(), width),
+                    RecentColumn::Mode => text_cell(request.mode.as_deref().unwrap_or("-")),
                     RecentColumn::Target => {
                         target_cell(request.provider.as_deref(), request.model.as_deref(), width)
                     }
@@ -1213,6 +1222,7 @@ enum EventColumn {
     Session,
     Provider,
     Model,
+    Mode,
     Message,
 }
 
@@ -1226,6 +1236,7 @@ fn event_columns(tier: LayoutTier) -> Vec<ColumnSpec<EventColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Mode, "Mode", Alignment::Left, MODE_WIDTH),
             ColumnSpec::flex(C::Message, "Message", Alignment::Left, 1),
         ],
         LayoutTier::Expanded => vec![
@@ -1297,6 +1308,7 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                     }
                     EventColumn::Provider => provider_cell(request.provider.as_deref()),
                     EventColumn::Model => model_cell(request.model.as_deref(), width),
+                    EventColumn::Mode => text_cell(request.mode.as_deref().unwrap_or("-")),
                     EventColumn::Message => detail_cell(message),
                 }
             })
@@ -1316,7 +1328,7 @@ fn render_session_detail(
     selected: usize,
 ) {
     let lines = if let Some(session) = state.sessions.get(selected) {
-        vec![
+        let mut lines = vec![
             detail_line("session", session.label(), WHITE),
             detail_line("project", session.project.as_deref().unwrap_or("-"), TEAL),
             detail_line("active requests", session.active_count.to_string(), YELLOW),
@@ -1354,7 +1366,11 @@ fn render_session_detail(
                 session.last_status.as_str(),
                 status_color(&session.last_status),
             ),
-        ]
+        ];
+        if let Some(mode) = session.mode.as_deref() {
+            lines.insert(7, detail_line("mode", mode, YELLOW));
+        }
+        lines
     } else {
         vec![Line::from(Span::styled(
             "No session selected",
@@ -1433,6 +1449,9 @@ fn render_request_detail(
                 DIM_WHITE,
             ),
         ];
+        if let Some(mode) = request.mode.as_deref() {
+            lines.insert(10, detail_line("mode", mode, YELLOW));
+        }
         if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
             lines.push(detail_line("detail", error, YELLOW));
         }
@@ -1862,6 +1881,15 @@ mod tests {
             fixed_width(&recent, RecentColumn::Provider),
             Some(PROVIDER_WIDTH)
         );
+    }
+
+    #[test]
+    fn wide_request_tables_show_execution_mode() {
+        assert!(headers(&session_columns(LayoutTier::Wide, true)).contains(&"Mode"));
+        assert!(headers(&active_columns(LayoutTier::Wide)).contains(&"Mode"));
+        assert!(headers(&recent_columns(LayoutTier::Wide)).contains(&"Mode"));
+        assert!(headers(&event_columns(LayoutTier::Wide)).contains(&"Mode"));
+        assert!(!headers(&active_columns(LayoutTier::Narrow)).contains(&"Mode"));
     }
 
     #[test]

@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Wide monitor tables show effective non-default provider execution modes.
+  Codex priority service displays as `FAST`, Codex flex as `FLEX`, and Cursor
+  fast requests as `FAST`, while the model column keeps the resolved model ID.
+
 ## v0.1.29 (2026-07-30)
 
 - Codex honors required, disabled, and single-tool choices from Claude Code, and

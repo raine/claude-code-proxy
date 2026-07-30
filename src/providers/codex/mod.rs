@@ -52,7 +52,8 @@ use self::translate::model_allowlist::{
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    ServiceTier, TranslateOptions, has_hosted_web_search, is_compact_messages_request,
+    translate_request,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
@@ -66,6 +67,22 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 
 pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
+}
+
+pub(crate) fn service_tier_mode(tier: Option<&ServiceTier>) -> Option<&'static str> {
+    match tier {
+        Some(ServiceTier::Priority) => Some("FAST"),
+        Some(ServiceTier::Flex) => Some("FLEX"),
+        None => None,
+    }
+}
+
+pub(crate) fn wire_service_tier_mode(tier: Option<&serde_json::Value>) -> Option<String> {
+    match tier.and_then(serde_json::Value::as_str) {
+        Some("fast" | "priority") => Some("FAST".to_string()),
+        Some("flex") => Some("FLEX".to_string()),
+        _ => None,
+    }
 }
 
 pub struct CodexProvider {
@@ -206,9 +223,6 @@ impl Provider for CodexProvider {
             );
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
-        }
 
         let mut translated = match translate_request(
             &body,
@@ -228,6 +242,13 @@ impl Provider for CodexProvider {
                 );
             }
         };
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.execution_resolved(
+                &ctx.req_id,
+                &translated.model,
+                service_tier_mode(translated.service_tier.as_ref()).map(str::to_string),
+            );
+        }
 
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
@@ -452,9 +473,6 @@ impl Provider for CodexProvider {
             );
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
-        }
 
         let translated = match translate_request(
             &body,
@@ -474,6 +492,9 @@ impl Provider for CodexProvider {
                 );
             }
         };
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.execution_resolved(&ctx.req_id, &translated.model, None);
+        }
 
         let tokens = count_translated_tokens(&translated);
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -1351,6 +1372,19 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tiers_have_monitor_modes() {
+        assert_eq!(
+            service_tier_mode(Some(&translate::request::ServiceTier::Priority)),
+            Some("FAST")
+        );
+        assert_eq!(
+            service_tier_mode(Some(&translate::request::ServiceTier::Flex)),
+            Some("FLEX")
+        );
+        assert_eq!(service_tier_mode(None), None);
+    }
 
     fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
         let mut bytes = Vec::new();

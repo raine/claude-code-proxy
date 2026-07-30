@@ -11,6 +11,8 @@ description: Use the claude-code-proxy monitor to inspect sessions, active and r
 
 - Sessions grouped by Claude Code session ID and project
 - Active request lifecycle and selected provider or model
+- Effective non-default execution modes in wide tables, such as Codex
+  `service_tier: "priority"` or Cursor `fast: true`, displayed as `FAST`
 - Recent requests, HTTP status, elapsed time, and errors
 - Input and output token totals
 - Output throughput based on matched upstream timing and cumulative usage samples

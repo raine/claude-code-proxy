@@ -83,6 +83,7 @@ pub enum MonitorEvent {
     ModelResolved {
         request_id: String,
         model: String,
+        mode: Option<String>,
     },
     CompactionStarted {
         request_id: String,
@@ -134,6 +135,7 @@ pub struct ActiveRequest {
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub mode: Option<String>,
     pub effort: Option<String>,
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
@@ -176,6 +178,7 @@ pub struct CompletedRequest {
     pub project: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub mode: Option<String>,
     pub effort: Option<String>,
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
@@ -247,6 +250,7 @@ pub struct SessionSummary {
     pub failure_count: usize,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub mode: Option<String>,
     pub effort: Option<String>,
     pub last_seen: SystemTime,
     pub input_tokens: u64,
@@ -370,9 +374,19 @@ impl MonitorHandle {
     }
 
     pub fn model_resolved(&self, request_id: impl Into<String>, model: impl Into<String>) {
+        self.execution_resolved(request_id, model, None);
+    }
+
+    pub fn execution_resolved(
+        &self,
+        request_id: impl Into<String>,
+        model: impl Into<String>,
+        mode: Option<String>,
+    ) {
         self.publish(MonitorEvent::ModelResolved {
             request_id: request_id.into(),
             model: model.into(),
+            mode,
         });
     }
 
@@ -485,6 +499,7 @@ impl MonitorStore {
                         project: None,
                         provider: None,
                         model: None,
+                        mode: None,
                         effort: None,
                         endpoint,
                         started_at: SystemTime::now(),
@@ -533,13 +548,25 @@ impl MonitorStore {
                     active.status = RequestStatus::ProviderSelected;
                 }
             }
-            MonitorEvent::ModelResolved { request_id, model } => {
+            MonitorEvent::ModelResolved {
+                request_id,
+                model,
+                mode,
+            } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.model = Some(match active.model.take() {
-                        Some(incoming) if incoming != model => format!("{incoming} → {model}"),
-                        Some(incoming) => incoming,
+                        Some(incoming) => {
+                            let displayed =
+                                displayed_incoming_model(active.provider.as_deref(), &incoming);
+                            if displayed == model {
+                                model
+                            } else {
+                                format!("{displayed} → {model}")
+                            }
+                        }
                         None => model,
                     });
+                    active.mode = mode;
                 }
             }
             MonitorEvent::CompactionStarted { request_id } => {
@@ -752,6 +779,7 @@ impl MonitorStore {
                 project: None,
                 provider: None,
                 model: None,
+                mode: None,
                 effort: None,
                 endpoint: EndpointKind::Messages,
                 started_at: SystemTime::now(),
@@ -782,6 +810,7 @@ impl MonitorStore {
             project: active.project,
             provider: active.provider,
             model: active.model,
+            mode: active.mode,
             effort: active.effort,
             endpoint: active.endpoint,
             started_at: active.started_at,
@@ -860,6 +889,7 @@ fn session_summaries(
                 failure_count: 0,
                 provider: None,
                 model: None,
+                mode: None,
                 effort: None,
                 last_seen: request.finished_at,
                 input_tokens: 0,
@@ -876,6 +906,7 @@ fn session_summaries(
         entry.project = request.project.clone().or(entry.project.clone());
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
+        entry.mode = request.mode.clone();
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
         entry.input_tokens = entry
@@ -910,6 +941,7 @@ fn session_summaries(
                 failure_count: 0,
                 provider: None,
                 model: None,
+                mode: None,
                 effort: None,
                 last_seen: request.started_at,
                 input_tokens: 0,
@@ -924,6 +956,7 @@ fn session_summaries(
         entry.project = request.project.clone().or(entry.project.clone());
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
+        entry.mode = request.mode.clone();
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.started_at);
         entry.input_tokens = entry
@@ -978,6 +1011,19 @@ fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
         right
     } else {
         left
+    }
+}
+
+fn displayed_incoming_model<'a>(provider: Option<&str>, model: &'a str) -> &'a str {
+    let model = if provider == Some("cursor") {
+        model.rsplit_once(':').map_or(model, |(_, model)| model)
+    } else {
+        model
+    };
+    if matches!(provider, Some("codex" | "cursor")) {
+        model.strip_suffix("-fast").unwrap_or(model)
+    } else {
+        model
     }
 }
 
@@ -1076,6 +1122,96 @@ mod tests {
 
         let state = monitor.snapshot();
         assert_eq!(state.active[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn fast_suffix_becomes_execution_mode_instead_of_model_mapping() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "codex", "gpt-5.6-terra-fast", None);
+        monitor.execution_resolved("r1", "gpt-5.6-terra", Some("FAST".to_string()));
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(state.active[0].mode.as_deref(), Some("FAST"));
+    }
+
+    #[test]
+    fn fast_suffix_is_removed_when_model_override_changes_target() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "codex", "gpt-5.4-fast", None);
+        monitor.execution_resolved("r1", "gpt-5.6-terra", Some("FAST".to_string()));
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.active[0].model.as_deref(),
+            Some("gpt-5.4 → gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn latest_completed_default_mode_clears_session_mode() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "fast",
+            Some("session".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("fast", "codex", "gpt-5.6-sol-fast", None);
+        monitor.execution_resolved("fast", "gpt-5.6-sol", Some("FAST".to_string()));
+        monitor.request_completed("fast", 200, None, None);
+
+        monitor.request_started(
+            "default",
+            Some("session".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("default", "codex", "gpt-5.6-sol", None);
+        monitor.execution_resolved("default", "gpt-5.6-sol", None);
+        monitor.request_completed("default", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].mode, None);
+    }
+
+    #[test]
+    fn active_default_mode_clears_completed_session_mode() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "fast",
+            Some("session".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("fast", "codex", "gpt-5.6-sol-fast", None);
+        monitor.execution_resolved("fast", "gpt-5.6-sol", Some("FAST".to_string()));
+        monitor.request_completed("fast", 200, None, None);
+
+        monitor.request_started(
+            "default",
+            Some("session".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("default", "codex", "gpt-5.6-sol", None);
+        monitor.execution_resolved("default", "gpt-5.6-sol", None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].mode, None);
+    }
+
+    #[test]
+    fn cursor_route_prefix_is_not_shown_as_model_mapping() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "cursor", "cursor:composer-2.5", None);
+        monitor.execution_resolved("r1", "composer-2.5", None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].model.as_deref(), Some("composer-2.5"));
     }
 
     #[test]
@@ -1261,6 +1397,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             project: None,
             provider: Some("codex".to_string()),
             model: Some("gpt-5.6-sol".to_string()),
+            mode: None,
             effort: None,
             endpoint: EndpointKind::Messages,
             started_at: SystemTime::UNIX_EPOCH,

@@ -46,7 +46,11 @@ impl CodexNativeBackend {
             Err(response) => return response,
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
+            monitor.execution_resolved(
+                &ctx.req_id,
+                &resolved.model,
+                super::wire_service_tier_mode(body.get("service_tier")),
+            );
             monitor.upstream_started(&ctx.req_id);
         }
 
