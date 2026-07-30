@@ -193,8 +193,13 @@ agent files:
 
 The `co` profile also routes recognized automatic and manual compaction to
 GPT-5.6 Terra. Codex compaction uses `medium` reasoning independently of the
-main session effort. The session-scoped override replaces an inherited
-compaction header, while `cg` keeps its existing main-loop compaction behavior.
+main session effort. The launcher preserves unrelated newline-separated
+`ANTHROPIC_CUSTOM_HEADERS`, removes every case-insensitive inherited
+`x-ccproxy-compaction-model` entry, and appends exactly one profile-controlled
+value. Malformed, non-UTF-8, CR-containing, or oversized inherited header input
+fails before Claude Code starts instead of being guessed or silently dropped.
+The `cg` profile does not modify this variable and keeps its existing main-loop
+compaction behavior.
 
 The special built-in `claude` catch-all remains untouched because Claude Code
 adds a private background-job and Agent View protocol that public `--agents`
@@ -224,6 +229,58 @@ starts. Options that can replace profile isolation (`--settings`,
 rejected. Run plain `claude` for fully custom combinations. A future custom
 agent outside the injected table that names a generic model alias inherits the
 active parent model unless its definition uses a profile-allowed concrete id.
+
+Managed `co` and `cg` launches currently set
+`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`. Claude Code 2.1.219 expanded its
+default nested-subagent depth, but nested hook request shapes and same-family
+routing have not yet passed the versioned depth-2/depth-3 canary. Depth 1 keeps
+the verified top-level Agent boundary and prevents a nested generic model alias
+from silently crossing the GPT/Grok profile boundary. Run plain `claude` for an
+unmanaged nesting policy.
+
+Every pull request, main-branch push, and release tag runs the Ubuntu
+latest/previous compatibility gate. The scheduled/manual
+`Claude Code compatibility canary` workflow additionally runs the latest pin on
+macOS. These jobs read
+[`compatibility/claude-code.json`](compatibility/claude-code.json) and install
+the pinned latest and previous Claude Code releases. Run the same isolated
+compatibility canary locally with:
+
+```sh
+scripts/claude-code-launcher-smoke
+```
+
+The manifest is the sole source of the latest/previous version pins and their
+npm `dist.integrity` SHA-512 values. The smoke verifies the downloaded tarball
+before installation and fails when npm's `latest` dist-tag or its immediate
+previous stable release no longer matches the reviewed manifest. It then checks
+the exact installed version, real `co` and `cg` startup with the managed inline
+settings/agent definitions, top-level Agent input preservation, model-override
+removal, and fail-safe nested-hook behavior. For each version it also starts
+ccproxy on a temporary loopback port with fake credentials and a deterministic
+Responses mock, then runs real Claude Code requests through `co`. The mock
+requires a `Read` round trip before it computes a weighted proof from the
+returned file contents. The canary asserts the translated model and streaming
+shape, matching tool call/result IDs, Anthropic cache-read/cache-write usage,
+and a real `--resume` continuation that must carry the prior tool result and
+content-derived proof. It also exercises the top-level Agent/Explore chain:
+Explore must route to the same-family `gpt-5.6-luna` model and return a derived
+child proof, and the parent must carry that Agent result before producing its
+own proof. A direct Anthropic probe asserts HTTP 413 and
+`error.type=request_too_large`; the real Claude client must independently show
+an unambiguous size failure without relying on words planted in its prompt.
+Both paths check one-shot dispatch and absence of an injected secret in direct,
+Claude-facing, and proxy-log output. The canary never uses the default config,
+default port, deployed service, or real provider credentials. Manual dispatch
+accepts an ordered, comma-separated subset of versions already pinned in the
+manifest; empty lists, duplicates, unknown versions, and any whitespace are
+rejected.
+
+This covers the deterministic provider, tool, top-level agent, resume, and
+typed-error slices of CC-COMPAT-002, but does **not** claim live compaction,
+terminal-stream interruption, real provider, or depth-2 routing coverage. The
+scheduled workflow remains manually dispatchable for targeted reruns and macOS
+coverage; the Ubuntu matrix is also an explicit pull-request and release gate.
 
 On Unix, symlinking the same binary as `co` and `cg` enables shorter forms. The
 proxy selects the profile from the executable name and launches Claude Code
@@ -481,7 +538,10 @@ Also verified:
 If the resolved model isn't supported by your account, upstream returns a 400
 like
 `"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."`.
-The proxy surfaces that verbatim.
+The proxy preserves bounded, allowlisted diagnostic fields while sanitizing
+secrets, credentials, local paths, and URL query data. Unknown JSON error
+shapes are replaced with a generic status-bearing message instead of being
+echoed to Claude Code.
 
 Auth:
 
@@ -797,14 +857,16 @@ The proxy speaks enough of the Anthropic API for Claude Code:
 - `POST /v1/messages?beta=true`: same (Claude Code always sends `?beta=true`)
 - `POST /v1/messages/count_tokens`: local token count via `tiktoken-rs`
   (`o200k_base` text tokenization plus compatibility estimates for fixed
-  request overhead and non-text content); used by Claude Code's compaction
-  logic. GPT and Grok share a two-slot blocking admission gate, and the work
-  runs through Tokio's blocking pool. A request waiting more than 30 seconds
-  for an admission slot receives retryable HTTP 503 overload.
+  request overhead, non-text content, and translated structured-output
+  schemas); used by Claude Code's compaction logic. GPT and Grok share a
+  two-slot blocking admission gate, and the work runs through Tokio's blocking
+  pool. A request waiting more than 30 seconds for an admission slot receives
+  retryable HTTP 503 overload.
 - `GET /v1/models`: the active Codex and Grok model catalog
 - `GET /healthz`: liveness check
 - `GET /version`: build SHA, binary SHA-256, PID, executable path, startup time,
-  and a non-secret configuration fingerprint
+  a non-secret configuration fingerprint, current/provider-construction config
+  generations, and the live-versus-restart-required reload contract
 
 ## Configuration
 
@@ -939,6 +1001,34 @@ ignored and defaults are used; during hot reload ccproxy keeps the last valid
 snapshot and generation until the file becomes valid again. Type errors reject
 the new snapshot as a whole so a partially applied configuration cannot mix old
 and new policy.
+
+“Hot reload” applies only to settings resolved on a later request. Transport
+clients, listeners, and admission semaphores are intentionally not swapped
+inside a running process:
+
+| Application point | Settings |
+| --- | --- |
+| Next request after the metadata recheck (normally within 500 ms) | `log.*`; Codex model, effort, reasoning summary, service tier, lane/tool switches, request headers, continuation/salvage policy, total deadline, stream heartbeat, and WebSocket request/pool timeouts; Grok total deadline and stream heartbeat |
+| Restart required | `bindAddress`, `port`, `server.*`; Codex base URL, transport, connect/header/HTTP first-byte/body-idle timeouts; Grok base URL, client version, connect/header/first-byte/body-idle timeouts; environment or operating-system proxy settings |
+
+`GET /version` exposes `configGeneration`,
+`providerConstructionConfigGeneration`, and
+`configGenerationChangedSinceProviderConstruction`. It also reports
+`providerConstructionConfigGenerationEnd` and
+`providerConstructionSnapshotStable`, because provider construction resolves
+multiple immutable transport settings and a file generation accepted during
+that window could otherwise make a single construction generation misleading.
+An unstable construction snapshot always requires restart. A later changed
+generation does not claim that every field is stale: compare the edited field
+with the `configReload` matrix returned by the endpoint. Restart the service
+when a restart-required effective field changed (a file value masked by an
+environment override is not effective); the endpoint deliberately reports the
+generation difference instead of pretending that provider clients were
+hot-swapped.
+The first `GET /version` that observes each new stale generation also emits one
+`provider_config_generation_stale` warning. It contains only construction
+generation metadata, the current generation, and a fixed remediation action;
+configuration paths and values are not logged.
 
 Codex uses `auto` transport by default. Without a system proxy, `auto` starts
 with live WebSocket streaming while the connection is healthy. It falls back

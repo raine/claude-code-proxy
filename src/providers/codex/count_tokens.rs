@@ -4,6 +4,8 @@ use super::translate::request::{
 };
 use tiktoken_rs::o200k_base_singleton;
 
+const TEXT_FORMAT_OVERHEAD_TOKENS: u64 = 4;
+
 /// Local token counter for Codex translated requests using GPT-5's o200k_base
 /// tokenizer plus fixed estimates for non-text model inputs.
 pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
@@ -22,6 +24,14 @@ pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
     // Tools
     if let Some(ref tools) = translated.tools {
         total += count_tool_tokens(tools);
+    }
+
+    // Structured-output formats are injected into the model's prompt upstream.
+    // Count the translated wire representation so schema normalization is
+    // reflected in the same estimate Claude Code uses for context admission.
+    if let Some(ref format) = translated.text.format {
+        total += token_count(&serde_json::to_string(format).unwrap_or_default());
+        total += TEXT_FORMAT_OVERHEAD_TOKENS;
     }
 
     // Overhead
@@ -116,7 +126,26 @@ fn token_count(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::schema::MessagesRequest;
+    use crate::providers::codex::translate::request::{
+        TranslateOptions, TranslationOverrides, translate_request_with_overrides,
+    };
     use serde_json::json;
+
+    fn translated_request(value: serde_json::Value) -> ResponsesRequest {
+        let request: MessagesRequest = serde_json::from_value(value).unwrap();
+        translate_request_with_overrides(
+            &request,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.5".to_string(),
+                use_responses_lite: false,
+            },
+            TranslationOverrides::default(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn count_simple_request() {
@@ -191,6 +220,42 @@ mod tests {
         }))
         .unwrap();
         assert!(count_translated_tokens(&long) >= count_translated_tokens(&short));
+    }
+
+    #[test]
+    fn count_tokens_structured_schema_increases_estimate() {
+        let baseline = translated_request(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "return a result"}]
+        }));
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "description": "x".repeat(10 * 1024)
+                }
+            },
+            "required": ["result"],
+            "additionalProperties": false
+        });
+        assert!(
+            serde_json::to_vec(&schema).unwrap().len() >= 10 * 1024,
+            "fixture must exercise a schema of at least 10 KiB"
+        );
+        let structured = translated_request(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "return a result"}],
+            "output_config": {"format": {
+                "type": "json_schema",
+                "name": "large_result",
+                "schema": schema
+            }}
+        }));
+
+        let baseline_count = count_translated_tokens(&baseline);
+        let structured_count = count_translated_tokens(&structured);
+        assert!(structured_count > baseline_count);
     }
 
     #[test]

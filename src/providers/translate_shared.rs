@@ -1107,9 +1107,239 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
     }
 }
 
+pub(crate) const MAX_EXTERNAL_ERROR_DETAIL_BYTES: usize = 1_024;
+const EXTERNAL_ERROR_TRUNCATED_SUFFIX: &str = "…[truncated]";
+
+/// Bound and redact untrusted provider error text before it crosses the proxy boundary.
+///
+/// Upstream error bodies are not a safe display contract: they can echo credentials,
+/// request payloads, or local paths. Callers should retain structured, allowlisted
+/// error codes separately and expose only this sanitized detail to clients and logs.
+pub(crate) fn sanitize_external_error_detail(value: &str) -> Option<String> {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    let lower = collapsed.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "bearer ",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "x-api-key",
+        "client_secret",
+        "set-cookie:",
+        "cookie:",
+        "password=",
+        "password:",
+        "token=",
+        "secret=",
+        "secret:",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "private_key",
+        "-----begin ",
+        "\"prompt\"",
+        "\"input\"",
+        "prompt=",
+        "system prompt",
+        "/users/",
+        "/home/",
+        "/volumes/",
+        "/private/",
+        "/var/folders/",
+        "/tmp/",
+        "file://",
+        "\\users\\",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || [
+            "\"authorization\"",
+            "\"password\"",
+            "\"token\"",
+            "\"secret\"",
+            "\"access_token\"",
+            "\"refreshtoken\"",
+            "\"refresh_token\"",
+            "\"id_token\"",
+            "\"api_key\"",
+            "\"apikey\"",
+            "\"x-api-key\"",
+            "\"client_secret\"",
+            "\"clientsecret\"",
+            "\"exaapikey\"",
+            "\"cookie\"",
+            "\"set-cookie\"",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || contains_secret_token_prefix(&lower)
+        || [
+            "?key=",
+            "&key=",
+            "?token=",
+            "&token=",
+            "?api_key=",
+            "&api_key=",
+            "?apikey=",
+            "&apikey=",
+            "?exaapikey=",
+            "&exaapikey=",
+            "?access_token=",
+            "&access_token=",
+            "?refresh_token=",
+            "&refresh_token=",
+            "?client_secret=",
+            "&client_secret=",
+            "?password=",
+            "&password=",
+            "?signature=",
+            "&signature=",
+            "?credential=",
+            "&credential=",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || contains_url_query(&lower)
+        || contains_url_userinfo(&lower)
+        || contains_posix_absolute_path(&lower)
+        || contains_windows_absolute_path(&lower)
+    {
+        return Some("[redacted upstream error detail]".to_string());
+    }
+
+    if collapsed.len() <= MAX_EXTERNAL_ERROR_DETAIL_BYTES {
+        return Some(collapsed);
+    }
+
+    let prefix_budget =
+        MAX_EXTERNAL_ERROR_DETAIL_BYTES.saturating_sub(EXTERNAL_ERROR_TRUNCATED_SUFFIX.len());
+    let mut end = prefix_budget.min(collapsed.len());
+    while end > 0 && !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}{}",
+        &collapsed[..end],
+        EXTERNAL_ERROR_TRUNCATED_SUFFIX
+    ))
+}
+
+fn contains_posix_absolute_path(value: &str) -> bool {
+    value.char_indices().any(|(index, character)| {
+        if character != '/' {
+            return false;
+        }
+        let next = value.as_bytes().get(index + 1).copied();
+        if next.is_none()
+            || next == Some(b'/')
+            || next.is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            return false;
+        }
+        index == 0
+            || value[..index].chars().next_back().is_some_and(|previous| {
+                previous.is_ascii_whitespace()
+                    || matches!(previous, '"' | '\'' | '=' | ':' | '(' | '[' | '{')
+            })
+    })
+}
+
+fn contains_windows_absolute_path(value: &str) -> bool {
+    value.contains(r"\\")
+        || value.as_bytes().windows(3).any(|window| {
+            window[0].is_ascii_alphabetic()
+                && window[1] == b':'
+                && matches!(window[2], b'\\' | b'/')
+        })
+}
+
+fn contains_secret_token_prefix(value: &str) -> bool {
+    value.match_indices("sk-").any(|(index, _)| {
+        let has_boundary = index == 0
+            || value
+                .as_bytes()
+                .get(index - 1)
+                .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+        has_boundary && value.len().saturating_sub(index) >= 8
+    })
+}
+
+fn contains_url_userinfo(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        let Some((_, after_scheme)) = token.split_once("://") else {
+            return false;
+        };
+        after_scheme
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
+}
+
+fn contains_url_query(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        token
+            .split_once("://")
+            .is_some_and(|(_, remainder)| remainder.contains('?'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_error_detail_is_redacted_collapsed_and_utf8_bounded() {
+        assert_eq!(
+            sanitize_external_error_detail("  safe \n diagnostic  ").as_deref(),
+            Some("safe diagnostic")
+        );
+        assert_eq!(
+            sanitize_external_error_detail("disk-full diagnostic").as_deref(),
+            Some("disk-full diagnostic")
+        );
+        for secret in [
+            "Authorization: Bearer top-secret",
+            r#"{"access_token":"top-secret"}"#,
+            r#"{"password":"top-secret"}"#,
+            r#"{"token":"top-secret"}"#,
+            r#"{"secret":"top-secret"}"#,
+            "token=top-secret",
+            "provider returned sk-live-123",
+            r#"{"authorization":"Basic dXNlcjpzZWNyZXQ="}"#,
+            r#"{"exaApiKey":"top-secret"}"#,
+            "https://example.test/failure?key=top-secret",
+            "https://example.test/failure?exaApiKey=top-secret",
+            "https://example.test/failure?X-Amz-Signature=top-secret",
+            "https://user:top-secret@example.test/failure",
+            r#"{"prompt":"private request"}"#,
+            "failed while reading /Users/alice/private.txt",
+            "failed while reading /Volumes/External/private.txt",
+            "failed while reading /root/private.txt",
+            r#"{"path":"/srv/ccproxy/private.txt"}"#,
+            "failed while reading file:///private/tmp/request.json",
+            r"failed while reading C:\Users\alice\private.txt",
+            r"failed while reading \\server\share\private.txt",
+        ] {
+            assert_eq!(
+                sanitize_external_error_detail(secret).as_deref(),
+                Some("[redacted upstream error detail]")
+            );
+        }
+
+        let detail = format!("{}😊", "x".repeat(MAX_EXTERNAL_ERROR_DETAIL_BYTES));
+        let sanitized = sanitize_external_error_detail(&detail).unwrap();
+        assert!(sanitized.ends_with(EXTERNAL_ERROR_TRUNCATED_SUFFIX));
+        assert!(sanitized.len() <= MAX_EXTERNAL_ERROR_DETAIL_BYTES);
+        assert!(sanitized.is_char_boundary(sanitized.len()));
+    }
 
     #[test]
     fn normalization_recognizes_redacted_thinking_without_payload() {

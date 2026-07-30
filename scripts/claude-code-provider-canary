@@ -1,0 +1,1239 @@
+#!/usr/bin/env python3
+"""Exercise a pinned Claude Code client through co and an isolated mock upstream."""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+
+CONTEXT_SECRET = "CCPROXY_CONTEXT_SECRET_9f4e8c2d"
+CONTEXT_MARKER = "CCPROXY_FAIL_CASE_74A9"
+RESUME_MARKER = "CCPROXY_RESUME_CASE"
+AGENT_PARENT_MARKER = "CCPROXY_AGENT_PARENT_CASE"
+AGENT_CHILD_MARKER = "CCPROXY_AGENT_CHILD_CASE"
+CALL_ID = "call_ccproxy_canary_read"
+AGENT_CALL_ID = "call_ccproxy_canary_agent"
+EXPECTED_MODEL = "gpt-5.6-sol"
+EXPECTED_EXPLORE_MODEL = "gpt-5.6-luna"
+EXPECTED_PROOF = 411
+EXPECTED_RESUME_PROOF = 841
+EXPECTED_AGENT_CHILD_PROOF = 162
+EXPECTED_AGENT_PARENT_PROOF = 493
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message.replace(CONTEXT_SECRET, "[redacted]"))
+
+
+def reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def json_tree(value: Any):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from json_tree(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from json_tree(child)
+
+
+def find_function_output(
+    request: dict[str, Any], call_id: str = CALL_ID
+) -> dict[str, Any] | None:
+    for value in json_tree(request.get("input")):
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "function_call_output"
+            and value.get("call_id") == call_id
+        ):
+            return value
+    return None
+
+
+def read_tool_names(request: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    tools = request.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name")
+            if isinstance(name, str):
+                names.add(name)
+            function = tool.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                names.add(function["name"])
+    # Responses Lite projects callable schemas into an `additional_tools`
+    # developer input instead of the top-level `tools` array.
+    for value in json_tree(request.get("input")):
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "function"
+            and isinstance(value.get("name"), str)
+        ):
+            names.add(value["name"])
+        if isinstance(value, dict) and value.get("type") == "additional_tools":
+            additional = value.get("tools")
+            if isinstance(additional, list):
+                for tool in additional:
+                    if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+                        names.add(tool["name"])
+    return names
+
+
+def sse(events: list[dict[str, Any]]) -> bytes:
+    return "".join(
+        f"data: {json.dumps(event, separators=(',', ':'))}\n\n" for event in events
+    ).encode("utf-8")
+
+
+class CanaryState:
+    def __init__(self, fixture: Path) -> None:
+        self.fixture = fixture
+        self.lock = threading.Lock()
+        self.normal_requests: list[dict[str, Any]] = []
+        self.agent_requests: list[dict[str, Any]] = []
+        self.error_requests: list[dict[str, Any]] = []
+        self.failures: list[str] = []
+        self.proof: int | None = None
+
+    def record_failure(self, message: str) -> None:
+        with self.lock:
+            self.failures.append(message.replace(CONTEXT_SECRET, "[redacted]"))
+
+    def validate_common(
+        self,
+        request: dict[str, Any],
+        authorization: str | None,
+        expected_model: str = EXPECTED_MODEL,
+    ) -> None:
+        if authorization != "Bearer canary-access":
+            fail("mock upstream did not receive the isolated fake bearer credential")
+        if request.get("model") != expected_model:
+            fail(
+                f"expected translated model {expected_model}, got {request.get('model')!r}"
+            )
+        if request.get("stream") is not True:
+            fail("Claude Code request was not translated to a streaming Responses request")
+
+    def handle(
+        self, request: dict[str, Any], authorization: str | None
+    ) -> tuple[int, str, bytes]:
+        try:
+            serialized_input = json.dumps(
+                request.get("input"), ensure_ascii=False, separators=(",", ":")
+            )
+            agent_output = find_function_output(request, AGENT_CALL_ID)
+            expected_model = (
+                EXPECTED_EXPLORE_MODEL
+                if AGENT_CHILD_MARKER in serialized_input and agent_output is None
+                else EXPECTED_MODEL
+            )
+            self.validate_common(request, authorization, expected_model)
+            if CONTEXT_MARKER in serialized_input:
+                with self.lock:
+                    self.error_requests.append(
+                        {
+                            "model": request.get("model"),
+                            "stream": request.get("stream"),
+                        }
+                    )
+                body = json.dumps(
+                    {
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "type": "invalid_request_error",
+                            "param": "input",
+                            "message": (
+                                "Authorization: Bearer "
+                                f"{CONTEXT_SECRET}; synthetic context overflow"
+                            ),
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                return 400, "application/json", body
+
+            if AGENT_PARENT_MARKER in serialized_input and agent_output is not None:
+                output_text = json.dumps(
+                    agent_output.get("output"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                child_proof = re.search(
+                    r"CCPROXY_AGENT_CHILD_PROOF=(\d+)", output_text
+                )
+                if child_proof is None:
+                    fail(
+                        "parent Agent tool_result lost the Explore child proof; "
+                        f"output={output_text[:1000]}"
+                    )
+                parent_proof = int(child_proof.group(1)) * 3 + 7
+                if parent_proof != EXPECTED_AGENT_PARENT_PROOF:
+                    fail(f"unexpected parent Agent proof {parent_proof}")
+                with self.lock:
+                    self.agent_requests.append(
+                        {
+                            "phase": "agent_parent_result",
+                            "model": request.get("model"),
+                            "stream": request.get("stream"),
+                            "callId": agent_output.get("call_id"),
+                            "proof": parent_proof,
+                        }
+                    )
+                answer = (
+                    f"CCPROXY_AGENT_PARENT_PROOF={parent_proof}; "
+                    "derived from the Explore result as 162*3+7."
+                )
+                message_id = "msg_ccproxy_canary_agent_parent"
+                return (
+                    200,
+                    "text/event-stream",
+                    sse(
+                        [
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": message_id},
+                            },
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": message_id,
+                                "delta": answer,
+                            },
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": 0,
+                                "item_id": message_id,
+                                "text": answer,
+                            },
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": message_id},
+                            },
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_ccproxy_canary_agent_parent",
+                                    "usage": {
+                                        "input_tokens": 88,
+                                        "output_tokens": 9,
+                                    },
+                                },
+                            },
+                        ]
+                    ),
+                )
+
+            if AGENT_CHILD_MARKER in serialized_input:
+                operands = re.search(r"CHILD_OPERANDS\s*=\s*37,14", serialized_input)
+                if operands is None:
+                    fail("Explore child request lost its unique operands")
+                values = [int(value) for value in re.findall(r"\d+", operands.group(0))]
+                child_proof = values[0] * 4 + values[1]
+                if child_proof != EXPECTED_AGENT_CHILD_PROOF:
+                    fail(f"unexpected Explore child proof {child_proof}")
+                with self.lock:
+                    self.agent_requests.append(
+                        {
+                            "phase": "agent_child",
+                            "model": request.get("model"),
+                            "stream": request.get("stream"),
+                            "proof": child_proof,
+                        }
+                    )
+                answer = (
+                    f"CCPROXY_AGENT_CHILD_PROOF={child_proof}; "
+                    "derived inside Explore as 37*4+14."
+                )
+                message_id = "msg_ccproxy_canary_agent_child"
+                return (
+                    200,
+                    "text/event-stream",
+                    sse(
+                        [
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": message_id},
+                            },
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": message_id,
+                                "delta": answer,
+                            },
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": 0,
+                                "item_id": message_id,
+                                "text": answer,
+                            },
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": message_id},
+                            },
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_ccproxy_canary_agent_child",
+                                    "usage": {
+                                        "input_tokens": 43,
+                                        "input_tokens_details": {
+                                            "cached_tokens": 9,
+                                            "cache_write_tokens": 3,
+                                        },
+                                        "output_tokens": 8,
+                                    },
+                                },
+                            },
+                        ]
+                    ),
+                )
+
+            if AGENT_PARENT_MARKER in serialized_input:
+                tool_names = read_tool_names(request)
+                with self.lock:
+                    self.agent_requests.append(
+                        {
+                            "phase": "agent_parent_call",
+                            "model": request.get("model"),
+                            "stream": request.get("stream"),
+                            "agentToolAdvertised": "Agent" in tool_names,
+                        }
+                    )
+                arguments = json.dumps(
+                    {
+                        "description": "Compute child proof",
+                        "prompt": (
+                            f"{AGENT_CHILD_MARKER}: CHILD_OPERANDS=37,14. "
+                            "Compute first*4+second and return the exact proof."
+                        ),
+                        "subagent_type": "Explore",
+                        "run_in_background": False,
+                    },
+                    separators=(",", ":"),
+                )
+                return (
+                    200,
+                    "text/event-stream",
+                    sse(
+                        [
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "function_call",
+                                    "id": "item_ccproxy_canary_agent",
+                                    "call_id": AGENT_CALL_ID,
+                                    "name": "Agent",
+                                },
+                            },
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "output_index": 0,
+                                "call_id": AGENT_CALL_ID,
+                                "arguments": arguments,
+                            },
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "function_call",
+                                    "id": "item_ccproxy_canary_agent",
+                                    "call_id": AGENT_CALL_ID,
+                                    "name": "Agent",
+                                    "arguments": arguments,
+                                },
+                            },
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_ccproxy_canary_agent_call",
+                                    "usage": {
+                                        "input_tokens": 39,
+                                        "output_tokens": 6,
+                                    },
+                                },
+                            },
+                        ]
+                    ),
+                )
+
+            if RESUME_MARKER in serialized_input:
+                function_output = find_function_output(request)
+                if function_output is None:
+                    fail("resumed request lost the prior Read function_call_output")
+                if "CANARY_OPERANDS=41,17,29" not in serialized_input:
+                    fail("resumed request lost the prior Read result contents")
+                previous_proof = re.search(
+                    r"CCPROXY_TOOL_CHAIN_PROOF=(\d+)", serialized_input
+                )
+                if previous_proof is None:
+                    fail("resumed request lost the prior content-derived proof")
+                resumed_proof = int(previous_proof.group(1)) * 2 + 19
+                if resumed_proof != EXPECTED_RESUME_PROOF:
+                    fail(f"unexpected resumed proof {resumed_proof}")
+                with self.lock:
+                    self.normal_requests.append(
+                        {
+                            "phase": "resume",
+                            "model": request.get("model"),
+                            "stream": request.get("stream"),
+                            "callId": function_output.get("call_id"),
+                            "proof": resumed_proof,
+                        }
+                    )
+                answer = (
+                    f"CCPROXY_RESUME_PROOF={resumed_proof}; "
+                    "derived from the persisted 411 proof as 411*2+19."
+                )
+                message_id = "msg_ccproxy_canary_resume"
+                return (
+                    200,
+                    "text/event-stream",
+                    sse(
+                        [
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": message_id},
+                            },
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": message_id,
+                                "delta": answer,
+                            },
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": 0,
+                                "item_id": message_id,
+                                "text": answer,
+                            },
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {"type": "message", "id": message_id},
+                            },
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_ccproxy_canary_resume",
+                                    "usage": {
+                                        "input_tokens": 121,
+                                        "input_tokens_details": {
+                                            "cached_tokens": 31,
+                                            "cache_write_tokens": 7,
+                                        },
+                                        "output_tokens": 8,
+                                    },
+                                },
+                            },
+                        ]
+                    ),
+                )
+
+            function_output = find_function_output(request)
+            if function_output is None:
+                tool_names = read_tool_names(request)
+                if "Read" not in tool_names:
+                    fail(
+                        "translated request does not expose Claude Code's Read tool "
+                        f"(tools={sorted(tool_names)}, "
+                        f"request={json.dumps(request, ensure_ascii=False)[:3000]})"
+                    )
+                with self.lock:
+                    self.normal_requests.append(
+                        {
+                            "phase": "tool_call",
+                            "model": request.get("model"),
+                            "stream": request.get("stream"),
+                            "readTool": True,
+                        }
+                    )
+                arguments = json.dumps(
+                    {"file_path": str(self.fixture)}, separators=(",", ":")
+                )
+                return (
+                    200,
+                    "text/event-stream",
+                    sse(
+                        [
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "function_call",
+                                    "id": "item_ccproxy_canary_read",
+                                    "call_id": CALL_ID,
+                                    "name": "Read",
+                                },
+                            },
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "output_index": 0,
+                                "call_id": CALL_ID,
+                                "arguments": arguments,
+                            },
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "function_call",
+                                    "id": "item_ccproxy_canary_read",
+                                    "call_id": CALL_ID,
+                                    "name": "Read",
+                                    "arguments": arguments,
+                                },
+                            },
+                            {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": "resp_ccproxy_canary_tool",
+                                    "usage": {
+                                        "input_tokens": 31,
+                                        "input_tokens_details": {
+                                            "cached_tokens": 13,
+                                            "cache_write_tokens": 5,
+                                        },
+                                        "output_tokens": 7,
+                                    },
+                                },
+                            },
+                        ]
+                    ),
+                )
+
+            output_text = json.dumps(
+                function_output.get("output"), ensure_ascii=False, separators=(",", ":")
+            )
+            match = re.search(r"CANARY_OPERANDS\s*=\s*41,17,29", output_text)
+            if match is None:
+                fail(
+                    "second request carried the expected call_id but not the Read "
+                    "fixture contents"
+                )
+            operands = [int(value) for value in re.findall(r"\d+", match.group(0))]
+            if operands != [41, 17, 29]:
+                fail(f"unexpected operands in Read result: {operands}")
+            proof = operands[0] * 3 + operands[1] * 5 + operands[2] * 7
+            if proof != EXPECTED_PROOF:
+                fail(f"unexpected weighted proof {proof}")
+            with self.lock:
+                self.proof = proof
+                self.normal_requests.append(
+                    {
+                        "phase": "tool_result",
+                        "model": request.get("model"),
+                        "stream": request.get("stream"),
+                        "callId": function_output.get("call_id"),
+                        "proof": proof,
+                    }
+                )
+
+            answer = (
+                f"CCPROXY_TOOL_CHAIN_PROOF={proof}; "
+                "derived from Read operands with weights 3,5,7."
+            )
+            message_id = "msg_ccproxy_canary_final"
+            return (
+                200,
+                "text/event-stream",
+                sse(
+                    [
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {"type": "message", "id": message_id},
+                        },
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": message_id,
+                            "delta": answer,
+                        },
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": message_id,
+                            "text": answer,
+                        },
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {"type": "message", "id": message_id},
+                        },
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_ccproxy_canary_final",
+                                "usage": {
+                                    "input_tokens": 97,
+                                    "input_tokens_details": {
+                                        "cached_tokens": 23,
+                                        "cache_write_tokens": 11,
+                                    },
+                                    "output_tokens": 9,
+                                },
+                            },
+                        },
+                    ]
+                ),
+            )
+        except Exception as error:  # keep the mock failure visible to the driver
+            self.record_failure(str(error))
+            body = json.dumps(
+                {"error": {"code": "canary_contract_failed", "message": "mock rejected request"}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return 500, "application/json", body
+
+
+def make_handler(state: CanaryState):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "ccproxy-canary"
+        sys_version = ""
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            try:
+                length = int(self.headers.get("content-length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 16 * 1024 * 1024:
+                self.send_error(400)
+                return
+            try:
+                request = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.send_error(400)
+                return
+            if not isinstance(request, dict):
+                self.send_error(400)
+                return
+            status, content_type, body = state.handle(
+                request, self.headers.get("authorization")
+            )
+            self.send_response(status)
+            self.send_header("content-type", content_type)
+            self.send_header("content-length", str(len(body)))
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def wait_for_proxy(port: int, process: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            fail(f"isolated proxy exited before readiness with status {process.returncode}")
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.3)
+            connection.request("GET", "/healthz")
+            response = connection.getresponse()
+            body = response.read()
+            connection.close()
+            if response.status == 200 and b'"ok":true' in body.replace(b" ", b""):
+                return
+        except OSError:
+            pass
+        time.sleep(0.05)
+    fail(f"isolated proxy did not become ready on loopback port {port}")
+
+
+def post_anthropic_probe(port: int, prompt: str) -> tuple[int, bytes]:
+    body = json.dumps(
+        {
+            "model": EXPECTED_MODEL,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    connection.request(
+        "POST",
+        "/v1/messages",
+        body=body,
+        headers={
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-api-key": "unused",
+        },
+    )
+    response = connection.getresponse()
+    response_body = response.read()
+    status = response.status
+    connection.close()
+    return status, response_body
+
+
+def get_proxy_version(port: int) -> dict[str, Any]:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    connection.request("GET", "/version")
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+    if response.status != 200:
+        fail(f"isolated proxy /version returned HTTP {response.status}")
+    try:
+        value = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        fail(f"isolated proxy /version returned invalid JSON: {error}")
+    if not isinstance(value, dict):
+        fail("isolated proxy /version returned a non-object payload")
+    return value
+
+
+def wait_for_config_generation_change(port: int, previous: int) -> int:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        value = get_proxy_version(port)
+        generation = value.get("configGeneration")
+        if isinstance(generation, int) and generation > previous:
+            return generation
+        time.sleep(0.05)
+    fail(
+        "isolated proxy did not accept the Responses Lite config generation "
+        f"after generation {previous}"
+    )
+
+
+def terminate(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def parse_claude_json(output: bytes, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(output)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        rendered = output.decode("utf-8", errors="replace")
+        fail(f"{label} did not return JSON: {error}; output={rendered[:2000]}")
+    if not isinstance(value, dict):
+        fail(f"{label} returned a non-object JSON result")
+    return value
+
+
+def clean_environment(
+    base: dict[str, str], home: Path, config_dir: Path, claude_bin: Path
+) -> dict[str, str]:
+    # Start from a small process-runtime allowlist. In particular, no inherited
+    # CCP_*, PORT, Anthropic/Claude, proxy, XDG, logging, or credential variable
+    # may outrank the temporary config and route a fake bearer outside the mock.
+    environment = {
+        name: base[name]
+        for name in (
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "LOGNAME",
+            "SHELL",
+            "TERM",
+            "TZ",
+            "USER",
+        )
+        if name in base
+    }
+    base_path = base.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    canary_tmp = config_dir.parent / "tmp"
+    canary_tmp.mkdir(exist_ok=True)
+    environment.update(
+        {
+            "CCP_CONFIG_DIR": str(config_dir),
+            "CI": "1",
+            "DISABLE_AUTOUPDATER": "1",
+            "HOME": str(home),
+            "NO_PROXY": "127.0.0.1,localhost",
+            "PATH": f"{claude_bin.parent}{os.pathsep}{base_path}",
+            "TMPDIR": str(canary_tmp),
+            "no_proxy": "127.0.0.1,localhost",
+        }
+    )
+    return environment
+
+
+def run_claude(
+    co_binary: Path,
+    claude_bin: Path,
+    home: Path,
+    config_dir: Path,
+    workspace: Path,
+    prompt: str,
+    *,
+    persist_session: bool = False,
+    resume_session_id: str | None = None,
+    allowed_tools: tuple[str, ...] = ("Read",),
+) -> subprocess.CompletedProcess[bytes]:
+    environment = clean_environment(os.environ, home, config_dir, claude_bin)
+    command = [
+        str(co_binary),
+        "-p",
+        prompt,
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        ",".join(allowed_tools),
+        "--output-format",
+        "json",
+    ]
+    if resume_session_id is not None:
+        command.extend(["--resume", resume_session_id])
+    if not persist_session:
+        command.append("--no-session-persistence")
+    return subprocess.run(
+        command,
+        cwd=workspace,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        check=False,
+    )
+
+
+def ensure_no_secret(label: str, content: bytes) -> None:
+    if CONTEXT_SECRET.encode() in content:
+        fail(f"{label} leaked the synthetic upstream secret")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run real Claude Code requests through isolated co and ccproxy"
+    )
+    parser.add_argument("--claude-bin", required=True, type=Path)
+    parser.add_argument("--proxy-binary", required=True, type=Path)
+    parser.add_argument("--label", default="unlabeled")
+    args = parser.parse_args()
+
+    claude_bin = args.claude_bin.resolve()
+    proxy_binary = args.proxy_binary.resolve()
+    if not os.access(claude_bin, os.X_OK):
+        fail(f"Claude Code executable is missing: {claude_bin}")
+    if not os.access(proxy_binary, os.X_OK):
+        fail(f"ccproxy executable is missing: {proxy_binary}")
+
+    with tempfile.TemporaryDirectory(prefix="ccproxy-provider-canary.") as raw_root:
+        root = Path(raw_root)
+        fixture = root / "workspace" / "evidence.txt"
+        fixture.parent.mkdir()
+        fixture.write_text(
+            "Compatibility evidence; do not infer this value.\n"
+            "CANARY_OPERANDS=41,17,29\n"
+            "Use weights 3,5,7 in that order.\n",
+            encoding="utf-8",
+        )
+
+        state = CanaryState(fixture)
+        mock = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+        mock_thread = threading.Thread(target=mock.serve_forever, daemon=True)
+        mock_thread.start()
+        mock_port = int(mock.server_address[1])
+
+        config_dir = root / "proxy-config"
+        (config_dir / "codex").mkdir(parents=True)
+        (config_dir / "codex" / "auth.json").write_text(
+            json.dumps(
+                {
+                    "access": "canary-access",
+                    "refresh": "canary-refresh",
+                    "expires": 4102444800000,
+                    "accountId": "acct_canary",
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        proxy_port = reserve_loopback_port()
+        (config_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "bindAddress": "127.0.0.1",
+                    "port": proxy_port,
+                    "codex": {
+                        "baseUrl": f"http://127.0.0.1:{mock_port}/responses",
+                        "transport": "http",
+                        "responsesLite": False,
+                    },
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+        launcher_dir = root / "bin"
+        launcher_dir.mkdir()
+        co_binary = launcher_dir / "co"
+        co_binary.symlink_to(proxy_binary)
+        state_home = root / "state"
+        proxy_stderr_path = root / "proxy.stderr"
+        proxy_environment = clean_environment(
+            os.environ, root / "proxy-home", config_dir, claude_bin
+        )
+        proxy_environment.update(
+            {
+                "CCP_BIND_ADDRESS": "127.0.0.1",
+                "CCP_LOG_STDERR": "1",
+                "CCP_LOG_VERBOSE": "1",
+                "CCP_CODEX_TRANSPORT": "http",
+                "PORT": str(proxy_port),
+                "XDG_STATE_HOME": str(state_home),
+            }
+        )
+        (root / "proxy-home").mkdir()
+        with proxy_stderr_path.open("wb") as proxy_stderr:
+            proxy = subprocess.Popen(
+                [str(proxy_binary), "serve", "--no-monitor"],
+                cwd=root,
+                env=proxy_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=proxy_stderr,
+            )
+            try:
+                wait_for_proxy(proxy_port, proxy)
+
+                normal_home = root / "normal-home"
+                normal_home.mkdir()
+                normal = run_claude(
+                    co_binary,
+                    claude_bin,
+                    normal_home,
+                    config_dir,
+                    fixture.parent,
+                    (
+                        "Use the Read tool on evidence.txt. Do not infer or invent its "
+                        "contents. Apply the weights stated in the file to its three "
+                        "operands, then return the exact proof requested by the tool "
+                        "workflow."
+                    ),
+                    persist_session=True,
+                )
+                ensure_no_secret("successful Claude stdout", normal.stdout)
+                ensure_no_secret("successful Claude stderr", normal.stderr)
+                if normal.returncode != 0:
+                    with state.lock:
+                        normal_failures = list(state.failures)
+                    fail(
+                        "real Claude Code tool-chain request failed "
+                        f"(status {normal.returncode}): stdout="
+                        + normal.stdout.decode("utf-8", errors="replace")[:2000]
+                        + "; stderr="
+                        + normal.stderr.decode("utf-8", errors="replace")[:2000]
+                        + f"; mock_failures={normal_failures!r}"
+                    )
+                normal_json = parse_claude_json(normal.stdout, "tool-chain request")
+                result = normal_json.get("result")
+                if (
+                    not isinstance(result, str)
+                    or f"CCPROXY_TOOL_CHAIN_PROOF={EXPECTED_PROOF}" not in result
+                ):
+                    fail(f"non-trivial proof is absent from Claude result: {result!r}")
+                usage = normal_json.get("usage")
+                if not isinstance(usage, dict):
+                    fail(f"Claude result did not expose aggregate usage: {usage!r}")
+                expected_cache_usage = {
+                    "input_tokens": 76,
+                    "cache_creation_input_tokens": 16,
+                    "cache_read_input_tokens": 36,
+                    "output_tokens": 16,
+                }
+                observed_cache_usage = {
+                    name: usage.get(name) for name in expected_cache_usage
+                }
+                if observed_cache_usage != expected_cache_usage:
+                    fail(
+                        "Claude aggregate usage did not preserve the Anthropic cache "
+                        f"categories: expected {expected_cache_usage!r}, "
+                        f"got {observed_cache_usage!r}"
+                    )
+                session_id = normal_json.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    fail(
+                        "persistent Claude result did not expose a resumable session_id"
+                    )
+
+                resumed = run_claude(
+                    co_binary,
+                    claude_bin,
+                    normal_home,
+                    config_dir,
+                    fixture.parent,
+                    (
+                        f"{RESUME_MARKER}: use the previous proof from this exact "
+                        "session, multiply it by 2, add 19, and return the resulting "
+                        "resume proof. Do not read the file again."
+                    ),
+                    persist_session=True,
+                    resume_session_id=session_id,
+                )
+                ensure_no_secret("resumed Claude stdout", resumed.stdout)
+                ensure_no_secret("resumed Claude stderr", resumed.stderr)
+                if resumed.returncode != 0:
+                    fail(
+                        "real Claude Code --resume request failed: "
+                        + resumed.stderr.decode("utf-8", errors="replace")[:2000]
+                    )
+                resumed_json = parse_claude_json(resumed.stdout, "--resume request")
+                resumed_result = resumed_json.get("result")
+                if (
+                    not isinstance(resumed_result, str)
+                    or f"CCPROXY_RESUME_PROOF={EXPECTED_RESUME_PROOF}"
+                    not in resumed_result
+                ):
+                    fail(
+                        "non-trivial resumed proof is absent from Claude result: "
+                        f"{resumed_result!r}"
+                    )
+                if resumed_json.get("session_id") != session_id:
+                    fail(
+                        "Claude --resume changed the isolated session identity: "
+                        f"{resumed_json.get('session_id')!r}"
+                    )
+
+                # Luna is Lite-only. Flip the request-lane hot setting only
+                # after the full-lane Read/cache/resume contracts complete.
+                pre_flip_generation = get_proxy_version(proxy_port).get(
+                    "configGeneration"
+                )
+                if not isinstance(pre_flip_generation, int):
+                    fail("isolated proxy did not report an initial config generation")
+                (config_dir / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "bindAddress": "127.0.0.1",
+                            "port": proxy_port,
+                            "codex": {
+                                "baseUrl": (
+                                    f"http://127.0.0.1:{mock_port}/responses"
+                                ),
+                                "transport": "http",
+                                "responsesLite": True,
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                wait_for_config_generation_change(proxy_port, pre_flip_generation)
+
+                agent_home = root / "agent-home"
+                agent_home.mkdir()
+                agent = run_claude(
+                    co_binary,
+                    claude_bin,
+                    agent_home,
+                    config_dir,
+                    fixture.parent,
+                    (
+                        f"{AGENT_PARENT_MARKER}: delegate the isolated child "
+                        "calculation to the Explore agent, then use its returned "
+                        "proof to calculate child*3+7. Do not calculate the child "
+                        "value yourself."
+                    ),
+                    allowed_tools=("Agent",),
+                )
+                ensure_no_secret("Agent-chain Claude stdout", agent.stdout)
+                ensure_no_secret("Agent-chain Claude stderr", agent.stderr)
+                if agent.returncode != 0:
+                    with state.lock:
+                        agent_failures = list(state.failures)
+                    fail(
+                        "real Claude Code Agent/Explore request failed "
+                        f"(status {agent.returncode}): stdout="
+                        + agent.stdout.decode("utf-8", errors="replace")[:2000]
+                        + "; stderr="
+                        + agent.stderr.decode("utf-8", errors="replace")[:2000]
+                        + f"; mock_failures={agent_failures!r}"
+                    )
+                agent_json = parse_claude_json(agent.stdout, "Agent-chain request")
+                agent_result = agent_json.get("result")
+                if (
+                    not isinstance(agent_result, str)
+                    or f"CCPROXY_AGENT_PARENT_PROOF={EXPECTED_AGENT_PARENT_PROOF}"
+                    not in agent_result
+                ):
+                    fail(
+                        "parent proof is absent from Agent-chain result: "
+                        f"{agent_result!r}"
+                    )
+
+                direct_status, direct_body = post_anthropic_probe(
+                    proxy_port, CONTEXT_MARKER
+                )
+                ensure_no_secret("direct Anthropic error response", direct_body)
+                try:
+                    direct_json = json.loads(direct_body)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    fail(
+                        "direct Anthropic failure response was not JSON: "
+                        f"{error}; body={direct_body[:1000]!r}"
+                    )
+                if direct_status != 413:
+                    fail(
+                        "structured upstream size failure did not map to HTTP 413: "
+                        f"status={direct_status}, body={direct_json!r}"
+                    )
+                direct_error = (
+                    direct_json.get("error")
+                    if isinstance(direct_json, dict)
+                    else None
+                )
+                if (
+                    not isinstance(direct_error, dict)
+                    or direct_error.get("type") != "request_too_large"
+                ):
+                    fail(
+                        "structured upstream size failure did not map to "
+                        f"error.type=request_too_large: {direct_json!r}"
+                    )
+
+                error_home = root / "error-home"
+                error_home.mkdir()
+                context = run_claude(
+                    co_binary,
+                    claude_bin,
+                    error_home,
+                    config_dir,
+                    fixture.parent,
+                    (
+                        f"{CONTEXT_MARKER}: execute this opaque compatibility probe "
+                        "exactly. Do not call tools."
+                    ),
+                )
+                ensure_no_secret("failed Claude stdout", context.stdout)
+                ensure_no_secret("failed Claude stderr", context.stderr)
+                combined_error = (context.stdout + b"\n" + context.stderr).decode(
+                    "utf-8", errors="replace"
+                )
+                if context.returncode == 0:
+                    fail("structured context overflow unexpectedly returned success")
+                recognizable = (
+                    "prompt is too long",
+                    "request too large",
+                )
+                if not any(marker in combined_error.lower() for marker in recognizable):
+                    fail(
+                        "Claude Code did not surface a recognizable context-window "
+                        f"failure: {combined_error[:2000]}"
+                    )
+            finally:
+                terminate(proxy)
+                mock.shutdown()
+                mock.server_close()
+                mock_thread.join(timeout=5)
+
+        proxy_logs = proxy_stderr_path.read_bytes()
+        proxy_log_path = state_home / "claude-code-proxy" / "proxy.log"
+        if proxy_log_path.exists():
+            proxy_logs += b"\n" + proxy_log_path.read_bytes()
+        ensure_no_secret("proxy logs", proxy_logs)
+
+        with state.lock:
+            if state.failures:
+                fail("mock upstream contract failures: " + "; ".join(state.failures))
+            if [request["phase"] for request in state.normal_requests] != [
+                "tool_call",
+                "tool_result",
+                "resume",
+            ]:
+                fail(
+                    "expected exactly one tool-call request followed by one tool-result "
+                    f"request, got {state.normal_requests!r}"
+                )
+            if state.proof != EXPECTED_PROOF:
+                fail(f"mock did not derive the expected proof: {state.proof!r}")
+            if [request["phase"] for request in state.agent_requests] != [
+                "agent_parent_call",
+                "agent_child",
+                "agent_parent_result",
+            ]:
+                fail(
+                    "expected parent Agent call, Explore child request, and parent "
+                    f"tool-result request, got {state.agent_requests!r}"
+                )
+            if state.agent_requests[0]["agentToolAdvertised"] is not True:
+                fail(
+                    "Responses Lite parent request did not advertise the Agent tool: "
+                    f"{state.agent_requests[0]!r}"
+                )
+            if state.agent_requests[1]["model"] != EXPECTED_EXPLORE_MODEL:
+                fail(
+                    "Explore child did not use the configured same-family model: "
+                    f"{state.agent_requests[1]!r}"
+                )
+            if state.agent_requests[1]["proof"] != EXPECTED_AGENT_CHILD_PROOF:
+                fail(f"unexpected Explore child proof: {state.agent_requests[1]!r}")
+            if (
+                state.agent_requests[2]["callId"] != AGENT_CALL_ID
+                or state.agent_requests[2]["proof"] != EXPECTED_AGENT_PARENT_PROOF
+            ):
+                fail(
+                    "parent did not consume the exact Agent result/proof: "
+                    f"{state.agent_requests[2]!r}"
+                )
+            if len(state.error_requests) != 2:
+                fail(
+                    "direct and real-client structured size probes should each "
+                    "dispatch exactly once without retry, got "
+                    f"{len(state.error_requests)} requests"
+                )
+
+        print(
+            f"Claude Code {args.label}: real co tool round-trip, weighted proof, "
+            "cache usage, resume continuity, Agent/Explore routing, typed context "
+            "failure, and secret-redaction contracts passed"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.TimeoutExpired as error:
+        print(
+            f"error: Claude Code canary timed out: {error}".replace(
+                CONTEXT_SECRET, "[redacted]"
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    except Exception as error:
+        print(
+            f"error: {error}".replace(CONTEXT_SECRET, "[redacted]"),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)

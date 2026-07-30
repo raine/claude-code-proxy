@@ -22,7 +22,6 @@ use crate::traffic::TrafficCapture;
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REJECTED_RESPONSE_BYTES: usize = 64 * 1024;
-const MAX_REJECTED_DETAIL_BYTES: usize = 1_024;
 const MAX_WIRE_ATTEMPTS: u32 = MAX_RATE_LIMIT_RETRIES + 1;
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_HEADER_TIMEOUT_MS: u64 = 60_000;
@@ -1354,29 +1353,7 @@ fn rejected_response_detail(body: &[u8]) -> Option<String> {
 }
 
 fn sanitize_rejected_detail(value: &str) -> Option<String> {
-    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        return None;
-    }
-    let lower = collapsed.to_ascii_lowercase();
-    if [
-        "authorization:",
-        "bearer ",
-        "access_token",
-        "refresh_token",
-        "api_key",
-        "client_secret",
-        "password=",
-        "password:",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return Some("[redacted upstream error detail]".to_string());
-    }
-    let (prefix, truncated) = super::text::truncate_utf8(&collapsed, MAX_REJECTED_DETAIL_BYTES);
-    let suffix = if truncated { "…[truncated]" } else { "" };
-    Some(format!("{prefix}{suffix}"))
+    crate::providers::translate_shared::sanitize_external_error_detail(value)
 }
 
 pub(super) fn capture_terminal_failure(
@@ -1891,7 +1868,10 @@ mod tests {
             Some("[redacted upstream error detail]")
         );
 
-        let detail = format!("{}😊", "x".repeat(MAX_REJECTED_DETAIL_BYTES));
+        let detail = format!(
+            "{}😊",
+            "x".repeat(crate::providers::translate_shared::MAX_EXTERNAL_ERROR_DETAIL_BYTES)
+        );
         let sanitized = sanitize_rejected_detail(&detail).unwrap();
         assert!(sanitized.ends_with("…[truncated]"));
         assert!(sanitized.is_char_boundary(sanitized.len()));

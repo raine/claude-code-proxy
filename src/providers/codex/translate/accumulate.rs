@@ -380,6 +380,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn buffered_usage_maps_reported_cache_write_tokens() {
+        let upstream = sse_event(
+            "response.completed",
+            json!({
+                "response":{
+                    "id":"resp_cache_write",
+                    "status":"completed",
+                    "usage":{
+                        "input_tokens":100,
+                        "input_tokens_details":{
+                            "cached_tokens":20,
+                            "cache_write_tokens":30
+                        },
+                        "output_tokens":7
+                    }
+                }
+            }),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.6-sol").unwrap();
+
+        assert_eq!(response["usage"]["input_tokens"], 50);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 20);
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 30);
+        assert_eq!(response["usage"]["output_tokens"], 7);
+    }
+
     fn optional_reason_schema_bridge() -> SchemaBridge {
         SchemaBridge::build(&json!({
             "type": "object",

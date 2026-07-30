@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::anthropic::sse::encode_sse_event;
+use crate::providers::translate_shared::sanitize_external_error_detail;
 use crate::traffic::TrafficCapture;
 
 use super::super::events::validate_terminal_snapshot_status;
@@ -400,6 +401,8 @@ impl LiveStreamTranslator {
         if self.finished {
             return out;
         }
+        let message =
+            sanitize_external_error_detail(message).unwrap_or_else(|| "Upstream error".to_string());
         self.close_open_blocks(traffic, &mut out);
         self.ensure_message_start(traffic, &mut out);
         self.emit(
@@ -1554,6 +1557,10 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .get("input_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64()),
+        input_tokens_details_cache_write: usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(|v| v.as_u64()),
         output_tokens_details_reasoning: usage
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
@@ -1630,19 +1637,7 @@ fn is_valid_read_args(value: &serde_json::Value) -> bool {
 }
 
 fn error_message(payload: &serde_json::Value) -> String {
-    payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("message"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("Upstream error")
-        .to_string()
+    super::super::events::sanitized_error_message(payload)
 }
 
 #[cfg(test)]
@@ -1673,6 +1668,37 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn live_usage_maps_reported_cache_write_tokens() {
+        let output = render(vec![json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp_cache_write",
+                "status":"completed",
+                "usage":{
+                    "input_tokens":100,
+                    "input_tokens_details":{
+                        "cached_tokens":20,
+                        "cache_write_tokens":30
+                    },
+                    "output_tokens":7
+                }
+            }
+        })]);
+        let events = crate::anthropic::sse::try_parse_sse_events(output.as_bytes()).unwrap();
+        let usage = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| value["type"] == "message_delta")
+            .and_then(|value| value.get("usage").cloned())
+            .unwrap();
+
+        assert_eq!(usage["input_tokens"], 50);
+        assert_eq!(usage["cache_read_input_tokens"], 20);
+        assert_eq!(usage["cache_creation_input_tokens"], 30);
+        assert_eq!(usage["output_tokens"], 7);
     }
 
     fn structured_text_events(text: &str) -> [serde_json::Value; 3] {

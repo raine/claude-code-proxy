@@ -25,6 +25,8 @@ const AGENT_MODEL_POLICY_HELPER_ARG: &str = "--ccproxy-agent-model-policy-hook";
 const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_AGENT_MODEL_POLICY_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_DIAGNOSTIC_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES: usize = 64 * 1024;
+const CCP_COMPACTION_HEADER_NAME: &str = "x-ccproxy-compaction-model";
 const CLAUDE_PROFILE_ROOT_DIR: &str = ".claude-ccproxy";
 const CLAUDE_PROFILE_LOCK_FILE: &str = ".ccproxy-profile.lock";
 const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
@@ -290,7 +292,7 @@ fn run() -> Result<()> {
     match commands {
         Commands::Version { json } => {
             if json {
-                println!("{}", serde_json::to_string(&server::version_info())?);
+                println!("{}", serde_json::to_string(&local_binary_version_info())?);
             } else {
                 println!("claude-code-proxy {}", VERSION);
             }
@@ -399,6 +401,27 @@ fn run() -> Result<()> {
             launch_claude(profile, ClaudeLaunchStyle::Subcommand, &args)
         }
     }
+}
+
+fn local_binary_version_info() -> serde_json::Value {
+    let mut info = server::version_info();
+    let object = info
+        .as_object_mut()
+        .expect("server version metadata is always a JSON object");
+    // This command is a short-lived local process: it has not constructed the
+    // provider clients owned by a running server. Keep those generation and
+    // reload claims exclusive to GET /version on the serving process.
+    object.remove("configGeneration");
+    object.remove("providerConstructionConfigGeneration");
+    object.remove("providerConstructionConfigGenerationEnd");
+    object.remove("providerConstructionSnapshotStable");
+    object.remove("configGenerationChangedSinceProviderConstruction");
+    object.remove("configReload");
+    object.insert(
+        "metadataScope".to_string(),
+        serde_json::Value::String("local_binary".to_string()),
+    );
+    info
 }
 
 fn run_diagnostics(command: DiagnosticsCommand) -> Result<()> {
@@ -1418,7 +1441,7 @@ fn build_claude_command_for_profile_config(
 ) -> Result<Command> {
     let profile = profile.config();
     validate_claude_profile_args(profile, args)?;
-    let environment = claude_profile_environment(profile, base_url, profile_config_directory);
+    let environment = claude_profile_environment(profile, base_url, profile_config_directory)?;
     let settings_environment = environment
         .iter()
         .map(|(name, value)| (name.to_string(), serde_json::Value::String(value.clone())))
@@ -1574,7 +1597,7 @@ fn claude_profile_environment(
     profile: ClaudeProfileConfig,
     base_url: &str,
     profile_config_directory: &Path,
-) -> Vec<(&'static str, String)> {
+) -> Result<Vec<(&'static str, String)>> {
     let mut environment = vec![
         (CLAUDE_PROFILE_MANAGED_ENV, "1".to_string()),
         (
@@ -1632,14 +1655,19 @@ fn claude_profile_environment(
         ("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1".to_string()),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
         ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1".to_string()),
+        // Claude Code 2.1.219 enabled nested subagent spawning by default.
+        // Keep managed profiles at the previously verified boundary until a
+        // versioned canary proves same-family routing at greater depths.
+        ("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", "1".to_string()),
         ("CLAUDE_CODE_MAX_RETRIES", "1".to_string()),
         ("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "10".to_string()),
         ("ENABLE_TOOL_SEARCH", "true".to_string()),
     ];
     if let Some(model) = profile.compaction_model {
+        let inherited = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS");
         environment.push((
             "ANTHROPIC_CUSTOM_HEADERS",
-            format!("x-ccproxy-compaction-model: {model}"),
+            merge_anthropic_custom_headers(inherited.as_deref(), model)?,
         ));
     }
     if let Some(tokens) = profile.file_read_max_output_tokens {
@@ -1648,7 +1676,64 @@ fn claude_profile_environment(
             tokens.to_string(),
         ));
     }
-    environment
+    Ok(environment)
+}
+
+fn merge_anthropic_custom_headers(
+    inherited: Option<&std::ffi::OsStr>,
+    compaction_model: &str,
+) -> Result<String> {
+    let managed = format!("{CCP_COMPACTION_HEADER_NAME}: {compaction_model}");
+    http::HeaderValue::from_str(compaction_model)
+        .context("configured compaction model is not a valid HTTP header value")?;
+
+    let Some(inherited) = inherited else {
+        return Ok(managed);
+    };
+    let inherited = inherited
+        .to_str()
+        .context("ANTHROPIC_CUSTOM_HEADERS must be valid UTF-8")?;
+    if inherited.len() > MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES {
+        anyhow::bail!(
+            "ANTHROPIC_CUSTOM_HEADERS exceeds {MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES} bytes"
+        );
+    }
+    // Claude Code documents LF-separated `Name: Value` entries. Reject CR
+    // rather than normalizing it so an injected or platform-rewritten line
+    // cannot acquire a different meaning after this validation boundary.
+    if inherited.contains('\r') {
+        anyhow::bail!("ANTHROPIC_CUSTOM_HEADERS must use LF separators and must not contain CR");
+    }
+
+    let mut retained = Vec::new();
+    for line in inherited.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (raw_name, raw_value) = line.split_once(':').context(
+            "ANTHROPIC_CUSTOM_HEADERS entries must use newline-separated `Name: Value` syntax",
+        )?;
+        let name = raw_name.trim();
+        let value = raw_value.trim();
+        let parsed_name = http::HeaderName::from_bytes(name.as_bytes())
+            .context("ANTHROPIC_CUSTOM_HEADERS contains an invalid header name")?;
+        http::HeaderValue::from_str(value)
+            .context("ANTHROPIC_CUSTOM_HEADERS contains an invalid header value")?;
+        if parsed_name.as_str() != CCP_COMPACTION_HEADER_NAME {
+            // Emit exactly the syntax we validated. Retaining leading name
+            // whitespace or trailing value whitespace would make Claude Code
+            // parse a subtly different header line from this validation pass.
+            retained.push(format!("{}: {value}", parsed_name.as_str()));
+        }
+    }
+    retained.push(managed);
+    let merged = retained.join("\n");
+    if merged.len() > MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES {
+        anyhow::bail!(
+            "merged ANTHROPIC_CUSTOM_HEADERS exceeds {MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES} bytes"
+        );
+    }
+    Ok(merged)
 }
 
 fn proxy_client_url(bind_address: &str, port: u16) -> String {
@@ -2526,6 +2611,10 @@ mod tests {
             "272000"
         );
         assert_eq!(
+            command_env(&command, "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"),
+            "1"
+        );
+        assert_eq!(
             command_env(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"),
             "8000"
         );
@@ -2587,6 +2676,10 @@ mod tests {
         assert_eq!(
             command_env(&command, "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
             "grok-4.5-medium"
+        );
+        assert_eq!(
+            command_env(&command, "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"),
+            "1"
         );
         assert_eq!(
             command_env(&command, "ANTHROPIC_SMALL_FAST_MODEL"),
@@ -2689,6 +2782,53 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains(option));
         }
+    }
+
+    #[test]
+    fn custom_headers_preserve_unrelated_entries_and_replace_reserved_duplicates() {
+        let inherited = OsStr::new(
+            " x-trace-id : abc \nX-CCProxy-Compaction-Model: stale\nx-tenant: one:two\nx-ccproxy-compaction-model: duplicate",
+        );
+        let merged = merge_anthropic_custom_headers(Some(inherited), "gpt-5.6-terra").unwrap();
+        assert_eq!(
+            merged,
+            "x-trace-id: abc\nx-tenant: one:two\nx-ccproxy-compaction-model: gpt-5.6-terra"
+        );
+    }
+
+    #[test]
+    fn custom_headers_reject_ambiguous_or_unsafe_input_without_echoing_it() {
+        for inherited in [
+            "missing-colon",
+            "bad header: value",
+            "x-ok: value\r\nx-injected: yes",
+            "x-value: valid\u{7f}",
+        ] {
+            let error =
+                merge_anthropic_custom_headers(Some(OsStr::new(inherited)), "gpt-5.6-terra")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("ANTHROPIC_CUSTOM_HEADERS"),
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains(inherited));
+        }
+
+        let oversized = format!("x-long: {}", "a".repeat(MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES));
+        let error = merge_anthropic_custom_headers(Some(OsStr::new(&oversized)), "gpt-5.6-terra")
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        assert!(!error.to_string().contains(&oversized));
+
+        let prefix = "x-long: ";
+        let nearly_full = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES - prefix.len())
+        );
+        let error = merge_anthropic_custom_headers(Some(OsStr::new(&nearly_full)), "gpt-5.6-terra")
+            .unwrap_err();
+        assert!(error.to_string().contains("merged"));
+        assert!(!error.to_string().contains(&nearly_full));
     }
 
     #[test]

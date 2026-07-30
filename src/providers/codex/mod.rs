@@ -1138,7 +1138,9 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                     return LiveStreamStart::Response(map_codex_error_to_response(&error));
                 }
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
-                return LiveStreamStart::Response(map_codex_failure_to_response(&message));
+                return LiveStreamStart::Response(map_codex_payload_failure_to_response(
+                    &payload, &message,
+                ));
             }
         };
         if !chunk.is_empty() {
@@ -1911,7 +1913,7 @@ fn remaining_live_stream_response_with_replay(
                         );
                         let error_type = codex_stream_error_type(&error);
                         let chunk = translator.error_chunk(
-                            codex_error_message(&error),
+                            &codex_error_message(&error),
                             error_type,
                             ctx.traffic.as_deref(),
                         );
@@ -2101,7 +2103,7 @@ fn remaining_live_stream_response_with_replay(
                     );
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
-                        codex_error_message(&err),
+                        &codex_error_message(&err),
                         error_type,
                         ctx.traffic.as_deref(),
                     );
@@ -2194,7 +2196,7 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
                 err.detail.as_deref(),
                 Some("http_response_headers" | "http_response_body")
             ))
-        || (err.status == 0 && retryable_live_message(codex_error_message(err)))
+        || (err.status == 0 && retryable_live_message(&codex_error_message(err)))
 }
 
 fn replayable_live_start_codex_error(err: &client::CodexError) -> bool {
@@ -2264,24 +2266,29 @@ fn live_payload_codex_error(
     transport: config::CodexTransport,
 ) -> client::CodexError {
     let lower_message = message.to_ascii_lowercase();
-    let status = websocket::event_error_status(payload).unwrap_or_else(|| {
-        let error = payload
-            .get("error")
-            .or_else(|| payload.get("response").and_then(|value| value.get("error")));
-        let overloaded = error.is_some_and(|error| {
-            error.get("code").and_then(|value| value.as_str()) == Some("overloaded_error")
-                || error.get("type").and_then(|value| value.as_str()) == Some("overloaded_error")
-        });
-        if payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits")
-            || lower_message.contains("rate limit")
-        {
-            429
-        } else if overloaded || lower_message.contains("overloaded") {
-            529
-        } else {
-            503
-        }
-    });
+    let status = if events::is_context_overflow_error(payload) {
+        413
+    } else {
+        websocket::event_error_status(payload).unwrap_or_else(|| {
+            let error = payload
+                .get("error")
+                .or_else(|| payload.get("response").and_then(|value| value.get("error")));
+            let overloaded = error.is_some_and(|error| {
+                error.get("code").and_then(|value| value.as_str()) == Some("overloaded_error")
+                    || error.get("type").and_then(|value| value.as_str())
+                        == Some("overloaded_error")
+            });
+            if payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits")
+                || lower_message.contains("rate limit")
+            {
+                429
+            } else if overloaded || lower_message.contains("overloaded") {
+                529
+            } else {
+                503
+            }
+        })
+    };
     client::CodexError {
         status,
         message: message.clone(),
@@ -2297,6 +2304,7 @@ fn live_payload_codex_error(
 
 fn codex_stream_payload_error_type(payload: &serde_json::Value) -> &'static str {
     match events::classify_event_failure(payload).map(|failure| failure.kind) {
+        Some(events::CodexFailureKind::ContextOverflow) => "request_too_large",
         Some(events::CodexFailureKind::RateLimit) => "rate_limit_error",
         Some(events::CodexFailureKind::Overloaded) => "overloaded_error",
         _ => "api_error",
@@ -2305,6 +2313,7 @@ fn codex_stream_payload_error_type(payload: &serde_json::Value) -> &'static str 
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     match err.status {
+        413 => "request_too_large",
         429 => "rate_limit_error",
         529 => "overloaded_error",
         _ if codex_error_message(err)
@@ -2378,9 +2387,13 @@ fn update_continuation_from_upstream(
 // ---------------------------------------------------------------------------
 
 fn map_codex_error_to_response(err: &client::CodexError) -> Response {
+    // Statusful HTTP/WS/live sources classify structured payloads before
+    // constructing CodexError and normalize context overflow to 413. Do not
+    // throw away that typed decision by reclassifying sanitized prose here.
+    let context_overflow = err.status == 413;
     let message = codex_error_message(err);
-    if is_context_window_overflow(message) {
-        return map_codex_failure_to_response(message);
+    if context_overflow {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &message);
     }
 
     match err.status {
@@ -2393,18 +2406,10 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 err.message.as_str(),
             )
         }
-        401 | 403 => json_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            err.detail.as_deref().unwrap_or("Authentication failed"),
-        ),
+        401 | 403 => json_error(StatusCode::UNAUTHORIZED, "authentication_error", &message),
         429 => {
             let retry_after = err.retry_after.as_deref().unwrap_or("5");
-            let resp = json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                &err.message,
-            );
+            let resp = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &message);
             let headers = [(http::header::RETRY_AFTER, retry_after)];
             (headers, resp).into_response()
         }
@@ -2422,7 +2427,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 } else {
                     "api_error"
                 },
-                codex_error_message(err),
+                &message,
             );
             if let Some(retry_after) = err.retry_after.as_deref() {
                 ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
@@ -2430,37 +2435,117 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 response
             }
         }
-        _ => json_error(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            codex_error_message(err),
-        ),
+        _ => json_error(StatusCode::BAD_GATEWAY, "api_error", &message),
     }
 }
 
 fn map_codex_failure_to_response(message: &str) -> Response {
-    if is_context_window_overflow(message) {
-        json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
+    let trimmed = message.trim_end();
+    let typed_kind = [
+        "ContextOverflow",
+        "RateLimit",
+        "Overloaded",
+        "Transient",
+        "Failed",
+    ]
+    .into_iter()
+    .find_map(|kind| {
+        trimmed
+            .strip_suffix(&format!(" ({kind})"))
+            .map(|message| (kind, message))
+    });
+    // Buffered accumulation transports the reducer kind through anyhow text.
+    // Any known kind is more authoritative than prose. Only legacy/untyped
+    // errors use the conservative message fallback.
+    let context_overflow = match typed_kind {
+        Some(("ContextOverflow", _)) => true,
+        Some(_) => false,
+        None => is_context_window_overflow(message),
+    };
+    let external_message = typed_kind.map_or(trimmed, |(_, message)| message);
+    let message =
+        crate::providers::translate_shared::sanitize_external_error_detail(external_message)
+            .unwrap_or_else(|| "Upstream error".to_string());
+    if context_overflow {
+        json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &message)
     } else {
-        json_error(StatusCode::BAD_GATEWAY, "api_error", message)
+        json_error(StatusCode::BAD_GATEWAY, "api_error", &message)
+    }
+}
+
+fn map_codex_payload_failure_to_response(payload: &serde_json::Value, _message: &str) -> Response {
+    let message = events::sanitized_error_message(payload);
+    if events::is_context_overflow_error(payload) {
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &message);
+    }
+
+    // A structured payload has already applied code/type/status precedence.
+    // Never discard that decision and re-run the weaker prose-only legacy
+    // classifier. Preserve actionable non-context classes across live and
+    // buffered paths even when the replay barrier prevented an upstream retry.
+    let Some(failure) = events::classify_event_failure(payload) else {
+        return json_error(StatusCode::BAD_GATEWAY, "api_error", &message);
+    };
+    match failure.kind {
+        events::CodexFailureKind::ContextOverflow => {
+            json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &message)
+        }
+        events::CodexFailureKind::RateLimit => {
+            let response = json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &message);
+            if let Some(retry_after) = failure.retry_after.as_deref() {
+                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+            } else {
+                response
+            }
+        }
+        events::CodexFailureKind::Overloaded => json_error(
+            StatusCode::from_u16(529).expect("529 is a valid HTTP status"),
+            "overloaded_error",
+            &message,
+        ),
+        events::CodexFailureKind::Transient => {
+            let status = failure
+                .explicit_status
+                .filter(|status| (500..600).contains(status))
+                .and_then(|status| StatusCode::from_u16(status).ok())
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            json_error(status, "api_error", &message)
+        }
+        events::CodexFailureKind::Permanent
+            if matches!(failure.explicit_status, Some(401 | 403)) =>
+        {
+            json_error(StatusCode::UNAUTHORIZED, "authentication_error", &message)
+        }
+        events::CodexFailureKind::Permanent => {
+            json_error(StatusCode::BAD_GATEWAY, "api_error", &message)
+        }
     }
 }
 
 fn is_context_window_overflow(message: &str) -> bool {
-    message.to_ascii_lowercase().contains("context window")
+    events::is_context_overflow_message(message)
+        || serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .is_some_and(|payload| events::is_context_overflow_error(&payload))
 }
 
-fn codex_error_message(err: &client::CodexError) -> &str {
+fn codex_error_message(err: &client::CodexError) -> String {
+    crate::providers::translate_shared::sanitize_external_error_detail(codex_error_raw_message(err))
+        .unwrap_or_else(|| "Upstream error".to_string())
+}
+
+fn codex_error_raw_message(err: &client::CodexError) -> &str {
     if websocket::is_retryable_transport_detail(err.detail.as_deref()) {
-        return err.message.as_str();
+        err.message.as_str()
+    } else {
+        err.detail.as_deref().unwrap_or({
+            if err.status == 0 {
+                err.message.as_str()
+            } else {
+                "Upstream error"
+            }
+        })
     }
-    err.detail.as_deref().unwrap_or({
-        if err.status == 0 {
-            err.message.as_str()
-        } else {
-            "Upstream error"
-        }
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4610,6 +4695,196 @@ mod tests {
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
         );
+    }
+
+    #[tokio::test]
+    async fn structured_context_overflow_maps_to_request_too_large() {
+        let payload = serde_json::json!({
+            "type":"response.failed",
+            "response":{
+                "status":"failed",
+                "error":{
+                    "status":400,
+                    "code":"prompt_too_long",
+                    "message":"request rejected"
+                }
+            }
+        });
+        let response = map_codex_payload_failure_to_response(&payload, "generic upstream failure");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("code: prompt_too_long")
+        );
+        assert_eq!(
+            codex_stream_payload_error_type(&payload),
+            "request_too_large"
+        );
+        assert_eq!(
+            live_payload_codex_error(
+                &payload,
+                events::sanitized_error_message(&payload),
+                config::CodexTransport::WebSocket,
+            )
+            .status,
+            413
+        );
+
+        let unrelated = serde_json::json!({
+            "type":"response.failed",
+            "response":{"error":{"message":"window manager failed"}}
+        });
+        assert_eq!(
+            map_codex_payload_failure_to_response(&unrelated, "window manager failed").status(),
+            StatusCode::BAD_GATEWAY
+        );
+
+        for (status, expected_status, expected_type) in [
+            (401, StatusCode::UNAUTHORIZED, "authentication_error"),
+            (429, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            (503, StatusCode::SERVICE_UNAVAILABLE, "api_error"),
+        ] {
+            let conflict = serde_json::json!({
+                "type":"response.failed",
+                "response":{
+                    "status":"failed",
+                    "error":{
+                        "status":status,
+                        "type":"invalid_request_error",
+                        "message":"Prompt is too long for this service quota"
+                    }
+                }
+            });
+            let response = map_codex_payload_failure_to_response(&conflict, "Prompt is too long");
+            assert_eq!(
+                response.status(),
+                expected_status,
+                "structured status {status} must veto prose fallback"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], expected_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_error_detail_is_redacted_before_downstream_response() {
+        let auth_conflict = client::CodexError {
+            status: 401,
+            message: "Unauthorized".to_string(),
+            detail: Some("Prompt is too long for the authentication service".to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        };
+        let response = map_codex_error_to_response(&auth_conflict);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+
+        let err = client::CodexError {
+            status: 400,
+            message: "Bad request".to_string(),
+            detail: Some("Authorization: Bearer top-secret".to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::UpstreamHttp,
+        };
+        let response = map_codex_error_to_response(&err);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert_eq!(message, "[redacted upstream error detail]");
+        assert!(!message.contains("top-secret"));
+
+        let safety_conflict = client::CodexError {
+            status: 400,
+            message: "Bad request".to_string(),
+            detail: Some(
+                "Prompt is too long for the safety classifier (code: safety_policy_violation)"
+                    .to_string(),
+            ),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        };
+        let response = map_codex_error_to_response(&safety_conflict);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+
+        let context = client::CodexError {
+            status: 413,
+            message: "Bad request".to_string(),
+            detail: Some("Prompt is too long; Authorization: Bearer another-secret".to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::UpstreamHttp,
+        };
+        let response = map_codex_error_to_response(&context);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], "[redacted upstream error detail]");
+
+        let structured = client::CodexError {
+            status: 413,
+            message: "Bad request".to_string(),
+            detail: Some(
+                r#"{"error":{"code":"context_length_exceeded","message":"Bearer json-secret"}}"#
+                    .to_string(),
+            ),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocketHandshake,
+        };
+        let response = map_codex_error_to_response(&structured);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], "[redacted upstream error detail]");
+
+        assert_eq!(
+            map_codex_failure_to_response(
+                "upstream error: [redacted upstream error detail] (ContextOverflow)"
+            )
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let response = map_codex_failure_to_response(
+            "upstream error: [redacted upstream error detail] (ContextOverflow)",
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("ContextOverflow"));
+
+        let response = map_codex_failure_to_response(
+            "upstream error: Prompt is too long for this minute's quota (RateLimit)",
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("RateLimit"));
+        assert!(!body.contains("request_too_large"));
     }
 
     #[tokio::test]

@@ -63,6 +63,8 @@ impl SessionAffinityProvider {
 pub struct Registry {
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
+    construction_config_generation: u64,
+    construction_config_generation_end: u64,
 }
 
 impl Default for Registry {
@@ -73,6 +75,10 @@ impl Default for Registry {
 
 impl Registry {
     pub fn new() -> Self {
+        // Provider transports snapshot a subset of configuration while they
+        // are constructed. Retain that file generation so diagnostics can
+        // distinguish it from settings resolved on later requests.
+        let construction_config_generation = crate::config::load_config().config_generation;
         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
         models.insert("codex".into(), expand_codex_models());
         models.insert(
@@ -92,8 +98,17 @@ impl Registry {
             "grok".into(),
             Arc::new(crate::providers::grok::GrokProvider::new()),
         );
+        // Provider constructors resolve several transport settings. Record a
+        // second accepted snapshot after all constructors finish instead of
+        // assuming the starting generation covered the whole window.
+        let construction_config_generation_end = crate::config::load_config().config_generation;
 
-        Self { models, handlers }
+        Self {
+            models,
+            handlers,
+            construction_config_generation,
+            construction_config_generation_end,
+        }
     }
 
     pub fn with_default_alias() -> Self {
@@ -104,6 +119,18 @@ impl Registry {
         let mut names: Vec<String> = self.models.keys().cloned().collect();
         names.sort_unstable();
         names
+    }
+
+    pub fn construction_config_generation(&self) -> u64 {
+        self.construction_config_generation
+    }
+
+    pub fn construction_config_generation_end(&self) -> u64 {
+        self.construction_config_generation_end
+    }
+
+    pub fn construction_config_snapshot_stable(&self) -> bool {
+        self.construction_config_generation == self.construction_config_generation_end
     }
 
     pub fn provider(&self, name: &str) -> Option<Arc<dyn Provider>> {

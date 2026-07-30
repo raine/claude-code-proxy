@@ -78,6 +78,7 @@ pub(crate) fn validate_terminal_snapshot_status(payload: &Value) -> Result<(), S
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFailureKind {
+    ContextOverflow,
     RateLimit,
     Overloaded,
     Transient,
@@ -95,7 +96,10 @@ pub(crate) struct CodexEventFailure {
 
 impl CodexEventFailure {
     pub fn retryable(&self) -> bool {
-        !matches!(self.kind, CodexFailureKind::Permanent)
+        !matches!(
+            self.kind,
+            CodexFailureKind::ContextOverflow | CodexFailureKind::Permanent
+        )
     }
 }
 
@@ -130,27 +134,32 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     let error = payload
         .get("error")
         .or_else(|| payload.pointer("/response/error"));
-    let explicit_status = numeric_status(payload)
-        .or_else(|| {
-            error
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_u64)
-        })
-        .and_then(|status| u16::try_from(status).ok());
-    let message = error
+    let explicit_status = structured_error_status(payload);
+    let raw_message = error
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str)
-        .unwrap_or("Upstream error")
-        .to_string();
+        .or_else(|| {
+            error
+                .and_then(|value| value.get("detail"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("Upstream error");
+    let message = sanitized_error_message(payload);
     let code = error
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str);
     let error_type = error
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str);
-    let lower = message.to_ascii_lowercase();
+    let lower = raw_message.to_ascii_lowercase();
 
-    let kind = if explicit_status == Some(429) || lower.contains("rate limit") {
+    let kind = if is_context_overflow_error_with_status(payload, explicit_status) {
+        CodexFailureKind::ContextOverflow
+    } else if explicit_status == Some(429)
+        || code.is_some_and(is_rate_limit_error_code)
+        || error_type.is_some_and(is_rate_limit_error_code)
+        || lower.contains("rate limit")
+    {
         CodexFailureKind::RateLimit
     } else if explicit_status == Some(529)
         || code == Some("overloaded_error")
@@ -173,12 +182,17 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     } else {
         CodexFailureKind::Permanent
     };
-    let status = explicit_status.unwrap_or(match kind {
-        CodexFailureKind::RateLimit => 429,
-        CodexFailureKind::Overloaded => 529,
-        CodexFailureKind::Transient => 503,
-        CodexFailureKind::Permanent => 500,
-    });
+    let status = if kind == CodexFailureKind::ContextOverflow {
+        413
+    } else {
+        explicit_status.unwrap_or(match kind {
+            CodexFailureKind::ContextOverflow => unreachable!("handled above"),
+            CodexFailureKind::RateLimit => 429,
+            CodexFailureKind::Overloaded => 529,
+            CodexFailureKind::Transient => 503,
+            CodexFailureKind::Permanent => 500,
+        })
+    };
     let retry_after = error
         .and_then(|value| value.get("retry_after"))
         .and_then(scalar_string_value)
@@ -198,6 +212,235 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         message,
         retry_after,
     })
+}
+
+const CONTEXT_OVERFLOW_CODES: &[&str] = &[
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "max_context_length_exceeded",
+    "prompt_too_long",
+    "input_too_large",
+];
+
+fn error_object(payload: &Value) -> Option<&Value> {
+    payload
+        .get("error")
+        .or_else(|| payload.pointer("/response/error"))
+}
+
+fn structured_error_str<'a>(payload: &'a Value, field: &str) -> Option<&'a str> {
+    error_object(payload)
+        .filter(|error| error.is_object())
+        .unwrap_or(payload)
+        .get(field)
+        .and_then(Value::as_str)
+}
+
+fn is_context_overflow_code(value: &str) -> bool {
+    CONTEXT_OVERFLOW_CODES
+        .iter()
+        .any(|allowed| value.eq_ignore_ascii_case(allowed))
+}
+
+fn is_rate_limit_error_code(value: &str) -> bool {
+    ["rate_limit", "rate_limit_error", "rate_limit_exceeded"]
+        .iter()
+        .any(|known| value.trim().eq_ignore_ascii_case(known))
+}
+
+fn is_known_non_context_error_code(value: &str) -> bool {
+    [
+        "rate_limit",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "overloaded_error",
+        "authentication_error",
+        "invalid_api_key",
+        "unauthorized",
+        "permission_denied",
+        "forbidden",
+        "safety_policy_violation",
+        "content_policy_violation",
+        "policy_violation",
+        "server_error",
+        "internal_server_error",
+        "internal_error",
+    ]
+    .iter()
+    .any(|known| value.trim().eq_ignore_ascii_case(known))
+}
+
+fn structured_error_status(payload: &Value) -> Option<u16> {
+    numeric_status(payload)
+        .or_else(|| {
+            error_object(payload)
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_u64)
+        })
+        .and_then(|status| u16::try_from(status).ok())
+}
+
+pub(crate) fn is_authoritative_non_context_status(status: u16) -> bool {
+    (400..600).contains(&status) && !matches!(status, 400 | 413 | 422)
+}
+
+pub(crate) fn is_context_overflow_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "exceeds the context window",
+        "exceeds context window",
+        "exceeded the context window",
+        "exceeded context window",
+        "context window exceeded",
+        "maximum context length",
+        "max context length",
+        "prompt is too long",
+        "prompt too long",
+        "input is too long",
+        "(code: context_length_exceeded",
+        "(code: context_window_exceeded",
+        "(code: max_context_length_exceeded",
+        "(code: prompt_too_long",
+        "(code: input_too_large",
+        "(type: context_length_exceeded",
+        "(type: context_window_exceeded",
+        "(type: max_context_length_exceeded",
+        "(type: prompt_too_long",
+        "(type: input_too_large",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+}
+
+/// Classify only an allowlisted structured code/type, then use conservative
+/// English message patterns as a compatibility fallback.
+pub(crate) fn is_context_overflow_error(payload: &Value) -> bool {
+    is_context_overflow_error_with_status(payload, structured_error_status(payload))
+}
+
+/// Structured context codes remain authoritative when an intermediary wraps
+/// them in a generic status. Free-form prose is weaker evidence and must not
+/// override an explicit authentication, rate-limit, overload, or server status.
+pub(crate) fn is_context_overflow_error_with_status(
+    payload: &Value,
+    outer_status: Option<u16>,
+) -> bool {
+    let code = structured_error_str(payload, "code");
+    if code.is_some_and(is_context_overflow_code) {
+        return true;
+    }
+    // Known provider categories are more authoritative than free-form prose.
+    // In particular, rate-limit errors can mention a per-minute token budget;
+    // treating those as a context overflow would suppress a safe retry and
+    // incorrectly return 413 to Claude Code. Unknown and generic codes still
+    // reach the conservative message fallback because private endpoint
+    // vocabularies can drift.
+    if code.is_some_and(is_known_non_context_error_code) {
+        return false;
+    }
+
+    let error_type = structured_error_str(payload, "type");
+    if error_type.is_some_and(is_context_overflow_code) {
+        return true;
+    }
+    if error_type.is_some_and(is_known_non_context_error_code) {
+        return false;
+    }
+    let payload_status = structured_error_status(payload);
+    if payload_status == Some(413) {
+        return true;
+    }
+    if payload_status.is_some_and(is_authoritative_non_context_status) {
+        return false;
+    }
+    if outer_status == Some(413) {
+        return true;
+    }
+    if outer_status.is_some_and(is_authoritative_non_context_status) {
+        return false;
+    }
+
+    error_object(payload)
+        .and_then(|error| {
+            error.as_str().or_else(|| {
+                error
+                    .get("message")
+                    .or_else(|| error.get("detail"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .or_else(|| payload.get("detail").and_then(Value::as_str))
+        .is_some_and(is_context_overflow_message)
+}
+
+/// Render a safe, bounded diagnostic while retaining structured fields that
+/// remain useful after the raw provider body is discarded.
+pub(crate) fn sanitized_error_message(payload: &Value) -> String {
+    let error = error_object(payload);
+    let raw_message = error
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .get("message")
+                    .or_else(|| value.get("detail"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .or_else(|| payload.get("detail").and_then(Value::as_str))
+        .unwrap_or("Upstream error");
+    let message = crate::providers::translate_shared::sanitize_external_error_detail(raw_message)
+        .unwrap_or_else(|| "Upstream error".to_string());
+
+    let mut descriptors = Vec::new();
+    for field in ["code", "type", "param"] {
+        if field == "type"
+            && error.filter(|error| error.is_object()).is_none()
+            && CodexTerminalKind::from_payload(payload).is_some()
+        {
+            // `type` names the SSE event here, not the provider's structured
+            // error type. Do not expose it as a misleading error descriptor.
+            continue;
+        }
+        let Some(value) = error
+            .filter(|error| error.is_object())
+            .unwrap_or(payload)
+            .get(field)
+            .and_then(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(value) =
+            crate::providers::translate_shared::sanitize_external_error_detail(&value)
+        else {
+            continue;
+        };
+        let descriptor = format!("{field}: {value}");
+        if !message.contains(&descriptor) {
+            descriptors.push(descriptor);
+        }
+    }
+    if descriptors.is_empty() {
+        message
+    } else {
+        let descriptors = descriptors.join(", ");
+        let combined = format!("{message} ({descriptors})");
+        if combined.len() <= crate::providers::translate_shared::MAX_EXTERNAL_ERROR_DETAIL_BYTES {
+            combined
+        } else {
+            // Keep the actionable structured fields at the front when an
+            // adversarially long message forces a second, whole-detail bound.
+            crate::providers::translate_shared::sanitize_external_error_detail(&format!(
+                "({descriptors}) {message}"
+            ))
+            .unwrap_or_else(|| "Upstream error".to_string())
+        }
+    }
 }
 
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
@@ -456,6 +699,170 @@ mod tests {
         }))
         .unwrap();
         assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn context_overflow_prefers_allowlisted_code_and_keeps_safe_descriptors() {
+        let payload = serde_json::json!({
+            "type":"response.failed",
+            "response":{
+                "status":"failed",
+                "error":{
+                    "status":400,
+                    "code":"context_length_exceeded",
+                    "type":"invalid_request_error",
+                    "param":"input",
+                    "message":"request rejected"
+                }
+            }
+        });
+        let failure = classify_event_failure(&payload).unwrap();
+
+        assert_eq!(failure.kind, CodexFailureKind::ContextOverflow);
+        assert_eq!(failure.status, 413);
+        assert!(!failure.retryable());
+        assert!(failure.message.contains("code: context_length_exceeded"));
+        assert!(failure.message.contains("type: invalid_request_error"));
+        assert!(failure.message.contains("param: input"));
+    }
+
+    #[test]
+    fn context_overflow_message_fallback_is_conservative() {
+        assert!(is_context_overflow_error(&serde_json::json!({
+            "error":{"message":"Prompt is too long for this model"}
+        })));
+        assert!(is_context_overflow_error(&serde_json::json!({
+            "code":"input_too_large",
+            "message":"request rejected"
+        })));
+        assert!(!is_context_overflow_error(&serde_json::json!({
+            "error":{"message":"context window telemetry is temporarily unavailable"}
+        })));
+        assert!(!is_context_overflow_error(&serde_json::json!({
+            "error":{"code":"rate_limit_exceeded","message":"too many requests"}
+        })));
+        assert!(!is_context_overflow_error(&serde_json::json!({
+            "error":{
+                "code":"rate_limit_exceeded",
+                "type":"rate_limit_error",
+                "message":"too many tokens for this minute"
+            }
+        })));
+        let rate_limit = classify_event_failure(&serde_json::json!({
+            "type":"response.failed",
+            "response":{
+                "error":{
+                    "code":"rate_limit_exceeded",
+                    "type":"rate_limit_error",
+                    "message":"too many tokens for this minute"
+                }
+            }
+        }))
+        .expect("structured rate-limit code is an event failure");
+        assert_eq!(rate_limit.kind, CodexFailureKind::RateLimit);
+        assert_eq!(rate_limit.status, 429);
+        assert!(rate_limit.retryable());
+        assert!(!is_context_overflow_error(&serde_json::json!({
+            "error":{
+                "code":"safety_policy_violation",
+                "message":"Prompt is too long for the safety classifier"
+            }
+        })));
+        assert!(is_context_overflow_error(&serde_json::json!({
+            "error":{
+                "type":"invalid_request_error",
+                "message":"Prompt is too long for this model"
+            }
+        })));
+        assert!(is_context_overflow_error(&serde_json::json!({
+            "error":{
+                "code":"invalid_request_error",
+                "type":"invalid_request_error",
+                "message":"Prompt is too long for this model"
+            }
+        })));
+        assert!(is_context_overflow_error(&serde_json::json!({
+            "error":{
+                "code":"future_private_gateway_code",
+                "message":"The input exceeds the context window"
+            }
+        })));
+        for status in [401, 403, 404, 429, 500, 501, 502, 503, 504, 520, 529] {
+            let payload = serde_json::json!({
+                "type":"response.failed",
+                "status":status,
+                "response":{
+                    "status":"failed",
+                    "error":{
+                        "type":"invalid_request_error",
+                        "message":"Prompt is too long for this model"
+                    }
+                }
+            });
+            assert!(
+                !is_context_overflow_error(&payload),
+                "explicit non-context status {status} must veto prose fallback"
+            );
+        }
+        assert!(is_context_overflow_error(&serde_json::json!({
+            "type":"response.failed",
+            "status":429,
+            "response":{
+                "status":"failed",
+                "error":{
+                    "code":"context_length_exceeded",
+                    "message":"request rejected"
+                }
+            }
+        })));
+        let embedded_rate_limit = serde_json::json!({
+            "type":"response.failed",
+            "response":{
+                "status":"failed",
+                "error":{
+                    "status":429,
+                    "type":"invalid_request_error",
+                    "message":"Prompt is too long for this minute's token quota"
+                }
+            }
+        });
+        assert!(!is_context_overflow_error_with_status(
+            &embedded_rate_limit,
+            Some(200)
+        ));
+    }
+
+    #[test]
+    fn failure_message_redacts_secret_but_preserves_safe_code() {
+        let payload = serde_json::json!({
+            "error":{
+                "code":"context_length_exceeded",
+                "message":"Authorization: Bearer top-secret"
+            }
+        });
+        let message = sanitized_error_message(&payload);
+        assert!(!message.contains("top-secret"));
+        assert!(message.contains("[redacted upstream error detail]"));
+        assert!(message.contains("code: context_length_exceeded"));
+
+        let long = sanitized_error_message(&serde_json::json!({
+            "error":{
+                "code":"prompt_too_long",
+                "message":"x".repeat(2_048)
+            }
+        }));
+        assert!(long.starts_with("(code: prompt_too_long)"));
+        assert!(long.len() <= crate::providers::translate_shared::MAX_EXTERNAL_ERROR_DETAIL_BYTES);
+        assert!(long.is_char_boundary(long.len()));
+
+        assert_eq!(
+            sanitized_error_message(&serde_json::json!({"error":{"code":42}})),
+            "Upstream error (code: 42)"
+        );
+        assert_eq!(
+            sanitized_error_message(&serde_json::json!({"type":"response.failed"})),
+            "Upstream error"
+        );
     }
 
     #[test]

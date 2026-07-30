@@ -817,8 +817,22 @@ impl CodexHttpClient {
             }
 
             match result {
+                Ok(response)
+                    if codex_error_body_is_context_overflow(
+                        &response.body,
+                        Some(response.status),
+                    ) =>
+                {
+                    // A structured context code is terminal even when an
+                    // upstream gateway wraps it in an otherwise retryable
+                    // outer status such as 429/5xx. Replaying the same
+                    // oversized prompt cannot succeed and only burns model
+                    // dispatch budget.
+                    return Err(codex_status_error(response, result_transport));
+                }
                 Ok(response) if response.status == 401 => {
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
+                    let detail = codex_status_error_message(&response.body)
+                        .unwrap_or_else(|| "Authentication failed".to_string());
                     return Err(CodexError {
                         status: 401,
                         message: "Unauthorized".to_string(),
@@ -828,7 +842,8 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if response.status == 403 => {
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
+                    let detail = codex_status_error_message(&response.body)
+                        .unwrap_or_else(|| "Authentication failed".to_string());
                     return Err(CodexError {
                         status: 403,
                         message: "Forbidden".to_string(),
@@ -851,7 +866,8 @@ impl CodexHttpClient {
                             )
                             .expect("explicit retry response must permit model replay");
                         if delay.exceeds_budget {
-                            let detail = String::from_utf8_lossy(&response.body).to_string();
+                            let detail = codex_status_error_message(&response.body)
+                                .unwrap_or_else(|| "Rate limited".to_string());
                             return Err(CodexError {
                                 status: 429,
                                 message: "Rate limited".to_string(),
@@ -872,7 +888,8 @@ impl CodexHttpClient {
                         sleep(delay.wait_ms).await;
                         continue;
                     }
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
+                    let detail = codex_status_error_message(&response.body)
+                        .unwrap_or_else(|| "Rate limited".to_string());
                     log_buffered_retry_exhausted(
                         ctx,
                         result_transport,
@@ -1430,8 +1447,14 @@ impl CodexHttpClient {
                         429 => "Rate limited".to_string(),
                         _ => format!("Upstream Codex request failed with status {status}"),
                     });
+                let mapped_status =
+                    if codex_error_body_is_context_overflow(&error_body, Some(status)) {
+                        413
+                    } else {
+                        status
+                    };
                 return Err(CodexError {
-                    status,
+                    status: mapped_status,
                     detail: Some(message.clone()),
                     message,
                     retry_after,
@@ -2269,8 +2292,13 @@ fn codex_status_error(
             response.status
         )
     });
+    let status = if codex_error_body_is_context_overflow(&response.body, Some(response.status)) {
+        413
+    } else {
+        response.status
+    };
     CodexError {
-        status: response.status,
+        status,
         message: message.clone(),
         detail: Some(message),
         retry_after,
@@ -2279,21 +2307,48 @@ fn codex_status_error(
 }
 
 fn codex_status_error_message(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .or_else(|| value.get("message"))
-                .or_else(|| value.get("detail"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        let has_allowlisted_detail = value.pointer("/error/message").is_some()
+            || value.pointer("/error/detail").is_some()
+            || value.pointer("/error/code").is_some()
+            || value.pointer("/error/type").is_some()
+            || value.pointer("/error/param").is_some()
+            || value.get("error").is_some_and(serde_json::Value::is_string)
+            || value.get("message").is_some()
+            || value.get("detail").is_some();
+        // A valid but unknown JSON shape must not fall through to the raw-text
+        // renderer. Private gateways can place credentials or echoed input in
+        // arbitrary fields; only the allowlisted diagnostic surface above is
+        // safe to render.
+        return has_allowlisted_detail.then(|| super::events::sanitized_error_message(&value));
+    }
+
+    parse_sse_events(body)
+        .into_iter()
+        .find_map(|event| {
+            let payload = serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
+            super::events::classify_event_failure(&payload).map(|failure| failure.message)
         })
         .or_else(|| {
-            parse_sse_events(body).into_iter().find_map(|event| {
-                let payload = serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
-                super::events::classify_event_failure(&payload).map(|failure| failure.message)
-            })
+            let value = std::str::from_utf8(body).ok()?;
+            (!value.trim_start().starts_with("data:"))
+                .then(|| crate::providers::translate_shared::sanitize_external_error_detail(value))
+                .flatten()
+        })
+}
+
+fn codex_error_body_is_context_overflow(body: &[u8], outer_status: Option<u16>) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            super::events::is_context_overflow_error_with_status(&value, outer_status)
+        })
+        || parse_sse_events(body).into_iter().any(|event| {
+            serde_json::from_str::<serde_json::Value>(&event.data)
+                .ok()
+                .is_some_and(|payload| {
+                    super::events::is_context_overflow_error_with_status(&payload, outer_status)
+                })
         })
 }
 
@@ -2361,6 +2416,8 @@ fn log_buffered_retry(
     origin: &str,
     reason: &str,
 ) {
+    let reason = crate::providers::translate_shared::sanitize_external_error_detail(reason)
+        .unwrap_or_else(|| "Upstream error".to_string());
     let mut fields = serde_json::Map::new();
     fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
     fields.insert("transport".into(), serde_json::json!(transport.as_str()));
@@ -2384,6 +2441,8 @@ fn log_buffered_retry_exhausted(
     origin: &str,
     reason: &str,
 ) {
+    let reason = crate::providers::translate_shared::sanitize_external_error_detail(reason)
+        .unwrap_or_else(|| "Upstream error".to_string());
     let mut fields = serde_json::Map::new();
     fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
     fields.insert("transport".into(), serde_json::json!(transport.as_str()));
@@ -2405,6 +2464,8 @@ pub(super) fn log_live_transport_retry(
     delay_ms: u64,
     err: &CodexError,
 ) {
+    let reason = crate::providers::translate_shared::sanitize_external_error_detail(&err.message)
+        .unwrap_or_else(|| "Upstream error".to_string());
     create_logger("codex").warn(
         "live_transport_retry",
         Some(serde_json::Map::from_iter([
@@ -2419,7 +2480,7 @@ pub(super) fn log_live_transport_retry(
                 "origin".into(),
                 serde_json::json!(codex_error_origin_name(err.origin)),
             ),
-            ("reason".into(), serde_json::json!(err.message)),
+            ("reason".into(), serde_json::json!(reason)),
         ])),
     );
 }
@@ -2601,6 +2662,8 @@ pub(super) fn auto_http_fallback_delay(
 }
 
 pub(super) fn log_auto_http_fallback(ctx: &RequestContext, err: &CodexError) {
+    let reason = crate::providers::translate_shared::sanitize_external_error_detail(&err.message)
+        .unwrap_or_else(|| "Upstream error".to_string());
     let mut fields = serde_json::Map::from_iter([
         ("reqId".into(), serde_json::json!(ctx.req_id)),
         ("action".into(), serde_json::json!("fallback_http")),
@@ -2609,9 +2672,13 @@ pub(super) fn log_auto_http_fallback(ctx: &RequestContext, err: &CodexError) {
             serde_json::json!(codex_error_origin_name(err.origin)),
         ),
         ("status".into(), serde_json::json!(err.status)),
-        ("reason".into(), serde_json::json!(err.message)),
+        ("reason".into(), serde_json::json!(reason)),
     ]);
-    if let Some(detail) = err.detail.as_deref() {
+    if let Some(detail) = err
+        .detail
+        .as_deref()
+        .and_then(crate::providers::translate_shared::sanitize_external_error_detail)
+    {
         fields.insert("detail".into(), serde_json::json!(detail));
     }
     create_logger("codex").warn("auto_transport_fallback", Some(fields));
@@ -3086,6 +3153,93 @@ mod tests {
             )
             .await
             .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"data: keep\n\n");
+    }
+
+    #[tokio::test]
+    async fn buffered_http_context_code_does_not_retry_retryable_outer_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /responses "));
+            write_test_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "application/json",
+                "retry-after: 0\r\n",
+                br#"{"error":{"code":"context_length_exceeded","message":"request rejected"}}"#,
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let error = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .err()
+            .expect("structured context overflow must be returned as an error");
+
+        assert_eq!(error.status, 413);
+        assert_eq!(error.origin, CodexErrorOrigin::BufferedHttp);
+        assert!(
+            !server.await.unwrap(),
+            "a structured context overflow must not replay the same model POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_http_rate_limit_status_wins_over_context_like_prose_and_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_complete_http_request(&mut stream).await;
+                assert!(request.starts_with("POST /responses "));
+                if attempt == 0 {
+                    write_test_http_response(
+                        &mut stream,
+                        "429 Too Many Requests",
+                        "application/json",
+                        "retry-after: 0\r\n",
+                        br#"{"error":{"type":"invalid_request_error","message":"Prompt is too long for this minute's token quota"}}"#,
+                    )
+                    .await;
+                } else {
+                    write_test_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "text/event-stream",
+                        "",
+                        b"data: keep\n\n",
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .expect("an explicit 429 must remain eligible for safe retry");
+
         server.await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"data: keep\n\n");
@@ -4086,6 +4240,69 @@ mod tests {
         assert_eq!(error.status, 400);
         assert_eq!(error.detail.as_deref(), Some("bad request"));
         assert_eq!(error.origin, CodexErrorOrigin::BufferedWebSocket);
+    }
+
+    #[test]
+    fn status_error_uses_structured_context_code_and_sanitizes_detail() {
+        let error = codex_status_error(
+            CodexResponse {
+                body: br#"{"error":{"code":"context_length_exceeded","type":"invalid_request_error","param":"input","message":"Authorization: Bearer top-secret"}}"#
+                    .to_vec(),
+                status: 400,
+                headers: Vec::new(),
+            },
+            crate::config::CodexTransport::Http,
+        );
+
+        assert_eq!(error.status, 413);
+        let detail = error.detail.unwrap();
+        assert!(!detail.contains("top-secret"));
+        assert!(detail.contains("[redacted upstream error detail]"));
+        assert!(detail.contains("code: context_length_exceeded"));
+        assert!(detail.contains("param: input"));
+    }
+
+    #[test]
+    fn status_error_keeps_structured_non_context_code_authoritative() {
+        let error = codex_status_error(
+            CodexResponse {
+                body: br#"{"error":{"code":"safety_policy_violation","type":"invalid_request_error","message":"Prompt is too long for the safety classifier"}}"#
+                    .to_vec(),
+                status: 400,
+                headers: Vec::new(),
+            },
+            crate::config::CodexTransport::Http,
+        );
+
+        assert_eq!(error.status, 400);
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("safety_policy_violation"))
+        );
+    }
+
+    #[test]
+    fn malformed_error_bytes_are_not_exposed() {
+        assert_eq!(codex_status_error_message(b"\xffBearer top-secret"), None);
+        assert_eq!(
+            codex_status_error_message(br#"{"error":{"secret":"sk-live-123"}}"#),
+            None
+        );
+        let error = codex_status_error(
+            CodexResponse {
+                body: br#"{"error":{"secret":"sk-live-123"}}"#.to_vec(),
+                status: 400,
+                headers: Vec::new(),
+            },
+            crate::config::CodexTransport::Http,
+        );
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("Upstream Codex request failed with status 400")
+        );
+        assert!(!error.detail.unwrap().contains("sk-live-123"));
     }
 
     #[test]

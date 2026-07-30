@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "npmPackage": "@anthropic-ai/claude-code",
+  "launcherSmoke": {
+    "latest": {
+      "version": "2.1.220",
+      "distIntegrity": "sha512-ogBrvwkqF9f8okmnXKxmRNHuvtFxFEffe5pWdqOV3iQDxlUOKirFqnyWC7NGXXnDA4WkkbPH8pvSbwyCR2Auyw=="
+    },
+    "previous": {
+      "version": "2.1.219",
+      "distIntegrity": "sha512-6PVBrRsKHFi0gzv5bCabVL+XSqI3F8AR6ekFx4gpzdE5a9XotqewolID0PbcdD9IyWVYCIDET4GDCcUdA89i3Q=="
+    }
+  }
+}

@@ -1232,6 +1232,8 @@ where
 }
 
 fn log_websocket_pool_refresh(ctx: &RequestContext, reason: &str) {
+    let reason = crate::providers::translate_shared::sanitize_external_error_detail(reason)
+        .unwrap_or_else(|| "Upstream error".to_string());
     let mut fields = serde_json::Map::new();
     fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
     fields.insert("reason".into(), serde_json::json!(reason));
@@ -1239,9 +1241,15 @@ fn log_websocket_pool_refresh(ctx: &RequestContext, reason: &str) {
 }
 
 fn log_websocket_terminal_probe_failure(error: &CodexError) {
+    let reason = crate::providers::translate_shared::sanitize_external_error_detail(&error.message)
+        .unwrap_or_else(|| "Upstream error".to_string());
+    let detail = error
+        .detail
+        .as_deref()
+        .and_then(crate::providers::translate_shared::sanitize_external_error_detail);
     let fields = serde_json::Map::from_iter([
-        ("reason".into(), serde_json::json!(error.message)),
-        ("detail".into(), serde_json::json!(error.detail)),
+        ("reason".into(), serde_json::json!(reason)),
+        ("detail".into(), serde_json::json!(detail)),
     ]);
     crate::logging::create_logger("codex")
         .warn("websocket_terminal_pool_probe_failed", Some(fields));

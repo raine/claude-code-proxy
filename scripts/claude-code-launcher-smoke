@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: scripts/claude-code-launcher-smoke [--versions VERSION[,VERSION...]] [--skip-build] [--self-test]" >&2
+}
+
+validate_versions_input() {
+  local candidate_list="$1"
+  local candidate
+  local -a candidates
+
+  [[ -n "$candidate_list" ]] || return 1
+  [[ "$candidate_list" != *[[:space:]]* ]] || return 1
+  [[ "$candidate_list" != ,* ]] || return 1
+  [[ "$candidate_list" != *, ]] || return 1
+  [[ "$candidate_list" != *,,* ]] || return 1
+
+  IFS=',' read -r -a candidates <<<"$candidate_list"
+  ((${#candidates[@]} > 0)) || return 1
+  for candidate in "${candidates[@]}"; do
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  done
+}
+
+run_input_self_tests() {
+  validate_versions_input "1.2.3"
+  validate_versions_input "1.2.3,4.5.6"
+
+  local invalid
+  for invalid in \
+    "" \
+    " " \
+    "1.2.3, 4.5.6" \
+    "1.2.3"$'\t' \
+    "1.2.3"$'\n'"4.5.6" \
+    ",1.2.3" \
+    "1.2.3," \
+    "1.2.3,,4.5.6" \
+    "latest"; do
+    if validate_versions_input "$invalid"; then
+      echo "error: version-input self-test unexpectedly accepted an invalid value" >&2
+      return 1
+    fi
+  done
+}
+
+versions=""
+versions_override_set=0
+skip_build=0
+self_test=0
+while (($#)); do
+  case "$1" in
+    --versions)
+      [[ $# -ge 2 ]] || {
+        usage
+        exit 2
+      }
+      versions="$2"
+      versions_override_set=1
+      shift 2
+      ;;
+    --skip-build)
+      skip_build=1
+      shift
+      ;;
+    --self-test)
+      self_test=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+manifest_path="$repo_root/compatibility/claude-code.json"
+
+command -v python3 >/dev/null || {
+  echo "error: python3 is required to validate the compatibility manifest and hook output" >&2
+  exit 1
+}
+
+canary_root="$(mktemp -d "${TMPDIR:-/tmp}/ccproxy-claude-compat.XXXXXX")"
+cleanup() {
+  rm -rf "$canary_root"
+}
+trap cleanup EXIT INT TERM
+
+if ((versions_override_set == 1)); then
+  validate_versions_input "$versions" || {
+    echo "error: --versions requires a non-empty comma-separated semver list with no whitespace" >&2
+    exit 2
+  }
+fi
+
+selection_file="$canary_root/manifest-selection.tsv"
+python3 - "$manifest_path" "$versions_override_set" "$versions" >"$selection_file" <<'PY'
+import base64
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+override_set = sys.argv[2] == "1"
+requested = sys.argv[3].split(",") if override_set else None
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"error: cannot read compatibility manifest: {error}")
+
+if manifest.get("schemaVersion") != 1:
+    raise SystemExit("error: unsupported compatibility manifest schemaVersion")
+package = manifest.get("npmPackage")
+if not isinstance(package, str) or not package:
+    raise SystemExit("error: compatibility manifest npmPackage must be a non-empty string")
+
+smoke = manifest.get("launcherSmoke")
+if not isinstance(smoke, dict) or set(smoke) != {"latest", "previous"}:
+    raise SystemExit("error: launcherSmoke must contain exactly latest and previous entries")
+
+entries = []
+versions_seen = set()
+integrity_pattern = re.compile(r"^sha512-([A-Za-z0-9+/]+={0,2})$")
+for channel in ("latest", "previous"):
+    entry = smoke[channel]
+    if not isinstance(entry, dict):
+        raise SystemExit(f"error: launcherSmoke.{channel} must be an object")
+    version = entry.get("version")
+    integrity = entry.get("distIntegrity")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise SystemExit(f"error: launcherSmoke.{channel}.version must be strict semver")
+    if version in versions_seen:
+        raise SystemExit("error: latest and previous versions must be distinct")
+    versions_seen.add(version)
+    match = integrity_pattern.fullmatch(integrity) if isinstance(integrity, str) else None
+    if not match:
+        raise SystemExit(f"error: launcherSmoke.{channel}.distIntegrity must be npm sha512 SRI")
+    try:
+        digest = base64.b64decode(match.group(1), validate=True)
+    except ValueError as error:
+        raise SystemExit(f"error: invalid base64 integrity for {channel}: {error}") from error
+    if len(digest) != 64:
+        raise SystemExit(f"error: launcherSmoke.{channel}.distIntegrity is not a SHA-512 digest")
+    entries.append((version, integrity))
+
+if requested is not None:
+    by_version = dict(entries)
+    unknown = [version for version in requested if version not in by_version]
+    if unknown:
+        raise SystemExit(
+            "error: --versions contains an unpinned version; add it to compatibility/claude-code.json first: "
+            + ",".join(unknown)
+        )
+    if len(set(requested)) != len(requested):
+        raise SystemExit("error: --versions must not contain duplicate versions")
+    entries = [(version, by_version[version]) for version in requested]
+
+print(f"package\t{package}")
+print(f"manifestLatest\t{smoke['latest']['version']}")
+print(f"manifestPrevious\t{smoke['previous']['version']}")
+for version, integrity in entries:
+    print(f"version\t{version}\t{integrity}")
+PY
+
+if ((self_test == 1)); then
+  run_input_self_tests
+  [[ "$(sed -n '1p' "$selection_file")" == $'package\t@anthropic-ai/claude-code' ]] || {
+    echo "error: manifest self-test did not resolve the expected package" >&2
+    exit 1
+  }
+  self_test_previous="$(sed -n '3s/^manifestPrevious	//p' "$selection_file")"
+  [[ "$self_test_previous" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo "error: manifest self-test did not resolve the expected previous version" >&2
+    exit 1
+  }
+  [[ "$(sed -n '$=' "$selection_file")" == "5" ]] || {
+    echo "error: manifest self-test did not resolve latest and previous exactly once" >&2
+    exit 1
+  }
+  echo "Claude Code launcher smoke self-tests passed"
+  exit 0
+fi
+
+command -v npm >/dev/null || {
+  echo "error: npm is required to download the pinned Claude Code packages" >&2
+  exit 1
+}
+
+if ((skip_build == 0)); then
+  cargo build --locked --bin claude-code-proxy
+fi
+proxy_binary="$repo_root/target/debug/claude-code-proxy"
+[[ -x "$proxy_binary" ]] || {
+  echo "error: missing executable $proxy_binary" >&2
+  exit 1
+}
+
+launcher_bin="$canary_root/bin"
+mkdir -p "$launcher_bin"
+ln -s "$proxy_binary" "$launcher_bin/co"
+ln -s "$proxy_binary" "$launcher_bin/cg"
+
+package="$(sed -n '1s/^package	//p' "$selection_file")"
+[[ -n "$package" ]] || {
+  echo "error: compatibility manifest did not resolve an npm package" >&2
+  exit 1
+}
+manifest_latest_version="$(sed -n '2s/^manifestLatest	//p' "$selection_file")"
+[[ "$manifest_latest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "error: compatibility manifest did not resolve a latest version" >&2
+  exit 1
+}
+manifest_previous_version="$(sed -n '3s/^manifestPrevious	//p' "$selection_file")"
+[[ "$manifest_previous_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "error: compatibility manifest did not resolve a previous version" >&2
+  exit 1
+}
+
+registry_latest_json="$canary_root/npm-latest.json"
+npm view "$package@latest" version --json >"$registry_latest_json"
+registry_latest_version="$(
+  python3 - "$registry_latest_json" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    version = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"error: cannot read npm latest metadata: {error}")
+if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+    raise SystemExit("error: npm latest metadata did not contain one strict semver")
+print(version)
+PY
+)"
+[[ "$registry_latest_version" == "$manifest_latest_version" ]] || {
+  echo "error: npm latest is $registry_latest_version but the compatibility manifest pins $manifest_latest_version; review and update the manifest before accepting the new client" >&2
+  exit 1
+}
+
+registry_versions_json="$canary_root/npm-versions.json"
+npm view "$package" versions --json >"$registry_versions_json"
+registry_previous_version="$(
+  python3 - \
+    "$registry_versions_json" \
+    "$registry_latest_version" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+strict_semver = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)$")
+
+try:
+    versions = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"error: cannot read npm version metadata: {error}")
+latest = sys.argv[2]
+latest_match = strict_semver.fullmatch(latest)
+if latest_match is None:
+    raise SystemExit("error: npm latest is not strict stable semver")
+if not isinstance(versions, list) or not all(isinstance(item, str) for item in versions):
+    raise SystemExit("error: npm version metadata did not contain a string array")
+
+stable = {}
+for version in versions:
+    match = strict_semver.fullmatch(version)
+    if match is not None:
+        stable[tuple(int(part) for part in match.groups())] = version
+
+latest_key = tuple(int(part) for part in latest_match.groups())
+if stable.get(latest_key) != latest:
+    raise SystemExit("error: npm latest is absent from the stable version inventory")
+earlier = [key for key in stable if key < latest_key]
+if not earlier:
+    raise SystemExit("error: npm registry has no previous stable Claude Code release")
+print(stable[max(earlier)])
+PY
+)"
+[[ "$registry_previous_version" == "$manifest_previous_version" ]] || {
+  echo "error: npm's immediate previous stable release is $registry_previous_version but the compatibility manifest pins $manifest_previous_version; review and update the manifest before accepting the client matrix" >&2
+  exit 1
+}
+
+while IFS=$'\t' read -r record_type version expected_integrity; do
+  [[ "$record_type" == "version" ]] || {
+    echo "error: invalid compatibility manifest selection record" >&2
+    exit 1
+  }
+
+  download_root="$canary_root/download-$version"
+  mkdir -p "$download_root"
+  pack_json="$download_root/npm-pack.json"
+  npm pack \
+    --json \
+    --pack-destination "$download_root" \
+    "$package@$version" >"$pack_json"
+  package_tarball="$(
+    python3 - "$pack_json" "$download_root" "$expected_integrity" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+pack_json = Path(sys.argv[1])
+download_root = Path(sys.argv[2]).resolve()
+expected_integrity = sys.argv[3]
+try:
+    result = json.loads(pack_json.read_text(encoding="utf-8"))
+    filename = result[0]["filename"]
+except (OSError, UnicodeError, json.JSONDecodeError, IndexError, KeyError, TypeError) as error:
+    raise SystemExit(f"error: cannot parse npm pack result: {error}")
+
+tarball = (download_root / filename).resolve()
+if os.path.commonpath((download_root, tarball)) != str(download_root):
+    raise SystemExit("error: npm pack returned a path outside the download directory")
+try:
+    digest = hashlib.sha512(tarball.read_bytes()).digest()
+except OSError as error:
+    raise SystemExit(f"error: cannot read npm package tarball: {error}")
+actual_integrity = "sha512-" + base64.b64encode(digest).decode("ascii")
+if actual_integrity != expected_integrity:
+    raise SystemExit("error: downloaded Claude Code package failed pinned SHA-512 integrity verification")
+print(tarball)
+PY
+  )"
+
+  install_root="$canary_root/claude-$version"
+  npm install \
+    --prefix "$install_root" \
+    --package-lock=false \
+    --no-save \
+    --no-audit \
+    --no-fund \
+    "$package_tarball"
+  claude_bin="$install_root/node_modules/.bin/claude"
+  [[ -x "$claude_bin" ]] || {
+    echo "error: Claude Code $version did not install an executable" >&2
+    exit 1
+  }
+  actual_version="$(DISABLE_AUTOUPDATER=1 "$claude_bin" --version)"
+  [[ "$actual_version" == "$version (Claude Code)" ]] || {
+    echo "error: expected Claude Code $version, got: $actual_version" >&2
+    exit 1
+  }
+
+  for profile in co cg; do
+    profile_home="$canary_root/home-$version-$profile"
+    proxy_config="$canary_root/proxy-config-$version-$profile"
+    mkdir -p "$profile_home" "$proxy_config"
+    output="$(
+      env \
+        HOME="$profile_home" \
+        CCP_CONFIG_DIR="$proxy_config" \
+        DISABLE_AUTOUPDATER=1 \
+        PATH="$launcher_bin:$install_root/node_modules/.bin:$PATH" \
+        "$launcher_bin/$profile" --version 2>&1
+    )"
+    [[ "$output" == *"$version (Claude Code)"* ]] || {
+      echo "error: $profile did not launch Claude Code $version successfully" >&2
+      echo "$output" >&2
+      exit 1
+    }
+  done
+
+  hook_output="$(
+    printf '%s' \
+      '{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"subagent_type":"Plan","model":"fable","prompt":"canary","run_in_background":true}}' \
+      | "$launcher_bin/co" --ccproxy-agent-model-policy-hook
+  )"
+  printf '%s' "$hook_output" | python3 -c '
+import json
+import sys
+payload = json.load(sys.stdin)
+updated = payload["hookSpecificOutput"]["updatedInput"]
+assert "model" not in updated
+assert updated["subagent_type"] == "Plan"
+assert updated["prompt"] == "canary"
+assert updated["run_in_background"] is True
+'
+
+  nested_output="$(
+    printf '%s' \
+      '{"hook_event_name":"PreToolUse","agent_id":"nested-canary","agent_type":"Plan","tool_name":"Agent","tool_input":{"subagent_type":"Explore","model":"haiku","prompt":"nested canary"}}' \
+      | "$launcher_bin/co" --ccproxy-agent-model-policy-hook
+  )"
+  [[ -z "$nested_output" ]] || {
+    echo "error: nested ambiguous hook input must remain fail-safe and silent" >&2
+    exit 1
+  }
+
+  "$repo_root/scripts/claude-code-provider-canary" \
+    --claude-bin "$claude_bin" \
+    --proxy-binary "$proxy_binary" \
+    --label "$version"
+
+  echo "Claude Code $version: integrity, launcher, hook, and provider workflow contracts passed"
+done < <(sed '1,3d' "$selection_file")
+
+tested_versions="$(sed -n 's/^version	\([^	]*\).*/\1/p' "$selection_file" | paste -sd, -)"
+echo "Claude Code launcher smoke passed for: $tested_versions"

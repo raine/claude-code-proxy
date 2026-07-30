@@ -417,6 +417,7 @@ pub struct UpstreamStreamError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamErrorKind {
+    ContextOverflow,
     RateLimit,
     Overloaded,
     Transient,
@@ -460,6 +461,10 @@ pub struct CodexUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub input_tokens_details_cached: Option<u64>,
+    /// GPT-5.6 public Responses usage can report this field separately.
+    /// The private Codex endpoint may omit it, so preserve missing versus
+    /// an explicitly reported zero until the Anthropic boundary is rendered.
+    pub input_tokens_details_cache_write: Option<u64>,
     pub output_tokens_details_reasoning: Option<u64>,
 }
 
@@ -849,7 +854,7 @@ pub(crate) fn reduce_upstream_bytes_with_tool_policy(
             t.as_str(),
             "response.failed" | "response.error" | "response.cancelled" | "error"
         ) {
-            let msg = p
+            let raw_message = p
                 .get("response")
                 .and_then(|r| r.get("error"))
                 .and_then(|e| e.get("message"))
@@ -860,11 +865,12 @@ pub(crate) fn reduce_upstream_bytes_with_tool_policy(
                         .and_then(|v| v.as_str())
                 })
                 .unwrap_or("Upstream error");
-            let kind = upstream_failure_kind(&p, msg);
+            let kind = upstream_failure_kind(&p, raw_message);
+            let message = super::super::events::sanitized_error_message(&p);
             let retry_after = retry_after_from_payload(&p);
             return Err(UpstreamStreamError {
                 kind,
-                message: msg.to_string(),
+                message,
                 retry_after_seconds: retry_after,
                 diagnostics: None,
             });
@@ -1685,6 +1691,10 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .get("input_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64()),
+        input_tokens_details_cache_write: usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(|v| v.as_u64()),
         output_tokens_details_reasoning: usage
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
@@ -1857,6 +1867,10 @@ fn web_search_sources(item: &serde_json::Value) -> Vec<WebSearchResult> {
 }
 
 fn upstream_failure_kind(payload: &serde_json::Value, message: &str) -> UpstreamErrorKind {
+    if super::super::events::is_context_overflow_error(payload) {
+        return UpstreamErrorKind::ContextOverflow;
+    }
+
     let status = payload
         .get("status")
         .or_else(|| payload.get("status_code"))
@@ -1940,14 +1954,28 @@ pub fn map_codex_usage_to_anthropic(
         Some(u) => u,
         None => return AnthropicUsage::default(),
     };
-    let cached = usage.input_tokens_details_cached.unwrap_or(0);
     let total_input = usage.input_tokens.unwrap_or(0);
-    let input_tokens = total_input.saturating_sub(cached);
+    // OpenAI reports cache read/write as categories within input_tokens,
+    // whereas Anthropic exposes three mutually exclusive input categories.
+    // Clamp an inconsistent private-upstream breakdown so the mapped category
+    // sum can never exceed the reported total. Preserve the established cache
+    // read category first, then assign any remaining budget to cache writes.
+    let cached = usage
+        .input_tokens_details_cached
+        .unwrap_or(0)
+        .min(total_input);
+    let cache_write = usage
+        .input_tokens_details_cache_write
+        .unwrap_or(0)
+        .min(total_input.saturating_sub(cached));
+    let input_tokens = total_input
+        .saturating_sub(cached)
+        .saturating_sub(cache_write);
 
     let mut result = AnthropicUsage {
         input_tokens,
         output_tokens: usage.output_tokens.unwrap_or(0),
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: cache_write,
         cache_read_input_tokens: cached,
         server_tool_use: None,
     };
@@ -2895,6 +2923,27 @@ mod tests {
     }
 
     #[test]
+    fn reduce_structured_context_error_is_classified_and_sanitized() {
+        let upstream = sse(
+            "response.failed",
+            json!({
+                "response":{
+                    "status":"failed",
+                    "error":{
+                        "code":"input_too_large",
+                        "message":"Bearer top-secret"
+                    }
+                }
+            }),
+        );
+        let error = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+
+        assert_eq!(error.kind, UpstreamErrorKind::ContextOverflow);
+        assert!(!error.message.contains("top-secret"));
+        assert!(error.message.contains("code: input_too_large"));
+    }
+
+    #[test]
     fn reduce_web_search_output() {
         let upstream = format!(
             "{}{}{}{}{}{}",
@@ -3213,12 +3262,70 @@ mod tests {
             input_tokens: Some(100),
             output_tokens: Some(50),
             input_tokens_details_cached: Some(20),
+            input_tokens_details_cache_write: Some(30),
             output_tokens_details_reasoning: None,
         };
         let mapped = map_codex_usage_to_anthropic(&Some(usage), None);
-        assert_eq!(mapped.input_tokens, 80);
+        assert_eq!(mapped.input_tokens, 50);
         assert_eq!(mapped.output_tokens, 50);
+        assert_eq!(mapped.cache_creation_input_tokens, 30);
         assert_eq!(mapped.cache_read_input_tokens, 20);
+        assert_eq!(
+            crate::monitor::anthropic_total_input_tokens(
+                &serde_json::to_value(&mapped).expect("usage serializes")
+            ),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn map_usage_preserves_missing_and_clamps_inconsistent_cache_breakdown() {
+        let missing = parse_codex_usage(&serde_json::json!({
+            "usage":{"input_tokens":10,"input_tokens_details":{}}
+        }));
+        assert_eq!(missing.input_tokens_details_cache_write, None);
+        assert_eq!(
+            map_codex_usage_to_anthropic(&Some(missing), None).cache_creation_input_tokens,
+            0
+        );
+
+        let reported_zero = parse_codex_usage(&serde_json::json!({
+            "usage":{
+                "input_tokens":10,
+                "input_tokens_details":{"cache_write_tokens":0}
+            }
+        }));
+        assert_eq!(reported_zero.input_tokens_details_cache_write, Some(0));
+
+        let oversized = CodexUsage {
+            input_tokens: Some(5),
+            output_tokens: None,
+            input_tokens_details_cached: Some(4),
+            input_tokens_details_cache_write: Some(u64::MAX),
+            output_tokens_details_reasoning: None,
+        };
+        let mapped = map_codex_usage_to_anthropic(&Some(oversized), None);
+        assert_eq!(mapped.input_tokens, 0);
+        assert_eq!(mapped.cache_creation_input_tokens, 1);
+        assert_eq!(mapped.cache_read_input_tokens, 4);
+        assert_eq!(
+            crate::monitor::anthropic_total_input_tokens(
+                &serde_json::to_value(&mapped).expect("usage serializes")
+            ),
+            Some(5)
+        );
+
+        let oversized_read = CodexUsage {
+            input_tokens: Some(5),
+            output_tokens: None,
+            input_tokens_details_cached: Some(u64::MAX),
+            input_tokens_details_cache_write: Some(3),
+            output_tokens_details_reasoning: None,
+        };
+        let mapped = map_codex_usage_to_anthropic(&Some(oversized_read), None);
+        assert_eq!(mapped.input_tokens, 0);
+        assert_eq!(mapped.cache_creation_input_tokens, 0);
+        assert_eq!(mapped.cache_read_input_tokens, 5);
     }
 
     #[test]

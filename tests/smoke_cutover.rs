@@ -1986,7 +1986,10 @@ async fn smoke_codex_websocket_context_window_error_requests_compaction() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["error"]["type"], "request_too_large");
-    assert_eq!(value["error"]["message"], "input exceeds context window");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("input exceeds context window"));
+    assert!(message.contains("type: invalid_request_error"));
+    assert!(message.contains("param: input"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

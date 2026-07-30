@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Include translated structured-output schemas in Codex and Grok
+  `/count_tokens` estimates so large schemas can trigger Claude Code compaction
+  before the provider rejects the request.
+- Project optional Codex `cache_write_tokens` into Anthropic
+  `cache_creation_input_tokens`, while clamping read/write categories to the
+  reported total input-token invariant.
+- Classify allowlisted structured Codex context-limit codes before bounded
+  message fallbacks across HTTP, WebSocket, live, and buffered paths. These
+  failures now consistently return HTTP 413 `request_too_large` without replay;
+  rate-limit, authentication, overload, safety, and server errors retain their
+  own classes.
+- Sanitize all provider error details at the external boundary. Unknown JSON
+  error shapes are no longer echoed, and secrets, URL credentials/query
+  strings, local paths, excessive whitespace, and oversized Unicode details are
+  redacted or bounded before they reach Claude Code, logs, or diagnostics.
+- Preserve unrelated inherited Claude Code custom headers under `co` while
+  replacing only the reserved compaction header, and reject malformed header
+  lists before launch.
+- Hold managed `co`/`cg` profiles at one subagent spawn level until deeper
+  same-family routing passes a versioned canary. Add merge and release
+  latest/previous compatibility gates with manifest-pinned npm integrity
+  verification and strict npm latest/immediate-previous drift detection on
+  Ubuntu, plus scheduled latest-version coverage on macOS.
+  Each pinned client now runs a real `co` request through an isolated ccproxy
+  and deterministic loopback Responses mock, covering a `Read` tool/result
+  round trip, a content-derived proof, cache usage projection, persisted
+  `--resume` continuity, a real top-level Agent/Explore child round trip with
+  same-family routing, exact HTTP 413/request-too-large mapping, real-client
+  error recognition, and secret redaction. Live compaction, real-provider,
+  terminal-interruption, and depth-2 contracts remain outside this canary.
+- Report current and provider-construction config generations plus the
+  next-request/restart-required reload contract from `/version`, instead of
+  implying that provider transports are hot-swapped after file edits. Emit one
+  non-secret warning for each newly observed stale generation, and fail safe
+  when the accepted file generation changes during provider construction.
 - Preserve Codex rate-limit and overload error types when an upstream failure
   arrives after streaming output has already begun, without replaying the
   partially emitted turn.

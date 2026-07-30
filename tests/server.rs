@@ -132,6 +132,29 @@ async fn version_reports_build_and_runtime_identity() {
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert!(body["gitSha"].as_str().is_some_and(|sha| !sha.is_empty()));
     assert_eq!(body["pid"], std::process::id());
+    assert!(body["configGeneration"].as_u64().is_some());
+    assert_eq!(
+        body["providerConstructionConfigGeneration"],
+        body["configGeneration"]
+    );
+    assert_eq!(
+        body["providerConstructionConfigGenerationEnd"],
+        body["providerConstructionConfigGeneration"]
+    );
+    assert_eq!(body["providerConstructionSnapshotStable"], true);
+    assert_eq!(
+        body["configGenerationChangedSinceProviderConstruction"],
+        false
+    );
+    assert_eq!(
+        body["configReload"]["status"],
+        "provider_generation_current"
+    );
+    assert!(
+        body["configReload"]["restartRequired"]
+            .as_array()
+            .is_some_and(|fields| !fields.is_empty())
+    );
     assert!(
         body["binarySha256"]
             .as_str()
@@ -520,6 +543,75 @@ async fn count_tokens_routes_to_provider() {
         status != StatusCode::NOT_IMPLEMENTED,
         "count_tokens should no longer return 501 for codex models"
     );
+}
+
+#[tokio::test]
+async fn count_tokens_endpoint_includes_structured_output_schema_for_each_provider() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "result": {
+                "type": "string",
+                "description": "schema-token-evidence-".repeat(512)
+            }
+        },
+        "required": ["result"],
+        "additionalProperties": false
+    });
+    assert!(serde_json::to_vec(&schema).unwrap().len() >= 10 * 1024);
+
+    for model in ["gpt-5.6-sol", "grok-4.5-high"] {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let mut counts = Vec::new();
+        for format in [
+            None,
+            Some(json!({
+                "type": "json_schema",
+                "name": "large_result",
+                "schema": schema.clone()
+            })),
+        ] {
+            let mut payload = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "return a result"}]
+            });
+            if let Some(format) = format {
+                payload["output_config"] = json!({"format": format});
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/messages/count_tokens")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{model} count response: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            counts.push(
+                body["input_tokens"]
+                    .as_u64()
+                    .expect("count endpoint returns input_tokens"),
+            );
+        }
+        assert!(
+            counts[1] > counts[0],
+            "{model} endpoint omitted the translated structured schema: {counts:?}"
+        );
+    }
 }
 
 #[tokio::test]

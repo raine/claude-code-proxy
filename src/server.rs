@@ -22,7 +22,7 @@ use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -289,11 +289,22 @@ pub fn app_with_limits(
 ) -> Router {
     initialize_process_identity();
     initialize_config_fingerprint(&limits, None, None);
+    let provider_construction_config_generation = registry.construction_config_generation();
+    let provider_construction_config_generation_end = registry.construction_config_generation_end();
+    let provider_construction_config_snapshot_stable =
+        registry.construction_config_snapshot_stable();
     let state = Arc::new(AppState {
         registry,
         monitor,
         admission: AdmissionState::new(&limits),
         limits,
+        provider_construction_config_generation,
+        provider_construction_config_generation_end,
+        provider_construction_config_snapshot_stable,
+        config_generation_drift_warning: ConfigGenerationDriftWarning::new(
+            provider_construction_config_generation,
+            provider_construction_config_snapshot_stable,
+        ),
     });
     Router::new()
         .route("/healthz", get(healthz))
@@ -310,6 +321,45 @@ struct AppState {
     monitor: Option<MonitorHandle>,
     admission: AdmissionState,
     limits: ServerLimits,
+    provider_construction_config_generation: u64,
+    provider_construction_config_generation_end: u64,
+    provider_construction_config_snapshot_stable: bool,
+    config_generation_drift_warning: ConfigGenerationDriftWarning,
+}
+
+struct ConfigGenerationDriftWarning {
+    provider_construction_generation: u64,
+    provider_construction_snapshot_stable: bool,
+    warned_generations: Mutex<HashSet<u64>>,
+}
+
+impl ConfigGenerationDriftWarning {
+    fn new(
+        provider_construction_generation: u64,
+        provider_construction_snapshot_stable: bool,
+    ) -> Self {
+        Self {
+            provider_construction_generation,
+            provider_construction_snapshot_stable,
+            warned_generations: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn observe(&self, current_generation: u64) -> bool {
+        if self.provider_construction_snapshot_stable
+            && current_generation == self.provider_construction_generation
+        {
+            return false;
+        }
+
+        // GET /version is a diagnostic path, so a small lock is preferable to
+        // losing or repeating a warning if concurrent requests observe two
+        // different generations and complete out of order.
+        self.warned_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(current_generation)
+    }
 }
 
 struct AdmissionState {
@@ -379,8 +429,44 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn version() -> Json<serde_json::Value> {
-    Json(version_info())
+async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let current_config_generation = crate::config::load_config().config_generation;
+    if state
+        .config_generation_drift_warning
+        .observe(current_config_generation)
+    {
+        create_logger("server").warn(
+            "provider_config_generation_stale",
+            Some(Map::from_iter([
+                (
+                    "providerConstructionConfigGeneration".to_string(),
+                    Value::Number(state.provider_construction_config_generation.into()),
+                ),
+                (
+                    "configGeneration".to_string(),
+                    Value::Number(current_config_generation.into()),
+                ),
+                (
+                    "providerConstructionConfigGenerationEnd".to_string(),
+                    Value::Number(state.provider_construction_config_generation_end.into()),
+                ),
+                (
+                    "providerConstructionSnapshotStable".to_string(),
+                    Value::Bool(state.provider_construction_config_snapshot_stable),
+                ),
+                (
+                    "action".to_string(),
+                    Value::String("inspect_get_version_configReload_and_restart_if_needed".into()),
+                ),
+            ])),
+        );
+    }
+    Json(version_info_with_config_generations(
+        state.provider_construction_config_generation,
+        state.provider_construction_config_generation_end,
+        state.provider_construction_config_snapshot_stable,
+        current_config_generation,
+    ))
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -545,6 +631,66 @@ pub fn version_info() -> Value {
             "samplingControls": "rejected_before_dispatch",
         },
     })
+}
+
+fn version_info_with_config_generations(
+    provider_construction_config_generation: u64,
+    provider_construction_config_generation_end: u64,
+    provider_construction_config_snapshot_stable: bool,
+    current_config_generation: u64,
+) -> Value {
+    let generation_changed = current_config_generation != provider_construction_config_generation;
+    let mut info = version_info();
+    info.as_object_mut()
+        .expect("version metadata is a JSON object")
+        .extend(Map::from_iter([
+            (
+                "configGeneration".to_string(),
+                Value::Number(current_config_generation.into()),
+            ),
+            (
+                "providerConstructionConfigGeneration".to_string(),
+                Value::Number(provider_construction_config_generation.into()),
+            ),
+            (
+                "providerConstructionConfigGenerationEnd".to_string(),
+                Value::Number(provider_construction_config_generation_end.into()),
+            ),
+            (
+                "providerConstructionSnapshotStable".to_string(),
+                Value::Bool(provider_construction_config_snapshot_stable),
+            ),
+            (
+                "configGenerationChangedSinceProviderConstruction".to_string(),
+                Value::Bool(generation_changed),
+            ),
+            (
+                "configReload".to_string(),
+                json!({
+                    "status": if !provider_construction_config_snapshot_stable {
+                        "provider_construction_snapshot_unstable_restart_required"
+                    } else if generation_changed {
+                        "generation_changed_check_restart_required_fields"
+                    } else {
+                        "provider_generation_current"
+                    },
+                    "nextRequest": [
+                        "log.*",
+                        "codex.model/effort/reasoningSummary/serviceTier/responsesLite/parallelTools",
+                        "codex.originator/userAgent/previousResponseId/unsafeSalvageToolCallOnClose",
+                        "codex.totalTimeoutMs/streamHeartbeatMs/websocket*TimeoutMs/maxIdleWebSockets/idleWebSocketTtlMs",
+                        "grok.totalTimeoutMs/streamHeartbeatMs",
+                    ],
+                    "restartRequired": [
+                        "bindAddress/port/server.*",
+                        "codex.baseUrl/transport/connectTimeoutMs/headerTimeoutMs/httpFirstByteTimeoutMs/bodyIdleTimeoutMs",
+                        "grok.baseUrl/clientVersion/connectTimeoutMs/headerTimeoutMs/firstByteTimeoutMs/bodyIdleTimeoutMs",
+                        "HTTP(S)_PROXY/ALL_PROXY/NO_PROXY and operating-system proxy settings",
+                    ],
+                }),
+            ),
+        ]));
+    info
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -2288,6 +2434,60 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures_util::stream;
+
+    #[test]
+    fn provider_generation_drift_warning_is_once_per_new_generation() {
+        let warning = Arc::new(ConfigGenerationDriftWarning::new(7, true));
+        assert!(!warning.observe(7));
+
+        for generation in [8, 9] {
+            let observations = (0..16)
+                .map(|_| {
+                    let warning = warning.clone();
+                    std::thread::spawn(move || warning.observe(generation))
+                })
+                .collect::<Vec<_>>();
+            let emitted = observations
+                .into_iter()
+                .map(|observation| observation.join().unwrap())
+                .filter(|emitted| *emitted)
+                .count();
+            assert_eq!(emitted, 1, "generation {generation}");
+        }
+    }
+
+    #[test]
+    fn version_marks_provider_generation_drift_without_claiming_hot_swap() {
+        let info = version_info_with_config_generations(7, 7, true, 9);
+        assert_eq!(info["providerConstructionConfigGeneration"], 7);
+        assert_eq!(info["providerConstructionConfigGenerationEnd"], 7);
+        assert_eq!(info["providerConstructionSnapshotStable"], true);
+        assert_eq!(info["configGeneration"], 9);
+        assert_eq!(
+            info["configGenerationChangedSinceProviderConstruction"],
+            true
+        );
+        assert_eq!(
+            info["configReload"]["status"],
+            "generation_changed_check_restart_required_fields"
+        );
+    }
+
+    #[test]
+    fn version_requires_restart_when_provider_construction_snapshot_was_unstable() {
+        let info = version_info_with_config_generations(7, 8, false, 8);
+        assert_eq!(info["providerConstructionConfigGeneration"], 7);
+        assert_eq!(info["providerConstructionConfigGenerationEnd"], 8);
+        assert_eq!(info["providerConstructionSnapshotStable"], false);
+        assert_eq!(
+            info["configReload"]["status"],
+            "provider_construction_snapshot_unstable_restart_required"
+        );
+
+        let warning = ConfigGenerationDriftWarning::new(8, false);
+        assert!(warning.observe(8));
+        assert!(!warning.observe(8));
+    }
 
     fn compaction_request() -> crate::anthropic::schema::MessagesRequest {
         serde_json::from_value(serde_json::json!({

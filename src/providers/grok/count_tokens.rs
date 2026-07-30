@@ -7,6 +7,7 @@ use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesReq
 
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const TOOL_OVERHEAD_TOKENS: u64 = 4;
+const TEXT_FORMAT_OVERHEAD_TOKENS: u64 = 4;
 const IMAGE_OVERHEAD_TOKENS: u64 = 256;
 const IMAGE_TILE_EDGE: u64 = 512;
 const IMAGE_TILE_TOKENS: u64 = 256;
@@ -45,10 +46,19 @@ pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
                 + TOOL_OVERHEAD_TOKENS
         })
         .sum();
+    let text_format = request
+        .text
+        .as_ref()
+        .map(|text| {
+            text_token_count(&serde_json::to_string(&text.format).unwrap_or_default())
+                + TEXT_FORMAT_OVERHEAD_TOKENS
+        })
+        .unwrap_or(0);
 
     (instructions
         + input
         + tools
+        + text_format
         + request.input.len() as u64 * MESSAGE_OVERHEAD_TOKENS
         + text_token_count(&request.model))
     .max(1)
@@ -478,6 +488,42 @@ mod tests {
         }));
 
         assert!(count_tokens(&long) > count_tokens(&short));
+    }
+
+    #[test]
+    fn count_tokens_structured_schema_increases_estimate() {
+        let baseline = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "return a result"}]
+        }));
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "description": "x".repeat(10 * 1024)
+                }
+            },
+            "required": ["result"],
+            "additionalProperties": false
+        });
+        assert!(
+            serde_json::to_vec(&schema).unwrap().len() >= 10 * 1024,
+            "fixture must exercise a schema of at least 10 KiB"
+        );
+        let structured = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "return a result"}],
+            "output_config": {"format": {
+                "type": "json_schema",
+                "name": "large_result",
+                "schema": schema
+            }}
+        }));
+
+        let baseline_count = count_tokens(&baseline);
+        let structured_count = count_tokens(&structured);
+        assert!(structured_count > baseline_count);
     }
 
     #[test]
