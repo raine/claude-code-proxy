@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use tokio_tungstenite::{
 
 use crate::logging::create_logger;
 use crate::provider::RequestContext;
+use crate::retry::sleep as retry_sleep;
 use crate::traffic::TrafficCapture;
 
 use super::client::{ActualTransport, CodexError, CodexErrorOrigin, CodexResponse};
@@ -41,7 +43,11 @@ pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
+const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
+const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+const WEBSOCKET_CONNECT_START_SPACING: Duration = Duration::from_secs(1);
+const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
 
 // Terminal WebSocket event types that signal the request is done
 const TERMINAL_EVENTS: &[&str] = &[
@@ -217,10 +223,33 @@ impl std::fmt::Display for CodexWebSocketError {
 struct PoolEntry {
     ws: Arc<AsyncMutex<CodexWebSocketStream>>,
     created_at: u64,
+    last_activity: AtomicU64,
 }
 
+impl PoolEntry {
+    fn new(ws: CodexWebSocketStream) -> Self {
+        Self {
+            ws: Arc::new(AsyncMutex::new(ws)),
+            created_at: now_ms(),
+            last_activity: AtomicU64::new(next_pool_activity()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_activity
+            .fetch_max(next_pool_activity(), Ordering::Relaxed);
+    }
+}
+
+static POOL_ACTIVITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
+    once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+
+fn next_pool_activity() -> u64 {
+    POOL_ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -267,7 +296,9 @@ fn invalidate_pool_owner(pool_key: Option<&str>, entry: Option<&Arc<PoolEntry>>)
 
 fn pool_get_for_turn(key: &str, turn_id: Option<u64>) -> Option<Arc<PoolEntry>> {
     super::continuation::if_current_turn(Some(key), turn_id, || {
-        WS_POOL.lock().ok()?.get(key).cloned()
+        let entry = WS_POOL.lock().ok()?.get(key).cloned()?;
+        entry.touch();
+        Some(entry)
     })
     .flatten()
 }
@@ -287,6 +318,7 @@ fn pool_remove_entry(key: &str, entry: &Arc<PoolEntry>) {
 }
 
 fn pool_insert(key: String, entry: Arc<PoolEntry>) {
+    entry.touch();
     let mut guard = WS_POOL.lock().unwrap();
     // Evict oldest if at capacity
     if guard.len() >= MAX_POOL_ENTRIES
@@ -298,6 +330,54 @@ fn pool_insert(key: String, entry: Arc<PoolEntry>) {
     let now = now_ms();
     guard.retain(|_, e| now.saturating_sub(e.created_at) < POOL_IDLE_TTL_MS);
     guard.insert(key, entry);
+}
+
+fn cleanup_pool_before_connect() {
+    let removed = {
+        let mut guard = WS_POOL.lock().unwrap();
+        if guard.len() <= POOL_CONNECT_CLEANUP_THRESHOLD {
+            return;
+        }
+
+        let remove_count = guard.len() - POOL_CONNECT_CLEANUP_TARGET;
+        let mut candidates: Vec<_> = guard
+            .iter()
+            .filter(|(_, entry)| Arc::strong_count(entry) == 1)
+            .map(|(key, entry)| (key.clone(), entry.last_activity.load(Ordering::Relaxed)))
+            .collect();
+        candidates.sort_unstable_by(|left, right| {
+            left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0))
+        });
+        candidates
+            .into_iter()
+            .take(remove_count)
+            .filter_map(|(key, _)| guard.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    drop(removed);
+}
+
+struct WebSocketConnectGate {
+    last_start: AsyncMutex<Option<tokio::time::Instant>>,
+    start_spacing: Duration,
+}
+
+impl WebSocketConnectGate {
+    fn new(start_spacing: Duration) -> Self {
+        Self {
+            last_start: AsyncMutex::new(None),
+            start_spacing,
+        }
+    }
+
+    async fn wait_to_start(&self, before_start: impl std::future::Future<Output = ()>) {
+        let mut last_start = self.last_start.lock().await;
+        if let Some(previous) = *last_start {
+            tokio::time::sleep_until(previous + self.start_spacing).await;
+        }
+        before_start.await;
+        *last_start = Some(tokio::time::Instant::now());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +620,7 @@ pub(super) async fn codex_websocket_request(
                 traffic,
             )
             .await?;
+            entry.touch();
             let Some(terminal_event) = terminal_event else {
                 return Err(missing_terminal_error());
             };
@@ -587,10 +668,7 @@ pub(super) async fn codex_websocket_request(
     };
 
     // New connection path (not pooled or pool miss)
-    let entry = Arc::new(PoolEntry {
-        ws: Arc::new(AsyncMutex::new(ws_stream)),
-        created_at: now_ms(),
-    });
+    let entry = Arc::new(PoolEntry::new(ws_stream));
 
     // Send the request
     let msg = Message::Text(body_json);
@@ -612,6 +690,7 @@ pub(super) async fn codex_websocket_request(
             traffic,
         )
         .await?;
+        drop(ws_guard);
         let Some(terminal_event) = terminal_event else {
             return Err(missing_terminal_error());
         };
@@ -705,10 +784,7 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(stream)),
-            created_at: now_ms(),
-        })
+        Arc::new(PoolEntry::new(stream))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled {
@@ -821,6 +897,7 @@ pub(super) fn start_codex_websocket_events(
             tx,
         )
         .await;
+        drop(guard);
         if let Some(key) = pool_key.as_deref() {
             if reusable {
                 pool_insert_for_turn(key.to_string(), entry, turn_id);
@@ -1449,34 +1526,62 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
     }
 }
 
+enum ConnectAttemptError {
+    Origin(CodexError),
+    ProxyTunnel(CodexError),
+}
+
+impl ConnectAttemptError {
+    fn is_origin_forbidden(&self) -> bool {
+        matches!(
+            self,
+            Self::Origin(error) if error.status == http::StatusCode::FORBIDDEN.as_u16()
+        )
+    }
+
+    fn into_error(self) -> CodexError {
+        match self {
+            Self::Origin(error) | Self::ProxyTunnel(error) => error,
+        }
+    }
+}
+
 async fn connect_via_http_proxy_tunnel(
     proxy_config: &WebSocketProxyConfig,
     route: WebSocketProxyRoute,
     url: &str,
     headers: &HeaderMap,
-) -> Result<CodexWebSocketStream, CodexError> {
-    let (host, authority) = websocket_destination(url)?;
-    let stream = connect_to_http_proxy(&route, proxy_config.tls_config.clone()).await?;
-    let stream = establish_connect_tunnel(stream, &authority, route.basic_auth.as_ref()).await?;
+) -> Result<CodexWebSocketStream, ConnectAttemptError> {
+    let (host, authority) = websocket_destination(url).map_err(ConnectAttemptError::Origin)?;
+    let stream = connect_to_http_proxy(&route, proxy_config.tls_config.clone())
+        .await
+        .map_err(ConnectAttemptError::ProxyTunnel)?;
+    let stream = establish_connect_tunnel(stream, &authority, route.basic_auth.as_ref())
+        .await
+        .map_err(ConnectAttemptError::ProxyTunnel)?;
     let stream = tls_connect(
         stream,
         &host,
         proxy_config.tls_config.clone(),
         "destination",
     )
-    .await?;
+    .await
+    .map_err(ConnectAttemptError::Origin)?;
     let websocket_key = generate_key();
     let subprotocols = requested_subprotocols(headers);
-    let request = tunneled_websocket_request(url, headers, &websocket_key)?;
+    let request = tunneled_websocket_request(url, headers, &websocket_key)
+        .map_err(ConnectAttemptError::Origin)?;
     let (websocket, response) = tokio_tungstenite::client_async(request, stream)
         .await
-        .map_err(tungstenite_handshake_error)?;
+        .map_err(tungstenite_handshake_error)
+        .map_err(ConnectAttemptError::Origin)?;
     validate_websocket_upgrade(
         response.version(),
         response.headers(),
         &websocket_key,
         &subprotocols,
-    )?;
+    )
+    .map_err(ConnectAttemptError::Origin)?;
     Ok(websocket)
 }
 
@@ -1546,6 +1651,66 @@ async fn connect_via_http_upgrade(
     Ok(WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await)
 }
 
+async fn connect_once(
+    websocket_client: &reqwest::Client,
+    proxy_config: &WebSocketProxyConfig,
+    url: &str,
+    headers: &HeaderMap,
+) -> Result<CodexWebSocketStream, ConnectAttemptError> {
+    if let Some(route) = proxy_config
+        .http_connect_route(url)
+        .map_err(ConnectAttemptError::Origin)?
+    {
+        connect_via_http_proxy_tunnel(proxy_config, route, url, headers).await
+    } else {
+        connect_via_http_upgrade(websocket_client, url, headers)
+            .await
+            .map_err(ConnectAttemptError::Origin)
+    }
+}
+
+fn connect_timeout_error(connect_timeout: Duration) -> CodexError {
+    websocket_protocol_error(&format!(
+        "WebSocket connect timeout after {}ms",
+        connect_timeout.as_millis()
+    ))
+}
+
+async fn connect_with_policy<T, P, PFut, F, Fut>(
+    gate: &WebSocketConnectGate,
+    connect_timeout: Duration,
+    forbidden_cooldown: Duration,
+    mut before_start: P,
+    mut connect: F,
+) -> Result<T, CodexError>
+where
+    P: FnMut() -> PFut,
+    PFut: std::future::Future<Output = ()>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ConnectAttemptError>>,
+{
+    for attempt in 0..=1 {
+        gate.wait_to_start(before_start()).await;
+        let result = tokio::time::timeout(connect_timeout, connect())
+            .await
+            .unwrap_or_else(|_| {
+                Err(ConnectAttemptError::Origin(connect_timeout_error(
+                    connect_timeout,
+                )))
+            });
+        if result
+            .as_ref()
+            .is_err_and(ConnectAttemptError::is_origin_forbidden)
+            && attempt == 0
+        {
+            retry_sleep(u64::try_from(forbidden_cooldown.as_millis()).unwrap_or(u64::MAX)).await;
+            continue;
+        }
+        return result.map_err(ConnectAttemptError::into_error);
+    }
+    unreachable!()
+}
+
 async fn connect_with_timeout(
     websocket_client: &reqwest::Client,
     proxy_config: &WebSocketProxyConfig,
@@ -1553,22 +1718,14 @@ async fn connect_with_timeout(
     headers: &HeaderMap,
     connect_timeout_ms: u64,
 ) -> Result<CodexWebSocketStream, CodexError> {
-    let connect = async {
-        if let Some(route) = proxy_config.http_connect_route(url)? {
-            connect_via_http_proxy_tunnel(proxy_config, route, url, headers).await
-        } else {
-            connect_via_http_upgrade(websocket_client, url, headers).await
-        }
-    };
-    tokio::time::timeout(Duration::from_millis(connect_timeout_ms), connect)
-        .await
-        .map_err(|_| CodexError {
-            status: 0,
-            message: format!("WebSocket connect timeout after {connect_timeout_ms}ms"),
-            detail: None,
-            retry_after: None,
-            origin: CodexErrorOrigin::WebSocketHandshake,
-        })?
+    connect_with_policy(
+        &WS_CONNECT_GATE,
+        Duration::from_millis(connect_timeout_ms),
+        WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
+        || async { cleanup_pool_before_connect() },
+        || connect_once(websocket_client, proxy_config, url, headers),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,6 +2098,8 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
     use super::*;
 
     static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -1956,6 +2115,424 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap()
+    }
+
+    fn handshake_error(status: u16) -> CodexError {
+        CodexError {
+            status,
+            message: format!("handshake failed with status {status}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        }
+    }
+
+    fn origin_forbidden_error() -> ConnectAttemptError {
+        ConnectAttemptError::Origin(handshake_error(http::StatusCode::FORBIDDEN.as_u16()))
+    }
+
+    struct DropProbeIo {
+        probe: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    }
+
+    impl Drop for DropProbeIo {
+        fn drop(&mut self) {
+            if let Some((dropped, pool_was_unlocked)) = &self.probe {
+                pool_was_unlocked.store(WS_POOL.try_lock().is_ok(), Ordering::SeqCst);
+                dropped.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl AsyncRead for DropProbeIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for DropProbeIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn raw_test_stream(
+        probe: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    ) -> CodexWebSocketStream {
+        let io: BoxedWebSocketIo = Box::new(DropProbeIo { probe });
+        WebSocketStream::from_raw_socket(io, Role::Client, None).await
+    }
+
+    fn shared_pool_entry(ws: &Arc<AsyncMutex<CodexWebSocketStream>>) -> Arc<PoolEntry> {
+        Arc::new(PoolEntry {
+            ws: ws.clone(),
+            created_at: now_ms(),
+            last_activity: AtomicU64::new(next_pool_activity()),
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_cleanup_uses_threshold_target_lru_and_skips_leases() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let ws = Arc::new(AsyncMutex::new(raw_test_stream(None).await));
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            for index in 0..POOL_CONNECT_CLEANUP_THRESHOLD {
+                guard.insert(format!("entry-{index:02}"), shared_pool_entry(&ws));
+            }
+        }
+
+        cleanup_pool_before_connect();
+        assert_eq!(
+            WS_POOL.lock().unwrap().len(),
+            POOL_CONNECT_CLEANUP_THRESHOLD
+        );
+
+        WS_POOL
+            .lock()
+            .unwrap()
+            .insert("entry-50".to_string(), shared_pool_entry(&ws));
+        drop(pool_get_for_turn("entry-00", None).unwrap());
+        let leased = WS_POOL.lock().unwrap().get("entry-01").unwrap().clone();
+
+        cleanup_pool_before_connect();
+
+        let guard = WS_POOL.lock().unwrap();
+        assert_eq!(guard.len(), POOL_CONNECT_CLEANUP_TARGET);
+        assert!(guard.contains_key("entry-00"));
+        assert!(guard.contains_key("entry-01"));
+        for index in 2..=12 {
+            assert!(!guard.contains_key(&format!("entry-{index:02}")));
+        }
+        assert!(guard.contains_key("entry-13"));
+        assert!(guard.contains_key("entry-50"));
+        drop(guard);
+        drop(leased);
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn connect_cleanup_drops_final_socket_owners_after_unlocking_pool() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pool_was_unlocked = Arc::new(AtomicBool::new(false));
+        let shared_ws = Arc::new(AsyncMutex::new(raw_test_stream(None).await));
+        let probe_stream =
+            raw_test_stream(Some((dropped.clone(), pool_was_unlocked.clone()))).await;
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert(
+                "entry-00".to_string(),
+                Arc::new(PoolEntry::new(probe_stream)),
+            );
+            for index in 1..=POOL_CONNECT_CLEANUP_THRESHOLD {
+                guard.insert(format!("entry-{index:02}"), shared_pool_entry(&shared_ws));
+            }
+        }
+
+        cleanup_pool_before_connect();
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(pool_was_unlocked.load(Ordering::SeqCst));
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_gate_spaces_starts_without_serializing_handshakes() {
+        let gate = Arc::new(WebSocketConnectGate::new(Duration::from_secs(1)));
+        let preflight_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+
+        let first_gate = gate.clone();
+        let first_preflight = preflight_started.clone();
+        let first_release = release_first.clone();
+        let first_tx = started_tx.clone();
+        let first = tokio::spawn(async move {
+            first_gate
+                .wait_to_start(async move {
+                    first_preflight.notify_one();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                })
+                .await;
+            first_tx.send(tokio::time::Instant::now()).unwrap();
+            first_release.notified().await;
+        });
+        preflight_started.notified().await;
+
+        let second_gate = gate.clone();
+        let second = tokio::spawn(async move {
+            second_gate.wait_to_start(async {}).await;
+            started_tx.send(tokio::time::Instant::now()).unwrap();
+        });
+        let first_started = started_rx.recv().await.unwrap();
+        let second_started = started_rx.recv().await.unwrap();
+
+        assert!(second_started.duration_since(first_started) >= Duration::from_secs(1));
+        assert!(!first.is_finished());
+        second.await.unwrap();
+        release_first.notify_one();
+        first.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_gate_spaces_after_non_403_failure_without_retrying() {
+        let gate = WebSocketConnectGate::new(Duration::from_secs(1));
+        let attempts = AtomicUsize::new(0);
+        let starts = Mutex::new(Vec::new());
+
+        let error = connect_with_policy(
+            &gate,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            || async {},
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                starts.lock().unwrap().push(tokio::time::Instant::now());
+                async {
+                    Err::<(), ConnectAttemptError>(ConnectAttemptError::Origin(handshake_error(
+                        http::StatusCode::BAD_GATEWAY.as_u16(),
+                    )))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, http::StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        connect_with_policy(
+            &gate,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            || async {},
+            || {
+                starts.lock().unwrap().push(tokio::time::Instant::now());
+                async { Ok::<(), ConnectAttemptError>(()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        let starts = starts.lock().unwrap();
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn origin_403_waits_for_cooldown_retries_once_and_returns_second_error() {
+        let gate = WebSocketConnectGate::new(Duration::from_secs(1));
+        let attempts = AtomicUsize::new(0);
+        let starts = Mutex::new(Vec::new());
+
+        let error = connect_with_policy(
+            &gate,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            || async {},
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                starts.lock().unwrap().push(tokio::time::Instant::now());
+                async move {
+                    if attempt == 0 {
+                        Err::<(), ConnectAttemptError>(origin_forbidden_error())
+                    } else {
+                        Err::<(), ConnectAttemptError>(ConnectAttemptError::Origin(CodexError {
+                            status: http::StatusCode::FORBIDDEN.as_u16(),
+                            message: "second forbidden".to_string(),
+                            detail: Some("second-detail".to_string()),
+                            retry_after: Some("7".to_string()),
+                            origin: CodexErrorOrigin::WebSocketHandshake,
+                        }))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(error.message, "second forbidden");
+        assert_eq!(error.detail.as_deref(), Some("second-detail"));
+        assert_eq!(error.retry_after.as_deref(), Some("7"));
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocketHandshake);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let starts = starts.lock().unwrap();
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_connect_403_is_not_retried() {
+        let gate = WebSocketConnectGate::new(Duration::ZERO);
+        let attempts = AtomicUsize::new(0);
+
+        let error = connect_with_policy(
+            &gate,
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            || async {},
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<(), ConnectAttemptError>(ConnectAttemptError::ProxyTunnel(
+                        handshake_error(http::StatusCode::FORBIDDEN.as_u16()),
+                    ))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_connect_403_has_private_tunnel_provenance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while connect_response_header_end(&request).is_none() {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let proxy_url = format!("http://{proxy_addr}");
+        let proxy_config = WebSocketProxyConfig::new(None, Some(&proxy_url), None, None);
+        let client = test_websocket_client();
+
+        let error = match connect_once(
+            &client,
+            &proxy_config,
+            "wss://codex.invalid/backend-api/codex/responses",
+            &HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("proxy CONNECT rejection should fail"),
+            Err(error) => error,
+        };
+
+        match error {
+            ConnectAttemptError::ProxyTunnel(error) => {
+                assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+                assert_eq!(
+                    error.detail.as_deref(),
+                    Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
+                );
+                assert_eq!(error.origin, CodexErrorOrigin::WebSocketHandshake);
+            }
+            ConnectAttemptError::Origin(_) => panic!("proxy rejection was classified as origin"),
+        }
+        proxy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn origin_403_with_spoofed_proxy_detail_still_retries_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while connect_response_header_end(&request).is_none() {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let body = format!(
+                    "{{\"error\":{{\"message\":\"{WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL}\"}}}}"
+                );
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = test_websocket_client();
+        let proxy_config = WebSocketProxyConfig::direct();
+        let url = format!("ws://{addr}/backend-api/codex/responses");
+        let headers = HeaderMap::new();
+        let gate = WebSocketConnectGate::new(Duration::ZERO);
+
+        let error = match connect_with_policy(
+            &gate,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || async {},
+            || connect_once(&client, &proxy_config, &url, &headers),
+        )
+        .await
+        {
+            Ok(_) => panic!("spoofed origin rejection should fail after one retry"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_applies_to_each_network_attempt_not_waits_or_cooldown() {
+        let gate = WebSocketConnectGate::new(Duration::from_secs(1));
+        let attempts = AtomicUsize::new(0);
+        let started_at = tokio::time::Instant::now();
+
+        let error = connect_with_policy(
+            &gate,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            || async {},
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Err::<(), ConnectAttemptError>(origin_forbidden_error())
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(error.message, "WebSocket connect timeout after 2000ms");
+        assert_eq!(started_at.elapsed(), Duration::from_secs(6));
     }
 
     #[test]
@@ -2204,10 +2781,7 @@ mod tests {
     async fn pool_checkout_is_exclusive_and_removal_is_identity_safe() {
         let _pool_test_guard = lock_ws_pool_tests().await;
         clear_codex_websocket_pool_for_tests();
-        let first = Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
-            created_at: now_ms(),
-        });
+        let first = Arc::new(PoolEntry::new(create_dummy_stream_async().await));
         pool_insert("exclusive".to_string(), first.clone());
         assert!(Arc::ptr_eq(
             &WS_POOL.lock().unwrap().remove("exclusive").unwrap(),
@@ -2215,10 +2789,7 @@ mod tests {
         ));
         assert!(WS_POOL.lock().unwrap().remove("exclusive").is_none());
 
-        let replacement = Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
-            created_at: now_ms(),
-        });
+        let replacement = Arc::new(PoolEntry::new(create_dummy_stream_async().await));
         pool_insert("exclusive".to_string(), replacement.clone());
         pool_remove_entry("exclusive", &first);
         assert!(Arc::ptr_eq(
@@ -2237,13 +2808,7 @@ mod tests {
         let stream = create_dummy_stream_async().await;
         {
             let mut guard = WS_POOL.lock().unwrap();
-            guard.insert(
-                "test-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(stream)),
-                    created_at: now_ms(),
-                }),
-            );
+            guard.insert("test-session".to_string(), Arc::new(PoolEntry::new(stream)));
         }
         assert!(WS_POOL.lock().unwrap().contains_key("test-session"));
 
@@ -2253,6 +2818,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_connect_401_is_pre_request_handshake_error() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -2289,6 +2855,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_connect_502_preserves_retry_metadata() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -2328,6 +2895,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_connects_through_explicit_http_proxy() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -2498,6 +3066,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_wss_uses_http_connect_without_leaking_proxy_credentials() {
+        let _pool_test_guard = lock_ws_pool_tests().await;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -2571,10 +3140,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "binary-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
-                }),
+                Arc::new(PoolEntry::new(pooled_stream)),
             );
         }
 
@@ -2608,10 +3174,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "start-timeout-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
-                }),
+                Arc::new(PoolEntry::new(pooled_stream)),
             );
         }
 
@@ -2663,10 +3226,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "response-idle-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
-                }),
+                Arc::new(PoolEntry::new(pooled_stream)),
             );
         }
 
