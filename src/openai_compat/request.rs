@@ -167,6 +167,7 @@ pub fn parse_request(
             messages,
             stream: true,
             bypass_provider_model_override: false,
+            bypass_provider_effort_override: false,
             extra,
         },
         requested_model,

@@ -102,6 +102,32 @@ fn apply_auto_review_model(
     Some(route)
 }
 
+fn apply_auto_review_effort(
+    body: &mut crate::anthropic::schema::MessagesRequest,
+    count_tokens: bool,
+    configured_effort: Option<&str>,
+) -> bool {
+    if count_tokens || !is_claude_auto_review_request(body) {
+        return false;
+    }
+    let Some(effort) = configured_effort else {
+        return false;
+    };
+
+    let output_config = body
+        .extra
+        .entry("output_config".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !output_config.is_object() {
+        *output_config = Value::Object(Map::new());
+    }
+    output_config
+        .as_object_mut()
+        .expect("output_config was normalized to an object")
+        .insert("effort".to_string(), Value::String(effort.to_string()));
+    true
+}
+
 pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
@@ -1400,7 +1426,16 @@ async fn dispatch_request(
         }
     };
 
-    body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    let codex_auto_review_model = auto_review_route.is_some() && provider.name() == "codex";
+    body.bypass_provider_model_override = codex_auto_review_model;
+
+    let configured_auto_review_effort = crate::config::auto_review_effort();
+    let auto_review_effort_applied = apply_auto_review_effort(
+        &mut body,
+        count_tokens,
+        configured_auto_review_effort.as_deref(),
+    );
+    body.bypass_provider_effort_override = auto_review_effort_applied && provider.name() == "codex";
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(
@@ -1890,9 +1925,9 @@ fn _unused(session_state: Option<&SessionState>) {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, is_claude_auto_review_request};
+    use super::{apply_auto_review_effort, apply_auto_review_model, is_claude_auto_review_request};
     use crate::anthropic::schema::MessagesRequest;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn request(system: &str, stream: bool, tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(json!({
@@ -1972,6 +2007,126 @@ mod auto_review_tests {
             .expect("configured classifier should be routed");
         assert_eq!(route.override_model, "grok-4.5");
         assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn configured_effort_rewrites_the_ordinary_request_field() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        classifier.extra.insert(
+            "output_config".to_string(),
+            json!({
+                "effort": "high",
+                "format": {"type": "json_object"}
+            }),
+        );
+
+        assert!(apply_auto_review_effort(
+            &mut classifier,
+            false,
+            Some("bogus")
+        ));
+        assert_eq!(classifier.extra["output_config"]["effort"], json!("bogus"));
+        assert_eq!(
+            classifier.extra["output_config"]["format"],
+            json!({"type": "json_object"})
+        );
+    }
+
+    #[test]
+    fn configured_effort_normalizes_missing_or_malformed_output_config() {
+        for initial in [None, Some(Value::Null), Some(json!("invalid"))] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            if let Some(initial) = initial {
+                classifier
+                    .extra
+                    .insert("output_config".to_string(), initial);
+            }
+
+            assert!(apply_auto_review_effort(
+                &mut classifier,
+                false,
+                Some("low")
+            ));
+            assert_eq!(classifier.extra["output_config"], json!({"effort": "low"}));
+        }
+    }
+
+    #[test]
+    fn effort_override_follows_model_routing_but_does_not_require_it() {
+        let mut kimi_classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        kimi_classifier.model = Some("kimi-for-coding".to_string());
+        assert!(apply_auto_review_model(&mut kimi_classifier, false, None, "kimi").is_none());
+        assert!(apply_auto_review_effort(
+            &mut kimi_classifier,
+            false,
+            Some("medium")
+        ));
+        assert_eq!(kimi_classifier.model.as_deref(), Some("kimi-for-coding"));
+        assert_eq!(
+            kimi_classifier.extra["output_config"]["effort"],
+            json!("medium")
+        );
+
+        let mut rerouted = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        let route = apply_auto_review_model(&mut rerouted, false, Some("grok-4.5"), "codex")
+            .expect("configured model should route");
+        assert_eq!(route.override_model, "grok-4.5");
+        assert!(apply_auto_review_effort(
+            &mut rerouted,
+            false,
+            Some("xhigh")
+        ));
+        assert_eq!(rerouted.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(rerouted.extra["output_config"]["effort"], json!("xhigh"));
+    }
+
+    #[test]
+    fn effort_override_keeps_pr72_exclusions() {
+        let cases = [
+            request("You are an interactive coding agent.", false, json!([])),
+            request(
+                "You are a security monitor for autonomous AI coding agents.",
+                true,
+                json!([]),
+            ),
+            request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([{"name": "Bash"}]),
+            ),
+        ];
+        for mut body in cases {
+            assert!(!apply_auto_review_effort(&mut body, false, Some("low")));
+            assert!(body.extra.get("output_config").is_none());
+        }
+
+        let mut count_tokens = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        assert!(!apply_auto_review_effort(
+            &mut count_tokens,
+            true,
+            Some("low")
+        ));
+        assert!(count_tokens.extra.get("output_config").is_none());
     }
 
     #[test]

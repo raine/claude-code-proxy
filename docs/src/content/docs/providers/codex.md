@@ -32,6 +32,8 @@ When reasoning is enabled, the proxy requests an automatic reasoning summary and
 
 Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
 
+`CCP_AUTO_REVIEW_EFFORT` or the top-level `autoReviewEffort` key can replace the ordinary request effort for detected auto-review classifier requests before provider dispatch. Both are disabled by default; the environment setting takes precedence, and `off` explicitly disables a file-configured value. When the final provider is Codex, this more-specific value bypasses `CCP_CODEX_EFFORT` and `codex.effort`, while the normal request-effort validation and compaction cap still apply. See [Configuration](/reference/configuration/) for the provider-neutral routing behavior.
+
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
