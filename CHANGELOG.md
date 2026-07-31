@@ -35,8 +35,12 @@
 - Report current and provider-construction config generations plus the
   next-request/restart-required reload contract from `/version`, instead of
   implying that provider transports are hot-swapped after file edits. Emit one
-  non-secret warning for each newly observed stale generation, and fail safe
-  when the accepted file generation changes during provider construction.
+  non-secret warning for each newly observed stale generation, and mark
+  restart required when the accepted file generation changes during provider
+  construction while continuing to serve from the construction snapshot.
+- Close Codex post-ping live replay as soon as upstream generation starts, even
+  when no Anthropic text or tool bytes have been translated yet, so an explicit
+  503 after `response.created` cannot issue a second model dispatch.
 - Preserve Codex rate-limit and overload error types when an upstream failure
   arrives after streaming output has already begun, without replaying the
   partially emitted turn.

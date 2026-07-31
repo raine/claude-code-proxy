@@ -1070,7 +1070,10 @@ even when no Anthropic semantic output was emitted.
 An upstream hosted-search added, in-progress, searching, completed, or done
 event is also a replay barrier: after observing one, Codex will not retry,
 reconnect, or switch transports even if no Anthropic content block has yet been
-emitted.
+emitted. The same barrier applies once Codex starts generation (for example
+`response.created`): transport-only Anthropic `ping` events keep the
+pre-generation recovery window open, but a second model dispatch is closed after
+generation begins.
 Both Codex live transports emit a standard Anthropic `ping` after 5 seconds
 without visible output, including while waiting for the first generation event.
 HTTP SSE is decoded incrementally, so cancellation closes the upstream socket

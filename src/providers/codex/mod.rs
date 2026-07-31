@@ -1060,7 +1060,10 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                     // Once the model remains silent beyond it, establish downstream SSE so the
                     // active request does not look hung to Claude or an intermediary.
                     record_codex_stream_commit(&ctx, generation_started, keepalive_delay);
-                    if hosted_side_effect_started {
+                    // Ping alone keeps the pre-generation recovery window open, but an
+                    // upstream generation event or hosted side effect already makes a
+                    // second model dispatch unsafe for this logical request.
+                    if hosted_side_effect_started || generation_started {
                         replay_state = None;
                     }
                     return LiveStreamStart::Response(remaining_live_stream_response_with_replay(
@@ -2009,12 +2012,20 @@ fn remaining_live_stream_response_with_replay(
                         replay_state = None;
                     }
                     log_native_web_search_phase(&ctx, &payload, provider_started_at);
+                    let generation_started_before = generation_started;
                     record_codex_generation_start(
                         &ctx,
                         &payload,
                         provider_started_at,
                         &mut generation_started,
                     );
+                    // A prior generation event already makes a second model dispatch
+                    // unsafe. The current payload itself may still be the first
+                    // retryable failure after a transport-only ping, so only close
+                    // for history that predates this event here.
+                    if generation_started_before {
+                        replay_state = None;
+                    }
                     if continuation_capture
                         .as_mut()
                         .is_some_and(|capture| !capture.append(&payload))
@@ -2051,6 +2062,13 @@ fn remaining_live_stream_response_with_replay(
                                 return;
                             }
                         };
+                    // Successfully classified generation (for example response.created)
+                    // has begun even when no Anthropic text/tool bytes were produced.
+                    // Close the post-ping gate before any later transport or 503 path
+                    // can open a second model dispatch.
+                    if generation_started {
+                        replay_state = None;
+                    }
                     if !chunk.is_empty() {
                         replay_state = None;
                         record_live_stream_progress(&ctx, &chunk);
@@ -3915,6 +3933,125 @@ mod tests {
         assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
         assert!(!body.contains("event: error"), "{body}");
         assert_eq!(budget.snapshot().model, 2);
+    }
+
+    #[tokio::test]
+    async fn generation_start_after_heartbeat_closes_committed_replay_gate() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_forbidden_generation_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(3);
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Upstream has begun generation after the transport-only ping. An explicit
+        // 503 must surface in-band without a second model dispatch.
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_generation_started", "status": "in_progress"}
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the committed generation barrier should finish without replay")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: ping"), "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(
+            body.contains("temporarily unavailable") || body.contains("server_error"),
+            "{body}"
+        );
+        assert!(!body.contains("must not appear"), "{body}");
+        assert_eq!(
+            budget.snapshot().model,
+            1,
+            "generation start must keep the model dispatch count at 1"
+        );
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1,
+            "the scripted second attempt must remain unused"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_before_keepalive_commit_closes_post_ping_replay_gate() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_forbidden_pre_ping_generation_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(3);
+        // Deliver generation before the keepalive grace expires so the commit
+        // path itself must drop the replay gate.
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_pre_ping_generation", "status": "in_progress"}
+            })))
+            .await
+            .unwrap();
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("generation before ping commit should still close post-ping replay")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: ping"), "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("must not appear"), "{body}");
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
