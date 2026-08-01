@@ -64,6 +64,8 @@ struct CodexConfig {
     pub images_api: Option<bool>,
     #[serde(rename = "imagesBaseUrl")]
     pub images_base_url: Option<String>,
+    #[serde(rename = "transcriptionsApi")]
+    pub transcriptions_api: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(rename = "reasoningSummary")]
@@ -255,6 +257,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_IMAGES_BASE_URL") {
         out.push("codex.imagesBaseUrl (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_TRANSCRIPTIONS_API") {
+        out.push("codex.transcriptionsApi (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_OAUTH_HOST") {
         out.push("kimi.oauthHost (env)".to_string());
     }
@@ -333,6 +338,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.images_base_url.is_some() {
                 out.push("codex.imagesBaseUrl (config)".to_string());
+            }
+            if codex.transcriptions_api == Some(true) {
+                out.push("codex.transcriptionsApi: true".to_string());
             }
         }
     }
@@ -592,6 +600,21 @@ pub fn codex_images_api() -> bool {
     false
 }
 
+pub fn codex_transcriptions_api() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.transcriptions_api
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_images_base_url() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
@@ -816,6 +839,7 @@ mod tests {
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
+            std::env::remove_var("CCP_CODEX_TRANSCRIPTIONS_API");
             std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
         }
     }
@@ -1038,6 +1062,23 @@ mod tests {
             codex_images_base_url(),
             "https://chatgpt.com/backend-api/codex"
         );
+    }
+
+    #[test]
+    fn codex_transcriptions_api_defaults_to_disabled_and_env_overrides_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"transcriptionsApi":true}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_transcriptions_api());
+        let _enabled_env = EnvGuard::set("CCP_CODEX_TRANSCRIPTIONS_API", "false");
+        assert!(!codex_transcriptions_api());
     }
 
     #[test]

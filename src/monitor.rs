@@ -19,6 +19,7 @@ pub enum EndpointKind {
     Responses,
     ChatCompletions,
     Images,
+    Transcriptions,
 }
 
 impl EndpointKind {
@@ -29,6 +30,7 @@ impl EndpointKind {
             Self::Responses => "responses",
             Self::ChatCompletions => "chat_completions",
             Self::Images => "images",
+            Self::Transcriptions => "transcriptions",
         }
     }
 }

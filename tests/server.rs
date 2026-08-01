@@ -358,6 +358,7 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
     let features = AppFeatures {
         responses_api: false,
         images_api: true,
+        transcriptions_api: false,
     };
     let variation = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
         .oneshot(
@@ -407,6 +408,7 @@ async fn monitor_tracks_image_endpoint_without_session_affinity() {
         AppFeatures {
             responses_api: false,
             images_api: true,
+            transcriptions_api: false,
         },
     );
     let response = app
@@ -441,6 +443,7 @@ async fn image_edit_accepts_multipart_and_validates_fields() {
         AppFeatures {
             responses_api: false,
             images_api: true,
+            transcriptions_api: false,
         },
     );
     let boundary = "ccp-image-test";
@@ -486,6 +489,7 @@ async fn image_routes_are_independently_opt_in() {
         AppFeatures {
             responses_api: false,
             images_api: false,
+            transcriptions_api: false,
         },
     );
     let response = disabled
@@ -507,6 +511,7 @@ async fn image_routes_are_independently_opt_in() {
         AppFeatures {
             responses_api: false,
             images_api: true,
+            transcriptions_api: false,
         },
     );
     let response = enabled
@@ -516,6 +521,98 @@ async fn image_routes_are_independently_opt_in() {
                 .uri("/v1/images/generations")
                 .header("content-type", "application/json")
                 .body(body_string("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
+    let disabled = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: false,
+            images_api: false,
+            transcriptions_api: false,
+        },
+    );
+    let response = disabled
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/audio/transcriptions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let enabled = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: false,
+            images_api: false,
+            transcriptions_api: true,
+        },
+    );
+    let boundary = "ccp-transcription-test";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n--{boundary}--\r\n"
+    );
+    let response = enabled
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["param"], "file");
+}
+
+#[tokio::test]
+async fn transcription_route_rejects_non_audio_uploads() {
+    let app = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: false,
+            images_api: false,
+            transcriptions_api: true,
+        },
+    );
+    let boundary = "ccp-transcription-type-test";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain\r\n\r\nnot audio\r\n--{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/audio/transcriptions")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await

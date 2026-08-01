@@ -9,6 +9,23 @@ description: Release notes for claude-code-proxy.
   Codex priority service displays as `FAST`, Codex flex as `FLEX`, and Cursor
   fast requests as `FAST`, while the model column keeps the resolved model ID.
 
+## v0.1.30 (2026-07-31)
+
+- OpenAI-compatible clients can use Kimi, Grok, Cursor, or Codex through the
+  optional `POST /v1/chat/completions` and `POST /v1/responses` endpoints, with
+  support for streaming, reasoning, function tools, usage, and provider routing.
+- Codex users can transcribe audio through the optional OpenAI-compatible
+  `POST /v1/audio/transcriptions` endpoint using the existing Codex sign-in.
+  Enable it with `codex.transcriptionsApi` or
+  `CCP_CODEX_TRANSCRIPTIONS_API=1`.
+- Codex token estimates accurately count CJK text, long identifiers, minified
+  code, and base64-like content, improving context and compaction decisions.
+  ([#90](https://github.com/raine/claude-code-proxy/pull/90))
+- Codex WebSocket sessions remain reliable under high concurrency instead of
+  failing with 403 upgrade rejections.
+  ([#87](https://github.com/raine/claude-code-proxy/issues/87),
+  [#88](https://github.com/raine/claude-code-proxy/pull/88))
+
 ## v0.1.29 (2026-07-30)
 
 - Codex honors required, disabled, and single-tool choices from Claude Code, and

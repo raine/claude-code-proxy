@@ -2,10 +2,12 @@ use super::translate::request::{
     ResponsesContentPart, ResponsesFunctionCallOutput, ResponsesFunctionCallOutputContentPart,
     ResponsesInputItem, ResponsesRequest, ResponsesTool,
 };
+use tiktoken_rs::o200k_base_singleton;
 
 /// Approximate token counter for Codex translated requests.
-/// Uses a simple monotonic estimator that satisfies Claude Code's
-/// compaction logic (needs approximate, not exact counts).
+/// Text uses the OpenAI `o200k_base` tokenizer. Images, encrypted reasoning,
+/// and protocol framing still use local estimates, so the result is not a
+/// provider billing count.
 pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
     let mut total = 0u64;
 
@@ -117,27 +119,30 @@ fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
 }
 
 pub(crate) fn approx_token_count(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let mut count = 0u64;
-    let mut in_word = false;
+    u64::try_from(o200k_base_singleton().count_ordinary(text)).unwrap_or(u64::MAX)
+}
 
-    for ch in text.chars() {
-        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
-            if !in_word {
-                count += 1;
-                in_word = true;
-            }
-        } else {
-            in_word = false;
-            if !ch.is_whitespace() {
-                count += 1;
-            }
+pub(crate) fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
+    let max_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
+    if max_tokens == 0 {
+        return String::new();
+    }
+
+    let tokenizer = o200k_base_singleton();
+    let tokens = tokenizer.encode_ordinary(text);
+    if tokens.len() <= max_tokens {
+        return text.to_string();
+    }
+
+    // A token boundary may split a multi-byte UTF-8 scalar. Back up until the
+    // decoded prefix is valid rather than replacing bytes or splitting text.
+    for end in (1..=max_tokens).rev() {
+        if let Ok(prefix) = tokenizer.decode(&tokens[..end]) {
+            return prefix;
         }
     }
 
-    count.max(1)
+    String::new()
 }
 
 #[cfg(test)]
@@ -197,6 +202,34 @@ mod tests {
         }))
         .unwrap();
         assert!(count_translated_tokens(&long) >= count_translated_tokens(&short));
+    }
+
+    #[test]
+    fn o200k_counts_unbroken_text_instead_of_collapsing_it() {
+        assert_eq!(approx_token_count(&"a".repeat(4096)), 512);
+        assert_eq!(approx_token_count(&"汉字测试上下文压缩".repeat(384)), 2688);
+        assert_eq!(
+            approx_token_count(&"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo".repeat(112)),
+            2240
+        );
+        assert_eq!(
+            approx_token_count(&"function f(a){return a===0?1:a*f(a-1)};".repeat(96)),
+            1632
+        );
+    }
+
+    #[test]
+    fn truncation_respects_o200k_budget_and_utf8_boundaries() {
+        for text in [
+            "a".repeat(4096),
+            "汉字测试上下文压缩".repeat(384),
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo".repeat(112),
+        ] {
+            let truncated = truncate_to_token_budget(&text, 100);
+            assert!(text.starts_with(&truncated));
+            assert!(approx_token_count(&truncated) <= 100);
+            assert!(!truncated.is_empty());
+        }
     }
 
     #[test]

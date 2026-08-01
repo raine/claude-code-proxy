@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-proxy"
-version = "0.1.29"
+version = "0.1.30"
 description = "Anthropic-compatible proxy for Claude Code provider backends"
 edition = "2024"
 authors = ["Claude Code Proxy contributors"]
@@ -26,7 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "http2", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "blocking", "http2", "socks"] }
 base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"
@@ -45,8 +45,10 @@ flate2 = "1.0"
 ratatui = "0.29"
 crossterm = "0.28"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+tiktoken-rs = { version = "0.12", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.14"
 assert_cmd = "2"
 predicates = "3"

@@ -9,6 +9,10 @@ LLM docs: <https://claude-code-proxy.raine.dev/llms.txt>
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
+> [!TIP]
+> I'm building [aven](https://github.com/raine/aven), a local-first task manager
+> for power users and agents.
+
 ## Why?
 
 Claude Code remains an excellent coding harness, with strong tools, skills,

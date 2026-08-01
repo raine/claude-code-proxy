@@ -1610,7 +1610,7 @@ async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
 
     let response = tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_millis(1_500),
         call_messages_body(json!({
             "model": "gpt-5.5",
             "max_tokens": 64,

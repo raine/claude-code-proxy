@@ -245,6 +245,42 @@ pub fn build_codex_image_headers(
     Ok(headers)
 }
 
+pub fn build_codex_transcription_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        header_value("authorization", &format!("Bearer {}", auth.access))?,
+    );
+    headers.insert("originator", header_value("originator", "Codex Desktop")?);
+    if let Some(account_id) = auth.account_id.as_deref() {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            header_value("ChatGPT-Account-Id", account_id)?,
+        );
+    }
+    if let Some(session_id) = ctx.session_id.as_deref() {
+        headers.insert(
+            "x-client-request-id",
+            header_value("x-client-request-id", session_id)?,
+        );
+    }
+    let user_agent = config::codex_user_agent(&default_user_agent(false));
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
 fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError> {
     http::HeaderValue::from_str(value).map_err(|e| CodexError {
         status: 500,
@@ -577,6 +613,91 @@ impl CodexHttpClient {
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
+    }
+
+    pub(crate) async fn post_transcription(
+        &self,
+        base_url: &str,
+        input: &super::transcription::PreparedTranscription,
+        ctx: &RequestContext,
+    ) -> Result<reqwest::Response, CodexError> {
+        let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let mut refresh_attempted = false;
+
+        loop {
+            let headers = build_codex_transcription_headers(&auth, ctx)?;
+            let response = self.attempt_transcription(&url, &headers, input).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                refresh_attempted = true;
+                drop(response);
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            return Ok(response);
+        }
+    }
+
+    async fn attempt_transcription(
+        &self,
+        url: &str,
+        headers: &http::HeaderMap,
+        input: &super::transcription::PreparedTranscription,
+    ) -> Result<reqwest::Response, CodexError> {
+        let part = reqwest::multipart::Part::bytes(input.audio.to_vec())
+            .file_name(input.filename.clone())
+            .mime_str(&input.content_type)
+            .map_err(|error| CodexError {
+                status: 400,
+                message: "Invalid audio content type".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(language) = input.language.as_deref() {
+            form = form.text("language", language.to_string());
+        }
+        let mut request = self.native_client.post(url).multipart(form);
+        for (key, value) in headers {
+            request = request.header(key.as_str(), value.as_bytes());
+        }
+        tokio::time::timeout(
+            Duration::from_millis(IMAGE_HEADER_TIMEOUT_MS),
+            request.send(),
+        )
+        .await
+        .map_err(|_| CodexError {
+            status: 0,
+            message: format!(
+                "Timed out waiting {}ms for Codex transcription response headers",
+                IMAGE_HEADER_TIMEOUT_MS
+            ),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })?
+        .map_err(|error| CodexError {
+            status: 0,
+            message: format!("Codex transcription transport error: {error}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })
     }
 
     pub(crate) async fn post_image_json(
