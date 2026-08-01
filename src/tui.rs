@@ -1893,6 +1893,19 @@ mod tests {
     }
 
     #[test]
+    fn wide_breakpoint_reserves_readable_recent_details() {
+        const MIN_DETAILS_WIDTH: u16 = 12;
+        let minimum_wide_outer_width = (2..=u16::MAX)
+            .find(|width| LayoutTier::for_outer_width(*width) == LayoutTier::Wide)
+            .unwrap();
+        let minimum_wide_inner_width = minimum_wide_outer_width.saturating_sub(2);
+        let details_width = minimum_wide_inner_width
+            .saturating_sub(fixed_budget(&recent_columns(LayoutTier::Wide)));
+
+        assert!(details_width >= MIN_DETAILS_WIDTH);
+    }
+
+    #[test]
     fn responsive_schemas_fit_their_minimum_terminal_widths() {
         assert!(fixed_budget(&session_columns(LayoutTier::Emergency, false)) <= 75);
         assert!(fixed_budget(&session_columns(LayoutTier::Narrow, false)) <= 76);
@@ -1952,7 +1965,7 @@ mod tests {
         assert!(expanded.contains("Endpoint"), "{expanded}");
         assert!(!expanded.contains("In"), "{expanded}");
 
-        let wide = render_at(154);
+        let wide = render_at(163);
         assert!(wide.contains("Project"), "{wide}");
         assert!(wide.contains("Session"), "{wide}");
         assert!(wide.contains("In"), "{wide}");

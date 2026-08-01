@@ -9,6 +9,8 @@ mod mock;
 
 pub use mock::{MockMonitor, mock_state};
 
+use crate::providers::cursor::model::strip_cursor_routing_prefix;
+
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
 
@@ -874,13 +876,28 @@ impl MonitorStore {
     }
 }
 
+#[derive(Debug)]
+struct LatestSessionMode {
+    session_seq: Option<u64>,
+    started_at: SystemTime,
+    mode: Option<String>,
+}
+
 fn session_summaries(
     active: &[ActiveRequest],
     recent: &VecDeque<CompletedRequest>,
     session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
 ) -> Vec<SessionSummary> {
     let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
+    let mut latest_modes: HashMap<Option<String>, LatestSessionMode> = HashMap::new();
     for request in recent.iter().rev() {
+        update_latest_session_mode(
+            &mut latest_modes,
+            request.session_id.clone(),
+            request.session_seq,
+            request.started_at,
+            request.mode.clone(),
+        );
         let entry = sessions
             .entry(request.session_id.clone())
             .or_insert_with(|| SessionSummary {
@@ -908,7 +925,6 @@ fn session_summaries(
         entry.project = request.project.clone().or(entry.project.clone());
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
-        entry.mode = request.mode.clone();
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
         entry.input_tokens = entry
@@ -933,6 +949,13 @@ fn session_summaries(
     }
 
     for request in active {
+        update_latest_session_mode(
+            &mut latest_modes,
+            request.session_id.clone(),
+            request.session_seq,
+            request.started_at,
+            request.mode.clone(),
+        );
         let entry = sessions
             .entry(request.session_id.clone())
             .or_insert_with(|| SessionSummary {
@@ -958,7 +981,6 @@ fn session_summaries(
         entry.project = request.project.clone().or(entry.project.clone());
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
-        entry.mode = request.mode.clone();
         entry.effort = request.effort.clone().or(entry.effort.clone());
         entry.last_seen = max_system_time(entry.last_seen, request.started_at);
         entry.input_tokens = entry
@@ -982,6 +1004,12 @@ fn session_summaries(
         entry.last_status = request.status.label().to_string();
     }
 
+    for (session_id, latest) in latest_modes {
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.mode = latest.mode;
+        }
+    }
+
     for (session_id, session) in &mut sessions {
         if let Some(buckets) = session_output_buckets.get(session_id) {
             session.output_token_samples = buckets
@@ -994,6 +1022,31 @@ fn session_summaries(
     let mut out: Vec<_> = sessions.into_values().collect();
     out.sort_by_key(SessionSummary::label);
     out
+}
+
+fn update_latest_session_mode(
+    latest_modes: &mut HashMap<Option<String>, LatestSessionMode>,
+    session_id: Option<String>,
+    session_seq: Option<u64>,
+    started_at: SystemTime,
+    mode: Option<String>,
+) {
+    let should_replace = latest_modes.get(&session_id).is_none_or(|latest| {
+        match (session_seq, latest.session_seq) {
+            (Some(candidate), Some(current)) if candidate != current => candidate > current,
+            _ => started_at.duration_since(latest.started_at).is_ok(),
+        }
+    });
+    if should_replace {
+        latest_modes.insert(
+            session_id,
+            LatestSessionMode {
+                session_seq,
+                started_at,
+                mode,
+            },
+        );
+    }
 }
 
 fn session_token_bucket(timestamp: SystemTime) -> u64 {
@@ -1018,7 +1071,7 @@ fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
 
 fn displayed_incoming_model<'a>(provider: Option<&str>, model: &'a str) -> &'a str {
     let model = if provider == Some("cursor") {
-        model.rsplit_once(':').map_or(model, |(_, model)| model)
+        strip_cursor_routing_prefix(model)
     } else {
         model
     };
@@ -1206,6 +1259,59 @@ mod tests {
     }
 
     #[test]
+    fn newer_completed_default_mode_wins_over_older_active_fast_mode() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "older-fast",
+            Some("session".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("older-fast", "codex", "gpt-5.6-sol-fast", None);
+        monitor.execution_resolved("older-fast", "gpt-5.6-sol", Some("FAST".to_string()));
+
+        monitor.request_started(
+            "newer-default",
+            Some("session".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("newer-default", "codex", "gpt-5.6-sol", None);
+        monitor.execution_resolved("newer-default", "gpt-5.6-sol", None);
+        monitor.request_completed("newer-default", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].mode, None);
+    }
+
+    #[test]
+    fn later_session_sequence_wins_when_requests_complete_out_of_order() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "older-fast",
+            Some("session".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("older-fast", "codex", "gpt-5.6-sol-fast", None);
+        monitor.execution_resolved("older-fast", "gpt-5.6-sol", Some("FAST".to_string()));
+
+        monitor.request_started(
+            "newer-default",
+            Some("session".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("newer-default", "codex", "gpt-5.6-sol", None);
+        monitor.execution_resolved("newer-default", "gpt-5.6-sol", None);
+        monitor.request_completed("newer-default", 200, None, None);
+        monitor.request_completed("older-fast", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions[0].mode, None);
+    }
+
+    #[test]
     fn cursor_route_prefix_is_not_shown_as_model_mapping() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
@@ -1214,6 +1320,18 @@ mod tests {
 
         let state = monitor.snapshot();
         assert_eq!(state.active[0].model.as_deref(), Some("composer-2.5"));
+    }
+
+    #[test]
+    fn cursor_namespaced_model_keeps_the_resolved_wire_id() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "cursor", "cursor:vendor:model-fast", None);
+        monitor.execution_resolved("r1", "vendor:model", Some("FAST".to_string()));
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active[0].model.as_deref(), Some("vendor:model"));
+        assert_eq!(state.active[0].mode.as_deref(), Some("FAST"));
     }
 
     #[test]

@@ -34,7 +34,7 @@ impl LayoutTier {
             0..=75 => Self::Emergency,
             76..=87 => Self::Narrow,
             88..=117 => Self::Medium,
-            118..=151 => Self::Expanded,
+            118..=160 => Self::Expanded,
             _ => Self::Wide,
         }
     }
@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(LayoutTier::for_outer_width(78), LayoutTier::Narrow);
         assert_eq!(LayoutTier::for_outer_width(90), LayoutTier::Medium);
         assert_eq!(LayoutTier::for_outer_width(120), LayoutTier::Expanded);
-        assert_eq!(LayoutTier::for_outer_width(153), LayoutTier::Expanded);
-        assert_eq!(LayoutTier::for_outer_width(154), LayoutTier::Wide);
+        assert_eq!(LayoutTier::for_outer_width(162), LayoutTier::Expanded);
+        assert_eq!(LayoutTier::for_outer_width(163), LayoutTier::Wide);
     }
 }

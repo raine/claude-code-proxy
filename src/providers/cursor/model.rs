@@ -17,6 +17,13 @@ pub enum CursorAgentMode {
     Ask,
 }
 
+const CURSOR_ROUTING_PREFIXES: [(&str, CursorAgentMode); 4] = [
+    ("cursor-agent:", CursorAgentMode::Agent),
+    ("cursor-plan:", CursorAgentMode::Plan),
+    ("cursor-ask:", CursorAgentMode::Ask),
+    ("cursor:", CursorAgentMode::Agent),
+];
+
 impl CursorAgentMode {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -33,14 +40,16 @@ fn resolve_wire_model(raw: &str) -> (String, bool) {
         .unwrap_or_else(|| (raw.to_string(), false))
 }
 
+pub(crate) fn strip_cursor_routing_prefix(model: &str) -> &str {
+    CURSOR_ROUTING_PREFIXES
+        .iter()
+        .find_map(|(prefix, _)| model.strip_prefix(prefix))
+        .unwrap_or(model)
+}
+
 pub fn resolve_cursor_model(model: &str) -> Result<CursorModelResolution, String> {
     let model = model.trim();
-    for (prefix, mode) in [
-        ("cursor-agent:", CursorAgentMode::Agent),
-        ("cursor-plan:", CursorAgentMode::Plan),
-        ("cursor-ask:", CursorAgentMode::Ask),
-        ("cursor:", CursorAgentMode::Agent),
-    ] {
+    for &(prefix, mode) in &CURSOR_ROUTING_PREFIXES {
         if let Some(raw) = model.strip_prefix(prefix) {
             let (model_id, fast) = resolve_wire_model(raw);
             return Ok(CursorModelResolution {
