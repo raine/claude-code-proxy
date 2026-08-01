@@ -509,7 +509,17 @@ struct ToolSlot {
     downstream_id: String,
     name: String,
     args: String,
-    started: bool,
+    state: ToolBlockState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolBlockState {
+    /// The upstream index is known, but no downstream block has been emitted.
+    Pending,
+    /// The downstream block has started and can still receive argument deltas.
+    Open,
+    /// The downstream block was emitted and stopped; it must not be reopened.
+    Closed,
 }
 
 struct TranslationState {
@@ -686,11 +696,17 @@ impl TranslationState {
                     downstream_id: make_tool_use_id(&self.message_id, upstream_index),
                     name: String::new(),
                     args: String::new(),
-                    started: false,
+                    state: ToolBlockState::Pending,
                 });
                 self.tools.len() - 1
             }
         };
+        if self.tools[position].state == ToolBlockState::Closed {
+            anyhow::bail!(
+                "OpenCode Go tool call {} continued after its content block was closed",
+                upstream_index
+            );
+        }
         let mut new_arguments = String::new();
         {
             let slot = &mut self.tools[position];
@@ -709,13 +725,15 @@ impl TranslationState {
         }
         let should_start = {
             let slot = &self.tools[position];
-            !slot.started && !slot.upstream_id.is_empty() && !slot.name.is_empty()
+            slot.state == ToolBlockState::Pending
+                && !slot.upstream_id.is_empty()
+                && !slot.name.is_empty()
         };
         if should_start {
             self.ensure_message_start(out);
             let (block_index, id, name, args) = {
                 let slot = &mut self.tools[position];
-                slot.started = true;
+                slot.state = ToolBlockState::Open;
                 (
                     slot.block_index,
                     slot.downstream_id.clone(),
@@ -753,7 +771,7 @@ impl TranslationState {
                     stored.push_str(&args);
                 }
             }
-        } else if self.tools[position].started && !new_arguments.is_empty() {
+        } else if self.tools[position].state == ToolBlockState::Open && !new_arguments.is_empty() {
             let block_index = self.tools[position].block_index;
             emit(
                 out,
@@ -779,7 +797,7 @@ impl TranslationState {
             return Ok(Vec::new());
         }
         for slot in &self.tools {
-            if !slot.started {
+            if slot.state == ToolBlockState::Pending {
                 anyhow::bail!(
                     "OpenCode Go tool call {} ended without id or function name",
                     slot.upstream_index
@@ -910,13 +928,13 @@ impl TranslationState {
 
     fn close_tools(&mut self, out: &mut Vec<u8>) {
         for slot in &mut self.tools {
-            if slot.started {
+            if slot.state == ToolBlockState::Open {
                 emit(
                     out,
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":slot.block_index}),
                 );
-                slot.started = false;
+                slot.state = ToolBlockState::Closed;
             }
         }
     }
@@ -1447,6 +1465,136 @@ mod tests {
             );
             assert!(rendered.contains("message_stop"), "split {split}");
         }
+    }
+
+    #[test]
+    fn live_stream_accepts_text_and_reasoning_after_a_tool_call() {
+        for (upstream, expected_type, expected_value) in [
+            (
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"after tool\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                "text",
+                "after tool",
+            ),
+            (
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"after tool\"}}]}\n\n",
+                    "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                "thinking",
+                "after tool",
+            ),
+        ] {
+            for split in 0..=upstream.len() {
+                let mut translator =
+                    LiveStreamTranslator::new("msg_after_tool".into(), "glm-5.2".into());
+                let mut output = translator.push(&upstream.as_bytes()[..split]).unwrap();
+                output.extend(translator.push(&upstream.as_bytes()[split..]).unwrap());
+                output.extend(translator.finish().unwrap());
+                let rendered = String::from_utf8(output).unwrap();
+                let events = crate::anthropic::sse::parse_sse_events(rendered.as_bytes())
+                    .into_iter()
+                    .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+                    .collect::<Vec<_>>();
+                let tool_starts = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| {
+                        event["type"] == "content_block_start"
+                            && event["content_block"]["type"] == "tool_use"
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let tool_stops = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| {
+                        event["type"] == "content_block_stop" && event["index"] == 0
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let following_start = events
+                    .iter()
+                    .position(|event| {
+                        event["type"] == "content_block_start"
+                            && event["content_block"]["type"] == expected_type
+                    })
+                    .unwrap();
+                assert_eq!(tool_starts.len(), 1, "split {split}");
+                assert_eq!(tool_stops.len(), 1, "split {split}");
+                assert!(tool_starts[0] < tool_stops[0], "split {split}");
+                assert!(tool_stops[0] < following_start, "split {split}");
+                assert_eq!(
+                    rendered
+                        .matches("\"id\":\"toolu_msg_after_tool_0\"")
+                        .count(),
+                    1,
+                    "split {split}"
+                );
+                assert!(rendered.contains("message_stop"), "split {split}");
+            }
+
+            let response =
+                accumulate_response(upstream.as_bytes(), "msg_after_tool_buffered", "glm-5.2")
+                    .unwrap();
+            assert_eq!(response["content"][0]["type"], "tool_use");
+            assert_eq!(response["content"][1]["type"], expected_type);
+            let value_field = if expected_type == "text" {
+                "text"
+            } else {
+                "thinking"
+            };
+            assert_eq!(response["content"][1][value_field], expected_value);
+            assert_eq!(response["stop_reason"], "tool_use");
+        }
+    }
+
+    #[test]
+    fn tool_call_without_identity_still_fails_at_finalize() {
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let error = accumulate_response(upstream.as_bytes(), "msg_missing", "glm-5.2")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ended without id or function name"));
+    }
+
+    #[test]
+    fn tool_call_cannot_resume_after_its_content_block_closed() {
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"after tool\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" \"}}]}}]}\n\n"
+        );
+        let error = accumulate_response(upstream.as_bytes(), "msg_resumed", "glm-5.2")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("continued after its content block was closed"));
+    }
+
+    #[test]
+    fn new_tool_index_can_start_after_text() {
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"first\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"between tools\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"second\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_new_tool", "glm-5.2").unwrap();
+        assert_eq!(response["content"][0]["type"], "tool_use");
+        assert_eq!(response["content"][1]["type"], "text");
+        assert_eq!(response["content"][2]["type"], "tool_use");
+        assert_eq!(response["content"][2]["name"], "second");
     }
 
     #[test]
