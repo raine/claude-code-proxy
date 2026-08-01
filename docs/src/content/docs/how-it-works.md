@@ -10,7 +10,7 @@ claude-code-proxy exposes Anthropic Messages and optional OpenAI-compatible rout
   <div class="route-arrow" aria-hidden="true">→</div>
   <div class="route-node"><strong>Proxy pipeline</strong><span>route model<br/>refresh auth<br/>translate events</span></div>
   <div class="route-arrow" aria-hidden="true">→</div>
-  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>Cursor Connect</code></div>
+  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>OpenCode Chat / Messages / Responses</code><code>Cursor Connect</code></div>
 </div>
 
 ## Anthropic requests
@@ -25,17 +25,17 @@ claude-code-proxy exposes Anthropic Messages and optional OpenAI-compatible rout
 
 ## OpenAI-compatible requests
 
-Enable the OpenAI routes to use `/v1/chat/completions` or `/v1/responses`. The `model` field chooses Codex, Kimi, Grok, or Cursor in the same way it does on `/v1/messages`.
+Enable the OpenAI routes to use `/v1/chat/completions` or `/v1/responses`. The `model` field chooses Codex, Kimi, Grok, OpenCode Go, or Cursor in the same way it does on `/v1/messages`.
 
 Codex Responses requests go directly to the native Codex API. The proxy translates other OpenAI requests to the selected provider and returns either Chat Completions or Responses output. Streaming and non-streaming requests use the same translation rules, and unsupported fields return an error instead of being ignored.
 
 ## Authentication boundary
 
-Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
+Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). OpenCode Go instead uses the configured subscription API key. Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
 
 ## Routing boundary
 
-Routing happens per request, not per server process or API surface. Codex IDs, Kimi IDs, Grok IDs, Cursor prefixes, and configured Anthropic-style aliases can share one listener across `/v1/messages`, `/v1/chat/completions`, and `/v1/responses`. Unknown model IDs return HTTP 400 with the supported catalog.
+Routing happens per request, not per server process or API surface. Codex IDs, Kimi IDs, Grok IDs, OpenCode Go IDs, Cursor prefixes, and configured Anthropic-style aliases can share one listener across `/v1/messages`, `/v1/chat/completions`, and `/v1/responses`. Unknown model IDs return HTTP 400 with the supported catalog.
 
 ## Session state
 

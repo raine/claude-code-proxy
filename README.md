@@ -1,7 +1,7 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, or **Cursor
-Agent**.
+Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode Go**,
+or **Cursor Agent**.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
@@ -88,6 +88,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
+| OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
 
 Run `claude-code-proxy models` for the current catalog or
