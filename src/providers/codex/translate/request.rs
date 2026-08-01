@@ -276,10 +276,6 @@ pub(crate) fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     }
 }
 
-fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
-    resolve_effort_override(effort, config::codex_effort().as_deref())
-}
-
 pub(crate) fn resolve_effort_override(
     effort: Option<Effort>,
     override_effort: Option<&str>,
@@ -526,10 +522,13 @@ pub fn translate_request(
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = resolve_effort(codex_effort)?;
+    let global_effort = (!req.bypass_provider_effort_override)
+        .then(config::codex_effort)
+        .flatten();
+    let mut resolved_effort = resolve_effort_override(codex_effort, global_effort.as_deref())?;
     if is_compact
         && let Some(cap) = compact_effort_cap()
-        && resolved_effort.as_ref().is_some_and(|e| *e > cap)
+        && resolved_effort.as_ref().is_some_and(|effort| *effort > cap)
     {
         resolved_effort = Some(cap);
     }
@@ -1570,6 +1569,30 @@ mod tests {
     fn translate_effort_override_max_maps_to_max() {
         let effort = resolve_effort_override(Some(Effort::Low), Some("max")).unwrap();
         assert!(matches!(effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn provider_effort_bypass_marker_cannot_be_spoofed_or_serialized() {
+        let spoofed: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "bypass_provider_effort_override": true
+        }))
+        .unwrap();
+        assert!(!spoofed.bypass_provider_effort_override);
+
+        let mut internal: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+        internal.bypass_provider_effort_override = true;
+        assert!(
+            serde_json::to_value(internal)
+                .unwrap()
+                .get("bypass_provider_effort_override")
+                .is_none()
+        );
     }
 
     #[test]

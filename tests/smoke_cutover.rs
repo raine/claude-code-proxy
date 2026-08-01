@@ -7,7 +7,7 @@ use axum::response::Response;
 use claude_code_proxy::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
-use claude_code_proxy::{registry::Registry, server::app};
+use claude_code_proxy::{config::AliasProvider, registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -61,6 +61,14 @@ impl EnvGuard {
         }
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -85,14 +93,26 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    call_messages_body_for_session(body, "smoke-session").await
+}
+
+async fn call_count_tokens_body(body: Value) -> Response {
+    call_messages_body_for_uri(body, "/v1/messages/count_tokens", "smoke-session").await
+}
+
+async fn call_messages_body_for_session(body: Value, session_id: &str) -> Response {
+    call_messages_body_for_uri(body, "/v1/messages", session_id).await
+}
+
+async fn call_messages_body_for_uri(body: Value, uri: &str, session_id: &str) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri(uri)
                 .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "smoke-session")
+                .header("x-claude-code-session-id", session_id)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -784,6 +804,96 @@ async fn smoke_kimi_messages_uses_mock_upstream() {
     assert!(!sent.to_string().contains("compaction_trigger"));
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_auto_review_effort_follows_kimi_routes() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "kimi");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"review ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_KIMI_BASE_URL", &upstream);
+    let _review_model_env = EnvGuard::remove("CCP_AUTO_REVIEW_MODEL");
+    let _review_effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "low");
+    let classifier_body = |model: &str, effort: &str| {
+        json!({
+            "model": model,
+            "max_tokens": 64,
+            "stream": false,
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+            }],
+            "messages": [{"role":"user","content":"review this Bash command"}],
+            "tools": [],
+            "output_config": {"effort": effort}
+        })
+    };
+
+    let effort_only = call_messages_body_for_session(
+        classifier_body("kimi-for-coding", "high"),
+        "smoke-effort-only-affinity",
+    )
+    .await;
+    assert_eq!(effort_only.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(effort_only.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        claude_code_proxy::session::existing_session_now(Some("smoke-effort-only-affinity"))
+            .and_then(|state| state.affinity_provider),
+        Some(AliasProvider::Kimi),
+        "an effort-only auto-review request must retain normal affinity bookkeeping"
+    );
+
+    {
+        let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "kimi-for-coding");
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "xhigh");
+        let rerouted = call_messages_body(classifier_body("gpt-5.6-sol", "medium")).await;
+        assert_eq!(rerouted.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(rerouted.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    let normal = call_messages_body(json!({
+        "model": "kimi-for-coding",
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"hello"}],
+        "output_config": {"effort": "high"}
+    }))
+    .await;
+    assert_eq!(normal.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(normal.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0]["model"], "kimi-for-coding");
+    assert_eq!(sent[0]["reasoning_effort"], "low");
+    assert_eq!(sent[1]["model"], "kimi-for-coding");
+    assert_eq!(sent[1]["reasoning_effort"], "high");
+    assert_eq!(sent[2]["model"], "kimi-for-coding");
+    assert_eq!(sent[2]["reasoning_effort"], "high");
+}
+
 // ---------------------------------------------------------------------------
 // Codex HTTP smoke: mock upstream verifies request shape and returns
 // Responses SSE events.
@@ -1093,6 +1203,10 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let _codex_model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-5.6-sol");
+    let _review_model_env = EnvGuard::remove("CCP_AUTO_REVIEW_MODEL");
+    let _review_effort_env = EnvGuard::remove("CCP_AUTO_REVIEW_EFFORT");
+    let _codex_effort_env = EnvGuard::remove("CCP_CODEX_EFFORT");
+    let _compact_effort_env = EnvGuard::remove("CCP_COMPACT_EFFORT");
     let classifier_body = || {
         json!({
             "model": "gpt-5.6-sol",
@@ -1103,7 +1217,8 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
                 "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
             }],
             "messages": [{"role":"user","content":"review this Bash command"}],
-            "tools": []
+            "tools": [],
+            "output_config": {"effort": "high"}
         })
     };
 
@@ -1114,7 +1229,8 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
         .unwrap();
 
     {
-        let _review_model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "low");
+        let _global_effort_env = EnvGuard::set("CCP_CODEX_EFFORT", "bogus");
         let classifier = call_messages_body(classifier_body()).await;
         assert_eq!(classifier.status(), StatusCode::OK);
         let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
@@ -1122,17 +1238,96 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
             .unwrap();
     }
 
-    let normal = call_messages("gpt-5.6-sol").await;
-    assert_eq!(normal.status(), StatusCode::OK);
-    let _ = axum::body::to_bytes(normal.into_body(), usize::MAX)
-        .await
+    {
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "none");
+        let classifier = call_messages_body(classifier_body()).await;
+        assert_eq!(classifier.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("Invalid output_config.effort: none"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let count_tokens = call_count_tokens_body(classifier_body()).await;
+        assert_eq!(count_tokens.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(count_tokens.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
         .unwrap();
+        assert!(
+            body["input_tokens"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 0)
+        );
+    }
+
+    {
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "off");
+        let _global_effort_env = EnvGuard::set("CCP_CODEX_EFFORT", "low");
+        let classifier = call_messages_body(classifier_body()).await;
+        assert_eq!(classifier.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    {
+        let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-5.6-terra");
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "max");
+        let classifier = call_messages_body(classifier_body()).await;
+        assert_eq!(classifier.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    {
+        let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "unknown-review-model");
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "low");
+        let classifier = call_messages_body(classifier_body()).await;
+        assert_eq!(classifier.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(classifier.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("unknown-review-model"),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    {
+        let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", "low");
+        let normal = call_messages_body(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"hello"}],
+            "output_config": {"effort": "high"}
+        }))
+        .await;
+        assert_eq!(normal.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(normal.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
 
     let sent = captured.lock().unwrap();
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 5);
     assert_eq!(sent[0]["model"], "gpt-5.6-luna");
-    assert_eq!(sent[1]["model"], "gpt-5.6-terra");
-    assert_eq!(sent[2]["model"], "gpt-5.6-sol");
+    assert_eq!(sent[0]["reasoning"]["effort"], "high");
+    assert_eq!(sent[1]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[1]["reasoning"]["effort"], "low");
+    assert_eq!(sent[2]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[2]["reasoning"]["effort"], "low");
+    assert_eq!(sent[3]["model"], "gpt-5.6-terra");
+    assert_eq!(sent[3]["reasoning"]["effort"], "max");
+    assert_eq!(sent[4]["model"], "gpt-5.6-sol");
+    assert_eq!(sent[4]["reasoning"]["effort"], "high");
 }
 
 #[allow(clippy::await_holding_lock)]
