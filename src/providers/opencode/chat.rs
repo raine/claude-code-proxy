@@ -126,6 +126,7 @@ fn build_messages(req: &MessagesRequest, model: &str) -> anyhow::Result<Vec<Valu
 
 fn push_user_messages(messages: &mut Vec<Value>, blocks: &[ContentBlock]) {
     let mut content = Vec::new();
+    let mut tool_messages = Vec::new();
     let flush = |messages: &mut Vec<Value>, content: &mut Vec<Value>| {
         if content.is_empty() {
             return;
@@ -159,16 +160,22 @@ fn push_user_messages(messages: &mut Vec<Value>, blocks: &[ContentBlock]) {
                 content: result,
                 is_error,
             } => {
-                flush(messages, &mut content);
-                messages.push(json!({
+                let rendered = render_tool_result(result, is_error.unwrap_or(false));
+                tool_messages.push(json!({
                     "role":"tool",
                     "tool_call_id":tool_use_id,
-                    "content":tool_result_text(result, is_error.unwrap_or(false)),
+                    "content":rendered.text,
                 }));
+                content.extend(rendered.images);
             }
             ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => {}
         }
     }
+    // A parallel assistant tool-call turn requires every matching tool
+    // response before any subsequent user message. Keep tool results in their
+    // original order, then reattach vision parts and ordinary user content in
+    // one protocol-compatible user message.
+    messages.extend(tool_messages);
     flush(messages, &mut content);
 }
 
@@ -222,8 +229,14 @@ fn assistant_message(blocks: &[ContentBlock], deepseek: bool) -> anyhow::Result<
     Ok(Some(Value::Object(message)))
 }
 
-fn tool_result_text(value: &Value, is_error: bool) -> String {
+struct RenderedToolResult {
+    text: String,
+    images: Vec<Value>,
+}
+
+fn render_tool_result(value: &Value, is_error: bool) -> RenderedToolResult {
     let mut text = String::new();
+    let mut images = Vec::new();
     if is_error {
         text.push_str("[tool execution error]\n");
     }
@@ -237,6 +250,15 @@ fn tool_result_text(value: &Value, is_error: bool) -> String {
                             text.push_str(value);
                         }
                     }
+                    Some("image") => match normalized_tool_result_image(part) {
+                        Some(image_url) => {
+                            images.push(json!({
+                                "type":"image_url",
+                                "image_url":{"url":image_url},
+                            }));
+                        }
+                        None => text.push_str("[unsupported tool result block omitted: image]"),
+                    },
                     Some(kind) => {
                         text.push_str(&format!("[unsupported tool result block omitted: {kind}]"))
                     }
@@ -246,7 +268,17 @@ fn tool_result_text(value: &Value, is_error: bool) -> String {
         }
         other => text.push_str(&other.to_string()),
     }
-    text
+    RenderedToolResult { text, images }
+}
+
+fn normalized_tool_result_image(part: &Value) -> Option<String> {
+    let block = normalize_content(&Value::Array(vec![part.clone()]), json!({}))
+        .into_iter()
+        .next()?;
+    let ContentBlock::Image { source } = block else {
+        return None;
+    };
+    Some(image_source_to_url(&source))
 }
 
 fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<Value>> {
@@ -473,7 +505,8 @@ enum BlockKind {
 struct ToolSlot {
     upstream_index: usize,
     block_index: usize,
-    id: String,
+    upstream_id: String,
+    downstream_id: String,
     name: String,
     args: String,
     started: bool,
@@ -649,7 +682,8 @@ impl TranslationState {
                 self.tools.push(ToolSlot {
                     upstream_index,
                     block_index,
-                    id: String::new(),
+                    upstream_id: String::new(),
+                    downstream_id: make_tool_use_id(&self.message_id, upstream_index),
                     name: String::new(),
                     args: String::new(),
                     started: false,
@@ -661,7 +695,7 @@ impl TranslationState {
         {
             let slot = &mut self.tools[position];
             if let Some(id) = id {
-                slot.id.push_str(&id);
+                slot.upstream_id.push_str(&id);
             }
             if let Some(function) = function {
                 if let Some(name) = function.name {
@@ -675,7 +709,7 @@ impl TranslationState {
         }
         let should_start = {
             let slot = &self.tools[position];
-            !slot.started && !slot.id.is_empty() && !slot.name.is_empty()
+            !slot.started && !slot.upstream_id.is_empty() && !slot.name.is_empty()
         };
         if should_start {
             self.ensure_message_start(out);
@@ -684,7 +718,7 @@ impl TranslationState {
                 slot.started = true;
                 (
                     slot.block_index,
-                    slot.id.clone(),
+                    slot.downstream_id.clone(),
                     slot.name.clone(),
                     slot.args.clone(),
                 )
@@ -901,6 +935,16 @@ fn parse_finish_reason(reason: &str) -> anyhow::Result<StopReason> {
 fn make_thinking_signature(message_id: &str, index: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(format!("ccp:opencode:v1:{message_id}:{index}"))
+}
+
+fn make_tool_use_id(message_id: &str, upstream_index: usize) -> String {
+    // Several Chat Completions providers restart tool-call IDs (for example,
+    // `Agent_0`) in every independent completion. Nested Claude Code agents
+    // are flattened into one downstream stream, so forwarding those IDs can
+    // make a child tool call appear to reference itself as its parent. The
+    // response message ID is generated uniquely by CCP; namespacing the slot
+    // with it keeps split deltas stable and independent completions distinct.
+    format!("toolu_{message_id}_{upstream_index}")
 }
 
 fn emit(out: &mut Vec<u8>, event: &str, value: Value) {
@@ -1226,9 +1270,135 @@ mod tests {
         assert_eq!(wire["reasoning_effort"], "max");
         assert_eq!(wire["parallel_tool_calls"], false);
         assert_eq!(wire["messages"][1]["reasoning_content"], "reason");
+        assert_eq!(wire["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(wire["messages"][2]["tool_call_id"], "call_1");
         assert_eq!(
             wire["messages"][1]["tool_calls"][0]["function"]["arguments"],
             "{\"q\":\"rust\"}"
+        );
+    }
+
+    #[test]
+    fn tool_result_images_follow_the_required_tool_response_in_image_order() {
+        let req = request(json!({
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_image","name":"Read","input":{"file_path":"image.png"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_image","is_error":true,"content":[
+                        {"type":"text","text":"before"},
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}},
+                        {"type":"text","text":"between"},
+                        {"type":"image","source":{"type":"url","url":"https://example.invalid/image.webp"}},
+                        {"type":"text","text":"after"}
+                    ]}
+                ]}
+            ]
+        }));
+
+        let wire = serde_json::to_value(prepare_request(&req, "glm-5.2").unwrap()).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_image");
+        assert_eq!(
+            messages[1]["content"],
+            concat!("[tool execution error]\n", "before", "between", "after")
+        );
+        assert!(
+            !messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported tool result block omitted: image")
+        );
+
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"],
+            json!([
+                {
+                    "type":"image_url",
+                    "image_url":{"url":"data:image/png;base64,YWJj"}
+                },
+                {
+                    "type":"image_url",
+                    "image_url":{"url":"https://example.invalid/image.webp"}
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_image_reattachment_preserves_surrounding_user_message_order() {
+        let req = request(json!({
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"before tool"},
+                {"type":"tool_result","tool_use_id":"call_image","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"YWJj"}}
+                ]},
+                {"type":"text","text":"after tool"}
+            ]}]
+        }));
+
+        let wire = serde_json::to_value(prepare_request(&req, "glm-5.2").unwrap()).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_image");
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"],
+            json!([
+                {"type":"text","text":"before tool"},
+                {
+                    "type":"image_url",
+                    "image_url":{"url":"data:image/jpeg;base64,YWJj"}
+                },
+                {"type":"text","text":"after tool"}
+            ])
+        );
+    }
+
+    #[test]
+    fn parallel_tool_results_stay_contiguous_before_reattached_images() {
+        let req = request(json!({
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_input","name":"Read","input":{"file_path":"input.txt"}},
+                    {"type":"tool_use","id":"call_image","name":"Read","input":{"file_path":"image.png"}},
+                    {"type":"tool_use","id":"call_bash","name":"Bash","input":{"command":"pwd"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_input","content":"input ok"},
+                    {"type":"tool_result","tool_use_id":"call_image","content":[
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}}
+                    ]},
+                    {"type":"tool_result","tool_use_id":"call_bash","content":"bash ok"}
+                ]}
+            ]
+        }));
+
+        let wire = serde_json::to_value(prepare_request(&req, "deepseek-v4-pro").unwrap()).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "tool", "tool", "user"]
+        );
+        assert_eq!(messages[1]["tool_call_id"], "call_input");
+        assert_eq!(messages[2]["tool_call_id"], "call_image");
+        assert_eq!(messages[2]["content"], "");
+        assert_eq!(messages[3]["tool_call_id"], "call_bash");
+        assert_eq!(
+            messages[4]["content"],
+            json!([{
+                "type":"image_url",
+                "image_url":{"url":"data:image/png;base64,YWJj"}
+            }])
         );
     }
 
@@ -1266,12 +1436,36 @@ mod tests {
             assert!(rendered.contains("text_delta"), "split {split}");
             assert!(rendered.contains("input_json_delta"), "split {split}");
             assert!(rendered.contains("tool_use"), "split {split}");
+            assert_eq!(
+                rendered.matches("\"id\":\"toolu_msg_1_7\"").count(),
+                1,
+                "split {split}"
+            );
             assert!(
                 rendered.contains("cache_read_input_tokens"),
                 "split {split}"
             );
             assert!(rendered.contains("message_stop"), "split {split}");
         }
+    }
+
+    #[test]
+    fn chat_tool_ids_are_namespaced_per_response() {
+        let upstream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"Agent_0\",\"function\":{\"name\":\"Agent\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let main = accumulate_response(upstream.as_bytes(), "msg_main", "kimi-k3").unwrap();
+        let child = accumulate_response(upstream.as_bytes(), "msg_child", "kimi-k3").unwrap();
+        let main_id = main["content"][0]["id"].as_str().unwrap();
+        let child_id = child["content"][0]["id"].as_str().unwrap();
+
+        assert_eq!(main_id, "toolu_msg_main_0");
+        assert_eq!(child_id, "toolu_msg_child_0");
+        assert_ne!(main_id, child_id);
+        assert_ne!(main_id, "Agent_0");
+        assert_ne!(child_id, "Agent_0");
     }
 
     #[test]
