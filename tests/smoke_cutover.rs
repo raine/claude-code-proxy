@@ -2155,3 +2155,367 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     traffic_file(&files, "032-upstream-response-body.sse");
     traffic_file(&files, "040-upstream-event.json");
 }
+
+// ---------------------------------------------------------------------------
+// Fault injection: rate limits and retry boundaries
+// ---------------------------------------------------------------------------
+
+/// WebSocket upstream that serves each connection with `script(nth)`, counting
+/// how many connections the proxy opened (its retry behavior made visible).
+async fn spawn_websocket_fault_upstream(
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    script: fn(u32) -> Vec<String>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        let mut nth: u32 = 0;
+        while let Ok((stream, _)) = listener.accept().await {
+            connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = script(nth);
+            nth += 1;
+            tokio::spawn(async move {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    let _ = ws.next().await;
+                    for event in events {
+                        let _ = ws.send(Message::Text(event)).await;
+                    }
+                }
+            });
+        }
+    });
+
+    addr_str
+}
+
+fn conn_count(c: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    c.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Count logical Anthropic messages by the SSE event line, not the substring
+/// (which also appears in the data payload's "type" field).
+fn message_start_events(body: &str) -> usize {
+    body.matches("event: message_start").count()
+}
+
+fn rate_limit_reached_event() -> String {
+    json!({
+        "type": "codex.rate_limits",
+        "rate_limits": {
+            "limit_reached": true,
+            "allowed": false,
+            "primary": {"used_percent": 100, "window_minutes": 10080, "reset_after_seconds": 518773}
+        }
+    })
+    .to_string()
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_rate_limit_at_stream_start_returns_429_fast_without_retry_storm() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_fault_upstream(connections.clone(), |_| vec![rate_limit_reached_event()])
+            .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let started = std::time::Instant::now();
+    let response = call_messages("gpt-5.5").await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = response
+        .headers()
+        .get(http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(retry_after, "518773", "Retry-After must carry the reset");
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["error"]["type"], "rate_limit_error");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "quota exhaustion must fail fast, took {elapsed:?}"
+    );
+    assert_eq!(
+        conn_count(&connections),
+        1,
+        "an exhausted quota must not be retried against the upstream"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_rate_limit_mid_stream_surfaces_error_without_replaying_request() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_websocket_fault_upstream(connections.clone(), |_| {
+        vec![
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#.to_string(),
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial text"}"#.to_string(),
+            rate_limit_reached_event(),
+        ]
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains("partial text"), "streamed text must be kept");
+    assert!(
+        body.contains("event: error"),
+        "mid-stream rate limit must surface as an SSE error event, body: {body}"
+    );
+    assert_eq!(
+        message_start_events(&body),
+        1,
+        "no silent replay: exactly one logical message"
+    );
+    assert_eq!(
+        conn_count(&connections),
+        1,
+        "after semantic output the request must not be replayed"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_disconnect_before_output_retries_transparently() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_websocket_fault_upstream(connections.clone(), |nth| {
+        if nth == 0 {
+            vec![] // close before any event: retryable
+        } else {
+            vec![
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#.to_string(),
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"recovered ok"}"#.to_string(),
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#.to_string(),
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#.to_string(),
+            ]
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages("gpt-5.5").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "recovered ok");
+    assert!(
+        conn_count(&connections) >= 2,
+        "pre-output disconnect must be retried"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_disconnect_after_output_does_not_replay_request() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_websocket_fault_upstream(connections.clone(), |_| {
+        vec![
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#.to_string(),
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial before drop"}"#.to_string(),
+            // close without a terminal event
+        ]
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains("partial before drop"));
+    assert!(
+        body.contains("event: error"),
+        "post-output disconnect must surface an error event"
+    );
+    assert_eq!(
+        message_start_events(&body),
+        1,
+        "no duplicated message after post-output disconnect"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        conn_count(&connections),
+        1,
+        "after semantic output the request must not be replayed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection: more transport faults (overload, malformed, no-reset)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_overload_at_stream_start_maps_to_overloaded_error() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_websocket_fault_upstream(connections.clone(), |_| {
+        vec![
+            json!({
+                "type": "error",
+                "status": 529,
+                "error": {"type": "overloaded_error", "message": "overloaded"}
+            })
+            .to_string(),
+        ]
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages("gpt-5.5").await;
+    // 529 is retryable, so after the retry budget it surfaces as an
+    // overloaded_error, never a silent hang or a misclassified 500.
+    let status = response.status();
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::from_u16(529).unwrap());
+    assert_eq!(value["error"]["type"], "overloaded_error");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_malformed_frame_does_not_crash_the_stream() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // A garbage frame, then a normal completion: the proxy must tolerate the
+    // unparseable frame and still deliver the real response.
+    let upstream = spawn_websocket_fault_upstream(connections.clone(), |_| {
+        vec![
+            "this is not json".to_string(),
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#.to_string(),
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"survived garbage"}"#.to_string(),
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#.to_string(),
+            r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#.to_string(),
+        ]
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages("gpt-5.5").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "survived garbage");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn fault_rate_limit_without_reset_still_returns_429() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // limit_reached with no primary/reset_after_seconds: still a clean 429,
+    // just without a precise Retry-After.
+    let upstream = spawn_websocket_fault_upstream(connections.clone(), |_| {
+        vec![
+            json!({"type": "codex.rate_limits", "rate_limits": {"limit_reached": true}})
+                .to_string(),
+        ]
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages("gpt-5.5").await;
+    let status = response.status();
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(value["error"]["type"], "rate_limit_error");
+}
