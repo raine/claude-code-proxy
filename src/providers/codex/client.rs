@@ -351,6 +351,32 @@ pub struct CodexResponse {
     pub transport: ActualTransport,
 }
 
+pub(crate) struct OwnerAwareCodexResponse {
+    response: CodexResponse,
+    pub(crate) socket_id: Option<u64>,
+}
+
+impl OwnerAwareCodexResponse {
+    pub(crate) fn new(response: CodexResponse, socket_id: Option<u64>) -> Self {
+        Self {
+            response,
+            socket_id,
+        }
+    }
+
+    fn into_response(self) -> CodexResponse {
+        self.response
+    }
+}
+
+impl std::ops::Deref for OwnerAwareCodexResponse {
+    type Target = CodexResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -882,6 +908,24 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
     ) -> Result<CodexResponse, CodexError> {
+        let reservation =
+            continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
+        self.post_codex_with_transport(
+            body,
+            ctx,
+            reservation.as_ref(),
+            crate::config::codex_transport(),
+        )
+        .await
+        .map(OwnerAwareCodexResponse::into_response)
+    }
+
+    pub(crate) async fn post_codex_for_owner(
+        &self,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) -> Result<OwnerAwareCodexResponse, CodexError> {
         self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
             .await
     }
@@ -952,9 +996,9 @@ impl CodexHttpClient {
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationCandidate>,
+        continuation: Option<&super::continuation::ContinuationReservation>,
         transport: crate::config::CodexTransport,
-    ) -> Result<CodexResponse, CodexError> {
+    ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
@@ -969,18 +1013,16 @@ impl CodexHttpClient {
         if should_reset_websocket_pool(continuation)
             && let Some(owner) = initial_pool_owner.as_ref()
         {
-            super::websocket::invalidate_codex_websocket_pool_turn(
+            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(
                 owner,
-                continuation.and_then(|candidate| candidate.turn_id),
+                continuation.and_then(super::continuation::ContinuationReservation::turn_id),
             );
         }
 
-        let turn_id = continuation.and_then(|candidate| candidate.turn_id);
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
         loop {
-            let pool_owner = websocket_pool_owner(active_continuation.as_ref()).cloned();
             let result = match transport {
                 CodexTransport::Http => {
                     let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -992,12 +1034,18 @@ impl CodexHttpClient {
                     })?;
                     self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
                         .await
+                        .map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket => {
                     let ws_headers =
                         build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(body, active_continuation.as_ref());
+                    let ws_body = build_websocket_request(
+                        body,
+                        active_continuation
+                            .as_ref()
+                            .map(super::continuation::ContinuationReservation::candidate),
+                    );
 
                     super::websocket::codex_websocket_request(
                         &self.websocket_client,
@@ -1007,7 +1055,6 @@ impl CodexHttpClient {
                         &ws_body,
                         ctx,
                         ctx.traffic.as_deref(),
-                        pool_owner.as_ref(),
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
@@ -1018,7 +1065,12 @@ impl CodexHttpClient {
                     let ws_headers =
                         build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(body, active_continuation.as_ref());
+                    let ws_body = build_websocket_request(
+                        body,
+                        active_continuation
+                            .as_ref()
+                            .map(super::continuation::ContinuationReservation::candidate),
+                    );
 
                     // Try WebSocket first
                     let ws_result = super::websocket::codex_websocket_request(
@@ -1029,7 +1081,6 @@ impl CodexHttpClient {
                         &ws_body,
                         ctx,
                         ctx.traffic.as_deref(),
-                        pool_owner.as_ref(),
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
@@ -1038,6 +1089,16 @@ impl CodexHttpClient {
 
                     match ws_result {
                         Ok(response) => Ok(response),
+                        Err(err)
+                            if should_retry_without_continuation(
+                                &err,
+                                active_continuation.as_ref(),
+                            ) =>
+                        {
+                            // Drop stale continuation state before considering a
+                            // replacement transport or connection.
+                            Err(err)
+                        }
                         Err(err)
                             if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
                         {
@@ -1057,6 +1118,7 @@ impl CodexHttpClient {
                                 body.client_metadata.is_some(),
                             )
                             .await
+                            .map(|response| OwnerAwareCodexResponse::new(response, None))
                         }
                         Err(err) => Err(err),
                     }
@@ -1068,9 +1130,7 @@ impl CodexHttpClient {
                 match self.auth_manager.force_refresh(&auth.access).await {
                     Ok(new_auth) => {
                         auth = new_auth;
-                        if let Some(owner) = pool_owner.as_ref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                        }
+                        invalidate_live_continuation_pool(active_continuation.as_ref());
                         active_continuation =
                             full_context_continuation(active_continuation.as_ref());
                         continue;
@@ -1215,7 +1275,7 @@ impl CodexHttpClient {
                             .map(|(_, value)| value.as_str());
                         let delay = compute_backoff_delay(transport_failures, retry_after);
                         if delay.exceeds_budget {
-                            return Err(codex_status_error(response));
+                            return Err(codex_status_error(response.into_response()));
                         }
                         log_buffered_retry(
                             ctx,
@@ -1237,18 +1297,15 @@ impl CodexHttpClient {
                         "upstream",
                         "retryable upstream status",
                     );
-                    return Err(codex_status_error(response));
+                    return Err(codex_status_error(response.into_response()));
                 }
                 Ok(response) if !(200..300).contains(&response.status) => {
-                    return Err(codex_status_error(response));
+                    return Err(codex_status_error(response.into_response()));
                 }
                 Ok(response) => return Ok(response),
                 Err(err)
                     if should_retry_without_continuation(&err, active_continuation.as_ref()) =>
                 {
-                    if let Some(owner) = pool_owner.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                    }
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     continue;
                 }
@@ -1295,6 +1352,19 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
     ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
+        let reservation =
+            continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
+        self.stream_codex_websocket_events_for_owner(body, ctx, reservation.as_ref())
+            .await
+            .map(super::websocket::CodexWebSocketEventStream::into_receiver)
+    }
+
+    pub(crate) async fn stream_codex_websocket_events_for_owner(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -1303,12 +1373,11 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Auth,
         })?;
 
-        let turn_id = continuation.and_then(|candidate| candidate.turn_id);
-        let pool_owner = websocket_pool_owner(continuation).cloned();
+        let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
         if should_reset_websocket_pool(continuation)
-            && let Some(owner) = pool_owner.as_ref()
+            && let Some(owner) = websocket_pool_owner(continuation)
         {
-            super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
+            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, turn_id);
         }
 
         let client = self.clone();
@@ -1316,47 +1385,61 @@ impl CodexHttpClient {
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
         tokio::spawn(async move {
             client
-                .coordinate_live_websocket_events(body, ctx, continuation, auth, pool_owner, tx)
+                .coordinate_live_websocket_events(
+                    body,
+                    ctx,
+                    continuation,
+                    auth,
+                    tx,
+                    socket_id_publisher,
+                )
                 .await;
         });
 
         Ok(rx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn coordinate_live_websocket_events(
         &self,
         body: ResponsesRequest,
         ctx: RequestContext,
-        mut continuation: Option<super::continuation::ContinuationCandidate>,
+        mut continuation: Option<super::continuation::ContinuationReservation>,
         mut auth: StoredAuth,
-        pool_owner: Option<ConversationIdentity>,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
+        socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) {
-        let turn_id = continuation
-            .as_ref()
-            .and_then(|candidate| candidate.turn_id);
-        let continuation_owner = continuation
-            .as_ref()
-            .and_then(|candidate| candidate.owner.clone());
         let mut auth_refresh_attempted = false;
         let mut continuation_retry_available = continuation
             .as_ref()
-            .and_then(|candidate| candidate.previous_response_id.as_deref())
+            .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
             .is_some();
         let mut forwarded_any = false;
 
         'attempt: loop {
+            socket_id_publisher.publish(None);
             let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
             {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
                 Err(err) => {
-                    let _ = tx.send(Err(err)).await;
+                    if tx.send(Err(err)).await.is_err() {
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
+                    }
                     return;
                 }
             };
-            let ws_body = build_websocket_request(&body, continuation.as_ref());
+            let ws_body = build_websocket_request(
+                &body,
+                continuation
+                    .as_ref()
+                    .map(super::continuation::ContinuationReservation::candidate),
+            );
             let start = super::websocket::codex_websocket_event_stream(
                 &self.websocket_client,
                 &self.websocket_proxy_config,
@@ -1365,52 +1448,66 @@ impl CodexHttpClient {
                 &ws_body,
                 &ctx,
                 ctx.traffic.clone(),
-                pool_owner.as_ref(),
                 super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                 super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                 continuation.as_ref(),
             );
             let mut stream = tokio::select! {
+                biased;
                 _ = tx.closed() => {
-                    super::continuation::abort_continuation(continuation_owner.as_ref(), turn_id);
-                    if let Some(owner) = pool_owner.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                    }
+                    abort_abandoned_live_continuation(
+                        continuation.as_ref(),
+                        &socket_id_publisher,
+                    );
                     return;
                 }
                 result = start => match result {
                     Ok(stream) => stream,
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
                         auth_refresh_attempted = true;
-                        if let Some(owner) = pool_owner.as_ref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                        }
+                        invalidate_live_continuation_pool(continuation.as_ref());
                         let refresh = self.auth_manager.force_refresh(&auth.access);
                         auth = match refresh.await {
                             Ok(auth) => {
                                 if tx.is_closed() {
+                                    abort_abandoned_live_continuation(
+                                        continuation.as_ref(),
+                                        &socket_id_publisher,
+                                    );
                                     return;
                                 }
                                 auth
                             },
                             Err(refresh_err) => {
-                                let _ = tx.send(Err(auth_refresh_error(refresh_err))).await;
+                                if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
+                                    abort_abandoned_live_continuation(
+                                        continuation.as_ref(),
+                                        &socket_id_publisher,
+                                    );
+                                }
                                 return;
                             }
                         };
+                        if continuation_retry_available {
+                            socket_id_publisher.mark_full_context_retry();
+                        }
                         continuation = full_context_continuation(continuation.as_ref());
+                        continuation_retry_available = false;
                         continue 'attempt;
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
-                        continuation_retry_available = false;
-                        if let Some(owner) = pool_owner.as_ref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                        }
+                        socket_id_publisher.mark_full_context_retry();
                         continuation = full_context_continuation(continuation.as_ref());
+                        continuation_retry_available = false;
                         continue 'attempt;
                     }
                     Err(err) => {
-                        let _ = tx.send(Err(err)).await;
+                        if tx.send(Err(err)).await.is_err() {
+                            abort_abandoned_live_continuation(
+                                continuation.as_ref(),
+                                &socket_id_publisher,
+                            );
+                        }
                         return;
                     }
                 }
@@ -1418,17 +1515,36 @@ impl CodexHttpClient {
 
             loop {
                 let item = tokio::select! {
+                    biased;
                     _ = tx.closed() => {
-                        if let Some(owner) = pool_owner.as_ref() {
-                            super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
+                        if let Some(reservation) = continuation.as_ref() {
+                            super::websocket::invalidate_codex_websocket_pool_socket(
+                                reservation,
+                                stream.socket_id(),
+                            );
                         }
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
                         return;
                     }
                     item = stream.recv() => item,
                 };
+                if tx.is_closed() {
+                    if let Some(reservation) = continuation.as_ref() {
+                        super::websocket::invalidate_codex_websocket_pool_socket(
+                            reservation,
+                            stream.socket_id(),
+                        );
+                    }
+                    abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher);
+                    return;
+                }
                 let Some(item) = item else {
                     return;
                 };
+                socket_id_publisher.publish(stream.socket_id());
 
                 let unauthorized = match &item {
                     Err(err) => err.status == 401,
@@ -1436,22 +1552,46 @@ impl CodexHttpClient {
                 };
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
-                    if let Some(owner) = pool_owner.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                    }
+                    invalidate_live_continuation_pool(continuation.as_ref());
                     let refresh = self.auth_manager.force_refresh(&auth.access);
                     auth = match refresh.await {
                         Ok(auth) => {
                             if tx.is_closed() {
+                                if let Some(reservation) = continuation.as_ref() {
+                                    super::websocket::invalidate_codex_websocket_pool_socket(
+                                        reservation,
+                                        stream.socket_id(),
+                                    );
+                                }
+                                abort_abandoned_live_continuation(
+                                    continuation.as_ref(),
+                                    &socket_id_publisher,
+                                );
                                 return;
                             }
                             auth
                         }
                         Err(refresh_err) => {
-                            let _ = tx.send(Err(auth_refresh_error(refresh_err))).await;
+                            if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
+                                if let Some(reservation) = continuation.as_ref() {
+                                    super::websocket::invalidate_codex_websocket_pool_socket(
+                                        reservation,
+                                        stream.socket_id(),
+                                    );
+                                }
+                                abort_abandoned_live_continuation(
+                                    continuation.as_ref(),
+                                    &socket_id_publisher,
+                                );
+                            }
                             return;
                         }
                     };
+                    if continuation_retry_available {
+                        socket_id_publisher.mark_full_context_retry();
+                    }
+                    continuation = full_context_continuation(continuation.as_ref());
+                    continuation_retry_available = false;
                     continue 'attempt;
                 }
 
@@ -1460,22 +1600,28 @@ impl CodexHttpClient {
                     && is_continuation_retry_error(err)
                     && !forwarded_any
                 {
-                    continuation_retry_available = false;
-                    if let Some(owner) = pool_owner.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
-                    }
+                    socket_id_publisher.mark_full_context_retry();
                     continuation = full_context_continuation(continuation.as_ref());
+                    continuation_retry_available = false;
                     continue 'attempt;
                 }
 
                 if item.as_ref().is_ok_and(event_closes_live_retry_window) {
                     forwarded_any = true;
                 }
+                let terminal = item.as_ref().is_err()
+                    || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
                 if tx.send(item).await.is_err() {
-                    super::continuation::abort_continuation(continuation_owner.as_ref(), turn_id);
-                    if let Some(owner) = pool_owner.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_turn(owner, turn_id);
+                    if let Some(reservation) = continuation.as_ref() {
+                        super::websocket::invalidate_codex_websocket_pool_socket(
+                            reservation,
+                            stream.socket_id(),
+                        );
                     }
+                    abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher);
+                    return;
+                }
+                if terminal {
                     return;
                 }
             }
@@ -1987,7 +2133,7 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 }
 
 fn should_refresh_after_unauthorized(
-    result: &Result<CodexResponse, CodexError>,
+    result: &Result<OwnerAwareCodexResponse, CodexError>,
     auth_refresh_attempted: bool,
     transport: crate::config::CodexTransport,
 ) -> bool {
@@ -2012,10 +2158,10 @@ fn should_fallback_to_http(err: &CodexError) -> bool {
 
 fn should_retry_without_continuation(
     err: &CodexError,
-    continuation: Option<&super::continuation::ContinuationCandidate>,
+    continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> bool {
     if continuation
-        .and_then(|c| c.previous_response_id.as_deref())
+        .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
         .is_none()
     {
         return false;
@@ -2025,16 +2171,36 @@ fn should_retry_without_continuation(
 }
 
 fn full_context_continuation(
-    continuation: Option<&super::continuation::ContinuationCandidate>,
-) -> Option<super::continuation::ContinuationCandidate> {
-    continuation.map(|candidate| super::continuation::ContinuationCandidate {
-        owner: candidate.owner.clone(),
-        turn_id: candidate.turn_id,
-        previous_response_id: None,
-        input_delta: None,
-        input_delta_count: candidate.input_delta_count,
-        disabled_reason: Some("full_context_retry".to_string()),
-    })
+    continuation: Option<&super::continuation::ContinuationReservation>,
+) -> Option<super::continuation::ContinuationReservation> {
+    continuation.map(super::continuation::ContinuationReservation::full_context_retry)
+}
+
+fn abort_live_continuation(continuation: Option<&super::continuation::ContinuationReservation>) {
+    if let Some(continuation) = continuation {
+        super::continuation::abort_continuation_for_owner(continuation);
+    }
+}
+
+fn abort_abandoned_live_continuation(
+    continuation: Option<&super::continuation::ContinuationReservation>,
+    socket_id_publisher: &super::websocket::CodexWebSocketSocketIdPublisher,
+) {
+    if !socket_id_publisher.is_provider_retry_handoff() {
+        abort_live_continuation(continuation);
+    }
+}
+
+fn invalidate_live_continuation_pool(
+    continuation: Option<&super::continuation::ContinuationReservation>,
+) {
+    let Some(continuation) = continuation else {
+        return;
+    };
+    let Some(owner) = websocket_pool_owner(Some(continuation)) else {
+        return;
+    };
+    super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, continuation.turn_id());
 }
 
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
@@ -2044,29 +2210,32 @@ fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
     )
 }
 
-fn is_continuation_retry_error(err: &CodexError) -> bool {
+pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
     matches!(
         err.detail.as_deref(),
         Some("previous_response_not_found")
+            | Some(super::websocket::WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL)
             | Some(super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
             | Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
     )
 }
 
 fn websocket_pool_owner(
-    continuation: Option<&super::continuation::ContinuationCandidate>,
+    continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {
     let continuation = continuation?;
-    if continuation.disabled_reason.as_deref() == Some("disabled") {
+    if continuation.candidate().disabled_reason.as_deref() == Some("disabled") {
         return None;
     }
-    continuation.owner.as_ref()
+    continuation.owner()
 }
 
 fn should_reset_websocket_pool(
-    continuation: Option<&super::continuation::ContinuationCandidate>,
+    continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> bool {
-    let Some(reason) = continuation.and_then(|c| c.disabled_reason.as_deref()) else {
+    let Some(reason) =
+        continuation.and_then(|continuation| continuation.candidate().disabled_reason.as_deref())
+    else {
         return false;
     };
     reason != "disabled"
@@ -2075,8 +2244,29 @@ fn should_reset_websocket_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_continuation(
+        owner: Option<ConversationIdentity>,
+        turn_id: Option<u64>,
+        previous_response_id: Option<&str>,
+        origin_socket_id: Option<u64>,
+        disabled_reason: Option<&str>,
+    ) -> super::super::continuation::ContinuationReservation {
+        super::super::continuation::ContinuationReservation::new(
+            super::super::continuation::ContinuationCandidate {
+                turn_id,
+                previous_response_id: previous_response_id.map(str::to_string),
+                input_delta: None,
+                input_delta_count: 1,
+                disabled_reason: disabled_reason.map(str::to_string),
+            },
+            owner,
+            origin_socket_id,
+        )
+    }
 
     #[test]
     fn normalizes_supported_proxy_urls() {
@@ -2178,6 +2368,84 @@ mod tests {
             },
             reasoning: None,
         }
+    }
+
+    fn buffered_request_with_texts(texts: &[&str]) -> ResponsesRequest {
+        let mut request = buffered_test_request();
+        request.input = texts
+            .iter()
+            .map(
+                |text| super::super::translate::request::ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: vec![
+                        super::super::translate::request::ResponsesContentPart::InputText {
+                            text: (*text).to_string(),
+                        },
+                    ],
+                },
+            )
+            .collect();
+        request
+    }
+
+    async fn next_websocket_json(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> serde_json::Value {
+        loop {
+            match websocket.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                    websocket
+                        .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                        .await
+                        .unwrap();
+                }
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    return serde_json::from_str(&text).unwrap();
+                }
+                other => panic!("unexpected WebSocket request frame: {other:?}"),
+            }
+        }
+    }
+
+    async fn send_completed_websocket_response(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        response_id: &str,
+    ) {
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "status": "completed",
+                        "output": []
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn send_nested_previous_response_missing(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "previous_response_not_found",
+                            "message": "Previous response not found"
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
     }
 
     fn authenticated_http_test_client(base_url: String) -> CodexHttpClient {
@@ -2474,6 +2742,849 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn buffered_missing_origin_retries_full_context_and_rebinds_exact_socket() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Agent(
+            "buffered-recovery-session".to_string(),
+            "buffered-recovery-agent".to_string(),
+        );
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut first_websocket, "resp_a").await;
+            drop(first_websocket);
+
+            let (second_socket, _) = listener.accept().await.unwrap();
+            let mut second_websocket = tokio_tungstenite::accept_async(second_socket)
+                .await
+                .unwrap();
+            request_tx
+                .send(next_websocket_json(&mut second_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut second_websocket, "resp_b").await;
+            request_tx
+                .send(next_websocket_json(&mut second_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut second_websocket, "resp_c").await;
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = client
+            .post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        let first_socket_id = first_response
+            .socket_id
+            .expect("first socket must be reusable");
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        let second_request = buffered_request_with_texts(&["one", "two"]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(second_candidate.origin_socket_id(), Some(first_socket_id));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let second_response = client
+            .post_codex_with_transport(
+                &second_request,
+                &context,
+                Some(&second_candidate),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        let second_socket_id = second_response
+            .socket_id
+            .expect("full-context retry socket must be reusable");
+        assert_ne!(second_socket_id, first_socket_id);
+        super::super::update_continuation_from_upstream(
+            None,
+            &second_candidate,
+            None,
+            &second_request,
+            &second_response.body,
+            second_response.socket_id,
+            false,
+        );
+
+        let third_request = buffered_request_with_texts(&["one", "two", "three"]);
+        let third_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &third_request,
+            true,
+        );
+        assert_eq!(
+            third_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_b")
+        );
+        assert_eq!(third_candidate.origin_socket_id(), Some(second_socket_id));
+        let third_response = client
+            .post_codex_with_transport(
+                &third_request,
+                &context,
+                Some(&third_candidate),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third_response.socket_id, Some(second_socket_id));
+
+        let first_payload = request_rx.recv().await.unwrap();
+        let retry_payload = request_rx.recv().await.unwrap();
+        let continued_payload = request_rx.recv().await.unwrap();
+        assert!(first_payload.get("previous_response_id").is_none());
+        assert_eq!(first_payload["input"].as_array().unwrap().len(), 1);
+        assert!(retry_payload.get("previous_response_id").is_none());
+        assert_eq!(retry_payload["input"].as_array().unwrap().len(), 2);
+        assert_eq!(continued_payload["previous_response_id"], "resp_b");
+        assert_eq!(continued_payload["input"].as_array().unwrap().len(), 1);
+        server.await.unwrap();
+
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&third_candidate);
+    }
+
+    #[tokio::test]
+    async fn buffered_nested_missing_response_retries_once_without_stale_previous_id() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("buffered-nested-recovery-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut first_websocket, "resp_nested_origin").await;
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            send_nested_previous_response_missing(&mut first_websocket).await;
+
+            let (retry_socket, _) = listener.accept().await.unwrap();
+            let mut retry_websocket = tokio_tungstenite::accept_async(retry_socket).await.unwrap();
+            request_tx
+                .send(next_websocket_json(&mut retry_websocket).await)
+                .unwrap();
+            send_nested_previous_response_missing(&mut retry_websocket).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1_200), listener.accept())
+                    .await
+                    .is_err(),
+                "nested missing-response recovery must not open a third socket"
+            );
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = client
+            .post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        let second_request = buffered_request_with_texts(&["one", "two"]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_nested_origin")
+        );
+        let error = match client
+            .post_codex_with_transport(
+                &second_request,
+                &context,
+                Some(&second_candidate),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+        {
+            Ok(_) => {
+                panic!("the bounded full-context retry must surface a repeated nested failure")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.detail.as_deref(), Some("previous_response_not_found"));
+
+        let first_payload = request_rx.recv().await.unwrap();
+        let continued_payload = request_rx.recv().await.unwrap();
+        let retry_payload = request_rx.recv().await.unwrap();
+        assert!(first_payload.get("previous_response_id").is_none());
+        assert_eq!(
+            continued_payload["previous_response_id"],
+            "resp_nested_origin"
+        );
+        assert_eq!(continued_payload["input"].as_array().unwrap().len(), 1);
+        assert!(retry_payload.get("previous_response_id").is_none());
+        assert_eq!(retry_payload["input"].as_array().unwrap().len(), 2);
+        assert!(request_rx.try_recv().is_err());
+        server.await.unwrap();
+
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&second_candidate);
+    }
+
+    #[tokio::test]
+    async fn live_nested_missing_response_retries_once_without_stale_previous_id() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Agent(
+            "live-nested-recovery-session".to_string(),
+            "live-nested-recovery-agent".to_string(),
+        );
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut first_websocket, "resp_live_nested_origin")
+                .await;
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            send_nested_previous_response_missing(&mut first_websocket).await;
+
+            let (retry_socket, _) = listener.accept().await.unwrap();
+            let mut retry_websocket = tokio_tungstenite::accept_async(retry_socket).await.unwrap();
+            request_tx
+                .send(next_websocket_json(&mut retry_websocket).await)
+                .unwrap();
+            send_nested_previous_response_missing(&mut retry_websocket).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1_200), listener.accept())
+                    .await
+                    .is_err(),
+                "live nested missing-response recovery must not open a third socket"
+            );
+        });
+
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = client
+            .post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        let second_request = buffered_request_with_texts(&["one", "two"]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_live_nested_origin")
+        );
+        let mut events = client
+            .stream_codex_websocket_events_for_owner(
+                &second_request,
+                &context,
+                Some(&second_candidate),
+            )
+            .await
+            .unwrap();
+        let error = events.recv().await.unwrap().unwrap_err();
+        assert_eq!(error.detail.as_deref(), Some("previous_response_not_found"));
+        assert!(events.used_full_context_retry());
+        assert_eq!(events.socket_id(), None);
+
+        let first_payload = request_rx.recv().await.unwrap();
+        let continued_payload = request_rx.recv().await.unwrap();
+        let retry_payload = request_rx.recv().await.unwrap();
+        assert!(first_payload.get("previous_response_id").is_none());
+        assert_eq!(
+            continued_payload["previous_response_id"],
+            "resp_live_nested_origin"
+        );
+        assert_eq!(continued_payload["input"].as_array().unwrap().len(), 1);
+        assert!(retry_payload.get("previous_response_id").is_none());
+        assert_eq!(retry_payload["input"].as_array().unwrap().len(), 2);
+        assert!(request_rx.try_recv().is_err());
+        server.await.unwrap();
+
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&second_candidate);
+    }
+
+    #[tokio::test]
+    async fn live_missing_origin_retries_once_with_full_context_and_actual_socket() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-recovery-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = buffered_request_with_texts(&["one", "two"]);
+        let reserved = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let continuation = super::super::continuation::ContinuationReservation::new(
+            super::super::continuation::ContinuationCandidate {
+                turn_id: reserved.turn_id(),
+                previous_response_id: Some("resp_missing".to_string()),
+                input_delta: Some(vec![request.input.last().unwrap().clone()]),
+                input_delta_count: 1,
+                disabled_reason: None,
+            },
+            Some(owner.clone()),
+            Some(u64::MAX),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            payload_tx
+                .send(next_websocket_json(&mut websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut websocket, "resp_live_retry").await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_websocket_events_for_owner(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+            )
+            .await
+            .unwrap();
+        let terminal = events.recv().await.unwrap().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert!(events.used_full_context_retry());
+        let socket_id = events
+            .socket_id()
+            .expect("successful internal retry must publish its socket");
+        let payload = payload_rx.await.unwrap();
+        assert!(payload.get("previous_response_id").is_none());
+        assert_eq!(payload["input"].as_array().unwrap().len(), 2);
+        server.await.unwrap();
+        assert_eq!(
+            super::super::websocket::pooled_socket_id_for_tests(&owner),
+            Some(socket_id)
+        );
+
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&reserved);
+    }
+
+    #[tokio::test]
+    async fn public_ownerless_candidate_never_writes_previous_id_to_websocket() {
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let request = buffered_request_with_texts(&["one", "two"]);
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(17),
+            previous_response_id: Some("resp_unproven".to_string()),
+            input_delta: Some(vec![request.input.last().unwrap().clone()]),
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            payload_tx
+                .send(next_websocket_json(&mut websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut websocket, "resp_public_full_context").await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "an ownerless stale candidate must use one full-context socket"
+            );
+        });
+
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut context = http_test_context();
+        context.session_id = Some("must-not-be-derived-as-owner".to_string());
+        let mut events = client
+            .stream_codex_websocket_events(&request, &context, Some(&continuation))
+            .await
+            .unwrap();
+        let terminal = events.recv().await.unwrap().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+
+        let payload = payload_rx.await.unwrap();
+        assert!(payload.get("previous_response_id").is_none());
+        assert_eq!(payload["input"].as_array().unwrap().len(), 2);
+        server.await.unwrap();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn live_missing_origin_does_not_enter_second_full_context_loop() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-bounded-recovery-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = buffered_request_with_texts(&["one", "two"]);
+        let reserved = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let continuation = super::super::continuation::ContinuationReservation::new(
+            super::super::continuation::ContinuationCandidate {
+                turn_id: reserved.turn_id(),
+                previous_response_id: Some("resp_missing".to_string()),
+                input_delta: Some(vec![request.input.last().unwrap().clone()]),
+                input_delta_count: 1,
+                disabled_reason: None,
+            },
+            Some(owner.clone()),
+            Some(u64::MAX),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            payload_tx
+                .send(next_websocket_json(&mut websocket).await)
+                .unwrap();
+            websocket.close(None).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_websocket_events_for_owner(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+            )
+            .await
+            .unwrap();
+        let error = events.recv().await.unwrap().unwrap_err();
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(super::super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
+        );
+        assert!(events.used_full_context_retry());
+        assert_eq!(events.socket_id(), None);
+        let payload = payload_rx.await.unwrap();
+        assert!(payload.get("previous_response_id").is_none());
+        assert_eq!(payload["input"].as_array().unwrap().len(), 2);
+        server.await.unwrap();
+
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&reserved);
+    }
+
+    #[tokio::test]
+    async fn dropping_live_receiver_clears_reserved_turn() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-drop-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = buffered_request_with_texts(&["one"]);
+        let continuation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_websocket_json(&mut websocket).await;
+            request_seen_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = websocket.close(None).await;
+        });
+
+        let events = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )))
+        .stream_codex_websocket_events_for_owner(
+            &request,
+            &http_test_context(),
+            Some(&continuation),
+        )
+        .await
+        .unwrap();
+        request_seen_rx.await.unwrap();
+        drop(events);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while super::super::continuation::is_current_turn_for_owner(&continuation) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the live receiver must clear its reserved turn");
+        server.await.unwrap();
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn dropping_retry_handoff_receiver_preserves_reserved_turn() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-retry-handoff-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = buffered_request_with_texts(&["one"]);
+        let continuation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (socket_closed_tx, socket_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_websocket_json(&mut websocket).await;
+            request_seen_tx.send(()).unwrap();
+            while websocket.next().await.is_some() {}
+            socket_closed_tx.send(()).unwrap();
+        });
+
+        let events = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )))
+        .stream_codex_websocket_events_for_owner(
+            &request,
+            &http_test_context(),
+            Some(&continuation),
+        )
+        .await
+        .unwrap();
+        request_seen_rx.await.unwrap();
+        events.mark_provider_retry_handoff();
+        drop(events);
+
+        tokio::time::timeout(Duration::from_secs(1), socket_closed_rx)
+            .await
+            .expect("marked receiver drop must close only the abandoned attempt socket")
+            .expect("socket-close acknowledgement sender dropped");
+        assert!(super::super::continuation::is_current_turn_for_owner(
+            &continuation
+        ));
+        server.await.unwrap();
+        super::super::continuation::abort_continuation_for_owner(&continuation);
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn delayed_retry_handoff_cleanup_preserves_replacement_state_and_socket() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-retry-cleanup-race-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = buffered_request_with_texts(&["one"]);
+        let continuation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_replacement_tx, release_replacement_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            let _ = next_websocket_json(&mut first_websocket).await;
+            send_completed_websocket_response(&mut first_websocket, "resp_attempt_a").await;
+            drop(first_websocket);
+
+            let (replacement_socket, _) = listener.accept().await.unwrap();
+            let mut replacement_websocket = tokio_tungstenite::accept_async(replacement_socket)
+                .await
+                .unwrap();
+            let _ = next_websocket_json(&mut replacement_websocket).await;
+            send_completed_websocket_response(&mut replacement_websocket, "resp_attempt_b").await;
+            let _ = release_replacement_rx.await;
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+
+        let mut attempt_a = client
+            .stream_codex_websocket_events_for_owner(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+            )
+            .await
+            .unwrap();
+        let terminal_a = attempt_a.recv().await.unwrap().unwrap();
+        assert_eq!(terminal_a["response"]["id"], "resp_attempt_a");
+        let socket_a = attempt_a.socket_id().expect("attempt A socket ID");
+        super::super::websocket::invalidate_codex_websocket_pool_socket(
+            &continuation,
+            Some(socket_a),
+        );
+
+        let mut attempt_b = client
+            .stream_codex_websocket_events_for_owner(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+            )
+            .await
+            .unwrap();
+        let terminal_b = attempt_b.recv().await.unwrap().unwrap();
+        assert_eq!(terminal_b["response"]["id"], "resp_attempt_b");
+        let socket_b = attempt_b.socket_id().expect("attempt B socket ID");
+        assert_ne!(socket_a, socket_b);
+        super::super::continuation::record_continuation_for_owner(
+            &continuation,
+            &request,
+            Some("resp_attempt_b"),
+            Some(socket_b),
+            &[],
+        );
+
+        let (_handoff_tx, handoff_rx) =
+            tokio::sync::mpsc::channel::<Result<serde_json::Value, CodexError>>(1);
+        let (handoff_stream, handoff_publisher) =
+            super::super::websocket::CodexWebSocketEventStream::pending(handoff_rx);
+        handoff_stream.mark_provider_retry_handoff();
+        let cleanup_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let cleanup_task_barrier = cleanup_barrier.clone();
+        let cleanup_continuation = continuation.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_task_barrier.wait().await;
+            super::super::websocket::invalidate_codex_websocket_pool_socket(
+                &cleanup_continuation,
+                Some(socket_a),
+            );
+            abort_abandoned_live_continuation(Some(&cleanup_continuation), &handoff_publisher);
+        });
+
+        cleanup_barrier.wait().await;
+        cleanup.await.unwrap();
+        assert!(super::super::continuation::is_current_turn_for_owner(
+            &continuation
+        ));
+        assert!(super::super::continuation::has_continuation_for_owner_for_tests(&owner));
+        assert_eq!(
+            super::super::websocket::pooled_socket_id_for_tests(&owner),
+            Some(socket_b)
+        );
+
+        let _ = release_replacement_tx.send(());
+        server.await.unwrap();
+        super::super::continuation::abort_continuation_for_owner(&continuation);
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn auto_clears_missing_origin_before_ordinary_http_fallback() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Agent(
+            "auto-recovery-session".to_string(),
+            "auto-recovery-agent".to_string(),
+        );
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = buffered_request_with_texts(&["one", "two"]);
+        let reserved = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let continuation = super::super::continuation::ContinuationReservation::new(
+            super::super::continuation::ContinuationCandidate {
+                turn_id: reserved.turn_id(),
+                previous_response_id: Some("resp_missing".to_string()),
+                input_delta: Some(vec![request.input.last().unwrap().clone()]),
+                input_delta_count: 1,
+                disabled_reason: None,
+            },
+            Some(owner.clone()),
+            Some(u64::MAX),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut websocket, _) = listener.accept().await.unwrap();
+            let websocket_request = read_http_request(&mut websocket).await;
+            assert!(String::from_utf8_lossy(&websocket_request).starts_with("GET "));
+            websocket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(websocket);
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let http_request = read_http_request(&mut http).await;
+            let body_start = http_request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let body: serde_json::Value =
+                serde_json::from_slice(&http_request[body_start..]).unwrap();
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(body["input"].as_array().unwrap().len(), 2);
+            let response_body =
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\"}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            http.write_all(response.as_bytes()).await.unwrap();
+            http.write_all(response_body).await.unwrap();
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.transport, ActualTransport::Http);
+        assert_eq!(response.socket_id, None);
+        server.await.unwrap();
+
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&reserved);
     }
 
     #[tokio::test]
@@ -3053,38 +4164,16 @@ mod tests {
     #[test]
     fn websocket_pool_owner_tracks_typed_continuation_opt_in() {
         let owner = ConversationIdentity::Agent("session".into(), "agent".into());
-        let disabled = super::super::continuation::ContinuationCandidate {
-            owner: Some(owner.clone()),
-            turn_id: None,
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("disabled".into()),
-        };
-        let first_enabled = super::super::continuation::ContinuationCandidate {
-            owner: Some(owner.clone()),
-            turn_id: Some(1),
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("missing_state".into()),
-        };
-        let append = super::super::continuation::ContinuationCandidate {
-            owner: Some(owner.clone()),
-            turn_id: Some(2),
-            previous_response_id: Some("resp_1".into()),
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: None,
-        };
-        let missing_identity = super::super::continuation::ContinuationCandidate {
-            owner: None,
-            turn_id: None,
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("missing_identity".into()),
-        };
+        let disabled = test_continuation(Some(owner.clone()), None, None, None, Some("disabled"));
+        let first_enabled = test_continuation(
+            Some(owner.clone()),
+            Some(1),
+            None,
+            None,
+            Some("missing_state"),
+        );
+        let append = test_continuation(Some(owner.clone()), Some(2), Some("resp_1"), Some(1), None);
+        let missing_identity = test_continuation(None, None, None, None, Some("missing_identity"));
 
         assert_eq!(websocket_pool_owner(Some(&disabled)), None);
         assert_eq!(websocket_pool_owner(Some(&first_enabled)), Some(&owner));
@@ -3094,30 +4183,11 @@ mod tests {
 
     #[test]
     fn websocket_pool_reset_clears_initial_stale_state() {
-        let missing_state = super::super::continuation::ContinuationCandidate {
-            owner: Some(ConversationIdentity::Main("session".into())),
-            turn_id: None,
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("missing_state".into()),
-        };
-        let disabled = super::super::continuation::ContinuationCandidate {
-            owner: Some(ConversationIdentity::Main("session".into())),
-            turn_id: None,
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("disabled".into()),
-        };
-        let prompt_changed = super::super::continuation::ContinuationCandidate {
-            owner: Some(ConversationIdentity::Main("session".into())),
-            turn_id: None,
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("prompt_changed".into()),
-        };
+        let owner = Some(ConversationIdentity::Main("session".into()));
+        let missing_state =
+            test_continuation(owner.clone(), None, None, None, Some("missing_state"));
+        let disabled = test_continuation(owner.clone(), None, None, None, Some("disabled"));
+        let prompt_changed = test_continuation(owner, None, None, None, Some("prompt_changed"));
 
         assert!(should_reset_websocket_pool(Some(&missing_state)));
         assert!(!should_reset_websocket_pool(Some(&disabled)));
@@ -3165,12 +4235,15 @@ mod tests {
 
     #[test]
     fn unauthorized_retry_distinguishes_auto_and_strict_websocket_handshakes() {
-        let http_unauthorized = Ok(CodexResponse {
-            body: Vec::new(),
-            status: 401,
-            headers: Vec::new(),
-            transport: ActualTransport::Http,
-        });
+        let http_unauthorized = Ok(OwnerAwareCodexResponse::new(
+            CodexResponse {
+                body: Vec::new(),
+                status: 401,
+                headers: Vec::new(),
+                transport: ActualTransport::Http,
+            },
+            None,
+        ));
         let websocket_unauthorized = Err(CodexError {
             status: 401,
             message: "WebSocket connect error".to_string(),
@@ -3246,22 +4319,11 @@ mod tests {
 
     #[test]
     fn continuation_retry_requires_previous_response_id() {
-        let append = super::super::continuation::ContinuationCandidate {
-            owner: Some(ConversationIdentity::Main("session".into())),
-            turn_id: None,
-            previous_response_id: Some("resp_1".into()),
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: None,
-        };
-        let initial = super::super::continuation::ContinuationCandidate {
-            owner: Some(ConversationIdentity::Main("session".into())),
-            turn_id: None,
-            previous_response_id: None,
-            input_delta: None,
-            input_delta_count: 1,
-            disabled_reason: Some("missing_state".into()),
-        };
+        let owner = ConversationIdentity::Main("session".into());
+        let append =
+            test_continuation(Some(owner.clone()), Some(17), Some("resp_1"), Some(1), None);
+        let initial =
+            test_continuation(Some(owner.clone()), None, None, None, Some("missing_state"));
         let timeout = CodexError {
             status: 0,
             message: "WebSocket response start timeout after 60000ms".to_string(),
@@ -3286,6 +4348,15 @@ mod tests {
             origin: CodexErrorOrigin::WebSocket,
         };
 
+        let full_context = full_context_continuation(Some(&append)).unwrap();
+        assert_eq!(full_context.owner(), Some(&owner));
+        assert_eq!(full_context.turn_id(), Some(17));
+        assert_eq!(full_context.candidate().previous_response_id, None);
+        assert_eq!(full_context.origin_socket_id(), None);
+        assert_eq!(
+            full_context.candidate().disabled_reason.as_deref(),
+            Some("full_context_retry")
+        );
         assert!(should_retry_without_continuation(&timeout, Some(&append)));
         assert!(should_retry_without_continuation(&missing, Some(&append)));
         assert!(!should_retry_without_continuation(&idle, Some(&append)));

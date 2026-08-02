@@ -39,6 +39,12 @@ pub(crate) fn is_terminal_rate_limit_event(payload: &Value) -> bool {
             != Some(true)
 }
 
+pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
+    payload
+        .get("error")
+        .or_else(|| payload.pointer("/response/error"))
+}
+
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
     if event_type == "codex.rate_limits" {
@@ -57,9 +63,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         return None;
     }
 
-    let error = payload
-        .get("error")
-        .or_else(|| payload.pointer("/response/error"));
+    let error = event_error(payload);
     let explicit_status = numeric_status(payload)
         .or_else(|| {
             error
