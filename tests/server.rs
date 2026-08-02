@@ -8,13 +8,14 @@ use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
+    request_identity::ConversationIdentity,
     server::{
         AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
         bind_proxy_listener,
     },
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
@@ -95,6 +96,56 @@ impl Provider for FakeProvider {
     }
 }
 
+type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
+
+struct IdentityCaptureProvider {
+    captured: Arc<Mutex<Vec<CapturedIdentity>>>,
+}
+
+#[async_trait]
+impl Provider for IdentityCaptureProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "legacy path").into_response()
+    }
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        _body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> axum::response::Response {
+        self.captured
+            .lock()
+            .unwrap()
+            .push((conversation_identity, ctx.session_id));
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::OK, "counted").into_response()
+    }
+}
+
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
         AliasProvider::Kimi,
@@ -113,6 +164,142 @@ fn routed_registry() -> Arc<Registry> {
             }),
         ],
     ))
+}
+
+async fn call_identity_ingress(
+    app: &axum::Router,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Value,
+) -> StatusCode {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn messages_ingress_forwards_only_strict_conversation_identity() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [provider],
+    )));
+    let normal_body = || {
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    };
+
+    let cases = [
+        (
+            vec![("x-claude-code-session-id", "session-main")],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-agent"),
+                ("x-claude-code-agent-id", "agent-direct"),
+            ],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-nested"),
+                ("x-claude-code-agent-id", "agent-child"),
+                ("x-claude-code-parent-agent-id", "agent-parent"),
+            ],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-malformed-agent"),
+                ("x-claude-code-agent-id", "malformed agent"),
+            ],
+            normal_body(),
+        ),
+        (vec![], normal_body()),
+        (
+            vec![("x-claude-code-session-id", " \tsession-trimmed\t ")],
+            normal_body(),
+        ),
+        (
+            vec![
+                ("x-claude-code-session-id", "session-auto-review"),
+                ("x-claude-code-agent-id", "agent-auto-review"),
+            ],
+            json!({
+                "model": "gpt-5.5",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "review"}],
+                "system": [{
+                    "type": "text",
+                    "text": "You are a security monitor for autonomous AI coding agents. Review this turn."
+                }]
+            }),
+        ),
+    ];
+
+    for (headers, body) in cases {
+        assert_eq!(
+            call_identity_ingress(&app, "/v1/messages", &headers, body).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call_identity_ingress(
+            &app,
+            "/v1/messages/count_tokens",
+            &[("x-claude-code-session-id", "session-count")],
+            normal_body(),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![
+            (
+                Some(ConversationIdentity::Main("session-main".to_string())),
+                Some("session-main".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "session-agent".to_string(),
+                    "agent-direct".to_string(),
+                )),
+                Some("session-agent".to_string()),
+            ),
+            (
+                Some(ConversationIdentity::Agent(
+                    "session-nested".to_string(),
+                    "agent-child".to_string(),
+                )),
+                Some("session-nested".to_string()),
+            ),
+            (None, Some("session-malformed-agent".to_string())),
+            (None, None),
+            (
+                Some(ConversationIdentity::Main("session-trimmed".to_string())),
+                Some(" \tsession-trimmed\t ".to_string()),
+            ),
+            (None, Some("session-auto-review".to_string())),
+        ]
+    );
 }
 
 #[tokio::test]

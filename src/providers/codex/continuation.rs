@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::request_identity::ConversationIdentity;
+
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_SESSION_TRANSCRIPT_BYTES: u64 = 2_000_000;
+const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
 const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
@@ -18,7 +20,7 @@ struct ContinuationState {
     updated_at: u64,
 }
 
-struct SessionState {
+struct OwnerState {
     current_turn: u64,
     continuation: Option<ContinuationState>,
     updated_at: u64,
@@ -26,7 +28,7 @@ struct SessionState {
 
 #[derive(Default)]
 struct ContinuationRegistry {
-    sessions: HashMap<String, SessionState>,
+    owners: HashMap<ConversationIdentity, OwnerState>,
     total_transcript_bytes: u64,
 }
 
@@ -35,6 +37,7 @@ static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct ContinuationCandidate {
+    pub owner: Option<ConversationIdentity>,
     pub turn_id: Option<u64>,
     pub previous_response_id: Option<String>,
     pub input_delta: Option<Vec<ResponsesInputItem>>,
@@ -50,12 +53,13 @@ fn now_ms() -> u64 {
 }
 
 pub fn continuation_candidate(
-    session_id: Option<&str>,
+    owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationCandidate {
     if !enabled {
         return ContinuationCandidate {
+            owner: owner.cloned(),
             turn_id: None,
             previous_response_id: None,
             input_delta: None,
@@ -64,13 +68,14 @@ pub fn continuation_candidate(
         };
     }
 
-    let Some(session_id) = session_id else {
+    let Some(owner) = owner else {
         return ContinuationCandidate {
+            owner: None,
             turn_id: None,
             previous_response_id: None,
             input_delta: None,
             input_delta_count: body.input.len(),
-            disabled_reason: Some("missing_session".to_string()),
+            disabled_reason: Some("missing_identity".to_string()),
         };
     };
 
@@ -79,17 +84,17 @@ pub fn continuation_candidate(
     let (state, superseded_turn) = {
         let mut guard = REGISTRY.lock().unwrap();
         let registry = guard.get_or_insert_with(ContinuationRegistry::default);
-        let existing = registry.sessions.remove(session_id);
+        let existing = registry.owners.remove(owner);
         let superseded_turn = existing.is_some();
-        let state = existing.and_then(|session| session.continuation);
+        let state = existing.and_then(|owner| owner.continuation);
         if let Some(state) = &state {
             registry.total_transcript_bytes = registry
                 .total_transcript_bytes
                 .saturating_sub(state.transcript_bytes);
         }
-        registry.sessions.insert(
-            session_id.to_string(),
-            SessionState {
+        registry.owners.insert(
+            owner.clone(),
+            OwnerState {
                 current_turn: turn_id,
                 continuation: None,
                 updated_at: now,
@@ -99,10 +104,11 @@ pub fn continuation_candidate(
         (state, superseded_turn)
     };
 
-    continuation_candidate_from_state(turn_id, body, state, superseded_turn, now)
+    continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now)
 }
 
 fn continuation_candidate_from_state(
+    owner: &ConversationIdentity,
     turn_id: u64,
     body: &ResponsesRequest,
     state: Option<ContinuationState>,
@@ -113,6 +119,7 @@ fn continuation_candidate_from_state(
         Some(state) if now.saturating_sub(state.updated_at) <= TTL_MS => state,
         Some(_) | None => {
             return ContinuationCandidate {
+                owner: Some(owner.clone()),
                 turn_id: Some(turn_id),
                 previous_response_id: None,
                 input_delta: None,
@@ -129,6 +136,7 @@ fn continuation_candidate_from_state(
     let signature = prompt_signature(body);
     if signature != state.prompt_signature {
         return ContinuationCandidate {
+            owner: Some(owner.clone()),
             turn_id: Some(turn_id),
             previous_response_id: None,
             input_delta: None,
@@ -139,6 +147,7 @@ fn continuation_candidate_from_state(
 
     let Some(suffix) = input_suffix_after_prefix(&body.input, &state.transcript) else {
         return ContinuationCandidate {
+            owner: Some(owner.clone()),
             turn_id: Some(turn_id),
             previous_response_id: None,
             input_delta: None,
@@ -149,6 +158,7 @@ fn continuation_candidate_from_state(
 
     if suffix.is_empty() {
         return ContinuationCandidate {
+            owner: Some(owner.clone()),
             turn_id: Some(turn_id),
             previous_response_id: None,
             input_delta: None,
@@ -158,6 +168,7 @@ fn continuation_candidate_from_state(
     }
 
     ContinuationCandidate {
+        owner: Some(owner.clone()),
         turn_id: Some(turn_id),
         previous_response_id: Some(state.response_id),
         input_delta_count: suffix.len(),
@@ -167,21 +178,21 @@ fn continuation_candidate_from_state(
 }
 
 pub fn record_continuation(
-    session_id: Option<&str>,
+    owner: Option<&ConversationIdentity>,
     turn_id: Option<u64>,
     request_body: &ResponsesRequest,
     response_id: Option<&str>,
     output_items: &[ResponsesInputItem],
 ) {
-    let (session_id, turn_id) = match (session_id, turn_id) {
-        (Some(session_id), Some(turn_id)) => (session_id, turn_id),
+    let (owner, turn_id) = match (owner, turn_id) {
+        (Some(owner), Some(turn_id)) => (owner, turn_id),
         _ => return,
     };
 
     let response_id = match response_id {
         Some(id) => id.to_string(),
         None => {
-            abort_continuation(Some(session_id), Some(turn_id));
+            abort_continuation(Some(owner), Some(turn_id));
             return;
         }
     };
@@ -192,8 +203,8 @@ pub fn record_continuation(
     let transcript_json = serde_json::to_string(&transcript).unwrap_or_default();
     let transcript_bytes = transcript_json.len() as u64;
 
-    if transcript_bytes > MAX_SESSION_TRANSCRIPT_BYTES {
-        abort_continuation(Some(session_id), Some(turn_id));
+    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
+        abort_continuation(Some(owner), Some(turn_id));
         return;
     }
 
@@ -209,13 +220,13 @@ pub fn record_continuation(
     let Some(registry) = guard.as_mut() else {
         return;
     };
-    let Some(session) = registry.sessions.get_mut(session_id) else {
+    let Some(owner_state) = registry.owners.get_mut(owner) else {
         return;
     };
-    if session.current_turn != turn_id {
+    if owner_state.current_turn != turn_id {
         return;
     }
-    if let Some(existing) = session.continuation.replace(state) {
+    if let Some(existing) = owner_state.continuation.replace(state) {
         registry.total_transcript_bytes = registry
             .total_transcript_bytes
             .saturating_sub(existing.transcript_bytes);
@@ -224,8 +235,8 @@ pub fn record_continuation(
     evict_oldest(registry);
 }
 
-pub fn abort_continuation(session_id: Option<&str>, turn_id: Option<u64>) {
-    let (Some(session_id), Some(turn_id)) = (session_id, turn_id) else {
+pub fn abort_continuation(owner: Option<&ConversationIdentity>, turn_id: Option<u64>) {
+    let (Some(owner), Some(turn_id)) = (owner, turn_id) else {
         return;
     };
     let mut guard = REGISTRY.lock().unwrap();
@@ -233,76 +244,76 @@ pub fn abort_continuation(session_id: Option<&str>, turn_id: Option<u64>) {
         return;
     };
     if registry
-        .sessions
-        .get(session_id)
-        .is_some_and(|session| session.current_turn == turn_id)
-        && let Some(session) = registry.sessions.remove(session_id)
-        && let Some(state) = session.continuation
+        .owners
+        .get(owner)
+        .is_some_and(|state| state.current_turn == turn_id)
+        && let Some(state) = registry.owners.remove(owner)
+        && let Some(continuation) = state.continuation
     {
         registry.total_transcript_bytes = registry
             .total_transcript_bytes
-            .saturating_sub(state.transcript_bytes);
+            .saturating_sub(continuation.transcript_bytes);
     }
 }
 
 pub fn if_current_turn<T>(
-    session_id: Option<&str>,
+    owner: Option<&ConversationIdentity>,
     turn_id: Option<u64>,
     action: impl FnOnce() -> T,
 ) -> Option<T> {
-    let (Some(session_id), Some(turn_id)) = (session_id, turn_id) else {
-        return Some(action());
+    let (Some(owner), Some(turn_id)) = (owner, turn_id) else {
+        return None;
     };
     let guard = REGISTRY.lock().unwrap();
     let current = guard
         .as_ref()
-        .and_then(|registry| registry.sessions.get(session_id))
-        .is_some_and(|session| session.current_turn == turn_id);
+        .and_then(|registry| registry.owners.get(owner))
+        .is_some_and(|state| state.current_turn == turn_id);
     current.then(action)
 }
 
 pub fn with_current_turn(
-    session_id: Option<&str>,
+    owner: Option<&ConversationIdentity>,
     turn_id: Option<u64>,
     action: impl FnOnce(),
 ) -> bool {
-    if_current_turn(session_id, turn_id, action).is_some()
+    if_current_turn(owner, turn_id, action).is_some()
 }
 
-pub fn is_current_turn(session_id: Option<&str>, turn_id: Option<u64>) -> bool {
-    let (Some(session_id), Some(turn_id)) = (session_id, turn_id) else {
+pub fn is_current_turn(owner: Option<&ConversationIdentity>, turn_id: Option<u64>) -> bool {
+    let (Some(owner), Some(turn_id)) = (owner, turn_id) else {
         return false;
     };
     let guard = REGISTRY.lock().unwrap();
     guard
         .as_ref()
-        .and_then(|registry| registry.sessions.get(session_id))
-        .is_some_and(|session| session.current_turn == turn_id)
+        .and_then(|registry| registry.owners.get(owner))
+        .is_some_and(|state| state.current_turn == turn_id)
 }
 
-pub fn clear_continuation(session_id: Option<&str>) {
-    let Some(session_id) = session_id else {
+pub fn clear_continuation(owner: Option<&ConversationIdentity>) {
+    let Some(owner) = owner else {
         return;
     };
     let mut guard = REGISTRY.lock().unwrap();
     let Some(registry) = guard.as_mut() else {
         return;
     };
-    if let Some(session) = registry.sessions.remove(session_id)
-        && let Some(state) = session.continuation
+    if let Some(state) = registry.owners.remove(owner)
+        && let Some(continuation) = state.continuation
     {
         registry.total_transcript_bytes = registry
             .total_transcript_bytes
-            .saturating_sub(state.transcript_bytes);
+            .saturating_sub(continuation.transcript_bytes);
     }
 }
 
-pub fn has_continuation_for_tests(session_id: &str) -> bool {
+pub fn has_continuation_for_tests(owner: &ConversationIdentity) -> bool {
     let guard = REGISTRY.lock().unwrap();
     guard
         .as_ref()
-        .and_then(|registry| registry.sessions.get(session_id))
-        .is_some_and(|session| session.continuation.is_some())
+        .and_then(|registry| registry.owners.get(owner))
+        .is_some_and(|state| state.continuation.is_some())
 }
 
 pub fn clear_all_continuations_for_tests() {
@@ -376,23 +387,23 @@ fn stable_json(value: &serde_json::Value) -> String {
 }
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
-    while registry.sessions.len() > MAX_STATES
+    while registry.owners.len() > MAX_STATES
         || registry.total_transcript_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
     {
-        let key = registry
-            .sessions
+        let owner = registry
+            .owners
             .iter()
-            .min_by_key(|(_, session)| session.updated_at)
-            .map(|(key, _)| key.clone());
-        let Some(key) = key else {
+            .min_by_key(|(_, state)| state.updated_at)
+            .map(|(owner, _)| owner.clone());
+        let Some(owner) = owner else {
             break;
         };
-        if let Some(session) = registry.sessions.remove(&key)
-            && let Some(state) = session.continuation
+        if let Some(state) = registry.owners.remove(&owner)
+            && let Some(continuation) = state.continuation
         {
             registry.total_transcript_bytes = registry
                 .total_transcript_bytes
-                .saturating_sub(state.transcript_bytes);
+                .saturating_sub(continuation.transcript_bytes);
         }
     }
 }
@@ -401,6 +412,33 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_registry() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_continuations_for_tests();
+        guard
+    }
+
+    fn main_owner(session_id: &str) -> ConversationIdentity {
+        ConversationIdentity::Main(session_id.to_string())
+    }
+
+    fn agent_owner(session_id: &str, agent_id: &str) -> ConversationIdentity {
+        ConversationIdentity::Agent(session_id.to_string(), agent_id.to_string())
+    }
+
+    fn input(text: &str) -> ResponsesInputItem {
+        ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: vec![
+                super::super::translate::request::ResponsesContentPart::InputText {
+                    text: text.to_string(),
+                },
+            ],
+        }
+    }
 
     fn request_with_input(
         input: Vec<ResponsesInputItem>,
@@ -416,142 +454,226 @@ mod tests {
         if let Some(extras) = extra
             && let Some(obj) = extras.as_object()
         {
-            for (k, v) in obj {
-                fields.insert(k.clone(), v.clone());
+            for (key, value) in obj {
+                fields.insert(key.clone(), value.clone());
             }
         }
         serde_json::from_value(serde_json::Value::Object(fields)).unwrap()
     }
 
-    fn start_and_record(session_id: &str, request: &ResponsesRequest, response_id: Option<&str>) {
-        let candidate = continuation_candidate(Some(session_id), request, true);
+    fn start_and_record(
+        owner: &ConversationIdentity,
+        request: &ResponsesRequest,
+        response_id: &str,
+    ) {
+        let candidate = continuation_candidate(Some(owner), request, true);
         record_continuation(
-            Some(session_id),
+            candidate.owner.as_ref(),
             candidate.turn_id,
             request,
-            response_id,
+            Some(response_id),
             &[],
         );
     }
 
     #[test]
-    fn continuation_behaviors() {
-        // All tests run in sequence to avoid global state interference
+    fn disabled_and_missing_identity_requests_are_stateless() {
+        let _registry_guard = lock_registry();
+        let request = request_with_input(vec![input("one")], None);
+        let owner = main_owner("session-a");
 
-        // disabled_when_not_enabled
-        clear_all_continuations_for_tests();
-        let input = vec![ResponsesInputItem::Message {
-            role: "user".to_string(),
-            content: vec![
-                super::super::translate::request::ResponsesContentPart::InputText {
-                    text: "one".to_string(),
-                },
-            ],
-        }];
-        let req = request_with_input(input, None);
-        let result = continuation_candidate(Some("s1"), &req, false);
-        assert_eq!(result.disabled_reason, Some("disabled".to_string()));
-        assert_eq!(result.input_delta_count, 1);
+        let disabled = continuation_candidate(Some(&owner), &request, false);
+        assert_eq!(disabled.owner.as_ref(), Some(&owner));
+        assert_eq!(disabled.turn_id, None);
+        assert_eq!(disabled.input_delta_count, request.input.len());
+        assert_eq!(disabled.disabled_reason.as_deref(), Some("disabled"));
 
-        // missing_session
-        clear_all_continuations_for_tests();
-        let input = vec![ResponsesInputItem::Message {
-            role: "user".to_string(),
-            content: vec![
-                super::super::translate::request::ResponsesContentPart::InputText {
-                    text: "one".to_string(),
-                },
-            ],
-        }];
-        let req = request_with_input(input, None);
-        let result = continuation_candidate(None, &req, true);
-        assert_eq!(result.disabled_reason, Some("missing_session".to_string()));
+        let missing = continuation_candidate(None, &request, true);
+        assert_eq!(missing.owner, None);
+        assert_eq!(missing.turn_id, None);
+        assert_eq!(missing.input_delta_count, request.input.len());
+        assert_eq!(missing.disabled_reason.as_deref(), Some("missing_identity"));
+    }
 
-        // uses_previous_response_id_for_append_only
-        clear_all_continuations_for_tests();
-        let input = vec![ResponsesInputItem::Message {
-            role: "user".to_string(),
-            content: vec![
-                super::super::translate::request::ResponsesContentPart::InputText {
-                    text: "one".to_string(),
-                },
-            ],
-        }];
-        let req = request_with_input(input, None);
-        start_and_record("s1", &req, Some("resp_1"));
+    #[test]
+    fn sibling_agents_reserve_and_publish_independently() {
+        let _registry_guard = lock_registry();
+        let sibling_one = agent_owner("session-a", "agent-one");
+        let sibling_two = agent_owner("session-a", "agent-two");
+        let first_request = request_with_input(vec![input("one")], None);
 
-        let input2 = vec![
-            ResponsesInputItem::Message {
-                role: "user".to_string(),
-                content: vec![
-                    super::super::translate::request::ResponsesContentPart::InputText {
-                        text: "one".to_string(),
-                    },
-                ],
-            },
-            ResponsesInputItem::Message {
-                role: "user".to_string(),
-                content: vec![
-                    super::super::translate::request::ResponsesContentPart::InputText {
-                        text: "two".to_string(),
-                    },
-                ],
-            },
-        ];
-        let req2 = request_with_input(input2, None);
-        let result = continuation_candidate(Some("s1"), &req2, true);
-        assert_eq!(result.previous_response_id, Some("resp_1".to_string()));
-        assert_eq!(result.input_delta_count, 1);
+        let first = continuation_candidate(Some(&sibling_one), &first_request, true);
+        let second = continuation_candidate(Some(&sibling_two), &first_request, true);
+        assert_ne!(first.turn_id, second.turn_id);
+        record_continuation(
+            first.owner.as_ref(),
+            first.turn_id,
+            &first_request,
+            Some("resp_one"),
+            &[],
+        );
+        record_continuation(
+            second.owner.as_ref(),
+            second.turn_id,
+            &first_request,
+            Some("resp_two"),
+            &[],
+        );
+        assert!(has_continuation_for_tests(&sibling_one));
+        assert!(has_continuation_for_tests(&sibling_two));
 
-        // clears_state_when_prompt_signature_changes
-        clear_all_continuations_for_tests();
-        let input = vec![ResponsesInputItem::Message {
-            role: "user".to_string(),
-            content: vec![
-                super::super::translate::request::ResponsesContentPart::InputText {
-                    text: "one".to_string(),
-                },
-            ],
-        }];
-        let req = request_with_input(input.clone(), None);
-        start_and_record("s1", &req, Some("resp_1"));
+        let next_request = request_with_input(vec![input("one"), input("two")], None);
+        let first_next = continuation_candidate(Some(&sibling_one), &next_request, true);
+        let second_next = continuation_candidate(Some(&sibling_two), &next_request, true);
+        assert_eq!(first_next.previous_response_id.as_deref(), Some("resp_one"));
+        assert_eq!(
+            second_next.previous_response_id.as_deref(),
+            Some("resp_two")
+        );
+    }
 
-        let req2 = request_with_input(input, Some(json!({"service_tier": "flex"})));
-        let result = continuation_candidate(Some("s1"), &req2, true);
-        assert_eq!(result.disabled_reason, Some("prompt_changed".to_string()));
-        assert!(!has_continuation_for_tests("s1"));
+    #[test]
+    fn different_owner_completion_order_cannot_interfere() {
+        let _registry_guard = lock_registry();
+        let main = main_owner("session-a");
+        let agent = agent_owner("session-a", "agent-a");
+        let request = request_with_input(vec![input("one")], None);
+        let main_candidate = continuation_candidate(Some(&main), &request, true);
+        let agent_candidate = continuation_candidate(Some(&agent), &request, true);
 
-        // clears_state_when_missing_response_id
-        clear_all_continuations_for_tests();
-        let input = vec![ResponsesInputItem::Message {
-            role: "user".to_string(),
-            content: vec![
-                super::super::translate::request::ResponsesContentPart::InputText {
-                    text: "one".to_string(),
-                },
-            ],
-        }];
-        let req = request_with_input(input.clone(), None);
-        start_and_record("s1", &req, Some("resp_1"));
-        assert!(has_continuation_for_tests("s1"));
+        record_continuation(
+            agent_candidate.owner.as_ref(),
+            agent_candidate.turn_id,
+            &request,
+            Some("resp_agent"),
+            &[],
+        );
+        record_continuation(
+            main_candidate.owner.as_ref(),
+            main_candidate.turn_id,
+            &request,
+            Some("resp_main"),
+            &[],
+        );
+        abort_continuation(Some(&main), agent_candidate.turn_id);
 
-        let candidate = continuation_candidate(Some("s1"), &req, true);
-        record_continuation(Some("s1"), candidate.turn_id, &req, None, &[]);
-        assert!(!has_continuation_for_tests("s1"));
+        assert!(has_continuation_for_tests(&main));
+        assert!(has_continuation_for_tests(&agent));
+        let next = request_with_input(vec![input("one"), input("two")], None);
+        assert_eq!(
+            continuation_candidate(Some(&agent), &next, true)
+                .previous_response_id
+                .as_deref(),
+            Some("resp_agent")
+        );
+    }
 
-        // stale turns cannot publish or clear a newer turn
-        clear_all_continuations_for_tests();
-        let first = continuation_candidate(Some("s1"), &req, true);
-        record_continuation(Some("s1"), first.turn_id, &req, Some("resp_1"), &[]);
-        let second = continuation_candidate(Some("s1"), &req, true);
-        let third = continuation_candidate(Some("s1"), &req, true);
-        assert_eq!(third.disabled_reason.as_deref(), Some("superseded_turn"));
+    #[test]
+    fn missing_response_id_aborts_only_the_current_owner() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let sibling = agent_owner("session-a", "agent-a");
+        let request = request_with_input(vec![input("one")], None);
+        start_and_record(&owner, &request, "resp_main");
+        start_and_record(&sibling, &request, "resp_agent");
 
-        record_continuation(Some("s1"), second.turn_id, &req, Some("resp_2"), &[]);
-        assert!(!has_continuation_for_tests("s1"));
-        record_continuation(Some("s1"), third.turn_id, &req, Some("resp_3"), &[]);
-        assert!(has_continuation_for_tests("s1"));
-        abort_continuation(Some("s1"), second.turn_id);
-        assert!(has_continuation_for_tests("s1"));
+        let candidate = continuation_candidate(Some(&owner), &request, true);
+        record_continuation(
+            candidate.owner.as_ref(),
+            candidate.turn_id,
+            &request,
+            None,
+            &[],
+        );
+
+        assert!(!has_continuation_for_tests(&owner));
+        assert!(has_continuation_for_tests(&sibling));
+    }
+
+    #[test]
+    fn same_owner_stale_turn_cannot_publish_clear_or_run_actions() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let request = request_with_input(vec![input("one")], None);
+        start_and_record(&owner, &request, "resp_1");
+
+        let stale = continuation_candidate(Some(&owner), &request, true);
+        let current = continuation_candidate(Some(&owner), &request, true);
+        assert_eq!(current.disabled_reason.as_deref(), Some("superseded_turn"));
+        record_continuation(
+            stale.owner.as_ref(),
+            stale.turn_id,
+            &request,
+            Some("resp_stale"),
+            &[],
+        );
+        assert!(!has_continuation_for_tests(&owner));
+        record_continuation(
+            current.owner.as_ref(),
+            current.turn_id,
+            &request,
+            Some("resp_current"),
+            &[],
+        );
+        assert!(has_continuation_for_tests(&owner));
+        abort_continuation(stale.owner.as_ref(), stale.turn_id);
+        assert!(has_continuation_for_tests(&owner));
+
+        let mut ran = false;
+        assert_eq!(
+            if_current_turn(stale.owner.as_ref(), stale.turn_id, || ran = true),
+            None
+        );
+        assert!(!ran);
+    }
+
+    #[test]
+    fn missing_owner_or_turn_mutations_are_hard_noops() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let request = request_with_input(vec![input("one")], None);
+        start_and_record(&owner, &request, "resp_1");
+
+        record_continuation(None, Some(1), &request, Some("ignored"), &[]);
+        record_continuation(Some(&owner), None, &request, Some("ignored"), &[]);
+        abort_continuation(None, Some(1));
+        abort_continuation(Some(&owner), None);
+        clear_continuation(None);
+        assert!(has_continuation_for_tests(&owner));
+
+        let mut runs = 0;
+        assert_eq!(if_current_turn(None, Some(1), || runs += 1), None);
+        assert_eq!(if_current_turn(Some(&owner), None, || runs += 1), None);
+        assert!(!with_current_turn(None, Some(1), || runs += 1));
+        assert!(!with_current_turn(Some(&owner), None, || runs += 1));
+        assert_eq!(runs, 0);
+    }
+
+    #[test]
+    fn append_only_and_prompt_guards_stay_owner_scoped() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let request = request_with_input(vec![input("one")], None);
+        start_and_record(&owner, &request, "resp_1");
+
+        let appended = request_with_input(vec![input("one"), input("two")], None);
+        let candidate = continuation_candidate(Some(&owner), &appended, true);
+        assert_eq!(candidate.previous_response_id.as_deref(), Some("resp_1"));
+        assert_eq!(candidate.input_delta_count, 1);
+
+        record_continuation(
+            candidate.owner.as_ref(),
+            candidate.turn_id,
+            &appended,
+            Some("resp_2"),
+            &[],
+        );
+        let changed = request_with_input(
+            vec![input("one"), input("two"), input("three")],
+            Some(json!({"service_tier": "flex"})),
+        );
+        let candidate = continuation_candidate(Some(&owner), &changed, true);
+        assert_eq!(candidate.disabled_reason.as_deref(), Some("prompt_changed"));
+        assert!(!has_continuation_for_tests(&owner));
     }
 }

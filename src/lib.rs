@@ -9,6 +9,7 @@ pub mod project;
 pub mod provider;
 pub mod providers;
 pub mod registry;
+pub mod request_identity;
 pub mod retry;
 pub mod server;
 pub mod session;

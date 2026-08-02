@@ -1,5 +1,6 @@
 use crate::anthropic::schema::MessagesRequest;
 use crate::monitor::MonitorHandle;
+use crate::request_identity::ConversationIdentity;
 use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -26,6 +27,17 @@ pub trait Provider: Send + Sync {
     fn supported_models(&self) -> Vec<String>;
     fn cli(&self) -> &'static dyn CliHandlers;
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
+
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> Response {
+        let _ = conversation_identity;
+        self.handle_messages(body, ctx).await
+    }
+
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
     async fn generate_anthropic_stream(

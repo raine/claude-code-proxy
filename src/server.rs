@@ -25,6 +25,7 @@ use crate::{
         },
     },
     registry::{Registry, normalize_incoming_model},
+    request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -1382,6 +1383,9 @@ async fn dispatch_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    let conversation_identity = (!count_tokens)
+        .then(|| ConversationIdentity::from_headers(&headers))
+        .flatten();
     let path = uri.path().to_string();
     let query = redacted_query(&uri);
     let endpoint = if count_tokens {
@@ -1721,7 +1725,17 @@ async fn dispatch_request(
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
     } else {
-        provider.handle_messages(body, context).await
+        provider
+            .handle_messages_with_conversation_identity(
+                body,
+                context,
+                if auto_review_route.is_some() {
+                    None
+                } else {
+                    conversation_identity
+                },
+            )
+            .await
     };
     log_request_completed(
         &log,
@@ -2040,7 +2054,15 @@ fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
         if let Ok(raw) = value.to_str() {
-            out.insert(key.as_str().to_string(), Value::String(raw.to_string()));
+            let value = if matches!(
+                key.as_str(),
+                CLAUDE_AGENT_HEADER | CLAUDE_PARENT_AGENT_HEADER
+            ) {
+                format!("[redacted len={}]", raw.len())
+            } else {
+                raw.to_string()
+            };
+            out.insert(key.as_str().to_string(), Value::String(value));
         }
     }
     Value::Object(out)
@@ -2124,8 +2146,10 @@ fn _unused(session_state: Option<&SessionState>) {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, is_claude_auto_review_request};
+    use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
     use crate::anthropic::schema::MessagesRequest;
+    use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
+    use http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     fn request(system: &str, stream: bool, tools: serde_json::Value) -> MessagesRequest {
@@ -2206,6 +2230,37 @@ mod auto_review_tests {
             .expect("configured classifier should be routed");
         assert_eq!(route.override_model, "grok-4.5");
         assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn traffic_headers_redact_agent_lineage_ids() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            HeaderValue::from_static("session-visible"),
+        );
+        headers.insert(
+            CLAUDE_AGENT_HEADER,
+            HeaderValue::from_static("agent-secret"),
+        );
+        headers.insert(
+            CLAUDE_PARENT_AGENT_HEADER,
+            HeaderValue::from_static("parent-secret"),
+        );
+
+        let captured = headers_to_record(&headers);
+        assert_eq!(
+            captured["x-claude-code-session-id"],
+            json!("session-visible")
+        );
+        assert_eq!(captured[CLAUDE_AGENT_HEADER], json!("[redacted len=12]"));
+        assert_eq!(
+            captured[CLAUDE_PARENT_AGENT_HEADER],
+            json!("[redacted len=13]")
+        );
+        let serialized = captured.to_string();
+        assert!(!serialized.contains("agent-secret"));
+        assert!(!serialized.contains("parent-secret"));
     }
 
     #[test]
