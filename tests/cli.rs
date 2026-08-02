@@ -24,6 +24,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
     assert!(out.contains("kimi:"));
+    assert!(out.contains("opencode:"));
     assert!(out.contains("cursor:"));
 
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;

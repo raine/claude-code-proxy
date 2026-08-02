@@ -428,6 +428,31 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(req, opts, true)
+}
+
+pub fn translate_openai_compatible_request(
+    req: &MessagesRequest,
+    model: String,
+    session_id: Option<String>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(
+        req,
+        TranslateOptions {
+            session_id,
+            service_tier: None,
+            model,
+            use_responses_lite: false,
+        },
+        false,
+    )
+}
+
+fn translate_request_inner(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    apply_codex_config: bool,
+) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let input = build_input(req);
@@ -519,15 +544,22 @@ pub fn translate_request(
         out.prompt_cache_key = Some(sid);
     }
 
-    let service_tier = resolve_service_tier(opts.service_tier)?;
-    if let Some(ref tier) = service_tier {
-        out.service_tier = Some(tier.clone());
+    if apply_codex_config {
+        let service_tier = resolve_service_tier(opts.service_tier)?;
+        if let Some(ref tier) = service_tier {
+            out.service_tier = Some(tier.clone());
+        }
     }
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = resolve_effort(codex_effort)?;
-    if is_compact
+    let mut resolved_effort = if apply_codex_config {
+        resolve_effort(codex_effort)?
+    } else {
+        codex_effort
+    };
+    if apply_codex_config
+        && is_compact
         && let Some(cap) = compact_effort_cap()
         && resolved_effort.as_ref().is_some_and(|e| *e > cap)
     {
@@ -535,7 +567,8 @@ pub fn translate_request(
     }
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
-            && reasoning_summary_requested(config::codex_reasoning_summary().as_deref())
+            && (!apply_codex_config
+                || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
             Some("auto".to_string())
         } else {

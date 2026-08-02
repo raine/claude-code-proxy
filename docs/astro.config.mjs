@@ -8,7 +8,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'claude-code-proxy',
-      description: 'Run Claude Code with Codex, Kimi, Grok, or Cursor Agent.',
+      description: 'Run Claude Code with Codex, Kimi, Grok, OpenCode Go, or Cursor Agent.',
       plugins: [starlightLlmsTxt()],
       favicon: '/favicon.svg',
       head: [
@@ -47,6 +47,7 @@ export default defineConfig({
             { label: 'Codex', slug: 'providers/codex' },
             { label: 'Kimi', slug: 'providers/kimi' },
             { label: 'Grok', slug: 'providers/grok' },
+            { label: 'OpenCode Go', slug: 'providers/opencode-go' },
             { label: 'Cursor Agent', slug: 'providers/cursor-agent' },
           ],
         },

@@ -3,7 +3,7 @@ title: HTTP API
 description: Local routes for health checks, Anthropic Messages, token counts, model discovery, OpenAI-compatible requests, and Codex images.
 ---
 
-The server exposes the Anthropic and OpenAI routes supported by the proxy. Each route uses the stored login for the model's provider.
+The server exposes the Anthropic and OpenAI routes supported by the proxy. Each route uses the configured provider credential for the selected model.
 
 <div class="security-callout">
 <strong>No client authentication.</strong> The listener accepts requests without validating `Authorization` or `x-api-key`. Loopback is the default. Protect every non-loopback listener with a firewall or authenticating reverse proxy.
@@ -37,7 +37,7 @@ Accepts the same basic Anthropic request shape and returns:
 {"input_tokens":1234}
 ```
 
-Codex tokenizes text locally with `o200k_base` and adds estimates for images, encrypted reasoning, and protocol framing. Kimi and Grok use local text heuristics, while Cursor estimates the rendered prompt from its character length. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
+Codex tokenizes text locally with `o200k_base` and adds estimates for images, encrypted reasoning, and protocol framing. Kimi, Grok, and OpenCode Go use local text heuristics, while Cursor estimates the rendered prompt from its character length. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
 
 ## `GET /v1/models`
 
@@ -64,7 +64,7 @@ Claude Code gateway discovery filters IDs according to its own model rules. See 
 
 ## `POST /v1/chat/completions`
 
-Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, or Cursor. The proxy ignores incoming bearer credentials and uses the stored login for that provider.
+Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, OpenCode Go, or Cursor. The proxy ignores incoming bearer credentials and uses the configured provider credential.
 
 ```sh
 curl http://127.0.0.1:18765/v1/chat/completions \
@@ -72,7 +72,7 @@ curl http://127.0.0.1:18765/v1/chat/completions \
   -d '{"model":"kimi-k2.6","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-For Kimi, Grok, and Cursor, the route accepts:
+For Kimi, Grok, OpenCode Go, and Cursor, the route accepts:
 
 - `system`, `developer`, `user`, `assistant`, and `tool` messages
 - text, supported user images, function calls, and tool results
@@ -116,7 +116,7 @@ The Images API is an internal ChatGPT Codex integration, not the public OpenAI P
 
 ## `POST /v1/responses`
 
-Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, or Cursor.
+Enable this route with `CCP_CODEX_RESPONSES_API=1` or `codex.responsesApi: true`. The `model` field selects Codex, Kimi, Grok, OpenCode Go, or Cursor.
 
 ```sh
 curl http://127.0.0.1:18765/v1/responses \
@@ -124,7 +124,7 @@ curl http://127.0.0.1:18765/v1/responses \
   -d '{"model":"grok-4.5","input":"Hello"}'
 ```
 
-Codex models use native Responses passthrough, including native JSON and SSE output. For Kimi, Grok, and Cursor, the route accepts:
+Codex models use native Responses passthrough, including native JSON and SSE output. For Kimi, Grok, OpenCode Go, and Cursor, the route accepts:
 
 - string input or message items
 - `instructions`
