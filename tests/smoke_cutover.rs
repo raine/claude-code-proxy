@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
@@ -194,6 +195,28 @@ where
     });
 
     addr_str
+}
+
+async fn spawn_truncated_http_upstream(body: &'static [u8]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request).await;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len() + 4096
+        );
+        let _ = stream.write_all(headers.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+        let _ = stream.shutdown().await;
+    });
+
+    format!("http://{addr}")
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1905,6 +1928,56 @@ async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_truncated_http_upstream(concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial before body error\"}\n\n"
+    ).as_bytes())
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("failed semantic stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("partial before body error"),
+        "stream body: {text}"
+    );
+    assert!(text.contains("event: error"), "stream body: {text}");
+    assert!(
+        text.contains("Transport error reading Codex response body"),
+        "stream body: {text}"
+    );
+    assert!(
+        !text.contains("\"message\":\"http_response_body\""),
+        "stream body: {text}"
+    );
 }
 
 #[allow(clippy::await_holding_lock)]

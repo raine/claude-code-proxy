@@ -1480,13 +1480,11 @@ fn is_context_window_overflow(message: &str) -> bool {
 }
 
 fn codex_error_message(err: &client::CodexError) -> &str {
-    err.detail.as_deref().unwrap_or({
-        if err.status == 0 {
-            err.message.as_str()
-        } else {
-            "Upstream error"
-        }
-    })
+    if err.status == 0 {
+        err.message.as_str()
+    } else {
+        err.detail.as_deref().unwrap_or("Upstream error")
+    }
 }
 
 // ---------------------------------------------------------------------------
