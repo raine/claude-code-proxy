@@ -57,14 +57,6 @@ const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const WEBSOCKET_KEEPALIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Terminal WebSocket event types that signal the request is done
-const TERMINAL_EVENTS: &[&str] = &[
-    "response.completed",
-    "response.incomplete",
-    "response.failed",
-    "error",
-];
-
 pub type CodexWebSocketEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
@@ -687,10 +679,7 @@ fn encode_sse(text: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 pub(super) fn is_terminal_event(payload: &serde_json::Value) -> bool {
-    match payload.get("type").and_then(|v| v.as_str()) {
-        Some(t) => TERMINAL_EVENTS.contains(&t),
-        None => false,
-    }
+    super::events::event_is_terminal(payload)
 }
 
 fn is_response_event(payload: &serde_json::Value) -> bool {
@@ -3144,11 +3133,20 @@ mod tests {
         let completed = serde_json::json!({"type": "response.completed"});
         assert!(is_terminal_event(&completed));
 
+        let done = serde_json::json!({"type": "response.done"});
+        assert!(is_terminal_event(&done));
+
         let delta = serde_json::json!({"type": "response.output_text.delta"});
         assert!(!is_terminal_event(&delta));
 
         let error = serde_json::json!({"type": "error", "error": {"message": "fail"}});
         assert!(is_terminal_event(&error));
+
+        let response_error = serde_json::json!({
+            "type": "response.error",
+            "response": {"error": {"message": "fail"}}
+        });
+        assert!(is_terminal_event(&response_error));
     }
 
     #[test]

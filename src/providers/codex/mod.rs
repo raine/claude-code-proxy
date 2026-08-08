@@ -407,6 +407,11 @@ impl CodexProvider {
             attempt += 1;
             sleep(delay.wait_ms).await;
         };
+        if let Some(failure) = events::first_event_failure(&upstream.body) {
+            abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+            abort_continuation_for_owner(&request_continuation);
+            return map_codex_event_failure_to_response(&failure);
+        }
         log.info(
             "codex_upstream_response_received",
             Some(serde_json::Map::from_iter([
@@ -885,39 +890,24 @@ async fn live_stream_response_once(
         {
             Ok(result) => result,
             Err(message) => {
-                if retryable_live_start_payload(&payload, &message) {
-                    let lower_message = message.to_ascii_lowercase();
-                    let status = websocket::event_error_status(&payload).unwrap_or_else(|| {
-                        let error = payload.get("error").or_else(|| {
-                            payload.get("response").and_then(|value| value.get("error"))
-                        });
-                        let overloaded = error.is_some_and(|error| {
-                            error.get("code").and_then(|value| value.as_str())
-                                == Some("overloaded_error")
-                                || error.get("type").and_then(|value| value.as_str())
-                                    == Some("overloaded_error")
-                        });
-                        if payload.get("type").and_then(|value| value.as_str())
-                            == Some("codex.rate_limits")
-                            || lower_message.contains("rate limit")
-                        {
-                            429
-                        } else if overloaded || lower_message.contains("overloaded") {
-                            529
-                        } else {
-                            503
-                        }
-                    });
-                    return provider_retry(
-                        &upstream_events,
-                        client::CodexError {
-                            status,
-                            message: message.clone(),
-                            detail: Some(message),
-                            retry_after: retry_after_from_live_payload(&payload),
-                            origin: client::CodexErrorOrigin::WebSocket,
-                        },
+                if let Some(failure) = events::classify_event_failure(&payload) {
+                    if failure.retryable() {
+                        return provider_retry(
+                            &upstream_events,
+                            codex_event_failure_error(
+                                &failure,
+                                client::CodexErrorOrigin::WebSocket,
+                            ),
+                        );
+                    }
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        &request_continuation,
+                        compaction.attempt,
                     );
+                    return LiveStreamStart::Response(map_codex_event_failure_to_response(
+                        &failure,
+                    ));
                 }
                 abort_request_state(
                     ctx.session_id.as_deref(),
@@ -1014,7 +1004,7 @@ fn translate_live_stream_payload(
     traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
     let chunk = translator.accept(payload, traffic)?;
-    let terminal = is_codex_terminal_event(payload) || translator.is_finished();
+    let terminal = events::event_is_terminal(payload) || translator.is_finished();
     Ok((chunk, terminal))
 }
 
@@ -1129,9 +1119,16 @@ fn remaining_live_stream_response(
                                 &request_continuation,
                                 compaction.attempt,
                             );
+                            let failure = events::classify_event_failure(&payload);
+                            let error_type = failure
+                                .as_ref()
+                                .map_or("api_error", events::CodexEventFailure::client_error_type);
+                            let error_message = failure
+                                .as_ref()
+                                .map_or(message.as_str(), |failure| failure.message.as_str());
                             let chunk = translator.error_chunk(
-                                &message,
-                                "api_error",
+                                error_message,
+                                error_type,
                                 ctx.traffic.as_deref(),
                             );
                             if !chunk.is_empty() {
@@ -1171,12 +1168,14 @@ fn remaining_live_stream_response(
                         &request_continuation,
                         compaction.attempt,
                     );
-                    let chunk =
-                        translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
-                    if !chunk.is_empty() {
-                        record_live_stream_progress(&ctx, &chunk);
-                        let _ = tx.send(Ok(Bytes::from(chunk))).await;
-                        return;
+                    if err.origin == client::CodexErrorOrigin::WebSocket {
+                        let chunk = translator
+                            .finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
+                        if !chunk.is_empty() {
+                            record_live_stream_progress(&ctx, &chunk);
+                            let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                            return;
+                        }
                     }
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
@@ -1282,23 +1281,8 @@ fn is_empty_codex_success_completion(upstream_sse: &[u8]) -> bool {
     saw_success_terminal
 }
 
-fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|v| v.as_str()),
-        Some("response.completed")
-            | Some("response.incomplete")
-            | Some("response.done")
-            | Some("response.failed")
-            | Some("response.error")
-            | Some("error")
-    )
-}
-
 fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|v| v.as_str()),
-        Some("response.completed") | Some("response.done")
-    )
+    events::event_is_success_terminal(payload)
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
@@ -1355,12 +1339,17 @@ fn retryable_live_message(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn retryable_live_start_payload(payload: &serde_json::Value, _message: &str) -> bool {
-    events::classify_event_failure(payload).is_some_and(|failure| failure.retryable())
-}
-
-fn retry_after_from_live_payload(payload: &serde_json::Value) -> Option<String> {
-    events::classify_event_failure(payload).and_then(|failure| failure.retry_after)
+fn codex_event_failure_error(
+    failure: &events::CodexEventFailure,
+    origin: client::CodexErrorOrigin,
+) -> client::CodexError {
+    client::CodexError {
+        status: failure.status,
+        message: failure.message.clone(),
+        detail: Some(failure.message.clone()),
+        retry_after: failure.retry_after.clone(),
+        origin,
+    }
 }
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
@@ -1477,6 +1466,16 @@ fn map_codex_failure_to_response(message: &str) -> Response {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
     } else {
         json_error(StatusCode::BAD_GATEWAY, "api_error", message)
+    }
+}
+
+fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> Response {
+    let status = StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let response = json_error(status, failure.client_error_type(), &failure.message);
+    if let Some(retry_after) = failure.retry_after.as_deref() {
+        ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+    } else {
+        response
     }
 }
 
@@ -2129,28 +2128,28 @@ mod tests {
     }
 
     #[test]
-    fn live_start_payload_retry_detection_covers_rate_limit_and_overload() {
-        assert!(retryable_live_start_payload(
-            &serde_json::json!({
+    fn live_start_payload_retry_detection_uses_event_failure_classification() {
+        assert!(
+            events::classify_event_failure(&serde_json::json!({
                 "type": "codex.rate_limits",
                 "rate_limits": {"limit_reached": true}
-            }),
-            "rate limit reached",
-        ));
-        assert!(retryable_live_start_payload(
-            &serde_json::json!({
+            }))
+            .is_none()
+        );
+        assert!(
+            events::classify_event_failure(&serde_json::json!({
                 "type": "response.failed",
                 "response": {"error": {"type": "overloaded_error", "message": "overloaded"}}
-            }),
-            "overloaded",
-        ));
-        assert!(!retryable_live_start_payload(
-            &serde_json::json!({
+            }))
+            .is_some_and(|failure| failure.retryable())
+        );
+        assert!(
+            !events::classify_event_failure(&serde_json::json!({
                 "type": "response.failed",
-                "response": {"error": {"message": "bad request"}}
-            }),
-            "bad request",
-        ));
+                "response": {"error": {"status": 400, "code": "invalid_prompt", "message": "bad request"}}
+            }))
+            .is_some_and(|failure| failure.retryable())
+        );
     }
 
     async fn run_live_failure_case(
@@ -2405,11 +2404,15 @@ mod tests {
         let status = run_live_failure_case(
             "live-retry-exhaustion-cleanup",
             serde_json::json!({
-                "type": "codex.rate_limits",
-                "rate_limits": {
-                    "allowed": false,
-                    "limit_reached": true,
-                    "primary": {"reset_after_seconds": 0}
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "status": 429,
+                        "code": "rate_limit_exceeded",
+                        "message": "rate limit reached",
+                        "retry_after_seconds": 0
+                    }
                 }
             }),
             11,
@@ -2425,11 +2428,15 @@ mod tests {
         let status = run_live_failure_case(
             "live-excessive-retry-after-cleanup",
             serde_json::json!({
-                "type": "codex.rate_limits",
-                "rate_limits": {
-                    "allowed": false,
-                    "limit_reached": true,
-                    "primary": {"reset_after_seconds": 31}
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "status": 429,
+                        "code": "rate_limit_exceeded",
+                        "message": "rate limit reached",
+                        "retry_after_seconds": 31
+                    }
                 }
             }),
             1,
@@ -2448,13 +2455,17 @@ mod tests {
                 "type": "response.failed",
                 "response": {
                     "status": "failed",
-                    "error": {"message": "invalid request"}
+                    "error": {
+                        "status": 400,
+                        "code": "invalid_prompt",
+                        "message": "invalid request"
+                    }
                 }
             }),
             1,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

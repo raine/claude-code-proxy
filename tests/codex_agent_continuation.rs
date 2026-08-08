@@ -236,8 +236,16 @@ impl PendingRequest {
         self.outcome
             .send(MockOutcome::RawEvent {
                 event: json!({
-                    "type": "codex.rate_limits",
-                    "rate_limits": {"allowed": false, "limit_reached": true}
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "status": 429,
+                            "code": "rate_limit_exceeded",
+                            "message": "rate limit exceeded",
+                            "retry_after_seconds": 0
+                        }
+                    }
                 }),
                 acknowledged,
             })

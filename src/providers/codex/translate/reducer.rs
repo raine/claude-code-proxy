@@ -1,5 +1,5 @@
 use crate::anthropic::sse::parse_sse_events;
-use crate::providers::codex::events::is_terminal_rate_limit_event;
+use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
@@ -329,20 +329,28 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         event_count += 1;
         last_event_type = Some(t.clone());
 
+        if let Some(failure) = classify_event_failure(&p) {
+            let kind = match failure.kind {
+                CodexFailureKind::RateLimit => UpstreamErrorKind::RateLimit,
+                CodexFailureKind::Overloaded => UpstreamErrorKind::Overloaded,
+                CodexFailureKind::Transient => UpstreamErrorKind::Transient,
+                CodexFailureKind::Permanent => UpstreamErrorKind::Failed,
+            };
+            let retry_after_seconds = failure
+                .retry_after
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value.ceil() as u64);
+            return Err(UpstreamStreamError {
+                kind,
+                message: failure.message,
+                retry_after_seconds,
+                diagnostics: None,
+            });
+        }
+
         if t == "codex.rate_limits" {
-            if is_terminal_rate_limit_event(&p) {
-                let retry_after = p
-                    .get("rate_limits")
-                    .and_then(|r| r.get("primary"))
-                    .and_then(|r| r.get("reset_after_seconds"))
-                    .and_then(|v| v.as_f64());
-                return Err(UpstreamStreamError {
-                    kind: UpstreamErrorKind::RateLimit,
-                    message: "rate limit reached".to_string(),
-                    retry_after_seconds: retry_after.map(|f| f as u64),
-                    diagnostics: None,
-                });
-            }
             out.push(ReducerEvent::Progress);
             continue;
         }
@@ -358,28 +366,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         {
             out.push(ReducerEvent::Progress);
             continue;
-        }
-
-        if t == "response.failed" || t == "response.error" || t == "error" {
-            let msg = p
-                .get("response")
-                .and_then(|r| r.get("error"))
-                .and_then(|e| e.get("message"))
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    p.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("Upstream error");
-            let kind = upstream_failure_kind(&p, msg);
-            let retry_after = retry_after_from_payload(&p);
-            return Err(UpstreamStreamError {
-                kind,
-                message: msg.to_string(),
-                retry_after_seconds: retry_after,
-                diagnostics: None,
-            });
         }
 
         if t == "response.output_item.added" {
@@ -1008,82 +994,6 @@ fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
     format!("srvtoolu_{suffix}")
 }
 
-fn upstream_failure_kind(payload: &serde_json::Value, message: &str) -> UpstreamErrorKind {
-    let status = payload
-        .get("status")
-        .or_else(|| payload.get("status_code"))
-        .and_then(|v| v.as_u64());
-    let code = payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("code"))
-        .or_else(|| payload.get("error").and_then(|e| e.get("code")))
-        .and_then(|v| v.as_str());
-    let err_type = payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("type"))
-        .or_else(|| payload.get("error").and_then(|e| e.get("type")))
-        .and_then(|v| v.as_str());
-    let lower_msg = message.to_lowercase();
-
-    if status == Some(529)
-        || code == Some("overloaded_error")
-        || err_type == Some("overloaded_error")
-        || lower_msg.contains("overloaded")
-    {
-        return UpstreamErrorKind::Overloaded;
-    }
-
-    if (status.is_some_and(|s| (500..600).contains(&s)))
-        || code == Some("server_error")
-        || code == Some("internal_server_error")
-        || code == Some("internal_error")
-        || err_type == Some("server_error")
-        || err_type == Some("internal_server_error")
-        || err_type == Some("internal_error")
-        || is_retryable_transport_message(&lower_msg)
-    {
-        return UpstreamErrorKind::Transient;
-    }
-
-    UpstreamErrorKind::Failed
-}
-
-fn retry_after_from_payload(payload: &serde_json::Value) -> Option<u64> {
-    let raw = payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("retry_after_seconds"))
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("retry_after_seconds"))
-        })
-        .or_else(|| payload.get("retry_after_seconds"))
-        .or_else(|| payload.get("headers").and_then(|h| h.get("retry-after")))
-        .or_else(|| payload.get("headers").and_then(|h| h.get("Retry-After")));
-    let value = match raw {
-        Some(v) if v.is_number() => v.as_f64(),
-        Some(v) if v.is_string() => v.as_str().and_then(|s| s.parse::<f64>().ok()),
-        _ => None,
-    };
-    value.map(|f| f as u64)
-}
-
-fn is_retryable_transport_message(msg: &str) -> bool {
-    msg.contains("you can retry your request")
-        || msg.contains("socket connection was closed unexpectedly")
-        || msg.contains("connection closed unexpectedly")
-        || msg.contains("connection reset")
-        || msg.contains("operation timed out")
-        || msg.contains("econnreset")
-        || msg.contains("epipe")
-        || msg.contains("etimedout")
-        || msg.contains("und_err_socket")
-        || msg.contains("fetch failed")
-}
-
 pub fn map_codex_usage_to_anthropic(
     u: &Option<CodexUsage>,
     web_search_requests: Option<usize>,
@@ -1239,14 +1149,21 @@ mod tests {
     }
 
     #[test]
-    fn reduce_rate_limit_throws() {
-        let upstream = sse(
-            "codex.rate_limits",
-            json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+    fn reduce_rate_limit_snapshot_is_progress_telemetry() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "codex.rate_limits",
+                json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            )
         );
-        let result = reduce_upstream_bytes(upstream.as_bytes());
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind, UpstreamErrorKind::RateLimit);
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(matches!(out.first(), Some(ReducerEvent::Progress)));
+        assert!(matches!(out.last(), Some(ReducerEvent::Finish { .. })));
     }
 
     #[test]
@@ -1392,24 +1309,14 @@ mod tests {
     }
 
     #[test]
-    fn reduce_incomplete_is_max_tokens() {
+    fn reduce_incomplete_is_upstream_error() {
         let upstream = sse(
             "response.incomplete",
             json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
         );
-        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
-        let last = out.last().unwrap();
-        if let ReducerEvent::Finish {
-            stop_reason,
-            continuation_eligible,
-            ..
-        } = last
-        {
-            assert_eq!(*stop_reason, "max_tokens");
-            assert!(!continuation_eligible);
-        } else {
-            panic!("expected Finish");
-        }
+        let err = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+        assert_eq!(err.kind, UpstreamErrorKind::Transient);
+        assert!(err.message.contains("max_output_tokens"));
     }
 
     #[test]

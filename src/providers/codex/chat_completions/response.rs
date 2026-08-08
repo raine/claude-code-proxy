@@ -1,6 +1,8 @@
+use http::StatusCode;
 use serde_json::{Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
+use crate::providers::codex::events::classify_event_failure;
 
 use super::ChatError;
 
@@ -46,8 +48,16 @@ impl CompletionState {
 
     pub fn observe(&mut self, event: &Value) -> Result<Option<String>, ChatError> {
         let kind = event.get("type").and_then(Value::as_str);
-        if matches!(kind, Some("response.failed" | "response.error" | "error")) {
-            return Err(event_error(event));
+        if let Some(failure) = classify_event_failure(event) {
+            let status =
+                StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+            return Err(ChatError::new(
+                status,
+                failure.client_error_type(),
+                failure.message,
+                None,
+                None,
+            ));
         }
         match kind {
             Some("response.created" | "response.in_progress") => {
@@ -62,18 +72,13 @@ impl CompletionState {
                 self.text.push_str(delta);
                 return Ok(Some(delta.to_string()));
             }
-            Some("response.completed" | "response.incomplete") => {
+            Some("response.completed" | "response.done") => {
                 let response = event.get("response").ok_or_else(|| {
                     ChatError::upstream("Codex completion event did not contain a response")
                 })?;
                 self.update_metadata(response);
                 if response.get("status").and_then(Value::as_str) == Some("failed") {
                     return Err(event_error(event));
-                }
-                if kind == Some("response.incomplete")
-                    || response.get("status").and_then(Value::as_str) == Some("incomplete")
-                {
-                    self.finish_reason = "length";
                 }
                 self.completed = true;
             }
@@ -199,10 +204,19 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_maps_to_length() {
+    fn incomplete_is_an_upstream_error() {
         let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n";
-        let value = aggregate_sse(body, "model").unwrap();
-        assert_eq!(value["choices"][0]["finish_reason"], "length");
+        let error = aggregate_sse(body, "model").unwrap_err();
+        assert!(error.message.contains("Incomplete response"));
+    }
+
+    #[test]
+    fn buffered_chat_preserves_typed_terminal_failure() {
+        let body = b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"input exceeds context window\"}}}\n\n";
+        let error = aggregate_sse(body, "model").unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.kind, "request_too_large");
+        assert_eq!(error.message, "input exceeds context window");
     }
 
     #[test]

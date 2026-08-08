@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
-use crate::providers::codex::events::is_terminal_rate_limit_event;
+use crate::providers::codex::events::classify_event_failure;
 use crate::traffic::TrafficCapture;
 
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
-use super::reducer::{
-    CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
-};
+use super::reducer::{CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic};
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
 const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
@@ -112,18 +110,16 @@ impl LiveStreamTranslator {
         let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = Vec::new();
 
+        if let Some(failure) = classify_event_failure(payload) {
+            return Err(failure.message);
+        }
+
         match kind {
             "codex.rate_limits" => {
-                if is_terminal_rate_limit_event(payload) {
-                    return Err("rate limit reached".to_string());
-                }
                 self.emit_ping(traffic, &mut out);
             }
             "keepalive" | "response.created" | "response.in_progress" => {
                 self.emit_ping(traffic, &mut out);
-            }
-            "response.failed" | "response.error" | "error" => {
-                return Err(error_message(payload));
             }
             "response.web_search_call.in_progress"
             | "response.web_search_call.searching"
@@ -167,7 +163,7 @@ impl LiveStreamTranslator {
             "response.output_item.done" => {
                 self.output_item_done(payload, traffic, &mut out);
             }
-            "response.completed" | "response.incomplete" | "response.done" => {
+            "response.completed" | "response.done" => {
                 self.finish(payload, traffic, &mut out);
             }
             _ => {}
@@ -339,7 +335,6 @@ impl LiveStreamTranslator {
             "function_call" => {
                 self.close_thinking(traffic, out);
                 self.saw_tool_use = true;
-                self.semantic_output_started = true;
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
                 let call_id = item
@@ -530,6 +525,7 @@ impl LiveStreamTranslator {
         if delta.is_empty() {
             return Ok(());
         }
+        self.semantic_output_started = true;
         let mut repaired_read: Option<(usize, String)> = None;
         let Some(LiveBlock::Tool {
             index,
@@ -562,6 +558,7 @@ impl LiveStreamTranslator {
         } else {
             *emitted_args = true;
             let index = *index;
+            self.semantic_output_started = true;
             self.emit(
                 traffic,
                 out,
@@ -579,6 +576,7 @@ impl LiveStreamTranslator {
         }
         if let Some((index, repaired)) = repaired_read {
             self.blocks_by_output_index.remove(&output_index);
+            self.semantic_output_started = true;
             self.emit(
                 traffic,
                 out,
@@ -713,6 +711,7 @@ impl LiveStreamTranslator {
                 emitted_args,
                 ..
             } => {
+                self.semantic_output_started = true;
                 if let Some(final_args) = payload
                     .get("item")
                     .and_then(|item| item.get("arguments"))
@@ -896,10 +895,7 @@ impl LiveStreamTranslator {
         self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
-        let incomplete = response_is_incomplete(payload);
-        let stop_reason = if incomplete {
-            STOP_MAX_TOKENS
-        } else if self.saw_tool_use {
+        let stop_reason = if self.saw_tool_use {
             STOP_TOOL_USE
         } else {
             STOP_END_TURN
@@ -1095,21 +1091,6 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
     }
 }
 
-fn response_is_incomplete(payload: &serde_json::Value) -> bool {
-    payload.get("type").and_then(|v| v.as_str()) == Some("response.incomplete")
-        || payload
-            .get("response")
-            .and_then(|r| r.get("status"))
-            .and_then(|v| v.as_str())
-            == Some("incomplete")
-        || payload
-            .get("response")
-            .and_then(|r| r.get("incomplete_details"))
-            .and_then(|d| d.get("reason"))
-            .and_then(|v| v.as_str())
-            .is_some()
-}
-
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
@@ -1176,22 +1157,6 @@ fn is_valid_read_args(value: &serde_json::Value) -> bool {
         return false;
     }
     true
-}
-
-fn error_message(payload: &serde_json::Value) -> String {
-    payload
-        .get("response")
-        .and_then(|r| r.get("error"))
-        .and_then(|e| e.get("message"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("Upstream error")
-        .to_string()
 }
 
 #[cfg(test)]
@@ -1330,13 +1295,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_thinking_and_web_search_events_are_semantic() {
+    fn structural_tool_start_is_not_semantic_until_arguments_arrive() {
         let mut tool = LiveStreamTranslator::new("msg_tool", "gpt-5.5");
         tool.accept(
             &json!({
                 "type": "response.output_item.added",
                 "output_index": 0,
                 "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(!tool.has_semantic_output());
+        tool.accept(
+            &json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{}"
             }),
             None,
         )
@@ -1455,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn finishes_after_closed_completed_tool_call() {
+    fn websocket_compat_can_finish_after_closed_completed_tool_call() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();
         for event in [
@@ -1546,9 +1521,9 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_event_returns_error() {
+    fn rate_limit_event_is_progress_telemetry() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let err = translator
+        let out = translator
             .accept(
                 &json!({
                     "type": "codex.rate_limits",
@@ -1556,8 +1531,10 @@ mod tests {
                 }),
                 None,
             )
-            .unwrap_err();
-        assert_eq!(err, "rate limit reached");
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("event: ping"));
+        assert!(!out.contains("event: error"));
     }
 
     #[test]

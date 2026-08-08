@@ -1462,6 +1462,7 @@ impl CodexHttpClient {
                             );
                         }
 
+                        let event_kind = super::events::classify_stream_event(&payload);
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded
                             && let Some(failure) = failure.as_ref()
@@ -1471,30 +1472,53 @@ impl CodexHttpClient {
                             break 'read_attempt codex_event_failure_error(failure.clone());
                         }
 
-                        let terminal = event_closes_http_stream(&payload);
-                        if !semantic_output_forwarded && failure.is_some() {
-                            pending_events.clear();
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
-                            }
-                        } else if !semantic_output_forwarded
-                            && http_event_starts_semantic_output(&payload)
-                        {
-                            semantic_output_forwarded = true;
-                            for pending in pending_events.drain(..) {
-                                if tx.send(Ok(pending)).await.is_err() {
+                        let terminal = super::events::event_is_terminal(&payload);
+                        match event_kind {
+                            super::events::CodexStreamEventKind::TerminalFailure => {
+                                if !semantic_output_forwarded {
+                                    pending_events.clear();
+                                }
+                                if tx.send(Ok(payload)).await.is_err() {
                                     return;
                                 }
                             }
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
+                            super::events::CodexStreamEventKind::TerminalSuccess => {
+                                for pending in pending_events.drain(..) {
+                                    if tx.send(Ok(pending)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else if semantic_output_forwarded || http_event_is_control(&payload) {
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
+                            super::events::CodexStreamEventKind::Semantic => {
+                                if !semantic_output_forwarded {
+                                    semantic_output_forwarded = true;
+                                    for pending in pending_events.drain(..) {
+                                        if tx.send(Ok(pending)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
                             }
-                        } else {
-                            pending_events.push(payload);
+                            super::events::CodexStreamEventKind::Control => {
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            super::events::CodexStreamEventKind::Structural => {
+                                if semantic_output_forwarded {
+                                    if tx.send(Ok(payload)).await.is_err() {
+                                        return;
+                                    }
+                                } else {
+                                    pending_events.push(payload);
+                                }
+                            }
                         }
 
                         if terminal {
@@ -2081,6 +2105,7 @@ impl CodexHttpClient {
                 }
             };
 
+            let mut pending_events = Vec::new();
             loop {
                 let item = tokio::select! {
                     biased;
@@ -2174,20 +2199,71 @@ impl CodexHttpClient {
                     continue 'attempt;
                 }
 
-                if item.as_ref().is_ok_and(event_closes_live_retry_window) {
-                    forwarded_any = true;
-                }
                 let terminal = item.as_ref().is_err()
                     || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
-                if tx.send(item).await.is_err() {
-                    if let Some(reservation) = continuation.as_ref() {
-                        super::websocket::invalidate_codex_websocket_pool_socket(
-                            reservation,
-                            stream.socket_id(),
-                        );
+                match item {
+                    Ok(payload) => match super::events::classify_stream_event(&payload) {
+                        super::events::CodexStreamEventKind::TerminalFailure => {
+                            if !forwarded_any {
+                                pending_events.clear();
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::TerminalSuccess => {
+                            for pending in pending_events.drain(..) {
+                                if tx.send(Ok(pending)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::Semantic => {
+                            if !forwarded_any {
+                                forwarded_any = true;
+                                for pending in pending_events.drain(..) {
+                                    if tx.send(Ok(pending)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::Control => {
+                            if tx.send(Ok(payload)).await.is_err() {
+                                return;
+                            }
+                        }
+                        super::events::CodexStreamEventKind::Structural => {
+                            if forwarded_any {
+                                if tx.send(Ok(payload)).await.is_err() {
+                                    return;
+                                }
+                            } else {
+                                pending_events.push(payload);
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        if tx.send(Err(err)).await.is_err() {
+                            if let Some(reservation) = continuation.as_ref() {
+                                super::websocket::invalidate_codex_websocket_pool_socket(
+                                    reservation,
+                                    stream.socket_id(),
+                                );
+                            }
+                            abort_abandoned_live_continuation(
+                                continuation.as_ref(),
+                                &socket_id_publisher,
+                            );
+                            return;
+                        }
                     }
-                    abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher);
-                    return;
                 }
                 if terminal {
                     return;
@@ -2456,62 +2532,6 @@ fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_str().unwrap_or("").to_string()))
         .collect()
-}
-
-fn event_closes_http_stream(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some(
-            "response.completed"
-                | "response.incomplete"
-                | "response.done"
-                | "response.failed"
-                | "response.error"
-                | "error"
-        )
-    )
-}
-
-fn http_event_is_control(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some(
-            "keepalive"
-                | "response.created"
-                | "response.in_progress"
-                | "codex.rate_limits"
-                | "response.web_search_call.in_progress"
-                | "response.web_search_call.searching"
-                | "response.web_search_call.completed"
-        )
-    )
-}
-
-fn http_event_starts_semantic_output(payload: &serde_json::Value) -> bool {
-    match payload.get("type").and_then(|value| value.as_str()) {
-        Some("response.output_item.added") => matches!(
-            payload
-                .pointer("/item/type")
-                .and_then(|value| value.as_str()),
-            Some("message" | "function_call")
-        ),
-        Some(
-            "response.reasoning_summary_text.delta"
-            | "response.output_text.delta"
-            | "response.function_call_arguments.delta",
-        ) => payload
-            .get("delta")
-            .and_then(|value| value.as_str())
-            .is_some_and(|delta| !delta.is_empty()),
-        Some("response.output_item.done") => matches!(
-            payload
-                .pointer("/item/type")
-                .and_then(|value| value.as_str()),
-            Some("reasoning" | "message" | "function_call")
-        ),
-        Some("response.completed" | "response.incomplete" | "response.done") => true,
-        _ => false,
-    }
 }
 
 fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> CodexError {
@@ -2953,11 +2973,9 @@ fn invalidate_live_continuation_pool(
     super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, continuation.turn_id());
 }
 
+#[cfg(test)]
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
-    !matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "keepalive")
-    )
+    super::events::classify_stream_event(payload) == super::events::CodexStreamEventKind::Semantic
 }
 
 pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
@@ -3432,7 +3450,7 @@ mod tests {
                 .unwrap();
             write_http_chunk(
                 &mut stream,
-                b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
             )
             .await;
             release_rx.await.unwrap();
@@ -3462,7 +3480,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             first_upstream.get("type").and_then(|value| value.as_str()),
-            Some("response.output_item.added")
+            Some("response.output_text.delta")
         );
 
         release_tx.send(()).unwrap();
@@ -5244,8 +5262,28 @@ mod tests {
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "keepalive"
         })));
-        assert!(event_closes_live_retry_window(&serde_json::json!({
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.created"
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": "msg_1"}
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "hello"
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": "{}"
         })));
     }
 
