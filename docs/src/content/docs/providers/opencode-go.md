@@ -5,10 +5,9 @@ description: Configure an OpenCode Go API key, model routing, streaming, tools, 
 
 OpenCode Go uses the API at `https://opencode.ai/zen/go/v1`. Its catalog spans
 OpenAI-compatible chat completions, Anthropic-compatible messages, and OpenAI
-Responses; the proxy selects the wire protocol for each registered model. The
-registered mapping follows the [official OpenCode Go endpoint table](https://opencode.ai/docs/go/#endpoints).
-The catalog additionally registers `glm-5`, `kimi-k2.5`, and `qwen3.5-plus`
-based on live protocol verification because the current table omits those IDs.
+Responses; the proxy selects the wire protocol for each registered model. Each
+mapping comes from the [official OpenCode Go endpoint table](https://opencode.ai/docs/go/#endpoints)
+or direct protocol verification against the API.
 
 ## Account and authentication
 
@@ -25,10 +24,9 @@ implement an OpenCode login flow.
 
 ## Models
 
-Run `claude-code-proxy models` for the statically registered catalog based on
-OpenCode's documented endpoint table. Every registered model has a
-provider-qualified form. Bare IDs are also accepted when they do not belong to
-another provider:
+Run `claude-code-proxy models` for the statically registered catalog. Every
+registered model has a provider-qualified form. Bare IDs are also accepted when
+they do not belong to another provider:
 
 ```sh
 ANTHROPIC_MODEL=opencode-go/glm-5.2 \
