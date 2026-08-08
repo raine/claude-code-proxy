@@ -31,6 +31,10 @@ pub const MODELS: &[ModelSpec] = &[
         endpoint: EndpointKind::ChatCompletions,
     },
     ModelSpec {
+        id: "glm-5",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
         id: "kimi-k3",
         endpoint: EndpointKind::ChatCompletions,
     },
@@ -40,6 +44,10 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "kimi-k2.6",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "kimi-k2.5",
         endpoint: EndpointKind::ChatCompletions,
     },
     ModelSpec {
@@ -71,6 +79,10 @@ pub const MODELS: &[ModelSpec] = &[
         endpoint: EndpointKind::Messages,
     },
     ModelSpec {
+        id: "qwen3.8-max",
+        endpoint: EndpointKind::Messages,
+    },
+    ModelSpec {
         id: "qwen3.7-max",
         endpoint: EndpointKind::Messages,
     },
@@ -80,6 +92,10 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "qwen3.6-plus",
+        endpoint: EndpointKind::Messages,
+    },
+    ModelSpec {
+        id: "qwen3.5-plus",
         endpoint: EndpointKind::Messages,
     },
     ModelSpec {
@@ -126,9 +142,34 @@ mod tests {
             .iter()
             .filter(|model| model.endpoint == EndpointKind::Responses)
             .count();
-        assert_eq!(chat, 11);
-        assert_eq!(messages, 6);
+        assert_eq!(chat, 13);
+        assert_eq!(messages, 8);
         assert_eq!(responses, 1);
+    }
+
+    #[test]
+    fn refreshed_models_resolve_and_are_advertised() {
+        let advertised = advertised_models();
+        for (id, endpoint) in [
+            ("glm-5", EndpointKind::ChatCompletions),
+            ("kimi-k2.5", EndpointKind::ChatCompletions),
+            ("qwen3.8-max", EndpointKind::Messages),
+            ("qwen3.5-plus", EndpointKind::Messages),
+        ] {
+            let qualified = format!("{MODEL_PREFIX}{id}");
+            assert_eq!(
+                resolve(id).expect("registered bare model").endpoint,
+                endpoint
+            );
+            assert_eq!(
+                resolve(&qualified)
+                    .expect("registered provider-qualified model")
+                    .endpoint,
+                endpoint
+            );
+            assert!(advertised.iter().any(|model| model == id));
+            assert!(advertised.contains(&qualified));
+        }
     }
 
     #[test]

@@ -7,6 +7,8 @@ OpenCode Go uses the API at `https://opencode.ai/zen/go/v1`. Its catalog spans
 OpenAI-compatible chat completions, Anthropic-compatible messages, and OpenAI
 Responses; the proxy selects the wire protocol for each registered model. The
 registered mapping follows the [official OpenCode Go endpoint table](https://opencode.ai/docs/go/#endpoints).
+The catalog additionally registers `glm-5`, `kimi-k2.5`, and `qwen3.5-plus`
+based on live protocol verification because the current table omits those IDs.
 
 ## Account and authentication
 
@@ -57,6 +59,6 @@ OpenCode Go.
 - `CCP_OPENCODE_BASE_URL` or `opencode.baseUrl` changes the API base URL.
 
 OpenCode Go may expose additional model IDs through `/models`, but the proxy
-registers only models whose wire protocol is documented. Unknown IDs are
-rejected locally. Access or usage-limit errors for registered models are
-surfaced from OpenCode.
+registers only models whose wire protocol is documented or has been verified
+against the live API. Unknown IDs are rejected locally. Access or usage-limit
+errors for registered models are surfaced from OpenCode.
