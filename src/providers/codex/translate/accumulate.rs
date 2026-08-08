@@ -2,9 +2,10 @@ use serde_json::Value;
 
 use crate::traffic::TrafficCapture;
 
+use super::IncompleteResponsePolicy;
 use super::reducer::{
     AnthropicUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
-    reduce_upstream_bytes,
+    reduce_upstream_bytes_with_policy,
 };
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
@@ -13,7 +14,13 @@ pub fn accumulate_response(
     message_id: &str,
     model: &str,
 ) -> Result<Value, anyhow::Error> {
-    accumulate_response_with_traffic(upstream, message_id, model, None)
+    accumulate_response_with_policy_and_traffic(
+        upstream,
+        message_id,
+        model,
+        IncompleteResponsePolicy::Error,
+        None,
+    )
 }
 
 pub fn accumulate_response_with_traffic(
@@ -22,7 +29,38 @@ pub fn accumulate_response_with_traffic(
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Value, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    accumulate_response_with_policy_and_traffic(
+        upstream,
+        message_id,
+        model,
+        IncompleteResponsePolicy::Error,
+        traffic,
+    )
+}
+
+pub(crate) fn accumulate_response_with_policy(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    incomplete_response_policy: IncompleteResponsePolicy,
+) -> Result<Value, anyhow::Error> {
+    accumulate_response_with_policy_and_traffic(
+        upstream,
+        message_id,
+        model,
+        incomplete_response_policy,
+        None,
+    )
+}
+
+fn accumulate_response_with_policy_and_traffic(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    incomplete_response_policy: IncompleteResponsePolicy,
+    traffic: Option<&TrafficCapture>,
+) -> Result<Value, anyhow::Error> {
+    let events = match reduce_upstream_bytes_with_policy(upstream, incomplete_response_policy) {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);

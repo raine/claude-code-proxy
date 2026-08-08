@@ -108,13 +108,35 @@ pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
         })
 }
 
+pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
+    let event_type = payload.get("type").and_then(Value::as_str);
+    let incomplete_details = payload.pointer("/response/incomplete_details");
+    matches!(
+        event_type,
+        Some("response.completed" | "response.incomplete" | "response.done")
+    ) && (event_type == Some("response.incomplete")
+        || payload.pointer("/response/status").and_then(Value::as_str) == Some("incomplete")
+        || incomplete_details.is_some_and(|details| !details.is_null()))
+}
+
+pub(crate) fn is_standard_max_output_tokens_incomplete(payload: &Value) -> bool {
+    let status = payload.pointer("/response/status");
+    payload.get("type").and_then(Value::as_str) == Some("response.incomplete")
+        && (status.is_none() || status.and_then(Value::as_str) == Some("incomplete"))
+        && payload
+            .pointer("/response/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
+        && event_error(payload).is_none()
+}
+
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
     let response_status = payload.pointer("/response/status").and_then(Value::as_str);
     if event_type == "codex.rate_limits" {
         return None;
     }
-    if event_type == "response.incomplete" || response_status == Some("incomplete") {
+    if response_is_incomplete_terminal(payload) {
         let reason = payload
             .pointer("/response/incomplete_details/reason")
             .and_then(Value::as_str)
@@ -488,5 +510,63 @@ mod tests {
         assert_eq!(failure.explicit_status, Some(400));
         assert_eq!(failure.client_status(), 413);
         assert_eq!(failure.client_error_type(), "request_too_large");
+    }
+
+    #[test]
+    fn incomplete_policy_only_accepts_consistent_max_output_terminal() {
+        let allowed = serde_json::json!({
+            "type":"response.incomplete",
+            "response": {
+                "status":"incomplete",
+                "error":null,
+                "incomplete_details":{"reason":"max_output_tokens"}
+            }
+        });
+        assert!(response_is_incomplete_terminal(&allowed));
+        assert!(is_standard_max_output_tokens_incomplete(&allowed));
+        let allowed_without_status = serde_json::json!({
+            "type":"response.incomplete",
+            "response": {
+                "incomplete_details":{"reason":"max_output_tokens"}
+            }
+        });
+        assert!(is_standard_max_output_tokens_incomplete(
+            &allowed_without_status
+        ));
+
+        for rejected in [
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}
+            }),
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":"incomplete","incomplete_details":{}}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"status":"completed","incomplete_details":{"reason":"max_output_tokens"}}
+            }),
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":null,"incomplete_details":{"reason":"max_output_tokens"}}
+            }),
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":123,"incomplete_details":{"reason":"max_output_tokens"}}
+            }),
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":"completed","incomplete_details":{"reason":"max_output_tokens"}}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"status":"completed","incomplete_details":{}}
+            }),
+        ] {
+            assert!(response_is_incomplete_terminal(&rejected));
+            assert!(!is_standard_max_output_tokens_incomplete(&rejected));
+            assert!(classify_event_failure(&rejected).is_some());
+        }
     }
 }

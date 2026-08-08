@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
-use crate::providers::codex::events::classify_event_failure;
+use crate::providers::codex::events::{
+    classify_event_failure, is_standard_max_output_tokens_incomplete,
+};
 use crate::traffic::TrafficCapture;
 
+use super::IncompleteResponsePolicy;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
-use super::reducer::{CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic};
+use super::reducer::{
+    CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
+};
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
 const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
@@ -65,6 +70,7 @@ pub struct LiveStreamTranslator {
     // Seeds Claude Code's live subagent counter until the provider returns
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
+    incomplete_response_policy: IncompleteResponsePolicy,
     finished: bool,
 }
 
@@ -94,8 +100,17 @@ impl LiveStreamTranslator {
             deferred_text: Vec::new(),
             semantic_output_started: false,
             estimated_input_tokens,
+            incomplete_response_policy: IncompleteResponsePolicy::Error,
             finished: false,
         }
+    }
+
+    pub(crate) fn with_incomplete_response_policy(
+        mut self,
+        policy: IncompleteResponsePolicy,
+    ) -> Self {
+        self.incomplete_response_policy = policy;
+        self
     }
 
     pub fn accept(
@@ -110,7 +125,10 @@ impl LiveStreamTranslator {
         let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = Vec::new();
 
-        if let Some(failure) = classify_event_failure(payload) {
+        let allowed_incomplete = self.incomplete_response_policy
+            == IncompleteResponsePolicy::AllowMaxOutputTokens
+            && is_standard_max_output_tokens_incomplete(payload);
+        if !allowed_incomplete && let Some(failure) = classify_event_failure(payload) {
             return Err(failure.message);
         }
 
@@ -163,7 +181,7 @@ impl LiveStreamTranslator {
             "response.output_item.done" => {
                 self.output_item_done(payload, traffic, &mut out);
             }
-            "response.completed" | "response.done" => {
+            "response.completed" | "response.incomplete" | "response.done" => {
                 self.finish(payload, traffic, &mut out);
             }
             _ => {}
@@ -895,7 +913,12 @@ impl LiveStreamTranslator {
         self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
-        let stop_reason = if self.saw_tool_use {
+        let stop_reason = if self.incomplete_response_policy
+            == IncompleteResponsePolicy::AllowMaxOutputTokens
+            && is_standard_max_output_tokens_incomplete(payload)
+        {
+            STOP_MAX_TOKENS
+        } else if self.saw_tool_use {
             STOP_TOOL_USE
         } else {
             STOP_END_TURN
@@ -1292,6 +1315,72 @@ mod tests {
         assert!(out.contains(r#""stop_reason":"end_turn""#));
         assert!(!out.contains(r#""stop_reason":"max_tokens""#));
         assert!(!translator.has_semantic_output());
+    }
+
+    #[test]
+    fn strict_live_translator_rejects_incomplete_response() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.incomplete",
+                    "response": {
+                        "status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"}
+                    }
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn standard_responses_policy_maps_max_output_tokens_to_message_stop() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-luna")
+            .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens);
+        let out = translator
+            .accept(
+                &json!({
+                    "type":"response.incomplete",
+                    "response": {
+                        "status":"incomplete",
+                        "error":null,
+                        "incomplete_details":{"reason":"max_output_tokens"},
+                        "usage":{"input_tokens":2,"output_tokens":8}
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(r#""stop_reason":"max_tokens""#));
+        assert!(out.contains(r#""output_tokens":8"#));
+        assert!(out.contains("event: message_stop"));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn standard_responses_policy_rejects_other_incomplete_reasons() {
+        for reason in ["content_filter", "unknown"] {
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-luna")
+                .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens);
+            assert!(
+                translator
+                    .accept(
+                        &json!({
+                            "type":"response.incomplete",
+                            "response": {
+                                "status":"incomplete",
+                                "incomplete_details":{"reason":reason}
+                            }
+                        }),
+                        None,
+                    )
+                    .is_err(),
+                "{reason}"
+            );
+        }
     }
 
     #[test]
