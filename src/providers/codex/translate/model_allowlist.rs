@@ -14,6 +14,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-daybreak-blue",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
