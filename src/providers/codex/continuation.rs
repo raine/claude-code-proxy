@@ -537,13 +537,50 @@ fn input_suffix_after_prefix(
         return None;
     }
     for i in 0..prefix.len() {
-        let a = serde_json::to_value(&input[i]).unwrap_or_default();
-        let b = serde_json::to_value(&prefix[i]).unwrap_or_default();
-        if a != b {
+        if !input_items_equivalent(&input[i], &prefix[i]) {
             return None;
         }
     }
     Some(input[prefix.len()..].to_vec())
+}
+
+/// Compares two transcript items for continuation prefix purposes.
+///
+/// `function_call.arguments` is a JSON string that is asymmetric across the two
+/// sides: the recorded transcript keeps the raw text the model streamed, while
+/// the next request re-serializes the client's parsed tool input (sorted keys,
+/// no whitespace). Compare those two as JSON values so a purely textual
+/// difference does not break an otherwise append-only prefix.
+fn input_items_equivalent(a: &ResponsesInputItem, b: &ResponsesInputItem) -> bool {
+    match (a, b) {
+        (
+            ResponsesInputItem::FunctionCall {
+                call_id: a_call_id,
+                name: a_name,
+                arguments: a_arguments,
+            },
+            ResponsesInputItem::FunctionCall {
+                call_id: b_call_id,
+                name: b_name,
+                arguments: b_arguments,
+            },
+        ) => {
+            a_call_id == b_call_id
+                && a_name == b_name
+                && (a_arguments == b_arguments
+                    || matches!(
+                        (
+                            serde_json::from_str::<serde_json::Value>(a_arguments),
+                            serde_json::from_str::<serde_json::Value>(b_arguments),
+                        ),
+                        (Ok(a_value), Ok(b_value)) if a_value == b_value
+                    ))
+        }
+        _ => {
+            serde_json::to_value(a).unwrap_or_default()
+                == serde_json::to_value(b).unwrap_or_default()
+        }
+    }
 }
 
 fn prompt_signature(body: &ResponsesRequest) -> String {
@@ -945,5 +982,185 @@ mod tests {
             Some("prompt_changed")
         );
         assert!(!has_continuation_for_owner_for_tests(&owner));
+    }
+
+    fn function_call(call_id: &str, name: &str, arguments: &str) -> ResponsesInputItem {
+        ResponsesInputItem::FunctionCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn function_call_output(call_id: &str, output: &str) -> ResponsesInputItem {
+        ResponsesInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: super::super::translate::request::ResponsesFunctionCallOutput::Text(
+                output.to_string(),
+            ),
+        }
+    }
+
+    fn record_with_output_items(
+        owner: &ConversationIdentity,
+        request: &ResponsesRequest,
+        response_id: &str,
+        output_items: &[ResponsesInputItem],
+    ) {
+        let reservation = continuation_candidate_for_owner(Some(owner), request, true);
+        record_continuation_for_owner(
+            &reservation,
+            request,
+            Some(response_id),
+            Some(1),
+            output_items,
+        );
+    }
+
+    #[test]
+    fn function_call_arguments_with_reordered_keys_keep_continuation() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let request = request_with_input(vec![input("one")], None);
+        let recorded = function_call(
+            "call_1",
+            "Edit",
+            "{\"file_path\":\"/tmp/x\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+        );
+        record_with_output_items(&owner, &request, "resp_1", &[recorded]);
+
+        let next = request_with_input(
+            vec![
+                input("one"),
+                function_call(
+                    "call_1",
+                    "Edit",
+                    "{\"file_path\":\"/tmp/x\",\"new_string\":\"b\",\"old_string\":\"a\"}",
+                ),
+                function_call_output("call_1", "done"),
+            ],
+            None,
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &next, true);
+        assert_eq!(reservation.candidate().disabled_reason, None);
+        assert_eq!(
+            reservation.candidate().previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(reservation.candidate().input_delta_count, 1);
+        let delta = reservation.candidate().input_delta.clone().unwrap();
+        assert_eq!(delta.len(), 1);
+        assert!(matches!(
+            delta[0],
+            ResponsesInputItem::FunctionCallOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn function_call_arguments_with_different_values_are_not_append_only() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let request = request_with_input(vec![input("one")], None);
+        let recorded = function_call(
+            "call_1",
+            "Edit",
+            "{\"file_path\":\"/tmp/x\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+        );
+        record_with_output_items(&owner, &request, "resp_1", &[recorded]);
+
+        let next = request_with_input(
+            vec![
+                input("one"),
+                function_call(
+                    "call_1",
+                    "Edit",
+                    "{\"file_path\":\"/tmp/x\",\"new_string\":\"c\",\"old_string\":\"a\"}",
+                ),
+                function_call_output("call_1", "done"),
+            ],
+            None,
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &next, true);
+        assert_eq!(
+            reservation.candidate().disabled_reason.as_deref(),
+            Some("not_append_only")
+        );
+        assert_eq!(reservation.candidate().previous_response_id, None);
+    }
+
+    #[test]
+    fn unparseable_function_call_arguments_require_exact_text() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-a");
+        let request = request_with_input(vec![input("one")], None);
+        record_with_output_items(
+            &owner,
+            &request,
+            "resp_1",
+            &[function_call("call_1", "Edit", "{not json")],
+        );
+
+        let identical = request_with_input(
+            vec![
+                input("one"),
+                function_call("call_1", "Edit", "{not json"),
+                function_call_output("call_1", "done"),
+            ],
+            None,
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &identical, true);
+        assert_eq!(reservation.candidate().disabled_reason, None);
+        assert_eq!(
+            reservation.candidate().previous_response_id.as_deref(),
+            Some("resp_1")
+        );
+        assert_eq!(reservation.candidate().input_delta_count, 1);
+
+        record_with_output_items(
+            &owner,
+            &request,
+            "resp_2",
+            &[function_call("call_1", "Edit", "{not json")],
+        );
+        let spaced = request_with_input(
+            vec![
+                input("one"),
+                function_call("call_1", "Edit", "{not json "),
+                function_call_output("call_1", "done"),
+            ],
+            None,
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &spaced, true);
+        assert_eq!(
+            reservation.candidate().disabled_reason.as_deref(),
+            Some("not_append_only")
+        );
+        assert_eq!(reservation.candidate().previous_response_id, None);
+    }
+
+    #[test]
+    fn input_items_equivalent_compares_arguments_as_json() {
+        assert!(input_items_equivalent(
+            &function_call("call_1", "Edit", "{\"a\": 1}"),
+            &function_call("call_1", "Edit", "{\"a\":1}"),
+        ));
+        assert!(!input_items_equivalent(
+            &function_call("call_1", "Edit", "{\"a\":1}"),
+            &function_call("call_1", "Edit", "{not json"),
+        ));
+        assert!(!input_items_equivalent(
+            &function_call("call_1", "Edit", "{\"a\":1}"),
+            &function_call("call_2", "Edit", "{\"a\":1}"),
+        ));
+        assert!(!input_items_equivalent(
+            &function_call("call_1", "Edit", "{\"a\":1}"),
+            &function_call("call_1", "Write", "{\"a\":1}"),
+        ));
+        assert!(input_items_equivalent(&input("one"), &input("one")));
+        assert!(!input_items_equivalent(&input("one"), &input("two")));
+        assert!(!input_items_equivalent(
+            &input("one"),
+            &function_call("call_1", "Edit", "{\"a\":1}"),
+        ));
     }
 }
