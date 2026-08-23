@@ -534,6 +534,7 @@ async fn handle_socket(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn emit_completion(
     websocket: &mut WebSocketStream<TcpStream>,
     response_id: &str,
