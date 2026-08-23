@@ -197,10 +197,22 @@ enum MockOutcome {
         close_after: bool,
         acknowledged: oneshot::Sender<()>,
     },
+    FunctionCall {
+        response_id: String,
+        call: FunctionCallReply,
+        acknowledged: oneshot::Sender<()>,
+    },
     RawEvent {
         event: Value,
         acknowledged: oneshot::Sender<()>,
     },
+}
+
+#[derive(Clone)]
+struct FunctionCallReply {
+    call_id: String,
+    name: String,
+    arguments: String,
 }
 
 struct PendingRequest {
@@ -216,6 +228,31 @@ impl PendingRequest {
                 response_id: response_id.to_string(),
                 text: text.to_string(),
                 close_after,
+                acknowledged,
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "upstream socket closed before responding to {}",
+                    self.captured.marker()
+                )
+            });
+        tokio::time::timeout(REQUEST_TIMEOUT, acknowledgement)
+            .await
+            .expect("mock response acknowledgement timed out")
+            .expect("mock response acknowledgement sender dropped");
+        self.captured
+    }
+
+    async fn respond_with_function_call(
+        self,
+        response_id: &str,
+        call: FunctionCallReply,
+    ) -> CapturedRequest {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        self.outcome
+            .send(MockOutcome::FunctionCall {
+                response_id: response_id.to_string(),
+                call,
                 acknowledged,
             })
             .unwrap_or_else(|_| {
@@ -514,6 +551,20 @@ async fn handle_socket(
                         }
                         let _ = acknowledged.send(());
                     }
+                    MockOutcome::FunctionCall {
+                        response_id,
+                        call,
+                        acknowledged,
+                    } => {
+                        if emit_function_call(&mut websocket, &response_id, &call)
+                            .await
+                            .is_err()
+                        {
+                            let _ = acknowledged.send(());
+                            return;
+                        }
+                        let _ = acknowledged.send(());
+                    }
                     MockOutcome::RawEvent {
                         event,
                         acknowledged,
@@ -555,6 +606,54 @@ async fn emit_completion(
             "type": "response.output_item.done",
             "output_index": 0,
             "item": {"type": "message", "id": format!("msg-{response_id}")}
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "usage": {"input_tokens": 5, "output_tokens": 2}
+            }
+        }),
+    ];
+    for event in events {
+        websocket.send(Message::Text(event.to_string())).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn emit_function_call(
+    websocket: &mut WebSocketStream<TcpStream>,
+    response_id: &str,
+    call: &FunctionCallReply,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    let item_id = format!("fc-{response_id}");
+    let events = [
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": item_id,
+                "call_id": call.call_id,
+                "name": call.name
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": call.arguments
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": item_id,
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": call.arguments
+            }
         }),
         json!({
             "type": "response.completed",
@@ -710,6 +809,23 @@ impl TestHarness {
     ) -> CapturedRequest {
         let request = self.start_request(body, identity.clone());
         let pending = self.pending(marker, &identity).await;
+        resolve_request(pending, request, response_id, reply, false).await
+    }
+
+    /// Round trip for turns whose final input item carries no text marker,
+    /// such as a turn that ends in a tool result.
+    async fn round_trip_any(
+        &mut self,
+        body: Value,
+        identity: IdentityHeaders,
+        response_id: &str,
+        reply: &str,
+    ) -> CapturedRequest {
+        let request = self.start_request(body, identity.clone());
+        let pending = self
+            .upstream
+            .next_any_request(identity.upstream_session.as_deref())
+            .await;
         resolve_request(pending, request, response_id, reply, false).await
     }
 
@@ -1898,5 +2014,99 @@ async fn cross_owner_completion_order_is_independent() {
     assert_eq!(b3_capture.socket_ordinal, b1_capture.socket_ordinal);
     assert_ne!(a3_capture.socket_ordinal, b3_capture.socket_ordinal);
     assert_eq!(harness.upstream.snapshot().len(), 6);
+    harness.shutdown().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_turn_with_noncanonical_arguments_continues_with_delta() {
+    let _environment_lock = env_lock();
+    let mut harness = TestHarness::start().await;
+    let case = unique("tool-turn");
+    let session = tagged(&case, "session");
+    let headers = IdentityHeaders::main(&session);
+    let first_prompt = tagged(&case, "prompt-1");
+    let first_response = tagged(&case, "resp-1");
+    let call_id = tagged(&case, "call-1");
+    // Streamed in the model's own key order, which differs from the canonical
+    // serialization of the tool input the client replays on the next turn.
+    let arguments = r#"{"file_path":"/tmp/x","old_string":"a","new_string":"b"}"#;
+
+    let tool_request = harness.start_request(
+        messages_body(false, vec![message("user", &first_prompt)]),
+        headers.clone(),
+    );
+    let tool_pending = harness.pending(&first_prompt, &headers).await;
+    let first_capture = tool_pending
+        .respond_with_function_call(
+            &first_response,
+            FunctionCallReply {
+                call_id: call_id.clone(),
+                name: "Edit".to_string(),
+                arguments: arguments.to_string(),
+            },
+        )
+        .await;
+    let tool_response = tokio::time::timeout(REQUEST_TIMEOUT, tool_request)
+        .await
+        .expect("downstream tool request timed out")
+        .expect("downstream tool request failed");
+    assert_eq!(tool_response.status, StatusCode::OK);
+    assert!(
+        tool_response.body.contains(&call_id),
+        "downstream response did not carry the tool call: {}",
+        tool_response.body
+    );
+
+    let second_capture = harness
+        .round_trip_any(
+            messages_body(
+                false,
+                vec![
+                    message("user", &first_prompt),
+                    json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": "Edit",
+                            "input": {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}
+                        }]
+                    }),
+                    json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": "done"
+                        }]
+                    }),
+                ],
+            ),
+            headers,
+            &tagged(&case, "resp-2"),
+            &tagged(&case, "reply-2"),
+        )
+        .await;
+
+    assert_full_input(&first_capture, &[("user", &first_prompt)]);
+    assert_eq!(
+        second_capture.previous_response_id(),
+        Some(first_response.as_str()),
+        "tool turn must continue from the recorded response"
+    );
+    assert_eq!(second_capture.socket_ordinal, first_capture.socket_ordinal);
+    let delta = second_capture.body["input"]
+        .as_array()
+        .expect("continuation delta input");
+    assert_eq!(
+        delta.len(),
+        1,
+        "tool turn must append only the tool result: {}",
+        second_capture.body
+    );
+    assert_eq!(delta[0]["type"], "function_call_output");
+    assert_eq!(delta[0]["call_id"], call_id.as_str());
+    assert_eq!(harness.upstream.snapshot().len(), 2);
     harness.shutdown().await;
 }

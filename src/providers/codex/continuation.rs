@@ -655,6 +655,7 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::translate::request::ResponsesFunctionCallOutput;
     use super::*;
     use serde_json::json;
 
@@ -995,9 +996,7 @@ mod tests {
     fn function_call_output(call_id: &str, output: &str) -> ResponsesInputItem {
         ResponsesInputItem::FunctionCallOutput {
             call_id: call_id.to_string(),
-            output: super::super::translate::request::ResponsesFunctionCallOutput::Text(
-                output.to_string(),
-            ),
+            output: ResponsesFunctionCallOutput::Text(output.to_string()),
         }
     }
 
