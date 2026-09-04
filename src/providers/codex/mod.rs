@@ -7,6 +7,7 @@ pub mod count_tokens;
 pub(crate) mod events;
 pub mod images;
 pub mod native;
+pub mod rate_limits;
 pub mod request_summary;
 pub mod search;
 pub mod transcription;
@@ -534,7 +535,7 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        self.handle_messages_inner(body, ctx, None).await
+        rate_limits::stamp_response(self.handle_messages_inner(body, ctx, None).await)
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -543,8 +544,10 @@ impl Provider for CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        self.handle_messages_inner(body, ctx, conversation_identity)
-            .await
+        rate_limits::stamp_response(
+            self.handle_messages_inner(body, ctx, conversation_identity)
+                .await,
+        )
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -886,6 +889,7 @@ async fn live_stream_response_once(
             generation_started = true;
         }
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+        record_rate_limit_telemetry(&payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
@@ -1107,6 +1111,7 @@ fn remaining_live_stream_response(
             match item {
                 Ok(payload) => {
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+                    record_rate_limit_telemetry(&payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
                         &payload,
@@ -1228,6 +1233,15 @@ fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value
         buffer.push(b'\n');
     }
     buffer.push(b'\n');
+}
+
+/// Keeps the quota numbers a `codex.rate_limits` event carries, so the response
+/// to the request after this one can pass them to the client. Every other event
+/// leaves the snapshot alone.
+fn record_rate_limit_telemetry(payload: &serde_json::Value) {
+    if payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits") {
+        rate_limits::record(rate_limits::event_headers(payload));
+    }
 }
 
 fn event_stream_response<S>(stream: S) -> Response

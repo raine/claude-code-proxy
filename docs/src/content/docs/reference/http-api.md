@@ -27,6 +27,8 @@ The request `model` selects the provider. The proxy translates supported message
 
 Streaming responses use Anthropic SSE events such as `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Non-streaming requests are accumulated from the provider's stream.
 
+Codex responses carry the quota headers Codex reports for the subscription: `x-codex-plan-type`, `x-codex-active-limit`, `x-codex-credits-*`, and, for every limit family, `-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, `-limit-name`, and `-over-secondary-limit-percent`. Which family a window belongs to and how long that window runs come from the headers themselves: a plan may meter a weekly window as `primary` and no secondary window at all. The values are the ones Codex sent for the request being answered. A response that arrives before any telemetry does carries the previous values, or none.
+
 Unknown models return HTTP 400 with the supported catalog. Missing provider auth returns HTTP 401.
 
 ## `POST /v1/messages/count_tokens`
