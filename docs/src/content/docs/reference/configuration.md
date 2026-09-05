@@ -70,6 +70,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
 | `CCP_TRAFFIC_LOG` | none | `false` | Enables full request captures for `1`, `true`, or `yes`. |
 | `XDG_STATE_HOME` | none | `~/.local/state` | State base on macOS and Linux. |
+| `CCP_SEARCH_CONSTRAINTS` | none | `soft` | How to treat Anthropic hosted-search options a provider cannot enforce (`allowed_domains`, `blocked_domains`, `user_location`). `soft` drops them and copies constraints into a prompt hint. `warning` drops them and logs. `hard` returns 400. First provider: Grok. Codex maps domain filters natively and ignores this setting. |
 
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
