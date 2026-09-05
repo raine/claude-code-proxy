@@ -28,6 +28,62 @@ pub struct CodexError {
     pub origin: CodexErrorOrigin,
 }
 
+/// Consult the optional fleet quota-state file (config::codex_quota_state_file) to decide
+/// whether an upstream 429 is a QUOTA WALL rather than a transient throttle. Returns the
+/// ready-to-surface error when a window is exhausted; None means "no verdict — use the
+/// normal retry ladder" (file unset, unreadable, stale, malformed, or windows not full):
+/// every uncertainty falls open to today's behavior.
+pub(crate) fn quota_wall_error() -> Option<CodexError> {
+    quota_wall_error_from_file(&crate::config::codex_quota_state_file()?)
+}
+
+pub(crate) fn quota_wall_error_from_file(path: &std::path::Path) -> Option<CodexError> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let line = raw.lines().next()?;
+    let mut parts = line.split('|');
+    let p5 = parts.next()?.trim();
+    let r5 = parts.next()?.trim();
+    let p7 = parts.next()?.trim();
+    let r7 = parts.next()?.trim();
+    let epoch: i64 = parts.next()?.trim().parse().ok()?;
+    let now = jiff::Timestamp::now();
+    // Sample age must be sane in BOTH directions, and either anomaly is no-verdict:
+    // stale (a dead sampler must not keep declaring a wall forever; 900s = 1.5 sampler
+    // cycles at */10) and FUTURE-DATED (clock skew or a corrupt line — a timestamp from
+    // the future is not a fresher reading, it is an incoherent one).
+    let age = now.as_second() - epoch;
+    if !(0..=900).contains(&age) {
+        return None;
+    }
+    let full = |pct: &str| pct.parse::<f64>().map(|v| v >= 99.0).unwrap_or(false);
+    // Weekly first — the stricter wall wins the message.
+    let (window, resets_iso) = if full(p7) {
+        ("weekly", r7)
+    } else if full(p5) {
+        ("5h", r5)
+    } else {
+        return None;
+    };
+    let resets: jiff::Timestamp = resets_iso.parse().ok()?;
+    let secs = resets.as_second() - now.as_second();
+    // An already-expired reset time contradicts "the window is exhausted" — the sample is
+    // internally incoherent (or the wall just lifted). Emitting Retry-After from it would
+    // tell clients to hammer a wall that may not exist: no verdict, normal ladder.
+    if secs <= 0 {
+        return None;
+    }
+    Some(CodexError {
+        status: 429,
+        message: format!(
+            "Codex usage limit reached: the {window} window is exhausted; resets at {resets_iso} (in ~{}m). Retrying before then cannot succeed.",
+            (secs + 59) / 60
+        ),
+        detail: None,
+        retry_after: Some(secs.to_string()),
+        origin: CodexErrorOrigin::Http,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexErrorOrigin {
     Http,
@@ -1811,6 +1867,12 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if response.status == 429 => {
+                    // Quota wall? A 429 with an exhausted window cannot be retried into
+                    // success within the window — fail fast with the reset time instead of
+                    // walking the ladder (see quota_wall_error).
+                    if let Some(wall) = quota_wall_error() {
+                        return Err(wall);
+                    }
                     let retry_after = response
                         .headers
                         .iter()
@@ -5332,5 +5394,79 @@ mod tests {
         assert!(!should_retry_without_continuation(&idle, Some(&append)));
         assert!(!should_retry_without_continuation(&timeout, Some(&initial)));
         assert!(!should_retry_without_continuation(&timeout, None));
+    }
+}
+
+#[cfg(test)]
+mod quota_wall_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn state_file(line: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{line}").unwrap();
+        f
+    }
+    fn iso_in(secs: i64) -> String {
+        let ts = jiff::Timestamp::now() + jiff::Span::new().seconds(secs);
+        ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+    fn now_epoch() -> i64 {
+        jiff::Timestamp::now().as_second()
+    }
+
+    #[test]
+    fn hot_5h_window_is_a_wall_with_retry_after() {
+        let f = state_file(&format!("100|{}|16|{}|{}", iso_in(7200), iso_in(600_000), now_epoch()));
+        let err = quota_wall_error_from_file(f.path()).expect("wall");
+        assert_eq!(err.status, 429);
+        assert!(err.message.contains("5h window"), "{}", err.message);
+        let ra: i64 = err.retry_after.unwrap().parse().unwrap();
+        assert!((7100..=7201).contains(&ra), "retry_after={ra}");
+    }
+
+    #[test]
+    fn hot_weekly_wins_the_message_over_hot_5h() {
+        let f = state_file(&format!("100|{}|99|{}|{}", iso_in(7200), iso_in(600_000), now_epoch()));
+        let err = quota_wall_error_from_file(f.path()).expect("wall");
+        assert!(err.message.contains("weekly window"), "{}", err.message);
+    }
+
+    #[test]
+    fn cold_windows_are_no_verdict() {
+        let f = state_file(&format!("30|{}|5|{}|{}", iso_in(7200), iso_in(600_000), now_epoch()));
+        assert!(quota_wall_error_from_file(f.path()).is_none());
+    }
+
+    #[test]
+    fn stale_sample_is_no_verdict_even_when_hot() {
+        let f = state_file(&format!("100|{}|100|{}|{}", iso_in(7200), iso_in(600_000), now_epoch() - 3600));
+        assert!(quota_wall_error_from_file(f.path()).is_none());
+    }
+
+    #[test]
+    fn future_dated_sample_is_no_verdict_even_when_hot() {
+        let f = state_file(&format!("100|{}|100|{}|{}", iso_in(7200), iso_in(600_000), now_epoch() + 3600));
+        assert!(quota_wall_error_from_file(f.path()).is_none());
+    }
+
+    #[test]
+    fn expired_reset_time_is_no_verdict_even_when_hot() {
+        let f = state_file(&format!("100|{}|16|{}|{}", iso_in(-120), iso_in(600_000), now_epoch()));
+        assert!(quota_wall_error_from_file(f.path()).is_none());
+    }
+
+    #[test]
+    fn malformed_or_missing_is_no_verdict() {
+        let f = state_file("not|a|sample");
+        assert!(quota_wall_error_from_file(f.path()).is_none());
+        assert!(quota_wall_error_from_file(std::path::Path::new("/no/such/file")).is_none());
+    }
+
+    #[test]
+    fn empty_pct_field_is_no_verdict_not_a_wall() {
+        // The sampler publishes an empty pct for an axis whose window failed sanity.
+        let f = state_file(&format!("|{}|16|{}|{}", iso_in(7200), iso_in(600_000), now_epoch()));
+        assert!(quota_wall_error_from_file(f.path()).is_none());
     }
 }
