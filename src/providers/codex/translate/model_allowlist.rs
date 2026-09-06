@@ -2,8 +2,12 @@ use std::collections::HashSet;
 
 use crate::config;
 
+use super::model_catalog::{catalog_model, catalog_models};
 use super::request::ServiceTier;
 
+/// Baseline allowlist compiled into the binary. At runtime the Codex CLI's
+/// model cache (`model_catalog`) extends it, so models OpenAI ships to Codex
+/// work before a proxy release lists them.
 pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.2",
     "gpt-5.3-codex",
@@ -38,8 +42,47 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
+/// True for baseline models and for API-supported models from the Codex
+/// model cache.
+pub fn is_allowed_model(model: &str) -> bool {
+    ALLOWED_MODELS.contains(&model)
+        || catalog_model(model).is_some_and(|entry| entry.supported_in_api)
+}
+
+/// Baseline ∪ API-supported catalog models, sorted and de-duplicated —
+/// for listings and error messages.
+pub fn allowed_models() -> Vec<String> {
+    let mut set: HashSet<String> = ALLOWED_MODELS.iter().map(|m| (*m).to_string()).collect();
+    for entry in catalog_models() {
+        if entry.supported_in_api {
+            set.insert(entry.slug);
+        }
+    }
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort_unstable();
+    out
+}
+
+/// Catalog models advertised by the Codex picker (`visibility == "list"`)
+/// and usable through the API — what `models` and the unknown-model hint
+/// should show in addition to the baseline.
+pub fn listed_catalog_models() -> Vec<String> {
+    catalog_models()
+        .into_iter()
+        .filter(|entry| entry.listed && entry.supported_in_api)
+        .map(|entry| entry.slug)
+        .collect()
+}
+
+pub fn allowed_models_display() -> String {
+    allowed_models().join(", ")
+}
+
 fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+    allowed_models()
+        .iter()
+        .map(|m| format!("{m}-fast"))
+        .collect()
 }
 
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
@@ -108,7 +151,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_allowed_model(model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -121,7 +164,7 @@ pub fn uses_responses_lite(model: &str) -> bool {
     matches!(
         model,
         "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
-    )
+    ) || catalog_model(model).is_some_and(|entry| entry.use_responses_lite)
 }
 
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
@@ -137,7 +180,7 @@ pub fn full_lane_web_search_model(model: &str) -> &str {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_allowed_model(model) {
         return true;
     }
     let fast_set = fast_model_aliases();
@@ -218,5 +261,15 @@ mod tests {
     #[test]
     fn not_allowed_rejected() {
         assert!(assert_allowed_model("gpt-7").is_err());
+        assert!(assert_allowed_model("gpt-7-fast").is_err());
+    }
+
+    #[test]
+    fn allowed_models_listing_contains_baseline() {
+        let listing = allowed_models();
+        for baseline in ALLOWED_MODELS {
+            assert!(listing.iter().any(|m| m == baseline), "{baseline} missing");
+        }
+        assert!(allowed_models_display().contains("gpt-6-astra"));
     }
 }
