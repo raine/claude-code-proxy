@@ -49,6 +49,13 @@ Claude Code summary compaction requests are capped at low effort by default beca
   Structured result DTOs map back to Anthropic `server_tool_use` and
   `web_search_tool_result` blocks, while standalone text output remains text.
   The proxy locally estimates input and output tokens and reports search usage.
+  Standalone search sessions use the same ownership identity as continuation:
+  Main keeps its Claude Code session ID, while each direct Agent gets a stable,
+  opaque owner derived from its session and Agent IDs. The parent Agent ID is
+  validation-only. Missing, malformed, or ambiguous identity headers use a fresh
+  random search ID instead of sharing state. The search body ID and upstream
+  `session_id`, `x-client-request-id`, and `x-codex-window-id` headers all carry
+  that same search owner (with the window header's required `:0` suffix).
 - Top-level base64 user images map to `input_image`.
 - Supported base64 images nested in tool results also map to `input_image`.
 - Remote image URLs, malformed images, and unsupported tool-result image forms remain textual placeholders.

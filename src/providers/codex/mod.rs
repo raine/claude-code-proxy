@@ -120,7 +120,7 @@ impl CodexProvider {
             let (search_request, query) = match search::build_search_request(
                 &body,
                 &resolved.model,
-                ctx.session_id.as_deref(),
+                conversation_identity.as_ref(),
             ) {
                 Ok(request) => request,
                 Err(error) => {

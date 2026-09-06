@@ -185,8 +185,19 @@ pub fn build_native_codex_headers(
 pub fn build_codex_search_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
+    search_session_id: &str,
 ) -> Result<http::HeaderMap, CodexError> {
     let mut headers = build_codex_headers(auth, ctx, false)?;
+    headers.insert("session_id", header_value("session_id", search_session_id)?);
+    headers.insert(
+        "x-client-request-id",
+        header_value("x-client-request-id", search_session_id)?,
+    );
+    let window_id = format!("{search_session_id}:0");
+    headers.insert(
+        "x-codex-window-id",
+        header_value("x-codex-window-id", &window_id)?,
+    );
     headers.insert(
         http::header::ACCEPT,
         header_value("accept", "application/json")?,
@@ -1082,7 +1093,9 @@ impl CodexHttpClient {
         let mut retries = 0_u32;
 
         loop {
-            let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
+            let response = self
+                .attempt_post_search(&auth, &body_json, ctx, &body.id)
+                .await?;
             if response.status == 401 && !auth_refresh_attempted {
                 auth_refresh_attempted = true;
                 auth = self
@@ -2419,9 +2432,10 @@ impl CodexHttpClient {
         auth: &StoredAuth,
         body_json: &str,
         ctx: &RequestContext,
+        search_session_id: &str,
     ) -> Result<CodexResponse, CodexError> {
         let url = search_endpoint(&self.base_url);
-        let headers = build_codex_search_headers(auth, ctx)?;
+        let headers = build_codex_search_headers(auth, ctx, search_session_id)?;
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, &url, &headers, body_json);
