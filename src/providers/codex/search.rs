@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::anthropic::sse::encode_sse_event;
+use crate::request_identity::ConversationIdentity;
 use crate::traffic::TrafficCapture;
 
 use super::count_tokens::{approx_token_count, truncate_to_token_budget};
@@ -91,14 +92,15 @@ pub fn is_standalone_search_request(req: &MessagesRequest) -> bool {
 pub fn build_search_request(
     req: &MessagesRequest,
     model: &str,
-    session_id: Option<&str>,
+    owner: Option<&ConversationIdentity>,
 ) -> Result<(SearchRequest, String), anyhow::Error> {
     let query = extract_search_query(req)
         .ok_or_else(|| anyhow::anyhow!("web_search request does not contain a text query"))?;
     let input = search_input(req);
     let filters = search_filters(req);
-    let id = session_id
-        .map(str::to_owned)
+    let id = owner
+        .map(ConversationIdentity::search_session_id)
+        .map(Into::into)
         .unwrap_or_else(|| format!("search-{}", uuid::Uuid::new_v4()));
 
     Ok((
@@ -504,6 +506,7 @@ fn emit(out: &mut Vec<u8>, traffic: Option<&TrafficCapture>, event: &str, data: 
 mod tests {
     use super::*;
     use crate::anthropic::sse::parse_sse_events;
+    use crate::request_identity::ConversationIdentity;
 
     fn request() -> MessagesRequest {
         serde_json::from_value(json!({
@@ -528,9 +531,10 @@ mod tests {
     }
 
     #[test]
-    fn request_preserves_luna_and_omits_reasoning() {
+    fn request_preserves_luna_and_main_search_owner() {
+        let owner = ConversationIdentity::Main("session-1".into());
         let (request, query) =
-            build_search_request(&request(), "gpt-5.6-luna", Some("session-1")).unwrap();
+            build_search_request(&request(), "gpt-5.6-luna", Some(&owner)).unwrap();
         assert_eq!(request.model, "gpt-5.6-luna");
         assert_eq!(request.reasoning, None);
         assert_eq!(request.id, "session-1");
@@ -544,6 +548,36 @@ mod tests {
     }
 
     #[test]
+    fn request_uses_stable_isolated_agent_search_owners() {
+        let agent = ConversationIdentity::Agent("session-a".into(), "agent-a".into());
+        let same_agent = ConversationIdentity::Agent("session-a".into(), "agent-a".into());
+        let sibling = ConversationIdentity::Agent("session-a".into(), "agent-b".into());
+        let other_session = ConversationIdentity::Agent("session-b".into(), "agent-a".into());
+
+        let id = build_search_request(&request(), "gpt-5.6-luna", Some(&agent))
+            .unwrap()
+            .0
+            .id;
+        let same_id = build_search_request(&request(), "gpt-5.6-luna", Some(&same_agent))
+            .unwrap()
+            .0
+            .id;
+        let sibling_id = build_search_request(&request(), "gpt-5.6-luna", Some(&sibling))
+            .unwrap()
+            .0
+            .id;
+        let other_session_id =
+            build_search_request(&request(), "gpt-5.6-luna", Some(&other_session))
+                .unwrap()
+                .0
+                .id;
+
+        assert_eq!(id, same_id);
+        assert_ne!(id, sibling_id);
+        assert_ne!(id, other_session_id);
+    }
+
+    #[test]
     fn only_forced_claude_search_uses_standalone_endpoint() {
         let forced = request();
         assert!(is_standalone_search_request(&forced));
@@ -553,6 +587,22 @@ mod tests {
             .extra
             .insert("tool_choice".to_string(), json!({"type": "auto"}));
         assert!(!is_standalone_search_request(&automatic));
+    }
+
+    #[test]
+    fn absent_owner_uses_a_fresh_stateless_search_id() {
+        let first = build_search_request(&request(), "gpt-5.6-luna", None)
+            .unwrap()
+            .0
+            .id;
+        let second = build_search_request(&request(), "gpt-5.6-luna", None)
+            .unwrap()
+            .0
+            .id;
+
+        assert!(first.starts_with("search-"));
+        assert!(second.starts_with("search-"));
+        assert_ne!(first, second);
     }
 
     #[test]
