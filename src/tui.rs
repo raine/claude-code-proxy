@@ -32,8 +32,10 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
-        SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        MockMonitor, MonitorHandle, SESSION_TOKEN_BUCKET_SECS,
+        snapshot::{
+            ActiveSnapshot, CompletedSnapshot, MonitorSnapshot, SessionSnapshot, SnapshotUpdate,
+        },
     },
     paths,
     registry::Registry,
@@ -67,41 +69,78 @@ pub struct MonitorUiConfig<'a> {
 pub enum MonitorExit {
     ShutdownComplete,
     ForceQuit,
+    Detached,
 }
 
 pub fn run_monitor(
     handle: MonitorHandle,
     config: MonitorUiConfig<'_>,
 ) -> Result<MonitorExit, anyhow::Error> {
-    run_monitor_loop(|| handle.snapshot(), config, None)
+    run_monitor_loop(
+        || SnapshotUpdate::Live(handle.snapshot().into()),
+        UiSession::from(config),
+    )
+}
+
+pub fn run_attached_monitor(
+    snapshot: impl FnMut() -> SnapshotUpdate,
+    listen_url: String,
+) -> Result<MonitorExit, anyhow::Error> {
+    let setup_text = format!(
+        "Attached to {listen_url}\nClosing this dashboard leaves the proxy running.\nConfigure providers and authentication in the proxy service."
+    );
+    run_monitor_loop(
+        snapshot,
+        UiSession {
+            listen_url,
+            setup_text,
+            shutdown: None,
+            shutdown_complete: None,
+        },
+    )
 }
 
 pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Error> {
     let mut monitor = MockMonitor::new();
     run_monitor_loop(
-        move || monitor.snapshot(),
-        MonitorUiConfig {
+        move || SnapshotUpdate::Live(monitor.snapshot().into()),
+        UiSession {
             listen_url: "mock://tui-demo".to_string(),
-            port,
-            registry,
+            setup_text: mock_setup_text(port, registry),
             shutdown: None,
             shutdown_complete: None,
         },
-        Some(mock_setup_text(port, registry)),
     )
     .map(|_| ())
 }
 
+struct UiSession {
+    listen_url: String,
+    setup_text: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    shutdown_complete: Option<mpsc::Receiver<()>>,
+}
+
+impl From<MonitorUiConfig<'_>> for UiSession {
+    fn from(config: MonitorUiConfig<'_>) -> Self {
+        Self {
+            setup_text: setup_text(config.port, config.registry),
+            listen_url: config.listen_url,
+            shutdown: config.shutdown,
+            shutdown_complete: config.shutdown_complete,
+        }
+    }
+}
+
 fn run_monitor_loop(
-    mut snapshot: impl FnMut() -> MonitorState,
-    config: MonitorUiConfig<'_>,
-    setup_text_override: Option<String>,
+    mut snapshot: impl FnMut() -> SnapshotUpdate,
+    config: UiSession,
 ) -> Result<MonitorExit, anyhow::Error> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
     let mut app = MonitorApp {
         listen_url: config.listen_url,
-        setup_text: setup_text_override.unwrap_or_else(|| setup_text(config.port, config.registry)),
+        setup_text: config.setup_text,
         show_setup: false,
         show_help: false,
         detail: None,
@@ -118,7 +157,7 @@ fn run_monitor_loop(
     if run_result.is_err() {
         app.begin_shutdown();
         let state = snapshot();
-        let _ = terminal.draw(|frame| render(frame, &mut app, &state));
+        let _ = terminal.draw(|frame| render(frame, &mut app, state.snapshot()));
         app.wait_for_shutdown_completion();
     }
     let cursor_result = terminal.show_cursor();
@@ -129,20 +168,43 @@ fn run_monitor_loop(
 
 fn run_monitor_events(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    mut snapshot: impl FnMut() -> MonitorState,
+    mut snapshot: impl FnMut() -> SnapshotUpdate,
     app: &mut MonitorApp,
 ) -> Result<MonitorExit, anyhow::Error> {
     loop {
-        let state = snapshot();
+        let update = snapshot();
+        let state = update.snapshot();
         app.clamp_selection(state.sessions.len(), state.recent.len());
         app.tick = app.tick.wrapping_add(1);
-        terminal.draw(|frame| render(frame, app, &state))?;
+        terminal.draw(|frame| {
+            render(frame, app, state);
+            if let Some(error) = update.connection_error() {
+                let area = frame.area();
+                let banner = Rect::new(
+                    area.x,
+                    area.y + area.height.saturating_sub(1),
+                    area.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("Reconnecting; showing last snapshot: {error}"))
+                        .style(Style::default().fg(YELLOW).bg(BG)),
+                    banner,
+                );
+            }
+        })?;
         if app.shutdown_is_complete() {
             return Ok(MonitorExit::ShutdownComplete);
         }
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
+                    KeyCode::Char('q') if app.is_attached() => return Ok(MonitorExit::Detached),
+                    KeyCode::Char('c')
+                        if app.is_attached() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        return Ok(MonitorExit::Detached);
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if app.handle_ctrl_c() {
                             return Ok(MonitorExit::ForceQuit);
@@ -245,6 +307,9 @@ struct MonitorApp {
 }
 
 impl MonitorApp {
+    fn is_attached(&self) -> bool {
+        self.shutdown.is_none() && self.shutdown_complete.is_none()
+    }
     fn handle_ctrl_c(&mut self) -> bool {
         if self.phase == MonitorPhase::ShuttingDown {
             true
@@ -363,7 +428,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, anyhow::Error>
     Ok(terminal)
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorState) {
+fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorSnapshot) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
@@ -408,7 +473,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         render_setup_overlay(frame, area, &app.setup_text);
     }
     if app.show_help {
-        render_help_overlay(frame, area);
+        render_help_overlay(frame, area, app.is_attached());
     }
     match app.phase {
         MonitorPhase::Running => {}
@@ -421,7 +486,7 @@ fn render_header(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &MonitorApp,
-    state: &MonitorState,
+    state: &MonitorSnapshot,
 ) {
     let uptime = state
         .started_at
@@ -649,7 +714,7 @@ fn detail_cell(value: &str) -> Cell<'static> {
     }
 }
 
-fn error_indicator(request: &CompletedRequest) -> &'static str {
+fn error_indicator(request: &CompletedSnapshot) -> &'static str {
     if request.status == crate::monitor::RequestStatus::Failed
         || request.http_status.is_some_and(|status| status >= 400)
         || request
@@ -840,7 +905,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
 fn render_sessions(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    sessions: &[SessionSummary],
+    sessions: &[SessionSnapshot],
     selected: usize,
     focused: bool,
 ) {
@@ -990,7 +1055,7 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
 fn render_active(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    active: &[ActiveRequest],
+    active: &[ActiveSnapshot],
     tick: usize,
 ) {
     if active.is_empty() {
@@ -1144,7 +1209,7 @@ fn http_code_cell(status: Option<u16>) -> Cell<'static> {
 fn render_recent(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    recent: &[CompletedRequest],
+    recent: &[CompletedSnapshot],
     selected: usize,
     focused: bool,
 ) {
@@ -1258,7 +1323,7 @@ fn event_columns(tier: LayoutTier) -> Vec<ColumnSpec<EventColumn>> {
     }
 }
 
-fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
+fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedSnapshot]) {
     let events = recent
         .iter()
         .filter(|request| {
@@ -1312,7 +1377,7 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
 fn render_session_detail(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    state: &MonitorState,
+    state: &MonitorSnapshot,
     selected: usize,
 ) {
     let lines = if let Some(session) = state.sessions.get(selected) {
@@ -1372,7 +1437,7 @@ fn render_session_detail(
 fn render_request_detail(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    state: &MonitorState,
+    state: &MonitorSnapshot,
     selected: usize,
 ) {
     let lines = if let Some(request) = state.recent.get(selected) {
@@ -1465,11 +1530,18 @@ fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: C
     ])
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) {
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp) {
     let spans = vec![
         Span::raw(" "),
         Span::styled("q", Style::default().fg(TEAL)),
-        Span::styled(" quit  ", Style::default().fg(DIM)),
+        Span::styled(
+            if app.is_attached() {
+                " detach  "
+            } else {
+                " quit  "
+            },
+            Style::default().fg(DIM),
+        ),
         Span::styled("?", Style::default().fg(TEAL)),
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(TEAL)),
@@ -1560,7 +1632,7 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
     );
 }
 
-fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
+fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, attached: bool) {
     let width = 48.min(area.width.saturating_sub(4)).max(24);
     let height = 12.min(area.height.saturating_sub(2)).max(8);
     let popup = Rect {
@@ -1579,7 +1651,14 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let lines = [
-        ("q / Ctrl-C", "quit proxy"),
+        (
+            "q / Ctrl-C",
+            if attached {
+                "detach dashboard"
+            } else {
+                "quit proxy"
+            },
+        ),
         ("?", "toggle help"),
         ("b", "toggle setup"),
         ("arrows", "navigate rows and panes"),
@@ -1893,7 +1972,7 @@ mod tests {
 
     #[test]
     fn active_table_renders_expected_headers_at_tier_boundaries() {
-        let state = mock_state();
+        let state: MonitorSnapshot = mock_state().into();
         let render_at = |width| {
             let buffer = draw(width, 8, |frame| {
                 render_active(frame, frame.area(), &state.active, 0)
@@ -2131,7 +2210,7 @@ mod tests {
             monitor.provider_selected(&request_id, "codex", "gpt-5.6-sol", None);
             monitor.request_completed(&request_id, 200, Some(100), Some(tokens));
         }
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
         let render_at = |width| {
             let buffer = draw(width, 8, |frame| {
                 render_sessions(frame, frame.area(), &state.sessions, 0, true)
@@ -2201,7 +2280,7 @@ mod tests {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("request-1", None, None, EndpointKind::Messages);
         monitor.upstream_started("request-1");
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
 
         let active = draw(88, 6, |frame| {
             render_active(frame, frame.area(), &state.active, 0)
@@ -2216,7 +2295,7 @@ mod tests {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("request-1", None, None, EndpointKind::Messages);
         monitor.compaction_started("request-1");
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
 
         let active = draw(88, 6, |frame| {
             render_active(frame, frame.area(), &state.active, 0)
@@ -2243,7 +2322,7 @@ mod tests {
             "gpt-5.6-sol",
             Some("high".to_string()),
         );
-        let active_state = monitor.snapshot();
+        let active_state: MonitorSnapshot = monitor.snapshot().into();
 
         let sessions = draw(170, 8, |frame| {
             render_sessions(frame, frame.area(), &active_state.sessions, 0, true)
@@ -2264,7 +2343,7 @@ mod tests {
         assert!(!active_text.contains("No active requests"));
 
         monitor.request_completed("request-1", 200, Some(100), Some(25));
-        let completed_state = monitor.snapshot();
+        let completed_state: MonitorSnapshot = monitor.snapshot().into();
         let recent = draw(140, 8, |frame| {
             render_recent(frame, frame.area(), &completed_state.recent, 0, false)
         });
@@ -2281,7 +2360,7 @@ mod tests {
 
     #[test]
     fn selected_rows_scroll_into_table_viewports() {
-        let state = mock_state();
+        let state: MonitorSnapshot = mock_state().into();
         let sessions = (0..12)
             .map(|index| {
                 let mut session = state.sessions[0].clone();
@@ -2313,7 +2392,7 @@ mod tests {
 
     #[test]
     fn mock_state_renders_representative_panes_at_wide_width() {
-        let state = mock_state();
+        let state: MonitorSnapshot = mock_state().into();
         let mut app = MonitorApp {
             listen_url: "mock://tui-demo".to_string(),
             setup_text: String::new(),
@@ -2341,7 +2420,7 @@ mod tests {
 
     #[test]
     fn mock_request_detail_exposes_error_and_capture_fields() {
-        let state = mock_state();
+        let state: MonitorSnapshot = mock_state().into();
         let failed = state
             .recent
             .iter()
@@ -2364,7 +2443,7 @@ mod tests {
         monitor.request_started("request-1", None, None, EndpointKind::Messages);
         monitor.provider_selected("request-1", "codex", "gpt-5.6-sol", None);
         monitor.request_failed("request-1", Some(502), "upstream unavailable");
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
 
         let recent = draw(110, 8, |frame| {
             render_recent(frame, frame.area(), &state.recent, 0, true)
@@ -2385,7 +2464,7 @@ mod tests {
         monitor.request_started("request-1", None, None, EndpointKind::Messages);
         monitor.provider_selected("request-1", "codex", "gpt-5.6-sol", None);
         monitor.request_failed("request-1", Some(502), "upstream unavailable");
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
 
         let recent = draw(180, 8, |frame| {
             render_recent(frame, frame.area(), &state.recent, 0, false)
@@ -2415,7 +2494,7 @@ mod tests {
             Some("high".to_string()),
         );
         monitor.request_failed("request-1", Some(502), "upstream unavailable");
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
 
         let detail = draw(120, 20, |frame| {
             render_request_detail(frame, frame.area(), &state, 0)
@@ -2436,7 +2515,7 @@ mod tests {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("request-1", None, None, EndpointKind::Messages);
         monitor.request_failed("request-1", Some(502), "upstream unavailable");
-        let state = monitor.snapshot();
+        let state: MonitorSnapshot = monitor.snapshot().into();
 
         let events = draw(100, 8, |frame| {
             render_events(frame, frame.area(), &state.recent)
@@ -2473,7 +2552,7 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
 
-        let state = MonitorHandle::default().snapshot();
+        let state: MonitorSnapshot = MonitorHandle::default().snapshot().into();
         let screen = draw(80, 24, |frame| render(frame, &mut app, &state));
         let text = buffer_text(&screen);
         assert!(text.contains("Shut down proxy?"), "{text}");
@@ -2517,7 +2596,7 @@ mod tests {
 
         assert_eq!(app.phase, MonitorPhase::ShuttingDown);
         assert_eq!(shutdown_rx.try_recv(), Ok(()));
-        let state = MonitorHandle::default().snapshot();
+        let state: MonitorSnapshot = MonitorHandle::default().snapshot().into();
         let screen = draw(80, 24, |frame| render(frame, &mut app, &state));
         let text = buffer_text(&screen);
         assert!(text.contains("Shutting down..."));
@@ -2569,7 +2648,7 @@ mod tests {
             shutdown: None,
             shutdown_complete: Some(mpsc::channel().1),
         };
-        let state = MonitorHandle::default().snapshot();
+        let state: MonitorSnapshot = MonitorHandle::default().snapshot().into();
 
         let header = draw(100, 1, |frame| {
             render_header(frame, frame.area(), &app, &state)

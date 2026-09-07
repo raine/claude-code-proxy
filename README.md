@@ -54,6 +54,10 @@ Start the proxy in one terminal:
 claude-code-proxy serve
 ```
 
+For a background service, use `claude-code-proxy serve --no-monitor` and attach
+from another terminal with `claude-code-proxy monitor`. Closing an attached
+dashboard leaves the proxy running.
+
 Start Claude Code in another:
 
 ```sh

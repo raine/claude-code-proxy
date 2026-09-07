@@ -38,6 +38,11 @@ enum Commands {
         #[arg(long = "no-monitor", action = ArgAction::SetTrue)]
         no_monitor: bool,
     },
+    /// Attach a read-only dashboard to a running proxy
+    Monitor {
+        #[arg(long)]
+        url: Option<reqwest::Url>,
+    },
     /// Open the monitor TUI with mock data and no proxy server
     #[command(hide = true)]
     Demo,
@@ -105,10 +110,10 @@ fn main() -> Result<()> {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
                     runtime
-                        .block_on(server::serve(ServerConfig {
+                        .block_on(run_service(ServerConfig {
                             bind_address,
                             port: effective_port,
-                            monitor: None,
+                            monitor: Some(MonitorHandle::default()),
                         }))
                         .map_err(|err| anyhow::anyhow!(err))
                 }
@@ -157,6 +162,25 @@ fn main() -> Result<()> {
             let registry = Registry::with_default_alias();
             tui::run_mock_monitor(config::port(), &registry)
         }
+        Commands::Monitor { url } => {
+            let url = url.unwrap_or_else(|| {
+                format!("http://127.0.0.1:{}", config::port())
+                    .parse()
+                    .expect("local proxy URL")
+            });
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(2))
+                .build()?;
+            let monitor = runtime.block_on(
+                claude_code_proxy::monitor::remote::RemoteMonitor::connect(client, url.clone()),
+            )?;
+            tui::run_attached_monitor(|| monitor.snapshot(), url.to_string())?;
+            Ok(())
+        }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
             Ok(())
@@ -166,6 +190,36 @@ fn main() -> Result<()> {
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
     }
+}
+
+async fn run_service(config: ServerConfig) -> Result<()> {
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = server::serve_with_shutdown(config, async {
+        let _ = stopped.await;
+    });
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        signal = service_shutdown_signal() => {
+            signal?;
+            let _ = shutdown.send(());
+            server.await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn service_shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn service_shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

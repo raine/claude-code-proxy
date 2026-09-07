@@ -34,7 +34,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
     http::{Request, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use http_body_util::{BodyExt, StreamBody};
@@ -168,9 +168,12 @@ pub async fn serve_listener(
         ])),
     );
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -259,6 +262,7 @@ pub fn app_with_features(
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/monitor", get(handler_monitor))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -299,6 +303,40 @@ struct AppState {
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
+}
+
+async fn handler_monitor(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+) -> Response {
+    let Some(axum::Extension(axum::extract::ConnectInfo(peer))) = peer else {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Monitor access requires a local connection",
+        );
+    };
+    if !peer.ip().is_loopback() {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Monitor access requires a local connection",
+        );
+    }
+    match &state.monitor {
+        Some(monitor) => (
+            [(http::header::CACHE_CONTROL, "no-store")],
+            Json(crate::monitor::snapshot::MonitorResponse::from(
+                monitor.snapshot(),
+            )),
+        )
+            .into_response(),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Monitor collection is disabled",
+        ),
+    }
 }
 
 async fn healthz() -> Json<serde_json::Value> {
