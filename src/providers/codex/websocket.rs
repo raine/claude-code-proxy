@@ -52,7 +52,11 @@ const MAX_POOL_ENTRIES: usize = 10_000;
 const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
 const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
-const WEBSOCKET_CONNECT_START_SPACING: Duration = Duration::from_secs(1);
+// Premier palier appliqué dès qu'une origine refuse un upgrade, puis doublement.
+const WEBSOCKET_CONNECT_BACKOFF_STEP: Duration = Duration::from_secs(1);
+const WEBSOCKET_CONNECT_MAX_SPACING: Duration = Duration::from_secs(8);
+// Connexions réussies consécutives avant de réduire l'espacement de moitié.
+const WEBSOCKET_CONNECT_RELAX_AFTER: u32 = 20;
 const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const WEBSOCKET_KEEPALIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -334,7 +338,9 @@ static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<ConversationIdentity, Arc<Po
 #[cfg(test)]
 static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
-    once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+    once_cell::sync::Lazy::new(|| {
+        WebSocketConnectGate::new(crate::config::codex_websocket_connect_spacing())
+    });
 
 fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
     let previous = sequence
@@ -562,26 +568,92 @@ fn cleanup_pool_before_connect() {
     drop(removed);
 }
 
+struct GateState {
+    last_start: Option<tokio::time::Instant>,
+    spacing: Duration,
+    successes: u32,
+}
+
+/// Espacement adaptatif des ouvertures de WebSocket.
+///
+/// Un espacement fixe protège l'origine des rafales d'upgrades (voir 529e1d6) mais la
+/// facture est permanente : la continuation étant désactivée par défaut, chaque requête
+/// ouvre une socket neuve, et un espacement d'une seconde plafonne le PROCESSUS entier
+/// à environ une génération par seconde même quand l'origine accepte tout. Mesuré le
+/// 2026-09-07 sur un compte au repos : 12 requêtes triviales en 13.27 s (0.90 req/s).
+///
+/// L'espacement devient donc le prix d'un refus constaté et non une taxe d'avance : il
+/// part du plancher configuré (zéro par défaut), double à chaque upgrade refusé jusqu'à
+/// un plafond, puis se relâche après une série de connexions réussies.
 struct WebSocketConnectGate {
-    last_start: AsyncMutex<Option<tokio::time::Instant>>,
-    start_spacing: Duration,
+    state: AsyncMutex<GateState>,
+    floor: Duration,
 }
 
 impl WebSocketConnectGate {
     fn new(start_spacing: Duration) -> Self {
         Self {
-            last_start: AsyncMutex::new(None),
-            start_spacing,
+            state: AsyncMutex::new(GateState {
+                last_start: None,
+                spacing: start_spacing,
+                successes: 0,
+            }),
+            floor: start_spacing,
         }
     }
 
     async fn wait_to_start(&self, before_start: impl std::future::Future<Output = ()>) {
-        let mut last_start = self.last_start.lock().await;
-        if let Some(previous) = *last_start {
-            tokio::time::sleep_until(previous + self.start_spacing).await;
+        let mut state = self.state.lock().await;
+        if let Some(previous) = state.last_start
+            && !state.spacing.is_zero()
+        {
+            tokio::time::sleep_until(previous + state.spacing).await;
         }
         before_start.await;
-        *last_start = Some(tokio::time::Instant::now());
+        state.last_start = Some(tokio::time::Instant::now());
+    }
+
+    /// Une origine vient de refuser un upgrade : élargir immédiatement.
+    fn note_origin_forbidden(&self) {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            // Un autre appelant tient l'état : il est en train d'ouvrir une connexion.
+            // Perdre un signal d'élargissement est sans conséquence — le refus suivant
+            // le portera — alors que bloquer ici retiendrait le chemin de connexion.
+            Err(_) => return,
+        };
+        state.successes = 0;
+        state.spacing = if state.spacing.is_zero() {
+            WEBSOCKET_CONNECT_BACKOFF_STEP
+        } else {
+            state.spacing.saturating_mul(2)
+        }
+        .min(WEBSOCKET_CONNECT_MAX_SPACING)
+        .max(self.floor);
+    }
+
+    /// Une connexion a abouti : se rapprocher du plancher configuré.
+    fn note_connect_success(&self) {
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        if state.spacing <= self.floor {
+            return;
+        }
+        state.successes += 1;
+        if state.successes < WEBSOCKET_CONNECT_RELAX_AFTER {
+            return;
+        }
+        state.successes = 0;
+        state.spacing = (state.spacing / 2).max(self.floor);
+        if state.spacing < WEBSOCKET_CONNECT_BACKOFF_STEP {
+            state.spacing = self.floor;
+        }
+    }
+
+    #[cfg(test)]
+    async fn spacing_for_tests(&self) -> Duration {
+        self.state.lock().await.spacing
     }
 }
 
@@ -1903,13 +1975,20 @@ where
                     connect_timeout,
                 )))
             });
+        // L'espacement suit ce que l'origine répond réellement : un upgrade refusé
+        // l'élargit, une connexion établie le relâche vers le plancher configuré.
         if result
             .as_ref()
             .is_err_and(ConnectAttemptError::is_origin_forbidden)
-            && attempt == 0
         {
-            retry_sleep(u64::try_from(forbidden_cooldown.as_millis()).unwrap_or(u64::MAX)).await;
-            continue;
+            gate.note_origin_forbidden();
+            if attempt == 0 {
+                retry_sleep(u64::try_from(forbidden_cooldown.as_millis()).unwrap_or(u64::MAX))
+                    .await;
+                continue;
+            }
+        } else if result.is_ok() {
+            gate.note_connect_success();
         }
         return result.map_err(ConnectAttemptError::into_error);
     }
@@ -2646,6 +2725,75 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert!(pool_was_unlocked.load(Ordering::SeqCst));
         clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_gate_starts_connections_without_spacing_them() {
+        // Mesuré le 2026-09-07 : avec un espacement fixe d'une seconde, un processus
+        // plafonne à ~0.90 génération/seconde quelle que soit la santé de l'origine,
+        // parce que la continuation est désactivée par défaut et que chaque requête
+        // ouvre donc une socket neuve. L'espacement doit être le prix d'un refus
+        // constaté, pas une taxe permanente.
+        let gate = WebSocketConnectGate::new(Duration::ZERO);
+        let started = tokio::time::Instant::now();
+        for _ in 0..8 {
+            gate.wait_to_start(async {}).await;
+        }
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_spaces_starts_after_the_origin_rejects_an_upgrade() {
+        // L'intention d'origine (529e1d6) est préservée : dès qu'une origine refuse un
+        // upgrade, on cesse de la marteler.
+        let gate = WebSocketConnectGate::new(Duration::ZERO);
+        gate.wait_to_start(async {}).await;
+        gate.note_origin_forbidden();
+
+        let before = tokio::time::Instant::now();
+        gate.wait_to_start(async {}).await;
+        assert!(
+            tokio::time::Instant::now().duration_since(before) >= WEBSOCKET_CONNECT_BACKOFF_STEP,
+            "a rejected origin must be given room"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_rejections_widen_the_spacing_up_to_a_cap() {
+        let gate = WebSocketConnectGate::new(Duration::ZERO);
+        for _ in 0..16 {
+            gate.note_origin_forbidden();
+        }
+        assert_eq!(
+            gate.spacing_for_tests().await,
+            WEBSOCKET_CONNECT_MAX_SPACING
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_success_relaxes_the_spacing_back_to_zero() {
+        // Sans retour à zéro, un seul 403 taxerait le processus pour toute sa vie.
+        let gate = WebSocketConnectGate::new(Duration::ZERO);
+        gate.note_origin_forbidden();
+        assert!(gate.spacing_for_tests().await > Duration::ZERO);
+        for _ in 0..(WEBSOCKET_CONNECT_RELAX_AFTER * 8) {
+            gate.note_connect_success();
+        }
+        assert_eq!(gate.spacing_for_tests().await, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_floor_is_never_relaxed_away() {
+        // Un opérateur qui impose un espacement garde son plancher, même après des
+        // milliers de succès.
+        let gate = WebSocketConnectGate::new(Duration::from_millis(250));
+        for _ in 0..(WEBSOCKET_CONNECT_RELAX_AFTER * 8) {
+            gate.note_connect_success();
+        }
+        assert_eq!(gate.spacing_for_tests().await, Duration::from_millis(250));
     }
 
     #[tokio::test(start_paused = true)]

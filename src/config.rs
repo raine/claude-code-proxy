@@ -76,6 +76,8 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+    #[serde(rename = "websocketConnectSpacingMs")]
+    pub websocket_connect_spacing_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -873,6 +875,28 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
         "auto" => Some(CodexTransport::Auto),
         _ => None,
     }
+}
+
+/// Plancher d'espacement des ouvertures de WebSocket Codex, en millisecondes.
+///
+/// Zéro (le défaut) laisse le processus ouvrir ses connexions sans attente tant que
+/// l'origine n'a refusé aucun upgrade ; l'espacement s'élargit alors tout seul. Un
+/// opérateur qui préfère un rythme garanti peut imposer un plancher.
+pub fn codex_websocket_connect_spacing() -> std::time::Duration {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_WS_CONNECT_SPACING_MS")
+        && let Ok(ms) = raw.trim().parse::<u64>()
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(ms) = codex.websocket_connect_spacing_ms
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::ZERO
 }
 
 pub fn codex_transport() -> CodexTransport {

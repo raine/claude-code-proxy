@@ -65,6 +65,20 @@ Claude Code summary compaction requests are capped at low effort by default beca
 
 WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE, or `auto` to use WebSocket with HTTP fallback only when setup fails before a request is sent.
 
+### Connection pacing
+
+Fresh WebSocket connections are paced adaptively. While the origin accepts upgrades the
+proxy opens connections without spacing them; each rejected upgrade widens the spacing
+(1s, then doubling up to 8s), and a run of successful connections narrows it back down.
+
+Because continuation is off by default, every request opens a fresh connection, so a
+fixed spacing would cap a single process at roughly one generation per second no matter
+how healthy the origin is. Pacing is therefore the price of an observed rejection rather
+than a standing tax.
+
+Set `CCP_CODEX_WS_CONNECT_SPACING_MS` (or `codex.websocketConnectSpacingMs`) to impose a
+floor the proxy never relaxes below. The default is `0`.
+
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
 
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. A valid identity containing only a Claude Code session ID owns the Main continuation for that session. Each valid direct Agent ID owns an independent continuation and reusable WebSocket within the same session. Nested Agents are keyed by their direct child ID; the parent ID is validated but does not become part of the owner key. The proxy sends `previous_response_id` only when the translated request shape and transcript extension are safe, and only on the exact live WebSocket that produced that response.

@@ -5,6 +5,11 @@ description: Release notes for claude-code-proxy.
 
 ## Unreleased
 
+- Codex WebSocket connection pacing is adaptive: connections start without
+  spacing while the origin accepts upgrades, widen after a rejected upgrade,
+  and relax again after sustained success. A fixed 1s spacing previously
+  capped each process near one generation per second. Set a floor with
+  `CCP_CODEX_WS_CONNECT_SPACING_MS` to restore fixed pacing.
 - Codex standalone searches keep stable per-Agent sessions without colliding
   with sibling Agents that share a Claude Code session, and align all upstream
   search identity headers with the request body owner.
