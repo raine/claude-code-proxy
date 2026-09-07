@@ -224,7 +224,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["anthropic", "codex", "kimi", "grok", "opencode", "cursor"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };
@@ -277,7 +277,12 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     println!();
     println!("Configure Claude Code (pick a model from above):");
     println!("  export ANTHROPIC_BASE_URL=\"http://localhost:{port}\"");
-    println!("  export ANTHROPIC_AUTH_TOKEN=\"anything\"");
+    if registry.provider("anthropic").is_some() {
+        println!("  # Keep Claude Code's subscription login for Claude models:");
+        println!("  unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY");
+    } else {
+        println!("  export ANTHROPIC_AUTH_TOKEN=\"anything\"");
+    }
     println!("  export ANTHROPIC_MODEL=\"gpt-5.6-sol\"");
     println!("  export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-5.6-luna\"");
     println!("  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");

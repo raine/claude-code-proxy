@@ -62,6 +62,15 @@ pub struct Registry {
 impl Registry {
     pub fn new(alias_provider: AliasProvider) -> Self {
         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if alias_provider == AliasProvider::Anthropic {
+            models.insert(
+                "anthropic".into(),
+                ANTHROPIC_STYLE_ALIASES
+                    .iter()
+                    .map(|model| (*model).to_string())
+                    .collect(),
+            );
+        }
         models.insert("codex".into(), expand_codex_models());
         models.insert(
             "kimi".into(),
@@ -83,6 +92,7 @@ impl Registry {
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
+                "anthropic" => Arc::new(crate::providers::anthropic::AnthropicProvider::new()),
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
@@ -169,6 +179,12 @@ impl Registry {
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
+        // Explicit Claude selection must survive a preceding Codex/Kimi turn.
+        if self.alias_provider == AliasProvider::Anthropic
+            && (is_anthropic_alias(&normalized) || normalized.starts_with("claude-"))
+        {
+            return self.handlers.get("anthropic").cloned();
+        }
         if is_anthropic_alias(&normalized) {
             let target = session_affinity.unwrap_or(&self.alias_provider);
             return self.handlers.get(target.as_str()).cloned();
@@ -340,6 +356,59 @@ fn build_cursor_models() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_routing_is_opt_in_and_ignores_other_provider_affinity() {
+        let native = Registry::new(AliasProvider::Anthropic);
+        let default = Registry::new(AliasProvider::Codex);
+        for model in ["haiku", "opus", "claude-opus-5", "claude-future-model[1m]"] {
+            assert_eq!(
+                native
+                    .provider_for_model(model, Some(&AliasProvider::Codex))
+                    .unwrap()
+                    .name(),
+                "anthropic"
+            );
+            assert_eq!(
+                native
+                    .provider_for_model(model, Some(&AliasProvider::Kimi))
+                    .unwrap()
+                    .name(),
+                "anthropic"
+            );
+        }
+        assert_eq!(
+            native
+                .provider_for_model("gpt-6-astra", None)
+                .unwrap()
+                .name(),
+            "codex"
+        );
+        assert_eq!(
+            native.provider_for_model("kimi-k3", None).unwrap().name(),
+            "kimi"
+        );
+        assert!(native.provider_for_model("unknown", None).is_none());
+        assert!(default.provider("anthropic").is_none());
+        assert!(
+            default
+                .provider_for_model("claude-future-model", None)
+                .is_none()
+        );
+        assert_eq!(
+            default
+                .provider_for_model("opus", Some(&AliasProvider::Kimi))
+                .unwrap()
+                .name(),
+            "kimi"
+        );
+        assert!(
+            native
+                .all_supported_models()
+                .iter()
+                .any(|(model, provider)| model == "claude-opus-5" && provider == "anthropic")
+        );
+    }
 
     #[test]
     fn normalize_model_trims_hint() {

@@ -12,6 +12,8 @@ Claude Code binds its base URL and client auth when the process starts. A **back
 | Toggle between proxy and direct Anthropic | Use a launch wrapper controlled by a flag |
 | Stay on the proxy and change provider or model | Use `/model`, `--model`, or a new `ANTHROPIC_MODEL` |
 
+To use Claude and GPT in one proxy-backed session, enable [Anthropic passthrough](/providers/anthropic/) with `CCP_ALIAS_PROVIDER=anthropic`. Claude Code keeps its subscription login and `/model` selects the provider per request. Switching the base URL itself still requires a new Claude Code process.
+
 ## One-shot aliases
 
 ```sh

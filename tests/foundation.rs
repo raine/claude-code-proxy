@@ -258,6 +258,34 @@ fn alias_provider_has_expected_default() {
 }
 
 #[test]
+fn anthropic_alias_provider_can_be_enabled_in_file_or_environment() {
+    let config = TempDir::new().unwrap();
+    std::fs::write(
+        config.path().join("config.json"),
+        r#"{"aliasProvider":"anthropic"}"#,
+    )
+    .unwrap();
+    let mut env = HashMap::from([(
+        "CCP_CONFIG_DIR".to_string(),
+        config.path().to_string_lossy().into_owned(),
+    )]);
+    assert_eq!(
+        load_config_for_env(&env).alias_provider,
+        AliasProvider::Anthropic
+    );
+    env.insert("CCP_ALIAS_PROVIDER".to_string(), "codex".to_string());
+    assert_eq!(
+        load_config_for_env(&env).alias_provider,
+        AliasProvider::Codex
+    );
+    env.insert("CCP_ALIAS_PROVIDER".to_string(), "anthropic".to_string());
+    assert_eq!(
+        load_config_for_env(&env).alias_provider,
+        AliasProvider::Anthropic
+    );
+}
+
+#[test]
 fn logger_factory_builds() {
     let logger = create_logger("server");
     let fields = Map::new();

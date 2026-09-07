@@ -8,7 +8,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
-    read_effort,
+    previous_reasoning_text, read_effort,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -898,18 +898,24 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 arguments: args,
                             });
                         }
-                        ContentBlock::Thinking { signature, .. } => {
-                            let Some(replay) =
+                        ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => {
+                            if let Some(replay) =
                                 signature.as_deref().and_then(decode_reasoning_signature)
-                            else {
-                                continue;
-                            };
-                            flush_text(&mut out, &mut text_parts);
-                            out.push(ResponsesInputItem::Reasoning {
-                                id: replay.id,
-                                summary: Vec::new(),
-                                encrypted_content: replay.encrypted_content,
-                            });
+                            {
+                                flush_text(&mut out, &mut text_parts);
+                                out.push(ResponsesInputItem::Reasoning {
+                                    id: replay.id,
+                                    summary: Vec::new(),
+                                    encrypted_content: replay.encrypted_content,
+                                });
+                            } else if !thinking.is_empty() {
+                                text_parts.push(ResponsesContentPart::OutputText {
+                                    text: previous_reasoning_text(thinking),
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -2341,5 +2347,29 @@ mod tests {
             out.input.get(reasoning_index + 1),
             Some(ResponsesInputItem::Message { role, .. }) if role == "assistant"
         ));
+    }
+
+    #[test]
+    fn foreign_thinking_preserves_visible_summary_and_tool_order() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-6-astra", "messages":[{"role":"assistant","content":[
+                {"type":"thinking","thinking":"Claude summary","signature":"opaque-native-signature"},
+                {"type":"redacted_thinking","data":"opaque-redaction"},
+                {"type":"tool_use","id":"call1","name":"Read","input":{"path":"a"}},
+                {"type":"text","text":"answer"}
+            ]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call1","content":"result"}]}]
+        })).unwrap();
+        let out = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            "<previous_reasoning>\nClaude summary\n</previous_reasoning>"
+        );
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call1");
+        assert_eq!(input[2]["content"][0]["text"], "answer");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert!(!out.to_string().contains("opaque-native-signature"));
+        assert!(!out.to_string().contains("opaque-redaction"));
     }
 }

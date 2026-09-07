@@ -81,4 +81,6 @@ ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
 
 ## Alias routing
 
-`CCP_ALIAS_PROVIDER=kimi` or `"aliasProvider": "kimi"` routes recognized Anthropic-style aliases to Kimi. Accepted values are `codex` and `kimi`. Explicit provider IDs always use their provider.
+`CCP_ALIAS_PROVIDER=kimi` or `"aliasProvider": "kimi"` routes recognized Anthropic-style aliases to Kimi. Accepted values are `codex`, `kimi`, and `anthropic`. Explicit provider IDs always use their provider.
+
+With `anthropic`, Claude aliases and explicit `claude-*` IDs go to [Anthropic](/providers/anthropic/) using the credentials Claude Code sends. They remain on Anthropic even after a GPT or Kimi turn establishes session affinity. Existing `codex` and `kimi` alias behavior is unchanged.

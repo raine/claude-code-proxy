@@ -7,6 +7,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 
 | Provider | Account | Upstream protocol | Model selection | Notable capabilities |
 | --- | --- | --- | --- | --- |
+| [Anthropic](/providers/anthropic/) (opt-in) | Claude Code subscription login or Anthropic API credentials | Anthropic Messages passthrough | `claude-*` and built-in Claude aliases | Native tools, thinking and streaming; credentials forwarded from Claude Code |
 | [Codex](/providers/codex/) | ChatGPT Plus or Pro | OpenAI Responses over WebSocket or HTTP SSE | Named Codex catalog, `-fast` variants | Function tools, image input, hosted web search, reasoning summaries, optional native Responses route |
 | [Kimi](/providers/kimi/) | kimi.com with Kimi Code access | OpenAI-style chat completions | `kimi-for-coding` and aliases | Function tools, reasoning, image and video input |
 | [Grok](/providers/grok/) | grok.com | Responses API | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6` | Function tools, reasoning, web search, X search, citations |
@@ -23,7 +24,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 
 ## Shared behavior
 
-All providers route by model ID, use proxy-owned credentials, refresh tokens when supported, stream responses, translate Claude Code tool definitions, and report failures through the same Anthropic-shaped API.
+All providers route by model ID, stream responses and report failures through the same Anthropic-shaped API. Translating providers use proxy-owned credentials and refresh tokens when supported. Anthropic forwards Claude Code's credentials and native request fields instead.
 
 <div class="security-callout">
 <strong>Account policy matters.</strong> Provider subscriptions, model access, regional availability, rate limits, and rules for unofficial clients can change. Review the terms for your account before using a provider through the proxy.

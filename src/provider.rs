@@ -4,10 +4,14 @@ use crate::request_identity::ConversationIdentity;
 use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
-use axum::{body::Body, http::StatusCode, response::Response};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    response::Response,
+};
 use bytes::Bytes;
 use clap::Subcommand;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
@@ -26,6 +30,16 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn supported_models(&self) -> Vec<String>;
     fn cli(&self) -> &'static dyn CliHandlers;
+
+    async fn handle_request(&self, request: ProviderRequest, ctx: RequestContext) -> Response {
+        match request.endpoint {
+            RequestEndpoint::Messages(identity) => {
+                self.handle_messages_with_conversation_identity(request.body, ctx, identity)
+                    .await
+            }
+            RequestEndpoint::CountTokens => self.handle_count_tokens(request.body, ctx).await,
+        }
+    }
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
     async fn handle_messages_with_conversation_identity(
@@ -53,6 +67,40 @@ pub trait Provider: Send + Sync {
                 self.name()
             ),
         ))
+    }
+}
+
+/// The parsed routing input and the original HTTP representation travel together.
+/// Translating providers use `body`; passthrough providers retain fields unknown
+/// to the proxy by forwarding `original`.
+pub struct ProviderRequest {
+    pub body: MessagesRequest,
+    pub original: Request<Bytes>,
+    pub endpoint: RequestEndpoint,
+}
+
+pub enum RequestEndpoint {
+    Messages(Option<ConversationIdentity>),
+    CountTokens,
+}
+
+/// Records a protocol failure discovered after response headers were sent.
+#[derive(Clone, Default)]
+pub struct ResponseOutcome {
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl ResponseOutcome {
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
+    pub(crate) fn fail(&self, message: String) {
+        if let Ok(mut failure) = self.failure.lock()
+            && failure.is_none()
+        {
+            *failure = Some(message);
+        }
     }
 }
 
