@@ -1,4 +1,8 @@
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
 use http::HeaderMap;
+use sha2::{Digest, Sha256};
 
 pub const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
 pub const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
@@ -28,6 +32,26 @@ impl ConversationIdentity {
             }
             (Some(session_id), None, None) => Some(Self::Main(session_id.to_string())),
             _ => None,
+        }
+    }
+
+    pub fn search_session_id(&self) -> Cow<'_, str> {
+        match self {
+            Self::Main(session_id) => Cow::Borrowed(session_id),
+            Self::Agent(session_id, agent_id) => {
+                let mut digest = Sha256::new();
+                digest.update(b"claude-code-proxy:search-agent:v1\0");
+                for value in [session_id, agent_id] {
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                let digest = digest.finalize();
+                let mut encoded = String::with_capacity(digest.len() * 2);
+                for byte in digest {
+                    write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+                }
+                Cow::Owned(format!("search-agent-v1-{encoded}"))
+            }
         }
     }
 }
@@ -179,6 +203,42 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn search_owner_is_stable_and_isolates_identity_tuples() {
+        let agent = ConversationIdentity::Agent("session-a".into(), "agent-a".into());
+        let sibling = ConversationIdentity::Agent("session-a".into(), "agent-b".into());
+        let other_session = ConversationIdentity::Agent("session-b".into(), "agent-a".into());
+        let shifted_boundary = ConversationIdentity::Agent("session-aa".into(), "gent-a".into());
+
+        assert_eq!(agent.search_session_id(), agent.search_session_id());
+        assert_ne!(agent.search_session_id(), sibling.search_session_id());
+        assert_ne!(agent.search_session_id(), other_session.search_session_id());
+        assert_ne!(
+            agent.search_session_id(),
+            shifted_boundary.search_session_id()
+        );
+    }
+
+    #[test]
+    fn agent_search_owner_is_bounded_and_does_not_disclose_raw_ids() {
+        let session = "s".repeat(MAX_IDENTITY_LEN);
+        let agent = "a".repeat(MAX_IDENTITY_LEN);
+        let owner = ConversationIdentity::Agent(session.clone(), agent.clone())
+            .search_session_id()
+            .into_owned();
+
+        assert_eq!(owner.len(), "search-agent-v1-".len() + 64);
+        assert!(!owner.contains(&session));
+        assert!(!owner.contains(&agent));
+    }
+
+    #[test]
+    fn main_search_owner_preserves_the_raw_session_id() {
+        let main = ConversationIdentity::Main("session-main".into());
+
+        assert_eq!(main.search_session_id(), "session-main");
     }
 
     #[test]

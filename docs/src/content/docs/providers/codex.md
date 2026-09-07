@@ -49,6 +49,13 @@ Claude Code summary compaction requests are capped at low effort by default beca
   Structured result DTOs map back to Anthropic `server_tool_use` and
   `web_search_tool_result` blocks, while standalone text output remains text.
   The proxy locally estimates input and output tokens and reports search usage.
+  Standalone search sessions use the same ownership identity as continuation:
+  Main keeps its Claude Code session ID, while each direct Agent gets a stable,
+  opaque owner derived from its session and Agent IDs. The parent Agent ID is
+  validation-only. Missing, malformed, or ambiguous identity headers use a fresh
+  random search ID instead of sharing state. The search body ID and upstream
+  `session_id`, `x-client-request-id`, and `x-codex-window-id` headers all carry
+  that same search owner (with the window header's required `:0` suffix).
 - Top-level base64 user images map to `input_image`.
 - Supported base64 images nested in tool results also map to `input_image`.
 - Remote image URLs, malformed images, and unsupported tool-result image forms remain textual placeholders.
@@ -57,6 +64,20 @@ Claude Code summary compaction requests are capped at low effort by default beca
 ## Transport and continuation
 
 WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE, or `auto` to use WebSocket with HTTP fallback only when setup fails before a request is sent.
+
+### Connection pacing
+
+Fresh WebSocket connections are paced adaptively. While the origin accepts upgrades the
+proxy opens connections without spacing them; each rejected upgrade widens the spacing
+(1s, then doubling up to 8s), and a run of successful connections narrows it back down.
+
+Because continuation is off by default, every request opens a fresh connection, so a
+fixed spacing would cap a single process at roughly one generation per second no matter
+how healthy the origin is. Pacing is therefore the price of an observed rejection rather
+than a standing tax.
+
+Set `CCP_CODEX_WS_CONNECT_SPACING_MS` (or `codex.websocketConnectSpacingMs`) to impose a
+floor the proxy never relaxes below. The default is `0`.
 
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
 

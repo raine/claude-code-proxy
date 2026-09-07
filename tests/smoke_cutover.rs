@@ -105,6 +105,21 @@ async fn call_messages_body(body: Value) -> Response {
         .unwrap()
 }
 
+async fn call_messages_body_with_headers(body: Value, headers: &[(&str, &str)]) -> Response {
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app(Arc::new(Registry::with_default_alias()))
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
 async fn call_responses_body(body: Value) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app_with_options(Arc::new(Registry::with_default_alias()), None, true)
@@ -170,17 +185,25 @@ where
     F: Fn(Value) -> Vec<u8> + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
+    spawn_http_upstream_with_headers(move |_, body| handler(body)).await
+}
+
+async fn spawn_http_upstream_with_headers<F>(handler: F) -> String
+where
+    F: Fn(http::HeaderMap, Value) -> Vec<u8> + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let addr_str = format!("http://{addr}");
 
     let app = axum::Router::new().fallback({
         let handler = handler.clone();
-        move |body: String| {
+        move |headers: http::HeaderMap, body: String| {
             let handler = handler.clone();
             async move {
                 let json: Value = serde_json::from_str(&body).unwrap_or_default();
-                let response_bytes = handler(json);
+                let response_bytes = handler(headers, json);
                 http::Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "text/event-stream")
@@ -882,6 +905,121 @@ async fn spawn_websocket_always_empty_completion_upstream(
 // ---------------------------------------------------------------------------
 // Health and routing smoke tests (no env var mutation needed)
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn codex_standalone_search_uses_conversation_identity_owner() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    let captured = Arc::new(Mutex::new(Vec::<[String; 4]>::new()));
+    let upstream = spawn_http_upstream_with_headers({
+        let captured = captured.clone();
+        move |headers, body| {
+            captured.lock().unwrap().push([
+                body["id"].as_str().unwrap().to_string(),
+                headers
+                    .get("session_id")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                headers
+                    .get("x-client-request-id")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                headers
+                    .get("x-codex-window-id")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            ]);
+            serde_json::to_vec(&json!({
+                "encrypted_output": null,
+                "output": "search ok",
+                "results": []
+            }))
+            .unwrap()
+        }
+    })
+    .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let body = json!({
+        "model": "gpt-5.6-luna",
+        "max_tokens": 64,
+        "messages": [{
+            "role": "user",
+            "content": "Perform a web search for the query: identity owner"
+        }],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "tool_choice": {"type": "tool", "name": "web_search"}
+    });
+    let cases: &[&[(&str, &str)]] = &[
+        &[
+            ("x-claude-code-session-id", "session-a"),
+            ("x-claude-code-agent-id", "agent-a"),
+            ("x-claude-code-parent-agent-id", "parent-one"),
+        ],
+        &[
+            ("x-claude-code-session-id", "session-a"),
+            ("x-claude-code-agent-id", "agent-a"),
+            ("x-claude-code-parent-agent-id", "parent-two"),
+        ],
+        &[
+            ("x-claude-code-session-id", "session-a"),
+            ("x-claude-code-agent-id", "agent-b"),
+        ],
+        &[
+            ("x-claude-code-session-id", "session-b"),
+            ("x-claude-code-agent-id", "agent-a"),
+        ],
+        &[("x-claude-code-session-id", "session-main")],
+        &[],
+        &[
+            ("x-claude-code-session-id", "session-malformed"),
+            ("x-claude-code-agent-id", "bad agent"),
+        ],
+    ];
+    for headers in cases {
+        let response = call_messages_body_with_headers(body.clone(), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let identities = captured.lock().unwrap();
+    assert_eq!(identities.len(), cases.len());
+    for carriers in identities.iter() {
+        assert_eq!(carriers[1], carriers[0], "session_id must match body id");
+        assert_eq!(
+            carriers[2], carriers[0],
+            "x-client-request-id must match body id"
+        );
+        assert_eq!(
+            carriers[3],
+            format!("{}:0", carriers[0]),
+            "x-codex-window-id must use the body id"
+        );
+    }
+    assert_eq!(
+        identities[0][0], identities[1][0],
+        "same direct agent must keep its owner"
+    );
+    assert_ne!(
+        identities[0][0], identities[2][0],
+        "siblings must not share an owner"
+    );
+    assert_ne!(
+        identities[0][0], identities[3][0],
+        "sessions must not share an owner"
+    );
+    assert_eq!(identities[4][0], "session-main");
+    assert!(identities[5][0].starts_with("search-"));
+    assert!(identities[6][0].starts_with("search-"));
+    assert_ne!(identities[5][0], identities[6][0]);
+}
 
 #[tokio::test]
 async fn smoke_healthz_returns_ok() {
