@@ -88,7 +88,13 @@ impl OpenCodeProvider {
                 };
                 mark_upstream_started(&ctx);
                 let upstream = match client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(upstream) => upstream,
@@ -111,7 +117,13 @@ impl OpenCodeProvider {
                 };
                 mark_upstream_started(&ctx);
                 let upstream = match client
-                    .post(spec.endpoint, &translated, false, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        false,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(upstream) => upstream,
@@ -135,7 +147,13 @@ impl OpenCodeProvider {
                     };
                 mark_upstream_started(&ctx);
                 let upstream = match client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(upstream) => upstream,
@@ -248,7 +266,13 @@ impl Provider for OpenCodeProvider {
                 let translated = chat::prepare_request(&body, spec.id)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                     .map_err(opencode_provider_error)?;
                 chat::stream_body(
@@ -264,7 +288,13 @@ impl Provider for OpenCodeProvider {
                 let translated = messages::prepare_request(&body, spec.id)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                     .map_err(opencode_provider_error)?;
                 messages::stream_body(
@@ -278,7 +308,13 @@ impl Provider for OpenCodeProvider {
                 let translated = responses::prepare_request(&body, spec.id, ctx.session_id.clone())
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
-                    .post(spec.endpoint, &translated, true, ctx.traffic.clone())
+                    .post(
+                        spec.endpoint,
+                        &translated,
+                        true,
+                        ctx.traffic.clone(),
+                        ctx.session_id.as_deref(),
+                    )
                     .await
                     .map_err(opencode_provider_error)?;
                 responses::stream_body(
@@ -448,7 +484,7 @@ mod tests {
     use axum::{
         Json, Router,
         body::Body,
-        extract::OriginalUri,
+        extract::{OriginalUri, State},
         http::HeaderMap,
         response::{IntoResponse, Response},
         routing::post,
@@ -457,6 +493,7 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
     use std::convert::Infallible;
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -469,6 +506,68 @@ mod tests {
             monitor: None,
             traffic: None,
         }
+    }
+
+    fn context_with_session(session_id: &str) -> RequestContext {
+        RequestContext {
+            session_id: Some(session_id.to_string()),
+            ..context()
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_code_session_id_is_forwarded_as_opencode_session_header() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        async fn capture_session_header(
+            State(seen): State<Arc<Mutex<Vec<String>>>>,
+            headers: HeaderMap,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Response {
+            seen.lock().unwrap().push(
+                headers
+                    .get("x-opencode-session")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            Json(json!({
+                "id": "msg_native",
+                "type": "message",
+                "role": "assistant",
+                "model": "minimax-m3",
+                "content": [{"type":"text","text":"hello"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens":1,"output_tokens":1}
+            }))
+            .into_response()
+        }
+
+        let app = Router::new()
+            .route("/v1/messages", post(capture_session_header))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenCodeProvider::with_client(
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap(),
+        );
+
+        let body: MessagesRequest = serde_json::from_value(json!({
+            "model": "opencode-go/minimax-m3",
+            "stream": false,
+            "messages": [{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let response = provider
+            .handle_messages(body, context_with_session("claude-session-42"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.as_slice(), ["claude-session-42"]);
     }
 
     #[tokio::test]
