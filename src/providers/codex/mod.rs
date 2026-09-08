@@ -7,6 +7,7 @@ pub mod count_tokens;
 pub(crate) mod events;
 pub mod images;
 pub mod native;
+pub(crate) mod rate_limits;
 pub mod request_summary;
 pub mod search;
 pub mod transcription;
@@ -791,7 +792,7 @@ async fn live_stream_response(
         {
             LiveStreamStart::Response(response) => {
                 cleanup.disarm();
-                return response;
+                return with_rate_limit_headers(response);
             }
             LiveStreamStart::Retry {
                 error,
@@ -885,6 +886,7 @@ async fn live_stream_response_once(
             }
             generation_started = true;
         }
+        rate_limits::observe_event(&payload);
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
@@ -1117,6 +1119,7 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
+                    rate_limits::observe_event(&payload);
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
@@ -1416,6 +1419,34 @@ fn update_continuation_from_upstream(
 // Error mapping
 // ---------------------------------------------------------------------------
 
+/// Attach the newest Codex quota reading to a response, so a client can warn
+/// its user before the allowance runs out rather than only when it has.
+///
+/// A response that already states a rate limit status is left alone: a refusal
+/// carries the exact state of the window that refused it, which is better than
+/// a reading taken earlier in the turn.
+fn with_rate_limit_headers(mut response: Response) -> Response {
+    if response
+        .headers()
+        .contains_key("anthropic-ratelimit-unified-status")
+    {
+        return response;
+    }
+    let Some(snapshot) = rate_limits::latest() else {
+        return response;
+    };
+
+    let headers = response.headers_mut();
+    for (name, value) in snapshot.headers() {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes())
+            && let Ok(value) = HeaderValue::from_str(&value)
+        {
+            headers.insert(name, value);
+        }
+    }
+    response
+}
+
 /// Answer a spent subscription window with the rate limit headers the client
 /// reads, so it can name the exhausted window and show when it reopens.
 ///
@@ -1650,6 +1681,48 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
+
+    #[test]
+    fn a_refusal_keeps_the_state_of_the_window_that_refused_it() {
+        // A reading from earlier in the turn says the allowance was fine, and
+        // both windows are still running so it survives to the response.
+        rate_limits::observe_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 5.0,
+                    "window_minutes": 300,
+                    "reset_at": 4_000_000_000u64
+                },
+                "secondary": {
+                    "used_percent": 5.0,
+                    "window_minutes": 10080,
+                    "reset_at": 4_000_000_001u64
+                }
+            }
+        }));
+        assert!(rate_limits::latest().is_some(), "reading must be live");
+
+        let refusal = with_rate_limit_headers(usage_limit_response(&events::CodexUsageLimit {
+            message: "The usage limit has been reached".to_string(),
+            resets_at: Some(1788879437),
+            window: Some(events::CodexLimitWindow::FiveHour),
+        }));
+
+        let headers = refusal.headers();
+        assert_eq!(
+            headers
+                .get("anthropic-ratelimit-unified-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("rejected"),
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-ratelimit-unified-reset")
+                .and_then(|value| value.to_str().ok()),
+            Some("1788879437"),
+        );
+    }
 
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
         translate::request::ResponsesRequest {
