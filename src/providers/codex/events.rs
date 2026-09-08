@@ -267,6 +267,122 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     })
 }
 
+/// Which upstream quota window ran out. Codex reports a 300 minute primary
+/// window and a 10080 minute secondary one, which line up with the session and
+/// weekly windows the Anthropic rate limit headers describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLimitWindow {
+    FiveHour,
+    SevenDay,
+}
+
+impl CodexLimitWindow {
+    pub(crate) fn claim(self) -> &'static str {
+        match self {
+            CodexLimitWindow::FiveHour => "five_hour",
+            CodexLimitWindow::SevenDay => "seven_day",
+        }
+    }
+}
+
+/// Quota exhaustion reported by Codex, together with the reset clock upstream
+/// sends alongside it. Unlike a transient rate limit this does not clear on a
+/// backoff, so the reset time is the only useful thing to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexUsageLimit {
+    pub message: String,
+    pub resets_at: Option<u64>,
+    pub window: Option<CodexLimitWindow>,
+}
+
+/// Recognise the `usage_limit_reached` error Codex emits when a subscription
+/// window is spent. Upstream puts the clock both in the error body
+/// (`resets_at`, `resets_in_seconds`) and in `X-Codex-*` headers mirrored into
+/// the event payload.
+pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit> {
+    if !matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("response.failed" | "response.error" | "error")
+    ) {
+        return None;
+    }
+    let error = event_error(payload)?;
+
+    let resets_at = numeric_value(error.get("resets_at"));
+    let resets_in_seconds = numeric_value(error.get("resets_in_seconds"));
+    let is_usage_limit = error.get("type").and_then(Value::as_str) == Some("usage_limit_reached")
+        || (numeric_status(payload) == Some(429)
+            && (resets_at.is_some() || resets_in_seconds.is_some()));
+    if !is_usage_limit {
+        return None;
+    }
+
+    let limiting = limiting_window(payload, resets_in_seconds);
+    let resets_at = resets_at.or_else(|| {
+        let (prefix, _) = limiting?;
+        header_number(payload, &format!("X-Codex-{prefix}-Reset-At"))
+    });
+
+    Some(CodexUsageLimit {
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Usage limit reached")
+            .to_string(),
+        resets_at,
+        window: limiting.map(|(_, window)| window),
+    })
+}
+
+/// Codex sends the clock for both windows on every limit error, so the one that
+/// actually ran out is the one whose countdown matches the error's own. Returns
+/// the header prefix naming that window along with the window itself.
+fn limiting_window(
+    payload: &Value,
+    resets_in_seconds: Option<u64>,
+) -> Option<(&'static str, CodexLimitWindow)> {
+    let primary = header_number(payload, "X-Codex-Primary-Reset-After-Seconds");
+    let secondary = header_number(payload, "X-Codex-Secondary-Reset-After-Seconds");
+    let secondary_is_limiting = match (resets_in_seconds, primary, secondary) {
+        (Some(actual), Some(primary), Some(secondary)) => {
+            actual.abs_diff(secondary) < actual.abs_diff(primary)
+        }
+        (_, None, Some(_)) => true,
+        _ => false,
+    };
+    let prefix = if secondary_is_limiting {
+        "Secondary"
+    } else {
+        "Primary"
+    };
+
+    // A 300 minute window is the five hour one; anything longer is the weekly.
+    let minutes = header_number(payload, &format!("X-Codex-{prefix}-Window-Minutes"))?;
+    let window = if minutes <= 360 {
+        CodexLimitWindow::FiveHour
+    } else {
+        CodexLimitWindow::SevenDay
+    };
+    Some((prefix, window))
+}
+
+fn header_number(payload: &Value, name: &str) -> Option<u64> {
+    payload
+        .get("headers")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| numeric_value(Some(value)))
+}
+
+fn numeric_value(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(raw) => raw.parse().ok(),
+        _ => None,
+    }
+}
+
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
     first_event_failure(body).filter(CodexEventFailure::retryable)
 }
@@ -335,6 +451,81 @@ fn retryable_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shape recorded from a live turn that exhausted the five hour window: the
+    /// clock arrives both in the error body and in the mirrored `X-Codex-*`
+    /// headers, and the primary window is the one that ran out.
+    fn spent_five_hour_window() -> Value {
+        serde_json::json!({
+            "type": "error",
+            "status_code": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "plus",
+                "resets_at": 1788879437u64,
+                "resets_in_seconds": 9568u64
+            },
+            "headers": {
+                "X-Codex-Primary-Used-Percent": "100",
+                "X-Codex-Primary-Window-Minutes": "300",
+                "X-Codex-Primary-Reset-After-Seconds": "9569",
+                "X-Codex-Primary-Reset-At": "1788879438",
+                "X-Codex-Secondary-Used-Percent": "16",
+                "X-Codex-Secondary-Window-Minutes": "10080",
+                "X-Codex-Secondary-Reset-After-Seconds": "596369",
+                "X-Codex-Secondary-Reset-At": "1789466238"
+            }
+        })
+    }
+
+    #[test]
+    fn reads_usage_limit_reset_clock() {
+        let limit = usage_limit_from_event(&spent_five_hour_window()).expect("usage limit");
+        assert_eq!(limit.message, "The usage limit has been reached");
+        assert_eq!(limit.resets_at, Some(1788879437));
+        assert_eq!(limit.window, Some(CodexLimitWindow::FiveHour));
+        assert_eq!(limit.window.unwrap().claim(), "five_hour");
+    }
+
+    #[test]
+    fn attributes_the_window_whose_clock_matches() {
+        let mut payload = spent_five_hour_window();
+        // Same error, but it is the weekly window that ran out.
+        payload["error"]["resets_in_seconds"] = serde_json::json!(596_368u64);
+        let limit = usage_limit_from_event(&payload).expect("usage limit");
+        assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+    }
+
+    #[test]
+    fn falls_back_to_header_clock_when_body_omits_it() {
+        let mut payload = spent_five_hour_window();
+        payload["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resets_at");
+        let limit = usage_limit_from_event(&payload).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(1788879438));
+    }
+
+    #[test]
+    fn ignores_errors_that_are_not_usage_limits() {
+        assert!(
+            usage_limit_from_event(&serde_json::json!({
+                "type": "error",
+                "status_code": 429,
+                "error": {"type": "rate_limit_exceeded", "message": "slow down"}
+            }))
+            .is_none()
+        );
+        assert!(
+            usage_limit_from_event(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": "hello"
+            }))
+            .is_none()
+        );
+    }
 
     #[test]
     fn classifies_retryable_failure_kinds() {
