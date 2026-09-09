@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.38 (2026-09-09)
+
+- Fix requests failing with an invalid Artifact tool schema in Claude Code 2.1.265+
+  when using Codex. ([#141](https://github.com/raine/claude-code-proxy/issues/141),
+  [#142](https://github.com/raine/claude-code-proxy/issues/142))
+
 ## v0.1.37 (2026-09-08)
 
 - OpenCode Go requests work again instead of failing with a missing session header
