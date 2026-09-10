@@ -1,6 +1,6 @@
 ---
 title: Command reference
-description: Canonical claude-code-proxy command syntax for serving, monitoring, listing models, version output, and provider authentication.
+description: Canonical claude-code-proxy command syntax for serving, monitoring, listing models, provider authentication, and OpenCode Go usage.
 ---
 
 Running `claude-code-proxy` without a subcommand is equivalent to `claude-code-proxy serve`.
@@ -73,6 +73,17 @@ claude-code-proxy cursor auth logout
 A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
+
+## OpenCode Go usage
+
+```sh
+claude-code-proxy opencode usage [--json]
+```
+
+Fetches the account's rolling five-hour, weekly, and monthly usage directly
+from OpenCode Go. The default output is human-readable; `--json` prints the
+upstream response for scripts. The command uses the same API key and base URL
+as OpenCode model requests.
 
 ## Development commands
 

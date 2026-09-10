@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::model::EndpointKind;
 use crate::traffic::TrafficCapture;
 
 const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const USER_AGENT: &str = concat!("claude-code-proxy/", env!("CARGO_PKG_VERSION"));
 
 pub struct OpenCodeClient {
     client: Arc<reqwest::Client>,
@@ -18,6 +19,26 @@ pub struct OpenCodeClient {
 
 pub struct OpenCodeResponse {
     response: reqwest::Response,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeUsageResponse {
+    pub usage: OpenCodeUsage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeUsage {
+    pub rolling: OpenCodeUsageWindow,
+    pub weekly: OpenCodeUsageWindow,
+    pub monthly: OpenCodeUsageWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeUsageWindow {
+    pub status: String,
+    pub percent: f64,
+    pub resets_at: String,
 }
 
 #[derive(Debug)]
@@ -64,6 +85,7 @@ impl OpenCodeClient {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
+            .user_agent(USER_AGENT)
             .build()?;
         Ok(Self {
             client: Arc::new(client),
@@ -80,13 +102,7 @@ impl OpenCodeClient {
         traffic: Option<Arc<TrafficCapture>>,
         session_id: Option<&str>,
     ) -> Result<OpenCodeResponse, OpenCodeError> {
-        let Some(api_key) = self.api_key.as_deref().filter(|key| !key.is_empty()) else {
-            return Err(OpenCodeError {
-                status: StatusCode::UNAUTHORIZED,
-                retry_after: None,
-                message: "OpenCode Go API key is not configured; set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, or opencode.apiKey in config.json".to_string(),
-            });
-        };
+        let api_key = self.api_key()?;
         let url = self.endpoint_url(endpoint);
         let accept = if stream {
             "text/event-stream"
@@ -162,6 +178,42 @@ impl OpenCodeClient {
         Ok(OpenCodeResponse { response })
     }
 
+    pub async fn get_usage(&self) -> Result<OpenCodeUsageResponse, OpenCodeError> {
+        let api_key = self.api_key()?;
+        let response = self
+            .client
+            .get(self.usage_url())
+            .header(http::header::ACCEPT, "application/json")
+            .header(http::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .send()
+            .await
+            .map_err(|_| OpenCodeError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "OpenCode Go usage request failed".to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(rejected_response(response).await);
+        }
+        let bytes = OpenCodeResponse { response }.into_bytes().await?;
+        serde_json::from_slice(&bytes).map_err(|_| OpenCodeError {
+            status: StatusCode::BAD_GATEWAY,
+            retry_after: None,
+            message: "OpenCode Go usage response was invalid".to_string(),
+        })
+    }
+
+    fn api_key(&self) -> Result<&str, OpenCodeError> {
+        self.api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| OpenCodeError {
+                status: StatusCode::UNAUTHORIZED,
+                retry_after: None,
+                message: "OpenCode Go API key is not configured; set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, or opencode.apiKey in config.json".to_string(),
+            })
+    }
+
     fn endpoint_url(&self, endpoint: EndpointKind) -> reqwest::Url {
         let mut url = self.base_url.clone();
         let base_path = url.path().trim_end_matches('/');
@@ -171,6 +223,13 @@ impl OpenCodeClient {
             EndpointKind::Responses => "responses",
         };
         url.set_path(&format!("{base_path}/{suffix}"));
+        url
+    }
+
+    fn usage_url(&self) -> reqwest::Url {
+        let mut url = self.base_url.clone();
+        let base_path = url.path().trim_end_matches('/');
+        url.set_path(&format!("{base_path}/usage"));
         url
     }
 }
@@ -237,7 +296,7 @@ mod tests {
         Json, Router,
         extract::{OriginalUri, State},
         http::HeaderMap,
-        routing::post,
+        routing::{get, post},
     };
     use std::sync::Mutex;
 
@@ -305,6 +364,65 @@ mod tests {
             client.endpoint_url(EndpointKind::Responses).as_str(),
             "https://opencode.ai/zen/go/v1/responses"
         );
+        assert_eq!(
+            client.usage_url().as_str(),
+            "https://opencode.ai/zen/go/v1/usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_uses_bearer_auth_and_parses_all_windows() {
+        async fn usage(headers: HeaderMap) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer test-key")
+            );
+            assert_eq!(
+                headers
+                    .get(http::header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok()),
+                Some(USER_AGENT)
+            );
+            Json(serde_json::json!({
+                "usage": {
+                    "rolling": {"status":"ok", "percent":12.5, "resetsAt":"2026-09-10T12:00:00.000Z"},
+                    "weekly": {"status":"ok", "percent":34, "resetsAt":"2026-09-14T00:00:00.000Z"},
+                    "monthly": {"status":"rate-limited", "percent":100, "resetsAt":"2026-10-01T00:00:00.000Z"}
+                }
+            }))
+        }
+
+        let app = Router::new().route("/v1/usage", get(usage));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap();
+
+        let response = client.get_usage().await.unwrap();
+        assert_eq!(response.usage.rolling.percent, 12.5);
+        assert_eq!(response.usage.weekly.percent, 34.0);
+        assert_eq!(response.usage.monthly.status, "rate-limited");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_usage_response_is_rejected() {
+        let app = Router::new().route("/v1/usage", get(|| async { "not json" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap();
+
+        let error = client.get_usage().await.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.message, "OpenCode Go usage response was invalid");
+        server.abort();
     }
 
     #[tokio::test]

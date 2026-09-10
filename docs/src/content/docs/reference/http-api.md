@@ -1,6 +1,6 @@
 ---
 title: HTTP API
-description: Local routes for health checks, Anthropic Messages, token counts, model discovery, OpenAI-compatible requests, and Codex images.
+description: Local routes for health checks, account usage, Anthropic Messages, token counts, model discovery, OpenAI-compatible requests, and Codex images.
 ---
 
 The server exposes the Anthropic and OpenAI routes supported by the proxy. Each route uses the configured provider credential for the selected model.
@@ -18,6 +18,26 @@ Liveness check:
 ```
 
 It does not verify provider credentials or upstream availability.
+
+## OpenCode Go account usage
+
+```text
+GET /.well-known/ccr/account
+GET /v1/account/limits
+```
+
+Both routes fetch OpenCode Go's rolling five-hour, weekly, and monthly account
+limits and return the same normalized account snapshot. Each window is a
+percentage quota meter with used and remaining values plus its reset time. The
+response follows Claude Code Router's standard account endpoint contract, so a
+proxy provider configured with **Fetch usage** and **Standard usage endpoint**
+can display the limits in its dashboard.
+
+The routes use the proxy-owned OpenCode credential. Incoming bearer or API-key
+headers are ignored, as on generation routes. Responses include
+`Cache-Control: no-store`. Because account usage is visible without client
+authentication, keep the listener on loopback or protect it as described
+above.
 
 ## `POST /v1/messages`
 

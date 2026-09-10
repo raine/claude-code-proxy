@@ -1,6 +1,6 @@
 ---
 title: OpenCode Go
-description: Configure an OpenCode Go API key, model routing, streaming, tools, and provider overrides.
+description: Configure an OpenCode Go API key, account usage, model routing, streaming, tools, and provider overrides.
 ---
 
 OpenCode Go uses the API at `https://opencode.ai/zen/go/v1`. Its catalog spans
@@ -21,6 +21,24 @@ claude-code-proxy serve
 `CCP_OPENCODE_API_KEY` takes precedence over `OPENCODE_API_KEY`. The
 `opencode.apiKey` configuration key is also supported. The proxy does not
 implement an OpenCode login flow.
+
+To see the current percentage used and reset time for each account limit, run:
+
+```sh
+claude-code-proxy opencode usage
+claude-code-proxy opencode usage --json
+```
+
+This fetches OpenCode Go's rolling five-hour, weekly, and monthly windows. The
+endpoint is implemented by OpenCode but is not yet listed in its public API
+table, so its response format may change.
+
+The proxy also exposes the same limits in the standard Claude Code Router
+account format. In Claude Code Router, enable **Fetch usage** for the proxy
+provider and select **Standard usage endpoint**. The dashboard will discover
+`/.well-known/ccr/account`; `/v1/account/limits` is available as a compatible
+alias. These routes use the proxy's configured OpenCode key and ignore the
+incoming placeholder key.
 
 ## Models
 
