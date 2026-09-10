@@ -431,6 +431,7 @@ mod tests {
         for (model, owner) in [
             ("gpt-5.6-luna", "codex"),
             ("grok-4.5", "grok"),
+            ("grok-4.6", "grok"),
             ("kimi-k3", "kimi"),
         ] {
             assert_eq!(
