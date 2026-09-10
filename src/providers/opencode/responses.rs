@@ -55,6 +55,8 @@ pub fn stream_body(
         decoder: SseDecoder::default(),
         translator: LiveStreamTranslator::new(message_id, model)
             .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens),
+        pending_completion: None,
+        done_seen: false,
         terminal: false,
         error_sent: false,
         monitor,
@@ -77,6 +79,8 @@ struct ResponsesStreamState<S> {
     upstream: S,
     decoder: SseDecoder,
     translator: LiveStreamTranslator,
+    pending_completion: Option<serde_json::Value>,
+    done_seen: bool,
     terminal: bool,
     error_sent: bool,
     monitor: Option<MonitorHandle>,
@@ -105,12 +109,22 @@ where
                 Some(Ok(chunk)) => chunk,
                 Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
                 None => {
-                    if self.decoder.finish().is_err() || !self.translator.is_finished() {
+                    if self.decoder.finish().is_err() {
                         return Some(self.fail_at("decoder", "incomplete_stream"));
                     }
+                    let Some(completion) = self.pending_completion.take() else {
+                        return Some(self.fail_at("decoder", "incomplete_stream"));
+                    };
+                    let output = match self.translator.accept(&completion, self.traffic.as_deref())
+                    {
+                        Ok(output) => output,
+                        Err(_) => return Some(self.fail_at("translation", "invalid_event")),
+                    };
                     self.terminal = true;
+                    self.record_progress(&output);
+                    self.capture_downstream(&output);
                     self.finish_capture(true);
-                    return None;
+                    return (!output.is_empty()).then_some(output);
                 }
             };
 
@@ -126,41 +140,14 @@ where
                 Ok(events) => events,
                 Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
             };
-            let mut completion_seen = false;
-            let mut done_seen = false;
-            for event in &events {
-                let data = event.data.trim();
-                if data == "[DONE]" {
-                    if !completion_seen || done_seen {
-                        return Some(self.fail_at("protocol", "premature_done"));
-                    }
-                    done_seen = true;
-                    continue;
-                }
-                let value: serde_json::Value = match serde_json::from_str(data) {
-                    Ok(value) => value,
-                    Err(_) => return Some(self.fail_at("json", "malformed_event")),
-                };
-                let event_type = value.get("type").and_then(serde_json::Value::as_str);
-                if completion_seen || done_seen {
-                    if event_type == Some("ping") {
-                        continue;
-                    }
-                    return Some(self.fail_at("protocol", "event_after_completion"));
-                }
-                completion_seen = matches!(
-                    event_type,
-                    Some("response.completed" | "response.incomplete" | "response.done")
-                );
-            }
-            if completion_seen && self.decoder.finish().is_err() {
-                return Some(self.fail_at("decoder", "trailing_incomplete_frame"));
-            }
-
             let mut output = Vec::new();
             for event in events {
                 let data = event.data.trim();
                 if data == "[DONE]" {
+                    if self.pending_completion.is_none() || self.done_seen {
+                        return Some(self.fail_at("protocol", "premature_done"));
+                    }
+                    self.done_seen = true;
                     if let Some(capture) = self.stream_capture.as_mut() {
                         capture
                             .upstream_event(event.event.as_deref(), &serde_json::json!("[DONE]"));
@@ -174,18 +161,26 @@ where
                 if let Some(capture) = self.stream_capture.as_mut() {
                     capture.upstream_event(event.event.as_deref(), &value);
                 }
+                let event_type = value.get("type").and_then(serde_json::Value::as_str);
+                if self.pending_completion.is_some() {
+                    if event_type == Some("ping") {
+                        continue;
+                    }
+                    return Some(self.fail_at("protocol", "event_after_completion"));
+                }
+                if matches!(
+                    event_type,
+                    Some("response.completed" | "response.incomplete" | "response.done")
+                ) {
+                    // Keep the translator open until EOF so invalid tails can emit an error.
+                    self.pending_completion = Some(value);
+                    continue;
+                }
                 let translated = match self.translator.accept(&value, self.traffic.as_deref()) {
                     Ok(translated) => translated,
                     Err(_) => return Some(self.fail_at("translation", "invalid_event")),
                 };
                 output.extend(translated);
-            }
-            if self.translator.is_finished() {
-                self.terminal = true;
-                self.record_progress(&output);
-                self.capture_downstream(&output);
-                self.finish_capture(true);
-                return (!output.is_empty()).then_some(output);
             }
             if !output.is_empty() {
                 self.record_progress(&output);
@@ -295,6 +290,129 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const COMPLETION: &str = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    const PING: &str = "event: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n";
+
+    fn test_state<S>(upstream: S) -> ResponsesStreamState<S> {
+        ResponsesStreamState {
+            upstream,
+            decoder: SseDecoder::default(),
+            translator: LiveStreamTranslator::new("msg_1", "gpt-5.6-luna"),
+            pending_completion: None,
+            done_seen: false,
+            terminal: false,
+            error_sent: false,
+            monitor: None,
+            req_id: "req".into(),
+            bytes: 0,
+            chunks: 0,
+            stream_capture: None,
+            traffic: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_tail_is_independent_of_chunk_boundaries() {
+        let wire = format!("{COMPLETION}{PING}data: [DONE]\n\n{PING}");
+        for split in 0..=wire.len() {
+            let upstream = futures_util::stream::iter([
+                Ok(Bytes::copy_from_slice(&wire.as_bytes()[..split])),
+                Ok(Bytes::copy_from_slice(&wire.as_bytes()[split..])),
+            ]);
+            let mut state = test_state(upstream);
+            let output = state.next_output().await.unwrap();
+            let text = String::from_utf8_lossy(&output);
+            assert!(text.contains("message_stop"), "split {split}: {text}");
+            assert!(!text.contains("api_error"), "split {split}: {text}");
+            assert_eq!(state.chunks, 2);
+            assert!(state.next_output().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tails_are_rejected_across_chunks() {
+        for tail in [
+            COMPLETION,
+            "data: {\"type\":\"response.done\"}\n\n",
+            "data: {\"type\":\"response.incomplete\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n",
+            "data: not-json\n\n",
+            "event: ping\ndata: {\"",
+            "data: [DONE]\n\ndata: [DONE]\n\n",
+            "data: [DONE]\n\ndata: {\"type\":\"response.completed\"}\n\n",
+        ] {
+            let wire = format!("{COMPLETION}{tail}");
+            for split in 0..=wire.len() {
+                let mut state = test_state(futures_util::stream::iter([
+                    Ok(Bytes::copy_from_slice(&wire.as_bytes()[..split])),
+                    Ok(Bytes::copy_from_slice(&wire.as_bytes()[split..])),
+                ]));
+                let output = state.next_output().await.unwrap();
+                let text = String::from_utf8_lossy(&output);
+                assert!(
+                    text.contains("api_error"),
+                    "tail {tail}, split {split}: {text}"
+                );
+                assert!(!text.contains("message_stop"));
+                assert!(state.next_output().await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_premature_done_and_transport_error_after_completion() {
+        for chunks in [
+            vec![Ok(Bytes::from_static(b"data: [DONE]\n\n"))],
+            vec![
+                Ok(Bytes::from_static(COMPLETION.as_bytes())),
+                Err(OpenCodeError {
+                    status: http::StatusCode::BAD_GATEWAY,
+                    retry_after: None,
+                    message: "disconnected".into(),
+                }),
+            ],
+        ] {
+            let mut state = test_state(futures_util::stream::iter(chunks));
+            let output = state.next_output().await.unwrap();
+            assert!(String::from_utf8_lossy(&output).contains("api_error"));
+            assert!(state.next_output().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_text_before_completion_and_waits_for_eof_to_finish() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|chunk| (chunk, receiver))
+        });
+        let mut state = test_state(Box::pin(upstream));
+        sender.send(Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\n",
+        ))).await.unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(1), state.next_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("early"));
+        sender
+            .send(Ok(Bytes::from_static(COMPLETION.as_bytes())))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), state.next_output())
+                .await
+                .is_err()
+        );
+        sender
+            .send(Ok(Bytes::from_static(PING.as_bytes())))
+            .await
+            .unwrap();
+        drop(sender);
+        let output = state.next_output().await.unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("message_stop"));
+        assert!(state.next_output().await.is_none());
+    }
+
     #[test]
     fn request_uses_standard_responses_fields_without_codex_lane_metadata() {
         let body: MessagesRequest = serde_json::from_value(json!({
@@ -328,6 +446,8 @@ mod tests {
             upstream,
             decoder: SseDecoder::default(),
             translator: LiveStreamTranslator::new("msg_1", "gpt-5.6-luna"),
+            pending_completion: None,
+            done_seen: false,
             terminal: false,
             error_sent: false,
             monitor: None,
@@ -354,6 +474,8 @@ mod tests {
             upstream,
             decoder: SseDecoder::default(),
             translator: LiveStreamTranslator::new("msg_1", "grok-4.6"),
+            pending_completion: None,
+            done_seen: false,
             terminal: false,
             error_sent: false,
             monitor: None,
