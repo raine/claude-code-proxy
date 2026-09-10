@@ -137,15 +137,19 @@ where
                     done_seen = true;
                     continue;
                 }
-                if completion_seen || done_seen {
-                    return Some(self.fail_at("protocol", "event_after_completion"));
-                }
                 let value: serde_json::Value = match serde_json::from_str(data) {
                     Ok(value) => value,
                     Err(_) => return Some(self.fail_at("json", "malformed_event")),
                 };
+                let event_type = value.get("type").and_then(serde_json::Value::as_str);
+                if completion_seen || done_seen {
+                    if event_type == Some("ping") {
+                        continue;
+                    }
+                    return Some(self.fail_at("protocol", "event_after_completion"));
+                }
                 completion_seen = matches!(
-                    value.get("type").and_then(serde_json::Value::as_str),
+                    event_type,
                     Some("response.completed" | "response.incomplete" | "response.done")
                 );
             }
@@ -337,5 +341,32 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output).contains("OpenCode Go Responses stream is invalid")
         );
+    }
+
+    #[tokio::test]
+    async fn live_stream_accepts_ping_after_completion() {
+        let upstream = futures_util::stream::iter([Ok::<Bytes, OpenCodeError>(
+            Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n",
+            ),
+        )]);
+        let mut state = ResponsesStreamState {
+            upstream,
+            decoder: SseDecoder::default(),
+            translator: LiveStreamTranslator::new("msg_1", "grok-4.6"),
+            terminal: false,
+            error_sent: false,
+            monitor: None,
+            req_id: "req".into(),
+            bytes: 0,
+            chunks: 0,
+            stream_capture: None,
+            traffic: None,
+        };
+
+        let output = state.next_output().await.expect("completion event");
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("message_stop"));
+        assert!(!text.contains("OpenCode Go Responses stream is invalid"));
     }
 }
