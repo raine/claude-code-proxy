@@ -226,6 +226,13 @@ pub fn app_with_features(
     monitor: Option<MonitorHandle>,
     features: AppFeatures,
 ) -> Router {
+    let opencode_usage = crate::providers::opencode::client::OpenCodeClient::new(
+        crate::config::opencode_base_url(),
+        crate::config::opencode_api_key(),
+    )
+    .map(crate::providers::opencode::usage::OpenCodeUsageService::new)
+    .map(Arc::new)
+    .map_err(|error| error.to_string());
     let native_responses = features
         .responses_api
         .then(|| Arc::new(CodexNativeBackend::new()));
@@ -252,6 +259,7 @@ pub fn app_with_features(
     let state = Arc::new(AppState {
         registry,
         monitor,
+        opencode_usage,
         native_responses,
         chat_completions,
         images,
@@ -297,6 +305,7 @@ pub fn app_with_features(
 struct AppState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
+    opencode_usage: Result<Arc<crate::providers::opencode::usage::OpenCodeUsageService>, String>,
     native_responses: Option<Arc<CodexNativeBackend>>,
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
@@ -307,29 +316,44 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn handler_opencode_account() -> Response {
-    let client = match crate::providers::opencode::client::OpenCodeClient::new(
-        crate::config::opencode_base_url(),
-        crate::config::opencode_api_key(),
-    ) {
-        Ok(client) => client,
+async fn handler_opencode_account(State(state): State<Arc<AppState>>) -> Response {
+    let service = match &state.opencode_usage {
+        Ok(service) => service,
         Err(error) => {
             return account_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error":{"type":"api_error", "message":error.to_string()}}),
+                json!({"error":{"type":"api_error", "message":error}}),
             );
         }
     };
-    match client.get_usage().await {
-        Ok(usage) => account_response(
+    opencode_account_response(service).await
+}
+
+async fn opencode_account_response(
+    service: &crate::providers::opencode::usage::OpenCodeUsageService,
+) -> Response {
+    match service.get().await {
+        Ok(snapshot) => account_response(
             StatusCode::OK,
-            crate::providers::opencode::usage::ccr_snapshot(&usage),
+            crate::providers::opencode::usage::ccr_snapshot(&snapshot),
         ),
-        Err(error) => account_response(
-            error.status,
-            json!({"error":{"type":"api_error", "message":error.message}}),
-        ),
+        Err(error) => account_error_response(error),
     }
+}
+
+fn account_error_response(error: crate::providers::opencode::client::OpenCodeError) -> Response {
+    let mut response = account_response(
+        error.status,
+        json!({"error":{"type":"api_error", "message":error.message}}),
+    );
+    if let Some(retry_after) = error.retry_after
+        && let Ok(value) = HeaderValue::from_str(&retry_after)
+    {
+        response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, value);
+    }
+    response
 }
 
 fn account_response(status: StatusCode, body: Value) -> Response {
@@ -2206,6 +2230,98 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _unused(session_state: Option<&SessionState>) {
     let _ = session_state;
+}
+
+#[cfg(test)]
+mod opencode_account_tests {
+    use axum::{Json, Router, response::IntoResponse, routing::get};
+    use http_body_util::BodyExt;
+
+    use super::opencode_account_response;
+    use crate::providers::opencode::{client::OpenCodeClient, usage::OpenCodeUsageService};
+
+    async fn service_for(app: Router) -> OpenCodeUsageService {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            OpenCodeClient::new(format!("http://{address}"), Some("secret".into())).unwrap();
+        OpenCodeUsageService::new(client)
+    }
+
+    #[tokio::test]
+    async fn account_response_is_ccr_compatible_and_not_stored() {
+        let app = Router::new().route(
+            "/usage",
+            get(|| async {
+                Json(serde_json::json!({
+                    "usage": {
+                        "rolling": {"status":"ok", "percent":12.5, "resetsAt":"2026-09-10T12:00:00Z"},
+                        "weekly": {"status":"ok", "percent":20},
+                        "monthly": {"status":"ok", "percent":30}
+                    }
+                }))
+            }),
+        );
+        let service = service_for(app).await;
+
+        let response = opencode_account_response(&service).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers().get(http::header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["provider"], "OpenCode Go");
+        assert_eq!(value["meters"].as_array().unwrap().len(), 3);
+        assert_eq!(value["meters"][0]["kind"], "quota");
+        assert_eq!(value["meters"][0]["used"], 12.5);
+    }
+
+    #[tokio::test]
+    async fn account_response_preserves_rate_limit_retry_after() {
+        let app = Router::new().route(
+            "/usage",
+            get(|| async {
+                (
+                    http::StatusCode::TOO_MANY_REQUESTS,
+                    [(http::header::RETRY_AFTER, "23")],
+                    Json(serde_json::json!({"error":{"message":"try later"}})),
+                )
+                    .into_response()
+            }),
+        );
+        let service = service_for(app).await;
+
+        let response = opencode_account_response(&service).await;
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "23"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_response_reports_missing_proxy_credential() {
+        let client = OpenCodeClient::new("https://example.com/v1".into(), None).unwrap();
+        let service = OpenCodeUsageService::new(client);
+
+        let response = opencode_account_response(&service).await;
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("OPENCODE_API_KEY")
+        );
+    }
 }
 
 #[cfg(test)]

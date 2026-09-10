@@ -1,14 +1,18 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::model::EndpointKind;
 use crate::traffic::TrafficCapture;
 
 const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_USAGE_RESPONSE_BYTES: usize = 64 * 1024;
+const USAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = concat!("claude-code-proxy/", env!("CARGO_PKG_VERSION"));
 
 pub struct OpenCodeClient {
@@ -24,21 +28,42 @@ pub struct OpenCodeResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenCodeUsageResponse {
     pub usage: OpenCodeUsage,
+    #[serde(flatten)]
+    pub(super) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenCodeUsage {
-    pub rolling: OpenCodeUsageWindow,
-    pub weekly: OpenCodeUsageWindow,
-    pub monthly: OpenCodeUsageWindow,
+    pub rolling: Option<OpenCodeUsageWindow>,
+    pub weekly: Option<OpenCodeUsageWindow>,
+    pub monthly: Option<OpenCodeUsageWindow>,
+    #[serde(flatten)]
+    pub(super) extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenCodeUsageWindow {
-    pub status: String,
-    pub percent: f64,
-    pub resets_at: String,
+    pub status: Option<String>,
+    pub percent: Option<f64>,
+    pub resets_at: Option<String>,
+    #[serde(flatten)]
+    pub(super) extra: BTreeMap<String, Value>,
+}
+
+impl OpenCodeUsage {
+    fn has_known_data(&self) -> bool {
+        [&self.rolling, &self.weekly, &self.monthly]
+            .into_iter()
+            .flatten()
+            .any(OpenCodeUsageWindow::has_known_data)
+    }
+}
+
+impl OpenCodeUsageWindow {
+    fn has_known_data(&self) -> bool {
+        self.status.is_some() || self.percent.is_some() || self.resets_at.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -62,15 +87,27 @@ impl OpenCodeResponse {
     }
 
     pub async fn into_bytes(self) -> Result<Vec<u8>, OpenCodeError> {
+        self.into_bytes_with_limit(
+            MAX_BUFFERED_RESPONSE_BYTES,
+            "OpenCode Go upstream response exceeds the size limit",
+        )
+        .await
+    }
+
+    async fn into_bytes_with_limit(
+        self,
+        limit: usize,
+        size_error: &'static str,
+    ) -> Result<Vec<u8>, OpenCodeError> {
         let mut stream = self.into_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_BUFFERED_RESPONSE_BYTES {
+            if bytes.len().saturating_add(chunk.len()) > limit {
                 return Err(OpenCodeError {
                     status: StatusCode::BAD_GATEWAY,
                     retry_after: None,
-                    message: "OpenCode Go upstream response exceeds the size limit".to_string(),
+                    message: size_error.to_string(),
                 });
             }
             bytes.extend_from_slice(&chunk);
@@ -173,7 +210,7 @@ impl OpenCodeClient {
         }
 
         if !response.status().is_success() {
-            return Err(rejected_response(response).await);
+            return Err(rejected_response(response, Some(api_key)).await);
         }
         Ok(OpenCodeResponse { response })
     }
@@ -185,22 +222,46 @@ impl OpenCodeClient {
             .get(self.usage_url())
             .header(http::header::ACCEPT, "application/json")
             .header(http::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .timeout(USAGE_REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|_| OpenCodeError {
-                status: StatusCode::BAD_GATEWAY,
+            .map_err(|error| OpenCodeError {
+                status: if error.is_timeout() {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
                 retry_after: None,
-                message: "OpenCode Go usage request failed".to_string(),
+                message: if error.is_timeout() {
+                    "OpenCode Go usage request timed out"
+                } else {
+                    "OpenCode Go usage request failed"
+                }
+                .to_string(),
             })?;
         if !response.status().is_success() {
-            return Err(rejected_response(response).await);
+            return Err(rejected_response(response, Some(api_key)).await);
         }
-        let bytes = OpenCodeResponse { response }.into_bytes().await?;
-        serde_json::from_slice(&bytes).map_err(|_| OpenCodeError {
-            status: StatusCode::BAD_GATEWAY,
-            retry_after: None,
-            message: "OpenCode Go usage response was invalid".to_string(),
-        })
+        let bytes = OpenCodeResponse { response }
+            .into_bytes_with_limit(
+                MAX_USAGE_RESPONSE_BYTES,
+                "OpenCode Go usage response exceeds the size limit",
+            )
+            .await?;
+        let parsed: OpenCodeUsageResponse =
+            serde_json::from_slice(&bytes).map_err(|_| OpenCodeError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "OpenCode Go usage response was invalid".to_string(),
+            })?;
+        if !parsed.usage.has_known_data() {
+            return Err(OpenCodeError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "OpenCode Go usage response contained no recognized windows".to_string(),
+            });
+        }
+        Ok(parsed)
     }
 
     fn api_key(&self) -> Result<&str, OpenCodeError> {
@@ -234,7 +295,7 @@ impl OpenCodeClient {
     }
 }
 
-async fn rejected_response(response: reqwest::Response) -> OpenCodeError {
+async fn rejected_response(response: reqwest::Response, secret: Option<&str>) -> OpenCodeError {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -253,7 +314,7 @@ async fn rejected_response(response: reqwest::Response) -> OpenCodeError {
         let remaining = 64 * 1024 - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
-    let message = serde_json::from_slice::<serde_json::Value>(&body)
+    let mut message = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
             value
@@ -264,6 +325,9 @@ async fn rejected_response(response: reqwest::Response) -> OpenCodeError {
         })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("OpenCode Go upstream returned HTTP {status}"));
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+        message = message.replace(secret, "[redacted]");
+    }
     OpenCodeError {
         status,
         retry_after,
@@ -296,6 +360,7 @@ mod tests {
         Json, Router,
         extract::{OriginalUri, State},
         http::HeaderMap,
+        response::IntoResponse,
         routing::{get, post},
     };
     use std::sync::Mutex;
@@ -403,10 +468,104 @@ mod tests {
                 .unwrap();
 
         let response = client.get_usage().await.unwrap();
-        assert_eq!(response.usage.rolling.percent, 12.5);
-        assert_eq!(response.usage.weekly.percent, 34.0);
-        assert_eq!(response.usage.monthly.status, "rate-limited");
+        assert_eq!(
+            response
+                .usage
+                .rolling
+                .as_ref()
+                .and_then(|window| window.percent),
+            Some(12.5)
+        );
+        assert_eq!(
+            response
+                .usage
+                .weekly
+                .as_ref()
+                .and_then(|window| window.percent),
+            Some(34.0)
+        );
+        assert_eq!(
+            response
+                .usage
+                .monthly
+                .as_ref()
+                .and_then(|window| window.status.as_deref()),
+            Some("rate-limited")
+        );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_accepts_partial_windows_and_preserves_unknown_fields() {
+        let app = Router::new().route(
+            "/v1/usage",
+            get(|| async {
+                Json(serde_json::json!({
+                    "usage": {
+                        "rolling": {"percent":12.5, "futureWindowField":true},
+                        "futureUsageField": "kept"
+                    },
+                    "futureRootField": {"kept": true}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap();
+
+        let response = client.get_usage().await.unwrap();
+        assert!(response.usage.weekly.is_none());
+        assert!(
+            response
+                .usage
+                .rolling
+                .as_ref()
+                .and_then(|window| window.resets_at.as_ref())
+                .is_none()
+        );
+        let serialized = serde_json::to_value(response).unwrap();
+        assert_eq!(serialized["futureRootField"]["kept"], true);
+        assert_eq!(serialized["usage"]["futureUsageField"], "kept");
+        assert_eq!(serialized["usage"]["rolling"]["futureWindowField"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_preserves_retry_after_on_rate_limit() {
+        let app = Router::new().route(
+            "/v1/usage",
+            get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(http::header::RETRY_AFTER, "17")],
+                    Json(serde_json::json!({"error":{"message":"try later test-key"}})),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap();
+
+        let error = client.get_usage().await.unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.retry_after.as_deref(), Some("17"));
+        assert_eq!(error.message, "try later [redacted]");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_requires_an_api_key() {
+        let client = OpenCodeClient::new("https://example.com/v1".to_string(), None).unwrap();
+        let error = client.get_usage().await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(error.message.contains("OPENCODE_API_KEY"));
     }
 
     #[tokio::test]
@@ -422,6 +581,28 @@ mod tests {
         let error = client.get_usage().await.unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.message, "OpenCode Go usage response was invalid");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_response_without_recognized_window_data_is_rejected() {
+        let app = Router::new().route(
+            "/v1/usage",
+            get(|| async { Json(serde_json::json!({"usage": {}})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
+                .unwrap();
+
+        let error = client.get_usage().await.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.message,
+            "OpenCode Go usage response contained no recognized windows"
+        );
         server.abort();
     }
 

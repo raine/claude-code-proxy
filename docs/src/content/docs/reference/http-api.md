@@ -26,12 +26,17 @@ GET /.well-known/ccr/account
 GET /v1/account/limits
 ```
 
-Both routes fetch OpenCode Go's rolling five-hour, weekly, and monthly account
-limits and return the same normalized account snapshot. Each window is a
-percentage quota meter with used and remaining values plus its reset time. The
-response follows Claude Code Router's standard account endpoint contract, so a
-proxy provider configured with **Fetch usage** and **Standard usage endpoint**
-can display the limits in its dashboard.
+Both routes return OpenCode Go's rolling five-hour, weekly, and monthly account
+limits as the same normalized account snapshot. Available percentages become
+quota meters with used and remaining values; reset times and upstream statuses
+are included when supplied. The response follows Claude Code Router's standard
+account endpoint contract, so a proxy provider configured with **Fetch usage**
+and **Standard usage endpoint** can display the limits in its dashboard.
+
+The server caches the latest successful upstream response for 60 seconds, so
+frequent dashboard polling does not make an upstream request each time. After
+the cache expires, an upstream failure is returned explicitly instead of
+serving an unmarked stale snapshot.
 
 The routes use the proxy-owned OpenCode credential. Incoming bearer or API-key
 headers are ignored, as on generation routes. Responses include

@@ -30,15 +30,17 @@ claude-code-proxy opencode usage --json
 ```
 
 This fetches OpenCode Go's rolling five-hour, weekly, and monthly windows. The
-endpoint is implemented by OpenCode but is not yet listed in its public API
-table, so its response format may change.
+upstream `/usage` endpoint is implemented by OpenCode but is not yet listed in
+its public API table, so its response format may evolve. The JSON form preserves
+additional upstream fields for scripting.
 
 The proxy also exposes the same limits in the standard Claude Code Router
 account format. In Claude Code Router, enable **Fetch usage** for the proxy
 provider and select **Standard usage endpoint**. The dashboard will discover
 `/.well-known/ccr/account`; `/v1/account/limits` is available as a compatible
 alias. These routes use the proxy's configured OpenCode key and ignore the
-incoming placeholder key.
+incoming placeholder key. Successful upstream results are cached for 60 seconds;
+an expired refresh failure is returned rather than silently serving stale data.
 
 ## Models
 
