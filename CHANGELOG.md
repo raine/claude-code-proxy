@@ -3,6 +3,17 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.39 (2026-09-10)
+
+- OpenCode Go users can select 14 additional models, including Grok 4.6, GLM 5.3,
+  GLM 5.3 Flash, LongCat 2.0, and Qwen 3.8 Flash. Use `opencode-go/grok-4.6`
+  to select Grok through OpenCode Go.
+  ([#145](https://github.com/raine/claude-code-proxy/pull/145))
+- Fix OpenCode Go responses failing when the provider sends a harmless keepalive
+  after completion. ([#145](https://github.com/raine/claude-code-proxy/pull/145))
+- OpenCode Go now reports malformed response endings and late connection failures
+  instead of marking affected streamed responses as successful.
+
 ## v0.1.38 (2026-09-09)
 
 - Fix requests failing with an invalid Artifact tool schema in Claude Code 2.1.265+
