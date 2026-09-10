@@ -44,6 +44,7 @@ export default defineConfig({
           label: 'Providers',
           items: [
             { label: 'Choosing a provider', slug: 'providers/choosing-a-provider' },
+            { label: 'Anthropic', slug: 'providers/anthropic' },
             { label: 'Codex', slug: 'providers/codex' },
             { label: 'Kimi', slug: 'providers/kimi' },
             { label: 'Grok', slug: 'providers/grok' },

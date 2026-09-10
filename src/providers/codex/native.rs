@@ -1,6 +1,6 @@
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -213,24 +213,7 @@ pub fn openai_error(
         .into_response()
 }
 
-#[derive(Clone, Default)]
-pub struct NativeResponseOutcome {
-    failure: Arc<Mutex<Option<String>>>,
-}
-
-impl NativeResponseOutcome {
-    pub fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|failure| failure.clone())
-    }
-
-    pub(crate) fn fail(&self, message: String) {
-        if let Ok(mut failure) = self.failure.lock()
-            && failure.is_none()
-        {
-            *failure = Some(message);
-        }
-    }
-}
+pub use crate::provider::ResponseOutcome as NativeResponseOutcome;
 
 fn passthrough_response(
     upstream: reqwest::Response,

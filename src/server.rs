@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{ProviderRequest, RequestContext, RequestEndpoint, ResponseOutcome},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -16,9 +16,7 @@ use crate::{
             MAX_GENERATION_REQUEST_BYTES, MultipartEditInput, UploadedImage, image_error_response,
             prepare_json_request, prepare_multipart_edit,
         },
-        native::{
-            CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
-        },
+        native::{CodexNativeBackend, openai_error, validate_native_request_model},
         transcription::{
             CodexTranscriptionBackend, MAX_TRANSCRIPTION_REQUEST_BYTES, TranscriptionRequestError,
             prepare_transcription, transcription_error_response,
@@ -1380,14 +1378,15 @@ async fn dispatch_request(
     let started_at = Instant::now();
     let log = create_logger("server");
     let req_id = Uuid::new_v4().to_string();
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let (parts, incoming_body) = req.into_parts();
+    let method = &parts.method;
+    let uri = &parts.uri;
+    let headers = &parts.headers;
     let conversation_identity = (!count_tokens)
-        .then(|| ConversationIdentity::from_headers(&headers))
+        .then(|| ConversationIdentity::from_headers(headers))
         .flatten();
     let path = uri.path().to_string();
-    let query = redacted_query(&uri);
+    let query = redacted_query(uri);
     let endpoint = if count_tokens {
         EndpointKind::CountTokens
     } else {
@@ -1402,8 +1401,7 @@ async fn dispatch_request(
             ("query".to_string(), json!(&query)),
         ])),
     );
-    let session_id = req
-        .headers()
+    let session_id = headers
         .get("x-claude-code-session-id")
         .and_then(|value| value.to_str().ok())
         .map(std::string::ToString::to_string);
@@ -1412,7 +1410,7 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
+    let body_bytes = match axum::body::to_bytes(incoming_body, MAX_OPENAI_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
             let response = json_error(
@@ -1704,7 +1702,7 @@ async fn dispatch_request(
                 "method": method.as_str(),
                 "path": &path,
                 "query": &query,
-                "headers": headers_to_record(&headers),
+                "headers": headers_to_record(headers),
             }),
         );
         capture.write_json(
@@ -1722,21 +1720,25 @@ async fn dispatch_request(
         monitor: state.monitor.clone(),
     };
 
-    let response = if count_tokens {
-        provider.handle_count_tokens(body, context).await
+    let endpoint = if count_tokens {
+        RequestEndpoint::CountTokens
     } else {
-        provider
-            .handle_messages_with_conversation_identity(
-                body,
-                context,
-                if auto_review_route.is_some() {
-                    None
-                } else {
-                    conversation_identity
-                },
-            )
-            .await
+        RequestEndpoint::Messages(if auto_review_route.is_some() {
+            None
+        } else {
+            conversation_identity
+        })
     };
+    let response = provider
+        .handle_request(
+            ProviderRequest {
+                body,
+                original: Request::from_parts(parts, body_bytes),
+                endpoint,
+            },
+            context,
+        )
+        .await;
     log_request_completed(
         &log,
         RequestLogContext {
@@ -1810,10 +1812,7 @@ fn with_request_id(mut response: Response, req_id: &str) -> Response {
 
 fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
     let status = response.status();
-    let outcome = response
-        .extensions()
-        .get::<NativeResponseOutcome>()
-        .cloned();
+    let outcome = response.extensions().get::<ResponseOutcome>().cloned();
     let (mut parts, body) = response.into_parts();
     // Stamped on the parts before the body is streamed, so a streaming SSE
     // response carries the header too.
@@ -1828,8 +1827,7 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
                     Some((Err(err), (body, guard, outcome)))
                 }
                 None => {
-                    if let Some(message) = outcome.as_ref().and_then(NativeResponseOutcome::failure)
-                    {
+                    if let Some(message) = outcome.as_ref().and_then(ResponseOutcome::failure) {
                         guard.failed(status, message);
                     } else if status.is_success() {
                         guard.completed(status);

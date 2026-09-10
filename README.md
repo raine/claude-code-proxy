@@ -83,6 +83,12 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 ## Providers
 
+To keep Claude models on Anthropic while switching GPT models through Codex in the
+same session, opt in with `CCP_ALIAS_PROVIDER=anthropic`. See
+[Anthropic passthrough](https://claude-code-proxy.raine.dev/providers/anthropic/)
+for subscription authentication and thinking compatibility.
+
+
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |

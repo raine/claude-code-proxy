@@ -7,6 +7,7 @@ use crate::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasProvider {
+    Anthropic,
     Codex,
     Kimi,
 }
@@ -14,6 +15,7 @@ pub enum AliasProvider {
 impl AliasProvider {
     pub fn as_str(&self) -> &str {
         match self {
+            AliasProvider::Anthropic => "anthropic",
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
         }
@@ -122,6 +124,7 @@ struct FileLog {
 
 fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
+        "anthropic" => Some(AliasProvider::Anthropic),
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
         _ => None,

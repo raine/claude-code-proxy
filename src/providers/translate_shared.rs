@@ -2,6 +2,10 @@ use serde_json::Value;
 
 use crate::anthropic::schema::MessagesRequest;
 
+pub(crate) fn previous_reasoning_text(reasoning: &str) -> String {
+    format!("<previous_reasoning>\n{reasoning}\n</previous_reasoning>")
+}
+
 #[derive(Debug)]
 pub enum ContentBlock {
     Text {
