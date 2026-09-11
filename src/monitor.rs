@@ -6,13 +6,16 @@ use std::{
 };
 
 mod mock;
+pub mod remote;
+pub mod snapshot;
 
 pub use mock::{MockMonitor, mock_state};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EndpointKind {
     Messages,
     CountTokens,
@@ -35,7 +38,8 @@ impl EndpointKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
     Started,
     ProviderSelected,
@@ -210,7 +214,8 @@ impl CompletedRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "unit", content = "value", rename_all = "snake_case")]
 pub enum Throughput {
     TokensPerSecond(f64),
     BytesPerSecond(f64),
