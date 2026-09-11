@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -355,6 +356,8 @@ pub type CodexHttpEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
 const MAX_HTTP_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_HTTP_EVENT_BYTES: usize = 2 * MAX_HTTP_SSE_FRAME_BYTES;
+const MIN_PENDING_HTTP_EVENT_BYTES: usize = 256;
 
 #[derive(Default)]
 struct HttpSseDecoder {
@@ -475,6 +478,16 @@ fn http_sse_error(message: &str) -> CodexError {
         status: 0,
         message: message.to_string(),
         detail: Some("http_response_sse".to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    }
+}
+
+fn http_sse_protocol_error(message: &str) -> CodexError {
+    CodexError {
+        status: 0,
+        message: format!("Codex HTTP tool event protocol error: {message}"),
+        detail: Some("http_response_sse_protocol".to_string()),
         retry_after: None,
         origin: CodexErrorOrigin::Http,
     }
@@ -1307,6 +1320,7 @@ impl CodexHttpClient {
         tokio::spawn(async move {
             let log = create_logger("codex");
             let mut semantic_output_forwarded = false;
+            let mut replay_committed = false;
 
             if tx
                 .send(Ok(serde_json::json!({
@@ -1324,7 +1338,8 @@ impl CodexHttpClient {
                 let mut body_bytes = 0_u64;
                 let mut body_chunks = 0_u64;
                 let mut event_count = 0_u64;
-                let mut pending_events = Vec::new();
+                let mut pending_events = PendingHttpEvents::default();
+                let mut provisional_tools = PendingHttpProvisionalTools::default();
 
                 let mut retry_error = 'read_attempt: loop {
                     let chunk = tokio::select! {
@@ -1366,7 +1381,7 @@ impl CodexHttpClient {
                                 event_count,
                                 Some(&error.message),
                             );
-                            if !semantic_output_forwarded && retryable_http_stream_error(&error) {
+                            if !replay_committed && retryable_http_stream_error(&error) {
                                 break 'read_attempt error;
                             }
                             let _ = tx.send(Err(error)).await;
@@ -1392,7 +1407,7 @@ impl CodexHttpClient {
                                 event_count,
                                 Some(&error.message),
                             );
-                            if !semantic_output_forwarded {
+                            if !replay_committed {
                                 break 'read_attempt error;
                             }
                             let _ = tx.send(Err(error)).await;
@@ -1418,7 +1433,7 @@ impl CodexHttpClient {
                                 event_count,
                                 Some(&error.message),
                             );
-                            if !semantic_output_forwarded {
+                            if !replay_committed {
                                 break 'read_attempt error;
                             }
                             let _ = tx.send(Err(error)).await;
@@ -1441,7 +1456,7 @@ impl CodexHttpClient {
                                 event_count,
                                 Some(&error.message),
                             );
-                            if !semantic_output_forwarded && retryable_http_stream_error(&error) {
+                            if !replay_committed && retryable_http_stream_error(&error) {
                                 break 'read_attempt error;
                             }
                             let _ = tx.send(Err(error)).await;
@@ -1450,7 +1465,7 @@ impl CodexHttpClient {
                     };
 
                     for event in events {
-                        let Some(payload) = event.payload else {
+                        let Some(mut payload) = event.payload else {
                             continue;
                         };
                         event_count = event_count.saturating_add(1);
@@ -1464,17 +1479,91 @@ impl CodexHttpClient {
 
                         let event_kind = super::events::classify_stream_event(&payload);
                         let failure = super::events::classify_event_failure(&payload);
+                        let provisional_event = match provisional_tools.observe(&mut payload) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
+                        };
+                        if let Err(error) = ensure_pending_http_buffer_budget(
+                            pending_events.event_bytes,
+                            provisional_tools.buffered_bytes(),
+                        ) {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+
+                        if let PendingHttpProvisionalToolEvent::Provisional { stalled_read_call } =
+                            provisional_event
+                        {
+                            if !semantic_output_forwarded
+                                && let Some(call) = stalled_read_call.and_then(|call_index| {
+                                    provisional_tools.take_stalled_read(call_index, &pending_events)
+                                })
+                            {
+                                for pending in pending_events.take() {
+                                    if tx.send(Ok(pending)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                let output_index = call.output_index.unwrap_or(usize::MAX);
+                                let call_id = call.call_id.unwrap_or_default();
+                                let added = serde_json::json!({
+                                    "type":"response.output_item.added",
+                                    "output_index":output_index,
+                                    "item":{"type":"function_call","call_id":call_id,"name":"Read"}
+                                });
+                                let delta = serde_json::json!({
+                                    "type":"response.function_call_arguments.delta",
+                                    "output_index":output_index,
+                                    "delta":call.read_args
+                                });
+                                if tx.send(Ok(added)).await.is_err()
+                                    || tx.send(Ok(delta)).await.is_err()
+                                {
+                                    return;
+                                }
+                                log_http_stream_end(
+                                    &log,
+                                    "codex_http_stream_local_finish",
+                                    &req_id,
+                                    started_at,
+                                    body_bytes,
+                                    body_chunks,
+                                    event_count,
+                                    None,
+                                );
+                                return;
+                            }
+                            continue;
+                        }
+
+                        let commits_replay = http_event_commits_replay(&payload, event_kind);
+                        replay_committed |= commits_replay;
+
                         if !semantic_output_forwarded
+                            && !replay_committed
                             && let Some(failure) = failure.as_ref()
                             && failure.retryable()
                         {
                             pending_events.clear();
                             break 'read_attempt codex_event_failure_error(failure.clone());
                         }
+                        if !semantic_output_forwarded
+                            && replay_committed
+                            && let Some(failure) = failure.as_ref()
+                        {
+                            let _ = tx
+                                .send(Err(codex_event_failure_error(failure.clone())))
+                                .await;
+                            return;
+                        }
 
                         let terminal = super::events::event_is_terminal(&payload);
                         match event_kind {
                             super::events::CodexStreamEventKind::TerminalFailure => {
+                                provisional_tools.clear();
                                 if !semantic_output_forwarded {
                                     pending_events.clear();
                                 }
@@ -1483,22 +1572,10 @@ impl CodexHttpClient {
                                 }
                             }
                             super::events::CodexStreamEventKind::TerminalSuccess => {
-                                for pending in pending_events.drain(..) {
+                                provisional_tools.clear();
+                                for pending in pending_events.take() {
                                     if tx.send(Ok(pending)).await.is_err() {
                                         return;
-                                    }
-                                }
-                                if tx.send(Ok(payload)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            super::events::CodexStreamEventKind::Semantic => {
-                                if !semantic_output_forwarded {
-                                    semantic_output_forwarded = true;
-                                    for pending in pending_events.drain(..) {
-                                        if tx.send(Ok(pending)).await.is_err() {
-                                            return;
-                                        }
                                     }
                                 }
                                 if tx.send(Ok(payload)).await.is_err() {
@@ -1510,13 +1587,27 @@ impl CodexHttpClient {
                                     return;
                                 }
                             }
-                            super::events::CodexStreamEventKind::Structural => {
+                            super::events::CodexStreamEventKind::Semantic
+                            | super::events::CodexStreamEventKind::Structural => {
                                 if semantic_output_forwarded {
                                     if tx.send(Ok(payload)).await.is_err() {
                                         return;
                                     }
                                 } else {
-                                    pending_events.push(payload);
+                                    if let Err(error) = pending_events
+                                        .push(payload, provisional_tools.buffered_bytes())
+                                    {
+                                        let _ = tx.send(Err(error)).await;
+                                        return;
+                                    }
+                                    if commits_replay {
+                                        semantic_output_forwarded = true;
+                                        for pending in pending_events.take() {
+                                            if tx.send(Ok(pending)).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2534,6 +2625,335 @@ fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
         .collect()
 }
 
+#[derive(Default)]
+struct PendingHttpEvents {
+    events: Vec<serde_json::Value>,
+    event_bytes: usize,
+}
+
+impl PendingHttpEvents {
+    fn push(
+        &mut self,
+        payload: serde_json::Value,
+        pending_tool_bytes: usize,
+    ) -> Result<(), CodexError> {
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|_| pending_http_event_buffer_error("event encoding"))?
+            .len()
+            .max(MIN_PENDING_HTTP_EVENT_BYTES);
+        let next_event_bytes = self.event_bytes.saturating_add(payload_bytes);
+        ensure_pending_http_buffer_budget(next_event_bytes, pending_tool_bytes)?;
+        self.event_bytes = next_event_bytes;
+        self.events.push(payload);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.event_bytes = 0;
+    }
+
+    fn take(&mut self) -> Vec<serde_json::Value> {
+        self.event_bytes = 0;
+        std::mem::take(&mut self.events)
+    }
+
+    fn has_no_open_output_items(&self) -> bool {
+        let mut open_output_items = HashSet::new();
+        for payload in &self.events {
+            match payload.get("type").and_then(serde_json::Value::as_str) {
+                Some("response.output_item.added") => {
+                    let Some(output_index) = http_event_output_index(payload) else {
+                        return false;
+                    };
+                    if !open_output_items.insert(output_index) {
+                        return false;
+                    }
+                }
+                Some("response.output_item.done") => {
+                    let Some(output_index) = http_event_output_index(payload) else {
+                        return false;
+                    };
+                    if !open_output_items.remove(&output_index) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        open_output_items.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct PendingHttpProvisionalFunctionCall {
+    output_index: Option<usize>,
+    item_id: Option<String>,
+    call_id: Option<String>,
+    name: Option<String>,
+    read_args: String,
+}
+
+#[derive(Debug, Default)]
+enum PendingHttpProvisionalToolEvent {
+    #[default]
+    Other,
+    Provisional {
+        stalled_read_call: Option<usize>,
+    },
+    AuthoritativeDone,
+}
+
+#[derive(Default)]
+struct PendingHttpProvisionalTools {
+    calls: Vec<PendingHttpProvisionalFunctionCall>,
+}
+
+impl PendingHttpProvisionalTools {
+    fn observe(
+        &mut self,
+        payload: &mut serde_json::Value,
+    ) -> Result<PendingHttpProvisionalToolEvent, CodexError> {
+        let event_type = payload.get("type").and_then(serde_json::Value::as_str);
+        match event_type {
+            Some("response.output_item.added")
+                if payload
+                    .pointer("/item/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("function_call") =>
+            {
+                let item = &payload["item"];
+                self.calls.push(PendingHttpProvisionalFunctionCall {
+                    output_index: http_event_output_index(payload),
+                    item_id: item
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    call_id: item
+                        .get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    name: item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    read_args: String::new(),
+                });
+                return Ok(PendingHttpProvisionalToolEvent::Provisional {
+                    stalled_read_call: None,
+                });
+            }
+            Some("response.function_call_arguments.delta") => {
+                let Some(call_index) = self.resolve(payload, None) else {
+                    return Ok(PendingHttpProvisionalToolEvent::Provisional {
+                        stalled_read_call: None,
+                    });
+                };
+                let delta = payload
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let call = &mut self.calls[call_index];
+                let stalled_read_call = if call.name.as_deref() == Some("Read") && !delta.is_empty()
+                {
+                    let next_len = call.read_args.len().saturating_add(delta.len());
+                    ensure_buffered_tool_args_limit("Read", next_len)?;
+                    call.read_args.push_str(delta);
+                    super::translate::read_rewrite::repair_whitespace_stalled_read_args(
+                        "Read",
+                        &call.read_args,
+                        None,
+                    )
+                    .is_some()
+                    .then_some(call_index)
+                } else {
+                    None
+                };
+                return Ok(PendingHttpProvisionalToolEvent::Provisional { stalled_read_call });
+            }
+            Some("response.function_call_arguments.done") => {
+                return Ok(PendingHttpProvisionalToolEvent::Provisional {
+                    stalled_read_call: None,
+                });
+            }
+            Some("response.output_item.done")
+                if payload
+                    .pointer("/item/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("function_call") =>
+            {
+                let completed = super::translate::live_stream::validate_completed_function_call(
+                    &payload["item"],
+                )
+                .map_err(|error| {
+                    match error {
+                    super::translate::live_stream::CompletedFunctionCallValidationError::TooLarge {
+                        ..
+                    } => {
+                        let message = error.to_string();
+                        CodexError {
+                            status: 413,
+                            message: message.clone(),
+                            detail: Some(message),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::Http,
+                        }
+                    }
+                    super::translate::live_stream::CompletedFunctionCallValidationError::Protocol(
+                        message,
+                    ) => http_sse_protocol_error(&message),
+                }
+                })?;
+                payload["item"]["arguments"] = serde_json::Value::String(completed.arguments);
+                if let Some(call_index) = self.resolve(payload, payload.get("item")) {
+                    self.calls.remove(call_index);
+                }
+                return Ok(PendingHttpProvisionalToolEvent::AuthoritativeDone);
+            }
+            _ => {}
+        }
+        Ok(PendingHttpProvisionalToolEvent::Other)
+    }
+
+    fn take_stalled_read(
+        &mut self,
+        call_index: usize,
+        pending_events: &PendingHttpEvents,
+    ) -> Option<PendingHttpProvisionalFunctionCall> {
+        if self.calls.len() != 1 || !pending_events.has_no_open_output_items() {
+            return None;
+        }
+        let call = self.calls.get(call_index)?;
+        if call.name.as_deref() != Some("Read")
+            || call
+                .call_id
+                .as_deref()
+                .is_none_or(|call_id| call_id.trim().is_empty())
+            || call.read_args.is_empty()
+        {
+            return None;
+        }
+        Some(self.calls.remove(call_index))
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.calls.iter().fold(0, |total, call| {
+            total
+                .saturating_add(std::mem::size_of::<PendingHttpProvisionalFunctionCall>())
+                .saturating_add(call.item_id.as_ref().map_or(0, String::capacity))
+                .saturating_add(call.call_id.as_ref().map_or(0, String::capacity))
+                .saturating_add(call.name.as_ref().map_or(0, String::capacity))
+                .saturating_add(call.read_args.capacity())
+        })
+    }
+
+    fn clear(&mut self) {
+        self.calls.clear();
+    }
+
+    fn resolve(
+        &self,
+        payload: &serde_json::Value,
+        item: Option<&serde_json::Value>,
+    ) -> Option<usize> {
+        let output_index = match payload.get("output_index") {
+            Some(_) => Some(http_event_output_index(payload)?),
+            None => None,
+        };
+        let item_id = match item
+            .and_then(|item| item.get("id"))
+            .or_else(|| payload.get("item_id"))
+        {
+            Some(value) => Some(value.as_str()?),
+            None => None,
+        };
+        let call_id = match item
+            .and_then(|item| item.get("call_id"))
+            .or_else(|| payload.get("call_id"))
+        {
+            Some(value) => Some(value.as_str()?),
+            None => None,
+        };
+        let has_explicit_alias = output_index.is_some() || item_id.is_some() || call_id.is_some();
+        let mut matches = self.calls.iter().enumerate().filter_map(|(index, call)| {
+            (output_index.is_none_or(|value| call.output_index == Some(value))
+                && item_id.is_none_or(|value| call.item_id.as_deref() == Some(value))
+                && call_id.is_none_or(|value| call.call_id.as_deref() == Some(value)))
+            .then_some(index)
+        });
+        let first = matches.next();
+        if matches.next().is_some() {
+            None
+        } else if has_explicit_alias {
+            first
+        } else {
+            first.or_else(|| (self.calls.len() == 1).then_some(0))
+        }
+    }
+}
+
+fn http_event_output_index(payload: &serde_json::Value) -> Option<usize> {
+    payload
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+}
+
+fn http_event_commits_replay(
+    payload: &serde_json::Value,
+    event_kind: super::events::CodexStreamEventKind,
+) -> bool {
+    if event_kind != super::events::CodexStreamEventKind::Semantic {
+        return false;
+    }
+    matches!(
+        payload.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "response.reasoning_summary_text.delta"
+                | "response.output_text.delta"
+                | "response.output_item.done"
+        )
+    )
+}
+
+fn ensure_buffered_tool_args_limit(name: &str, len: usize) -> Result<(), CodexError> {
+    if len <= super::translate::live_stream::BUFFERED_TOOL_MAX_ARGS_BYTES {
+        return Ok(());
+    }
+    let tool = if name.is_empty() { "tool" } else { name };
+    Err(CodexError {
+        status: 413,
+        message: format!("Buffered {tool} tool arguments exceeded safe limits"),
+        detail: Some(format!(
+            "Buffered {tool} tool arguments exceeded safe limits"
+        )),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    })
+}
+
+fn pending_http_event_buffer_error(limit: &str) -> CodexError {
+    CodexError {
+        status: 413,
+        message: format!("Codex pending HTTP event buffer exceeded its {limit} limit"),
+        detail: Some(format!(
+            "Codex pending HTTP event buffer exceeded its {limit} limit"
+        )),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    }
+}
+
+fn ensure_pending_http_buffer_budget(
+    pending_event_bytes: usize,
+    provisional_tool_bytes: usize,
+) -> Result<(), CodexError> {
+    if pending_event_bytes.saturating_add(provisional_tool_bytes) > MAX_PENDING_HTTP_EVENT_BYTES {
+        return Err(pending_http_event_buffer_error("aggregate bytes"));
+    }
+    Ok(())
+}
+
 fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> CodexError {
     CodexError {
         status: failure.status,
@@ -2585,7 +3005,9 @@ fn log_http_stream_end(
         fields.insert("error".to_string(), serde_json::json!(error));
     }
     match message {
-        "codex_http_stream_completed" => log.info(message, Some(fields)),
+        "codex_http_stream_completed" | "codex_http_stream_local_finish" => {
+            log.info(message, Some(fields))
+        }
         _ => log.warn(message, Some(fields)),
     }
 }
@@ -3431,6 +3853,259 @@ mod tests {
         assert!(retryable_http_stream_error(&http_sse_error(
             "Codex SSE frame contains invalid UTF-8",
         )));
+    }
+
+    #[test]
+    fn pending_http_event_buffer_caps_retained_read_metadata() {
+        let mut tools = PendingHttpProvisionalTools::default();
+        for index in 0..4 {
+            tools.calls.push(PendingHttpProvisionalFunctionCall {
+                output_index: Some(index),
+                item_id: None,
+                call_id: Some(format!("call_{index}")),
+                name: Some("Read".to_string()),
+                read_args: "x".repeat(MAX_PENDING_HTTP_EVENT_BYTES / 4),
+            });
+        }
+        let error = ensure_pending_http_buffer_budget(0, tools.buffered_bytes()).unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "Codex pending HTTP event buffer exceeded its aggregate bytes limit"
+        );
+        assert_eq!(error.detail.as_deref(), Some(error.message.as_str()));
+        assert_eq!(error.status, 413);
+        assert!(!retryable_http_stream_error(&error));
+    }
+
+    #[test]
+    fn pending_http_event_buffer_accepts_more_than_legacy_event_count() {
+        let mut pending = PendingHttpEvents::default();
+        for index in 0..2_048 {
+            pending
+                .push(serde_json::json!({"type":"x","index":index}), 0)
+                .unwrap();
+        }
+        assert_eq!(pending.event_bytes, 2_048 * MIN_PENDING_HTTP_EVENT_BYTES);
+        assert_eq!(pending.events.len(), 2_048);
+    }
+
+    #[test]
+    fn provisional_tool_calls_tolerate_missing_and_ambiguous_aliases() {
+        let mut tools = PendingHttpProvisionalTools::default();
+        let mut first_added = serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{"type":"function_call","call_id":"call_1","name":"Bash"}
+        });
+        tools.observe(&mut first_added).unwrap();
+        let mut second_added = serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{"type":"function_call","call_id":"call_2","name":"Bash"}
+        });
+        tools.observe(&mut second_added).unwrap();
+        let mut ambiguous_delta = serde_json::json!({
+            "type":"response.function_call_arguments.delta",
+            "delta":"{\"command\":"
+        });
+        let event = tools.observe(&mut ambiguous_delta).unwrap();
+        assert!(matches!(
+            event,
+            PendingHttpProvisionalToolEvent::Provisional {
+                stalled_read_call: None
+            }
+        ));
+        assert_eq!(tools.calls.len(), 2);
+    }
+
+    #[test]
+    fn provisional_tool_conflicting_alias_does_not_fall_back_to_sole_call() {
+        let mut tools = PendingHttpProvisionalTools::default();
+        let mut added = serde_json::json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","call_id":"call_read_0","name":"Read"}
+        });
+        tools.observe(&mut added).unwrap();
+
+        let mut conflicting_delta = serde_json::json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":1,
+            "delta":format!("{{\"file_path\":\"/tmp/conflicting\"}}{}", " ".repeat(1_024))
+        });
+        let event = tools.observe(&mut conflicting_delta).unwrap();
+
+        assert!(matches!(
+            event,
+            PendingHttpProvisionalToolEvent::Provisional {
+                stalled_read_call: None
+            }
+        ));
+        assert!(tools.calls[0].read_args.is_empty());
+    }
+
+    #[test]
+    fn provisional_read_with_whitespace_call_id_cannot_locally_finish() {
+        let mut tools = PendingHttpProvisionalTools::default();
+        let mut added = serde_json::json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","call_id":" \t ","name":"Read"}
+        });
+        tools.observe(&mut added).unwrap();
+        let mut repair_delta = serde_json::json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":0,
+            "delta":format!("{{\"file_path\":\"/tmp/blank-id\"}}{}", " ".repeat(1_024))
+        });
+        let event = tools.observe(&mut repair_delta).unwrap();
+        let PendingHttpProvisionalToolEvent::Provisional {
+            stalled_read_call: Some(call_index),
+        } = event
+        else {
+            panic!("stalled Read delta was not observed");
+        };
+
+        assert!(
+            tools
+                .take_stalled_read(call_index, &PendingHttpEvents::default())
+                .is_none()
+        );
+        assert_eq!(tools.calls.len(), 1);
+    }
+
+    #[test]
+    fn completed_function_call_normalizes_empty_args_and_preserves_valid_objects() {
+        let mut tools = PendingHttpProvisionalTools::default();
+        for arguments in ["", " \t\n "] {
+            let mut done = serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_empty",
+                    "name":"Bash",
+                    "arguments":arguments
+                }
+            });
+            assert!(matches!(
+                tools.observe(&mut done).unwrap(),
+                PendingHttpProvisionalToolEvent::AuthoritativeDone
+            ));
+            assert_eq!(
+                done.pointer("/item/arguments")
+                    .and_then(serde_json::Value::as_str),
+                Some("{}")
+            );
+        }
+
+        let arguments = r#" { "nested": {"items": [1, true, null]} } "#;
+        let mut done = serde_json::json!({
+            "type":"response.output_item.done",
+            "item":{
+                "type":"function_call",
+                "call_id":"call_nested",
+                "name":"Bash",
+                "arguments":arguments
+            }
+        });
+        assert!(matches!(
+            tools.observe(&mut done).unwrap(),
+            PendingHttpProvisionalToolEvent::AuthoritativeDone
+        ));
+        assert_eq!(
+            done.pointer("/item/arguments")
+                .and_then(serde_json::Value::as_str),
+            Some(arguments)
+        );
+    }
+
+    #[test]
+    fn completed_function_call_rejects_invalid_argument_shapes_before_commit() {
+        for arguments in ["{", "null", "[]", r#""string""#, "1", "false"] {
+            let mut tools = PendingHttpProvisionalTools::default();
+            let mut done = serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_invalid",
+                    "name":"Bash",
+                    "arguments":arguments
+                }
+            });
+
+            let error = tools.observe(&mut done).unwrap_err();
+            assert_eq!(error.status, 0, "arguments={arguments:?}");
+            assert_eq!(
+                error.detail.as_deref(),
+                Some("http_response_sse_protocol"),
+                "arguments={arguments:?}"
+            );
+            let expected_message = if arguments == "{" {
+                "arguments are not valid JSON"
+            } else {
+                "arguments must be a JSON object"
+            };
+            assert!(
+                error.message.contains(expected_message),
+                "arguments={arguments:?}: {error:?}"
+            );
+            assert!(
+                !retryable_http_stream_error(&error),
+                "arguments={arguments:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completed_function_call_requires_nonblank_identifiers_and_string_arguments() {
+        for (field, value) in [
+            ("call_id", serde_json::json!("")),
+            ("call_id", serde_json::json!(" \t")),
+            ("name", serde_json::json!("")),
+            ("name", serde_json::json!(" \t")),
+            ("arguments", serde_json::json!(null)),
+            ("arguments", serde_json::json!({})),
+        ] {
+            let mut item = serde_json::json!({
+                "type":"function_call",
+                "call_id":"call_required",
+                "name":"Bash",
+                "arguments":"{}"
+            });
+            item[field] = value;
+            let mut done = serde_json::json!({
+                "type":"response.output_item.done",
+                "item":item
+            });
+
+            let error = PendingHttpProvisionalTools::default()
+                .observe(&mut done)
+                .unwrap_err();
+            assert_eq!(error.detail.as_deref(), Some("http_response_sse_protocol"));
+            assert!(!retryable_http_stream_error(&error));
+        }
+    }
+
+    #[test]
+    fn completed_function_call_argument_limit_is_non_retryable() {
+        let mut done = serde_json::json!({
+            "type":"response.output_item.done",
+            "item":{
+                "type":"function_call",
+                "call_id":"call_too_large",
+                "name":"Bash",
+                "arguments":"x".repeat(super::super::translate::live_stream::BUFFERED_TOOL_MAX_ARGS_BYTES + 1)
+            }
+        });
+        let error = PendingHttpProvisionalTools::default()
+            .observe(&mut done)
+            .unwrap_err();
+
+        assert_eq!(error.status, 413);
+        assert_eq!(
+            error.message,
+            "Buffered Bash tool arguments exceeded safe limits"
+        );
+        assert!(!retryable_http_stream_error(&error));
     }
 
     #[tokio::test]
@@ -5000,6 +5675,35 @@ mod tests {
             headers.get("x-codex-beta-features").unwrap(),
             "remote_compaction_v2"
         );
+    }
+
+    #[test]
+    fn stalled_read_probe_does_not_record_offset_rewrite() {
+        let call_id = "call_pending_probe_offset";
+        let mut tools = PendingHttpProvisionalTools::default();
+        let mut added = serde_json::json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","call_id":call_id,"name":"Read"}
+        });
+        tools.observe(&mut added).unwrap();
+        let mut delta = serde_json::json!({
+            "type":"response.function_call_arguments.delta",
+            "output_index":0,
+            "delta":format!(
+                "{{\"file_path\":\"/tmp/probe\",\"offset\":1200000{}",
+                " ".repeat(1_024)
+            )
+        });
+        let observation = tools.observe(&mut delta).unwrap();
+
+        assert!(matches!(
+            observation,
+            PendingHttpProvisionalToolEvent::Provisional {
+                stalled_read_call: Some(0)
+            }
+        ));
+        assert!(super::super::translate::read_rewrite::read_offset_rewrite(call_id).is_none());
     }
 
     #[test]

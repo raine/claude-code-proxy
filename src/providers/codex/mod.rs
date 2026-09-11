@@ -868,6 +868,14 @@ async fn live_stream_response_once(
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
+                if err.origin == client::CodexErrorOrigin::Http {
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        &request_continuation,
+                        compaction.attempt,
+                    );
+                    return LiveStreamStart::Response(map_codex_error_to_response(&err));
+                }
                 if retryable_live_start_codex_error(&err) {
                     return provider_retry(&upstream_events, err);
                 }
@@ -1354,6 +1362,10 @@ fn codex_event_failure_error(
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     match err.status {
+        400 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        413 => "request_too_large",
         429 => "rate_limit_error",
         529 => "overloaded_error",
         _ if codex_error_message(err)
@@ -1425,6 +1437,30 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             "permission_error",
             err.detail.as_deref().unwrap_or("Permission denied"),
         ),
+        400 | 422 => {
+            let response = json_error(
+                StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_REQUEST),
+                "invalid_request_error",
+                codex_error_message(err),
+            );
+            if let Some(retry_after) = err.retry_after.as_deref() {
+                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+            } else {
+                response
+            }
+        }
+        413 => {
+            let response = json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                codex_error_message(err),
+            );
+            if let Some(retry_after) = err.retry_after.as_deref() {
+                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+            } else {
+                response
+            }
+        }
         429 => {
             let response = json_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2051,6 +2087,57 @@ mod tests {
             response.headers().get(http::header::RETRY_AFTER).unwrap(),
             "7"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_http_error_mapping_preserves_typed_client_contract() {
+        for (status, expected_status, expected_type) in [
+            (400, StatusCode::BAD_REQUEST, "invalid_request_error"),
+            (
+                422,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+            ),
+            (413, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+        ] {
+            let err = client::CodexError {
+                status,
+                message: format!("status {status}"),
+                detail: Some(format!("detail {status}")),
+                retry_after: None,
+                origin: client::CodexErrorOrigin::Http,
+            };
+            let response = map_codex_error_to_response(&err);
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], expected_type);
+            assert_eq!(body["error"]["message"], format!("detail {status}"));
+        }
+    }
+
+    #[test]
+    fn codex_stream_error_type_preserves_typed_client_contract() {
+        for (status, expected_type) in [
+            (400, "invalid_request_error"),
+            (422, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (413, "request_too_large"),
+            (429, "rate_limit_error"),
+            (529, "overloaded_error"),
+        ] {
+            let err = client::CodexError {
+                status,
+                message: format!("status {status}"),
+                detail: Some(format!("detail {status}")),
+                retry_after: None,
+                origin: client::CodexErrorOrigin::Http,
+            };
+            assert_eq!(codex_stream_error_type(&err), expected_type);
+        }
     }
 
     #[tokio::test]
