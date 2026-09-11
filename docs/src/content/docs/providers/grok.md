@@ -40,7 +40,9 @@ Search reaches Grok-native tools when the caller asks for it:
 
 - Anthropic's `web_search_20250305` declaration maps to Grok hosted web search.
   The Grok CLI endpoint accepts the minimal declaration without domain or
-  location constraints.
+  location constraints. `CCP_SEARCH_CONSTRAINTS` selects what happens when
+  Claude Code still sends those fields: `soft` (default) copies constraints into a
+  prompt hint, `warning` drops them and logs, `hard` returns 400.
 - A caller-managed search tool remains a function tool for the caller to run.
 - An X or Twitter query is additionally offered hosted `x_search`, which the
   model can use or ignore alongside the caller's tools.
@@ -83,6 +85,8 @@ Traffic captures redact Anthropic image data and upstream image data URLs.
 - `CCP_GROK_TOOL_IMAGE` selects `omit`, `reattach`, `inline`, or `reject`.
 - `CCP_GROK_HOSTED_SEARCH` enables hosted search replacement and forcing.
 - `CCP_GROK_SEARCH_BLOCKS` selects `text` or `native` hosted-search reporting.
+- `CCP_SEARCH_CONSTRAINTS` selects `soft`, `warning`, or `hard` for Anthropic
+  hosted-search domain and location fields Grok cannot enforce.
 
 See [Configuration](/reference/configuration/) for defaults.
 

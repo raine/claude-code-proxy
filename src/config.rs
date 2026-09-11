@@ -507,6 +507,40 @@ pub fn grok_search_blocks() -> GrokSearchBlocks {
     parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// Hosted-search constraints that a provider cannot enforce
+// (CCP_SEARCH_CONSTRAINTS)
+// ---------------------------------------------------------------------------
+
+/// How the proxy treats Anthropic hosted-search options that the upstream
+/// provider cannot enforce (`allowed_domains`, `blocked_domains`,
+/// `user_location`).
+///
+/// Applies to providers that lack those fields. First provider: Grok. Codex
+/// maps domain filters natively and does not use this policy.
+///
+/// `Soft` is the default: drop the fields and copy constraints into a prompt hint.
+/// `Warning` drops them, logs, and continues with no hint. `Hard` is the
+/// legacy 400. Unknown values fall back to `Soft`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchConstraints {
+    Soft,
+    Warning,
+    Hard,
+}
+
+pub fn parse_search_constraints(raw: Option<&str>) -> SearchConstraints {
+    match raw.map(str::trim) {
+        Some("hard") => SearchConstraints::Hard,
+        Some("warning") => SearchConstraints::Warning,
+        _ => SearchConstraints::Soft,
+    }
+}
+
+pub fn search_constraints() -> SearchConstraints {
+    parse_search_constraints(std::env::var("CCP_SEARCH_CONSTRAINTS").ok().as_deref())
+}
+
 struct ResolvedOpenCodeConfig {
     api_key: Option<String>,
     api_key_source: Option<&'static str>,

@@ -69,8 +69,9 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Model availability varies by account and region.
 - Hosted general web search and X search are translated with citations and usage.
 - Hosted web search omits `max_uses` because the Grok CLI endpoint exposes no
-  equivalent cap. Non-null domain filters and user location are rejected because
-  dropping them would weaken the caller's requested search scope.
+  equivalent cap. Non-null domain filters and user location follow
+  `CCP_SEARCH_CONSTRAINTS` (`soft` default, `warning`, or `hard`) because the
+  endpoint cannot enforce them.
 - The implemented multimodal path does not claim general image or video compatibility.
 
 ## Cursor Agent

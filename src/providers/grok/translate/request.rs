@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
-use crate::config::GrokToolImageMode;
+use crate::config::{GrokToolImageMode, SearchConstraints};
 use crate::providers::translate_shared::{
     ImageSource, image_source_to_url, parallel_tool_calls, read_effort_with_allowed,
 };
@@ -157,7 +157,13 @@ pub fn translate_request_with_mode(
     model: String,
     image_mode: GrokToolImageMode,
 ) -> anyhow::Result<GrokResponsesRequest> {
-    translate_request_with_options(req, model, image_mode, crate::config::grok_hosted_search())
+    translate_request_with_options(
+        req,
+        model,
+        image_mode,
+        crate::config::grok_hosted_search(),
+        crate::config::search_constraints(),
+    )
 }
 
 /// `hosted_search` selects how xAI's hosted search tools reach the model. When
@@ -165,15 +171,24 @@ pub fn translate_request_with_mode(
 /// preserves every caller tool. When enabled, hosted tools replace caller
 /// search tools and explicit search turns require a tool call. Tests pass the
 /// policy directly so their behavior is independent of process configuration.
+///
+/// `constraints` selects what happens when Anthropic hosted-search options
+/// (`allowed_domains`, `blocked_domains`, `user_location`) are present and
+/// Grok cannot enforce them.
 pub fn translate_request_with_options(
     req: &MessagesRequest,
     model: String,
     image_mode: GrokToolImageMode,
     hosted_search: bool,
+    constraints: SearchConstraints,
 ) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
     let mut instructions = parse_system(req.extra.get("system"))?;
-    let mut tools = parse_tools(req.extra.get("tools"), hosted_search)?;
+    let (mut tools, constraint_hint) =
+        parse_tools(req.extra.get("tools"), hosted_search, constraints)?;
+    if let Some(hint) = constraint_hint {
+        append_guidance(&mut instructions, &hint);
+    }
     let hosted_web_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
@@ -336,6 +351,58 @@ fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
     });
 }
 
+const HOSTED_SEARCH_CONSTRAINT_FIELDS: [&str; 3] =
+    ["allowed_domains", "blocked_domains", "user_location"];
+
+fn unsupported_hosted_search_message(fields: &[&str]) -> String {
+    format!(
+        "Grok hosted web search does not support {}",
+        fields.join(", ")
+    )
+}
+
+fn non_null_constraint_fields(obj: &serde_json::Map<String, Value>) -> Vec<&'static str> {
+    HOSTED_SEARCH_CONSTRAINT_FIELDS
+        .into_iter()
+        .filter(|field| obj.get(*field).is_some_and(|value| !value.is_null()))
+        .collect()
+}
+
+/// Render the caller's value verbatim. A plain string carries no brackets of
+/// its own, so it is wrapped in braces to separate the value from the sentence
+/// period. Arrays and objects already delimit themselves.
+fn format_constraint_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => format!("{{{text}}}"),
+        other => other.to_string(),
+    }
+}
+
+/// The directive each constraint becomes. Grok cannot enforce these fields, so
+/// the instruction states the rule rather than describing the proxy's own
+/// limitation.
+fn constraint_directive(field: &str) -> &'static str {
+    match field {
+        "blocked_domains" => "You are not allowed to search",
+        "user_location" => "You must search as",
+        _ => "You are only allowed to search",
+    }
+}
+
+fn constraint_hint_line(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let mut parts = Vec::new();
+    for field in HOSTED_SEARCH_CONSTRAINT_FIELDS {
+        if let Some(value) = obj.get(field).filter(|value| !value.is_null()) {
+            parts.push(format!(
+                "{} {field}={}.",
+                constraint_directive(field),
+                format_constraint_value(value)
+            ));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 fn latest_user_text(req: &MessagesRequest) -> Option<String> {
     let message = req
         .messages
@@ -489,13 +556,17 @@ fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
 fn parse_tools(
     value: Option<&Value>,
     hosted_search: bool,
-) -> anyhow::Result<Option<Vec<GrokTool>>> {
-    let Some(value) = value else { return Ok(None) };
+    constraints: SearchConstraints,
+) -> anyhow::Result<(Option<Vec<GrokTool>>, Option<String>)> {
+    let Some(value) = value else {
+        return Ok((None, None));
+    };
     let tools = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools must be an array"))?;
     let mut names = HashSet::new();
     let mut out = Vec::new();
+    let mut constraint_hint = None;
     for tool in tools {
         let obj = tool
             .as_object()
@@ -550,15 +621,25 @@ fn parse_tools(
             if kind != "web_search_20250305" || name != "web_search" {
                 anyhow::bail!("unsupported tool type: {kind}");
             }
-            for field in ["allowed_domains", "blocked_domains", "user_location"] {
-                if obj.get(field).is_some_and(|value| !value.is_null()) {
-                    anyhow::bail!("Grok hosted web search does not support {field}");
+            let dropped = non_null_constraint_fields(obj);
+            if !dropped.is_empty() {
+                match constraints {
+                    SearchConstraints::Hard => {
+                        anyhow::bail!("{}", unsupported_hosted_search_message(&dropped));
+                    }
+                    SearchConstraints::Warning => {
+                        crate::logging::create_logger("grok")
+                            .warn(&unsupported_hosted_search_message(&dropped), None);
+                    }
+                    SearchConstraints::Soft => {
+                        constraint_hint = constraint_hint_line(obj);
+                    }
                 }
             }
             out.push(GrokTool::hosted_named("web_search", name));
             continue;
         }
-        for field in ["allowed_domains", "blocked_domains", "user_location"] {
+        for field in HOSTED_SEARCH_CONSTRAINT_FIELDS {
             if obj.contains_key(field) {
                 anyhow::bail!("unsupported tool field: {field}");
             }
@@ -587,7 +668,7 @@ fn parse_tools(
             parameters,
         ));
     }
-    Ok(Some(out))
+    Ok((Some(out), constraint_hint))
 }
 
 fn parse_tool_choice(
@@ -1259,16 +1340,40 @@ mod tests {
         model: &str,
         hosted_search: bool,
     ) -> serde_json::Value {
+        translate_search_with_constraints(req, model, hosted_search, SearchConstraints::Soft)
+    }
+
+    fn translate_search_with_constraints(
+        req: &MessagesRequest,
+        model: &str,
+        hosted_search: bool,
+        constraints: SearchConstraints,
+    ) -> serde_json::Value {
         serde_json::to_value(
             translate_request_with_options(
                 req,
                 model.into(),
                 crate::config::GrokToolImageMode::Omit,
                 hosted_search,
+                constraints,
             )
             .unwrap(),
         )
         .unwrap()
+    }
+
+    fn translate_options(
+        req: &MessagesRequest,
+        hosted_search: bool,
+        constraints: SearchConstraints,
+    ) -> anyhow::Result<GrokResponsesRequest> {
+        translate_request_with_options(
+            req,
+            "grok-4.5".into(),
+            crate::config::GrokToolImageMode::Omit,
+            hosted_search,
+            constraints,
+        )
     }
 
     fn translate_hosted(req: &MessagesRequest, model: &str) -> serde_json::Value {
@@ -1817,19 +1922,136 @@ mod tests {
                 "tools":[{"type":"web_search_20250305","name":"web_search",(field):value}]
             }))
             .unwrap();
-            let error = translate_request_with_options(
-                &request,
-                "grok-4.5".into(),
-                crate::config::GrokToolImageMode::Omit,
-                false,
-            )
-            .unwrap_err()
-            .to_string();
+            let error = translate_options(&request, false, SearchConstraints::Hard)
+                .unwrap_err()
+                .to_string();
             assert_eq!(
                 error,
                 format!("Grok hosted web search does not support {field}")
             );
         }
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"find it"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["example.com"],
+                "user_location":{"type":"approximate","country":"GB"}
+            }]
+        }))
+        .unwrap();
+        let error = translate_options(&request, false, SearchConstraints::Hard)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Grok hosted web search does not support allowed_domains, user_location"
+        );
+    }
+
+    #[test]
+    fn grok_translation_softens_hosted_web_search_constraints_into_a_prompt_hint() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "system":"rules",
+            "messages":[{"role":"user","content":"find it"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["example.com","docs.example.com"],
+                "blocked_domains":["spam.example"],
+                "user_location":{"type":"approximate","country":"GB"}
+            }]
+        }))
+        .unwrap();
+        let translated =
+            translate_search_with_constraints(&request, "grok-4.5", false, SearchConstraints::Soft);
+        assert_eq!(
+            translated["tools"],
+            serde_json::json!([{"type":"web_search"}])
+        );
+        let instructions = translated["instructions"].as_str().unwrap();
+        assert_eq!(
+            instructions,
+            concat!(
+                "rules\n\n",
+                r#"You are only allowed to search allowed_domains=["example.com","docs.example.com"]. "#,
+                r#"You are not allowed to search blocked_domains=["spam.example"]. "#,
+                r#"You must search as user_location={"country":"GB","type":"approximate"}."#,
+            )
+        );
+        assert!(!translated["tools"].to_string().contains("allowed_domains"));
+    }
+
+    #[test]
+    fn grok_translation_wraps_a_plain_string_constraint_value_in_braces() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"find it"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "user_location":"London, GB"
+            }]
+        }))
+        .unwrap();
+        let translated =
+            translate_search_with_constraints(&request, "grok-4.5", false, SearchConstraints::Soft);
+        assert_eq!(
+            translated["instructions"],
+            "You must search as user_location={London, GB}."
+        );
+    }
+
+    #[test]
+    fn grok_translation_warns_and_drops_hosted_web_search_constraints() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "system":"rules",
+            "messages":[{"role":"user","content":"find it"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["example.com"]
+            }]
+        }))
+        .unwrap();
+        let _stderr = crate::logging::suppress_stderr();
+        let translated = translate_search_with_constraints(
+            &request,
+            "grok-4.5",
+            false,
+            SearchConstraints::Warning,
+        );
+        assert_eq!(
+            translated["tools"],
+            serde_json::json!([{"type":"web_search"}])
+        );
+        assert_eq!(translated["instructions"], "rules");
+        assert!(!translated.to_string().contains("allowed_domains"));
+    }
+
+    #[test]
+    fn search_constraints_parse_flag_values() {
+        use crate::config::parse_search_constraints;
+        assert_eq!(parse_search_constraints(None), SearchConstraints::Soft);
+        assert_eq!(
+            parse_search_constraints(Some("soft")),
+            SearchConstraints::Soft
+        );
+        assert_eq!(
+            parse_search_constraints(Some("warning")),
+            SearchConstraints::Warning
+        );
+        assert_eq!(
+            parse_search_constraints(Some("hard")),
+            SearchConstraints::Hard
+        );
+        assert_eq!(
+            parse_search_constraints(Some("bogus")),
+            SearchConstraints::Soft
+        );
     }
 
     #[test]
@@ -1861,14 +2083,9 @@ mod tests {
             "tools":[{"type":"code_execution_20260120","name":"code_execution"}]
         }))
         .unwrap();
-        let error = translate_request_with_options(
-            &request,
-            "grok-4.5".into(),
-            crate::config::GrokToolImageMode::Omit,
-            false,
-        )
-        .unwrap_err()
-        .to_string();
+        let error = translate_options(&request, false, SearchConstraints::Soft)
+            .unwrap_err()
+            .to_string();
         assert_eq!(error, "unsupported tool type: code_execution_20260120");
     }
 
@@ -1885,14 +2102,9 @@ mod tests {
                 "tools":[{"type":kind,"name":name}]
             }))
             .unwrap();
-            let error = translate_request_with_options(
-                &request,
-                "grok-4.5".into(),
-                crate::config::GrokToolImageMode::Omit,
-                false,
-            )
-            .unwrap_err()
-            .to_string();
+            let error = translate_options(&request, false, SearchConstraints::Hard)
+                .unwrap_err()
+                .to_string();
             assert_eq!(error, format!("unsupported tool type: {kind}"));
         }
     }
@@ -1905,14 +2117,9 @@ mod tests {
             "tools":[{"name":"WebSearch","input_schema":{"type":"object"},"invented":1}]
         }))
         .unwrap();
-        let error = translate_request_with_options(
-            &request,
-            "grok-4.5".into(),
-            crate::config::GrokToolImageMode::Omit,
-            false,
-        )
-        .unwrap_err()
-        .to_string();
+        let error = translate_options(&request, false, SearchConstraints::Soft)
+            .unwrap_err()
+            .to_string();
         assert_eq!(error, "unsupported tool field: invented");
     }
 
@@ -1932,15 +2139,7 @@ mod tests {
                 "tools":[tool]
             }))
             .unwrap();
-            assert!(
-                translate_request_with_options(
-                    &request,
-                    "grok-4.5".into(),
-                    crate::config::GrokToolImageMode::Omit,
-                    false,
-                )
-                .is_err()
-            );
+            assert!(translate_options(&request, false, SearchConstraints::Soft).is_err());
         }
     }
 
