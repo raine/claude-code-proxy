@@ -18,7 +18,7 @@ use axum::Json;
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http::StatusCode;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -890,6 +890,17 @@ async fn live_stream_response_once(
         {
             Ok(result) => result,
             Err(message) => {
+                // A spent subscription window reopens hours from now, so the
+                // retry budget can only burn the request down to the same 429.
+                // Report it once, with the reset clock upstream supplied.
+                if let Some(limit) = events::usage_limit_from_event(&payload) {
+                    abort_request_state(
+                        ctx.session_id.as_deref(),
+                        &request_continuation,
+                        compaction.attempt,
+                    );
+                    return LiveStreamStart::Response(usage_limit_response(&limit));
+                }
                 if let Some(failure) = events::classify_event_failure(&payload) {
                     if failure.retryable() {
                         return provider_retry(
@@ -1404,6 +1415,48 @@ fn update_continuation_from_upstream(
 // ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
+
+/// Answer a spent subscription window with the rate limit headers the client
+/// reads, so it can name the exhausted window and show when it reopens.
+///
+/// `Retry-After` is deliberately absent: clients sleep for its full value, and
+/// here that is hours. `x-should-retry: false` stops the retry loop instead,
+/// which is the honest signal — a spent window does not reopen on a backoff.
+fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-should-retry"),
+        HeaderValue::from_static("false"),
+    );
+    headers.insert(
+        HeaderName::from_static("anthropic-ratelimit-unified-status"),
+        HeaderValue::from_static("rejected"),
+    );
+    if let Some(resets_at) = limit.resets_at
+        && let Ok(value) = HeaderValue::from_str(&resets_at.to_string())
+    {
+        headers.insert(
+            HeaderName::from_static("anthropic-ratelimit-unified-reset"),
+            value,
+        );
+    }
+    if let Some(window) = limit.window {
+        headers.insert(
+            HeaderName::from_static("anthropic-ratelimit-unified-representative-claim"),
+            HeaderValue::from_static(window.claim()),
+        );
+    }
+
+    (
+        headers,
+        json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            &limit.message,
+        ),
+    )
+        .into_response()
+}
 
 fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     let message = codex_error_message(err);
