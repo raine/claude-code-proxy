@@ -754,6 +754,15 @@ async fn live_stream_response(
                 return map_codex_error_to_response(&err);
             }
             Err(err) if retryable_live_start_codex_error(&err) => {
+                // Quota wall? Same short-circuit as the buffered path: a 429 against an
+                // exhausted window gains nothing from MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                // worth of backoff (~165s measured) — surface the wall immediately.
+                if err.status == 429
+                    && let Some(wall) = client::quota_wall_error()
+                {
+                    cleanup.abort();
+                    return map_codex_error_to_response(&wall);
+                }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&err) {
                     attempt += 1;
