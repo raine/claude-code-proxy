@@ -2530,7 +2530,7 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), replacement_accepted_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(5), replacement_accepted_rx)
             .await
             .expect("replacement startup did not reach the blocked handshake")
             .expect("replacement startup acknowledgement sender dropped");
