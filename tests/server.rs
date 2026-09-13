@@ -6,6 +6,7 @@ use claude_code_proxy::{
     MessagesRequest,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
+    openai_compat::MAX_OPENAI_REQUEST_BYTES,
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
@@ -608,6 +609,108 @@ async fn missing_model_returns_400() {
         .unwrap();
     let error_type = body["error"]["type"].as_str().unwrap_or("");
     assert_eq!(error_type, "invalid_request_error");
+}
+
+async fn error_message(response: axum::response::Response) -> String {
+    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    body["error"]["message"].as_str().unwrap_or("").to_string()
+}
+
+// Builds a valid JSON /v1/messages body of exactly `total_len` bytes that has
+// no "model", so the handler parses it and then fails on the missing model.
+// That failure proves the body cleared the size gate without touching a
+// provider.
+fn padded_messages_body_without_model(total_len: usize) -> String {
+    let prefix = r#"{"messages":[{"role":"user","content":"hello"}],"padding":""#;
+    let suffix = r#""}"#;
+    let padding = total_len - prefix.len() - suffix.len();
+    let mut body = String::with_capacity(total_len);
+    body.push_str(prefix);
+    body.extend(std::iter::repeat_n('a', padding));
+    body.push_str(suffix);
+    assert_eq!(body.len(), total_len);
+    body
+}
+
+#[tokio::test]
+async fn messages_body_over_16mib_clears_size_gate() {
+    const OLD_LIMIT: usize = 16 * 1024 * 1024;
+    const { assert!(MAX_OPENAI_REQUEST_BYTES > OLD_LIMIT) };
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    OLD_LIMIT + 1,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = error_message(response).await;
+    assert!(
+        message.starts_with("Missing \"model\""),
+        "body over 16 MiB should reach model validation, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn messages_body_at_limit_clears_size_gate() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    MAX_OPENAI_REQUEST_BYTES,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = error_message(response).await;
+    assert!(
+        message.starts_with("Missing \"model\""),
+        "body at the limit should reach model validation, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn messages_body_over_limit_returns_length_error() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(padded_messages_body_without_model(
+                    MAX_OPENAI_REQUEST_BYTES + 1,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = error_message(response).await;
+    assert!(
+        message.contains("length limit exceeded"),
+        "body over the limit should fail at the size gate, got: {message}"
+    );
 }
 
 #[tokio::test]
