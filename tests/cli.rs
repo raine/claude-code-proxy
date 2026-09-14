@@ -49,11 +49,27 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
         "Manage Kimi authentication",
         "Manage Cursor authentication",
         "Manage Grok authentication",
+        "Inspect OpenCode Go account state",
     ] {
         assert!(stdout.contains(description), "missing: {description}");
     }
     assert!(!stdout.contains("demo"));
     assert!(!stdout.contains("mock data and no proxy server"));
+    Ok(())
+}
+
+#[test]
+fn opencode_usage_missing_key_is_actionable() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.args(["opencode", "usage"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env_remove("CCP_OPENCODE_API_KEY")
+        .env_remove("OPENCODE_API_KEY")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(contains("OPENCODE_API_KEY"));
     Ok(())
 }
 

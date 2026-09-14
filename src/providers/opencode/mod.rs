@@ -3,6 +3,7 @@ pub mod client;
 pub mod messages;
 pub mod model;
 pub mod responses;
+pub mod usage;
 
 use std::sync::Arc;
 
