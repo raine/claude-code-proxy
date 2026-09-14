@@ -4,9 +4,9 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
 use claude_code_proxy::{
     MessagesRequest,
+    anthropic::MAX_ANTHROPIC_REQUEST_BYTES,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
-    openai_compat::MAX_OPENAI_REQUEST_BYTES,
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
@@ -611,13 +611,12 @@ async fn missing_model_returns_400() {
     assert_eq!(error_type, "invalid_request_error");
 }
 
-async fn error_message(response: axum::response::Response) -> String {
-    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+async fn error_body(response: axum::response::Response) -> Value {
+    axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap();
-    body["error"]["message"].as_str().unwrap_or("").to_string()
+        .unwrap()
 }
 
 // Builds a valid JSON /v1/messages body of exactly `total_len` bytes that has
@@ -639,7 +638,7 @@ fn padded_messages_body_without_model(total_len: usize) -> String {
 #[tokio::test]
 async fn messages_body_over_16mib_clears_size_gate() {
     const OLD_LIMIT: usize = 16 * 1024 * 1024;
-    const { assert!(MAX_OPENAI_REQUEST_BYTES > OLD_LIMIT) };
+    const { assert!(MAX_ANTHROPIC_REQUEST_BYTES > OLD_LIMIT) };
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -656,7 +655,8 @@ async fn messages_body_over_16mib_clears_size_gate() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let message = error_message(response).await;
+    let body = error_body(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or("");
     assert!(
         message.starts_with("Missing \"model\""),
         "body over 16 MiB should reach model validation, got: {message}"
@@ -673,7 +673,7 @@ async fn messages_body_at_limit_clears_size_gate() {
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(Body::from(padded_messages_body_without_model(
-                    MAX_OPENAI_REQUEST_BYTES,
+                    MAX_ANTHROPIC_REQUEST_BYTES,
                 )))
                 .unwrap(),
         )
@@ -681,7 +681,8 @@ async fn messages_body_at_limit_clears_size_gate() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let message = error_message(response).await;
+    let body = error_body(response).await;
+    let message = body["error"]["message"].as_str().unwrap_or("");
     assert!(
         message.starts_with("Missing \"model\""),
         "body at the limit should reach model validation, got: {message}"
@@ -689,28 +690,26 @@ async fn messages_body_at_limit_clears_size_gate() {
 }
 
 #[tokio::test]
-async fn messages_body_over_limit_returns_length_error() {
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(Body::from(padded_messages_body_without_model(
-                    MAX_OPENAI_REQUEST_BYTES + 1,
-                )))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+async fn anthropic_bodies_over_limit_return_request_too_large() {
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = app(Arc::new(Registry::with_default_alias()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(padded_messages_body_without_model(
+                        MAX_ANTHROPIC_REQUEST_BYTES + 1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let message = error_message(response).await;
-    assert!(
-        message.contains("length limit exceeded"),
-        "body over the limit should fail at the size gate, got: {message}"
-    );
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "request_too_large");
+    }
 }
 
 #[tokio::test]
