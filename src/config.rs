@@ -678,6 +678,24 @@ pub fn codex_user_agent(default: &str) -> String {
     default.to_string()
 }
 
+/// Optional path to a fleet quota-state file for the codex provider, in the 5-field
+/// sampler format `<pct_5h>|<resets_5h_iso>|<pct_7d>|<resets_7d_iso>|<epoch_secs>` (percents
+/// are USED-side integers). When set and fresh, a 429 from upstream is checked against it:
+/// an exhausted window means every retry inside the window is guaranteed to fail, so the
+/// proxy fails fast with an explicit message and a Retry-After instead of walking the
+/// transient-429 backoff ladder (measured cost of the ladder on a quota wall: 13s buffered,
+/// ~165s live-stream — per request, multiplied by the client's own retries).
+pub fn codex_quota_state_file() -> Option<std::path::PathBuf> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_QUOTA_STATE_FILE") {
+        if raw.trim().is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(raw));
+    }
+    None
+}
+
 pub fn codex_previous_response_id() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
