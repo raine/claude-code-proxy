@@ -143,7 +143,8 @@ pub fn build_codex_headers(
         );
     }
     if let Some(ref session_id) = ctx.session_id {
-        headers.insert("session_id", header_value("session_id", session_id)?);
+        // ChatGPT derives Responses cache affinity from the `session-id` header.
+        headers.insert("session-id", header_value("session-id", session_id)?);
         headers.insert(
             "x-client-request-id",
             header_value("x-client-request-id", session_id)?,
@@ -5180,7 +5181,8 @@ mod tests {
             headers.get("openai-beta").unwrap(),
             "responses=experimental"
         );
-        assert_eq!(headers.get("session_id").unwrap(), "s");
+        assert_eq!(headers.get("session-id").unwrap(), "s");
+        assert!(headers.get("session_id").is_none());
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             "remote_compaction_v2"
@@ -5231,7 +5233,7 @@ mod tests {
             monitor: None,
         };
         let headers = build_codex_headers(&auth, &ctx, false).unwrap();
-        assert!(headers.get("session_id").is_none());
+        assert!(headers.get("session-id").is_none());
         assert!(headers.get("x-client-request-id").is_none());
     }
 
@@ -5253,7 +5255,7 @@ mod tests {
         };
         let err = build_codex_headers(&auth, &ctx, false).unwrap_err();
         assert_eq!(err.status, 500);
-        assert!(err.message.contains("session_id"));
+        assert!(err.message.contains("session-id"));
     }
 
     #[test]
