@@ -173,10 +173,15 @@ impl CapturedRequest {
         );
         assert_eq!(
             self.headers
-                .get("session_id")
+                .get("session-id")
                 .and_then(|value| value.to_str().ok()),
             expected_session,
-            "socket {} session_id header",
+            "socket {} session-id header",
+            self.socket_ordinal
+        );
+        assert!(
+            self.headers.get("session_id").is_none(),
+            "socket {} must not send the legacy session_id header",
             self.socket_ordinal
         );
         assert_eq!(

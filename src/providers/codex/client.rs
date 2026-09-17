@@ -143,7 +143,7 @@ pub fn build_codex_headers(
         );
     }
     if let Some(ref session_id) = ctx.session_id {
-        // ChatGPT derives Responses cache affinity from the `session-id` header.
+        // Match the official Codex Responses session header.
         headers.insert("session-id", header_value("session-id", session_id)?);
         headers.insert(
             "x-client-request-id",
