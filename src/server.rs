@@ -1896,7 +1896,7 @@ async fn record_failed_response(
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
-            log.info(
+            log.error(
                 "request_failed",
                 Some(serde_json::Map::from_iter([
                     ("reqId".to_string(), json!(ctx.req_id)),
@@ -1945,7 +1945,7 @@ async fn record_failed_response(
     if let Some(path) = error_file.as_ref() {
         fields.insert("errorFile".to_string(), json!(path.display().to_string()));
     }
-    log.info("request_failed", Some(fields));
+    log.error("request_failed", Some(fields));
 
     (
         Response::from_parts(parts, Body::from(bytes)),

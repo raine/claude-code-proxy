@@ -59,7 +59,8 @@ use self::translate::request::{
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
-const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
+const MAX_EMPTY_COMPLETION_RETRIES: u32 = 2;
+const EMPTY_COMPLETION_RETRY_BUDGET: Duration = Duration::from_secs(60);
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 use self::translate::stream::translate_stream_bytes_with_traffic;
@@ -358,10 +359,22 @@ impl CodexProvider {
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
         let upstream = loop {
-            let response = match client
-                .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
-                .await
+            let result = match await_empty_retry(
+                client.post_codex_for_owner(&translated, &ctx, continuation.as_ref()),
+                attempt > 0,
+                upstream_started_at,
+            )
+            .await
             {
+                Ok(result) => result,
+                Err(()) => {
+                    log_empty_completion_retry(&ctx, attempt, upstream_started_at.elapsed(), None);
+                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                    abort_continuation_for_owner(&request_continuation);
+                    return map_codex_error_to_response(&empty_buffered_completion_error());
+                }
+            };
+            let response = match result {
                 Ok(r) => r,
                 Err(e) => {
                     log.warn(
@@ -393,7 +406,8 @@ impl CodexProvider {
             // an empty end_turn; retry with full context instead.
             let error = empty_buffered_completion_error();
             drop_live_continuation_for_retry(&mut continuation);
-            if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
+            if !allow_empty_completion_retry(attempt, upstream_started_at.elapsed()) {
+                log_empty_completion_retry(&ctx, attempt, upstream_started_at.elapsed(), None);
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
@@ -404,6 +418,12 @@ impl CodexProvider {
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
+            log_empty_completion_retry(
+                &ctx,
+                attempt,
+                upstream_started_at.elapsed(),
+                Some(delay.wait_ms),
+            );
             attempt += 1;
             sleep(delay.wait_ms).await;
         };
@@ -723,28 +743,44 @@ async fn live_stream_response(
         compaction.attempt,
     );
     let mut attempt = 0_u32;
+    let started_at = Instant::now();
+    let mut empty_retry = false;
     let mut continuation = Some(continuation);
 
     loop {
-        let upstream_events = match transport {
-            config::CodexTransport::Http => {
-                client
-                    .stream_codex_http_events_for_owner(&request_body, &ctx)
-                    .await
+        let open_stream = async {
+            match transport {
+                config::CodexTransport::Http => {
+                    client
+                        .stream_codex_http_events_for_owner(&request_body, &ctx)
+                        .await
+                }
+                config::CodexTransport::WebSocket => {
+                    client
+                        .stream_codex_websocket_events_for_owner(
+                            &request_body,
+                            &ctx,
+                            continuation.as_ref(),
+                        )
+                        .await
+                }
+                config::CodexTransport::Auto => {
+                    client
+                        .stream_codex_auto_events_for_owner(
+                            &request_body,
+                            &ctx,
+                            continuation.as_ref(),
+                        )
+                        .await
+                }
             }
-            config::CodexTransport::WebSocket => {
-                client
-                    .stream_codex_websocket_events_for_owner(
-                        &request_body,
-                        &ctx,
-                        continuation.as_ref(),
-                    )
-                    .await
-            }
-            config::CodexTransport::Auto => {
-                client
-                    .stream_codex_auto_events_for_owner(&request_body, &ctx, continuation.as_ref())
-                    .await
+        };
+        let upstream_events = match await_empty_retry(open_stream, empty_retry, started_at).await {
+            Ok(events) => events,
+            Err(()) => {
+                log_empty_completion_retry(&ctx, attempt, started_at.elapsed(), None);
+                cleanup.abort();
+                return map_codex_error_to_response(&empty_live_completion_error());
             }
         };
         let upstream_events = match upstream_events {
@@ -759,8 +795,14 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                    || (empty_retry && !allow_empty_completion_retry(attempt, started_at.elapsed()))
+                {
                     cleanup.abort();
+                    if empty_retry {
+                        log_empty_completion_retry(&ctx, attempt, started_at.elapsed(), None);
+                        return map_codex_error_to_response(&empty_live_completion_error());
+                    }
                     return map_codex_error_to_response(&err);
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
@@ -778,7 +820,7 @@ async fn live_stream_response(
             }
         };
 
-        match live_stream_response_once(
+        let start_stream = live_stream_response_once(
             upstream_events,
             message_id.clone(),
             &model,
@@ -786,9 +828,16 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
-        )
-        .await
-        {
+        );
+        let started = match await_empty_retry(start_stream, empty_retry, started_at).await {
+            Ok(started) => started,
+            Err(()) => {
+                log_empty_completion_retry(&ctx, attempt, started_at.elapsed(), None);
+                cleanup.abort();
+                return map_codex_error_to_response(&empty_live_completion_error());
+            }
+        };
+        match started {
             LiveStreamStart::Response(response) => {
                 cleanup.disarm();
                 return response;
@@ -814,7 +863,16 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                let empty = error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL);
+                empty_retry |= empty;
+                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                    || (empty_retry && !allow_empty_completion_retry(attempt, started_at.elapsed()))
+                {
+                    if empty_retry {
+                        log_empty_completion_retry(&ctx, attempt, started_at.elapsed(), None);
+                        cleanup.abort();
+                        return map_codex_error_to_response(&empty_live_completion_error());
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -823,11 +881,70 @@ async fn live_stream_response(
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
+                if empty {
+                    log_empty_completion_retry(
+                        &ctx,
+                        attempt,
+                        started_at.elapsed(),
+                        Some(delay.wait_ms),
+                    );
+                }
                 attempt += 1;
                 sleep(delay.wait_ms).await;
             }
         }
     }
+}
+
+// Bound replay work only. Once real output is forwarded, this wrapper is gone
+// and the response stream can run normally without replaying tools.
+async fn await_empty_retry<T>(
+    future: impl std::future::Future<Output = T>,
+    retry: bool,
+    started_at: Instant,
+) -> Result<T, ()> {
+    if !retry {
+        return Ok(future.await);
+    }
+    let remaining = EMPTY_COMPLETION_RETRY_BUDGET
+        .checked_sub(started_at.elapsed())
+        .ok_or(())?;
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| ())
+}
+
+// Do not restart a long generation after its retry allowance is already spent.
+// The initial attempt is not timed out: legitimate reasoning may take time.
+fn allow_empty_completion_retry(attempt: u32, elapsed: Duration) -> bool {
+    attempt < MAX_EMPTY_COMPLETION_RETRIES
+        && elapsed + Duration::from_millis(compute_backoff_delay(attempt, None).wait_ms)
+            < EMPTY_COMPLETION_RETRY_BUDGET
+}
+
+fn log_empty_completion_retry(
+    ctx: &RequestContext,
+    attempt: u32,
+    elapsed: Duration,
+    delay: Option<u64>,
+) {
+    create_logger("codex").warn(
+        if delay.is_some() {
+            "empty_completion_retry"
+        } else {
+            "empty_completion_retry_exhausted"
+        },
+        Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(ctx.req_id)),
+            ("attempts".into(), serde_json::json!(attempt + 1)),
+            (
+                "maxAttempts".into(),
+                serde_json::json!(MAX_EMPTY_COMPLETION_RETRIES + 1),
+            ),
+            ("elapsedMs".into(), serde_json::json!(elapsed.as_millis())),
+            ("delayMs".into(), serde_json::json!(delay)),
+        ])),
+    );
 }
 
 fn provider_retry(
@@ -922,6 +1039,32 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
+            // Record shape only; never log prompt or generated content by default.
+            create_logger("codex").warn(
+                "empty_completion_received",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".into(), serde_json::json!(ctx.req_id)),
+                    ("model".into(), serde_json::json!(model)),
+                    ("eventType".into(), serde_json::json!(payload.get("type"))),
+                    (
+                        "status".into(),
+                        serde_json::json!(payload.pointer("/response/status")),
+                    ),
+                    (
+                        "outputItems".into(),
+                        serde_json::json!(
+                            payload
+                                .pointer("/response/output")
+                                .and_then(|v| v.as_array())
+                                .map(Vec::len)
+                        ),
+                    ),
+                    (
+                        "usage".into(),
+                        serde_json::json!(payload.pointer("/response/usage")),
+                    ),
+                ])),
+            );
             return provider_retry(&upstream_events, empty_live_completion_error());
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
@@ -1411,7 +1554,13 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
         return map_codex_failure_to_response(message);
     }
     if err.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message);
+        // Recovery has already been attempted here. Prevent Claude Code and
+        // the Anthropic SDK from multiplying this into another ten retry loops.
+        let mut response = json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message);
+        response
+            .headers_mut()
+            .insert("x-should-retry", http::HeaderValue::from_static("false"));
+        return response;
     }
 
     match err.status {
@@ -1623,6 +1772,32 @@ mod tests {
             },
             reasoning: None,
         }
+    }
+
+    #[test]
+    fn empty_retry_budget_includes_request_time_and_backoff() {
+        assert!(allow_empty_completion_retry(0, Duration::from_secs(1)));
+        assert!(allow_empty_completion_retry(1, Duration::from_secs(56)));
+        assert!(!allow_empty_completion_retry(1, Duration::from_secs(57)));
+        assert!(!allow_empty_completion_retry(2, Duration::ZERO));
+        assert!(!allow_empty_completion_retry(0, Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn empty_retry_deadline_does_not_limit_initial_generation() {
+        let expired = Instant::now() - Duration::from_secs(61);
+        assert_eq!(
+            await_empty_retry(async { 42 }, false, expired).await,
+            Ok(42)
+        );
+        assert_eq!(
+            await_empty_retry(std::future::pending::<()>(), true, expired).await,
+            Err(())
+        );
+        assert_eq!(
+            await_empty_retry(async { 42 }, true, Instant::now()).await,
+            Ok(42)
+        );
     }
 
     fn live_test_context(session_id: &str) -> RequestContext {
