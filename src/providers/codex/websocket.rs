@@ -3493,6 +3493,7 @@ mod tests {
             }
         });
         let context = RequestContext {
+            notification_id: None,
             req_id: "terminal-order-request".to_string(),
             session_id: Some("header-session-is-not-pool-owner".to_string()),
             session_seq: None,
