@@ -1602,6 +1602,7 @@ fn connection_reset_error(message: &str) -> client::CodexError {
         message: message.to_owned(),
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: client::CodexErrorOrigin::WebSocket,
     }
 }
