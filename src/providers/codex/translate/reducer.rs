@@ -340,6 +340,13 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
         event_count += 1;
         last_event_type = Some(t.clone());
 
+        // OpenCode Go's Responses endpoint may append a billing/keepalive ping
+        // after response.completed. It carries no model output and is safe to
+        // ignore, while all other JSON events after a terminal remain invalid.
+        if _saw_terminal && t == "ping" {
+            continue;
+        }
+
         if _saw_terminal {
             let message = if t == "response.completed"
                 || t == "response.incomplete"
@@ -1438,6 +1445,24 @@ mod tests {
                 "response.completed",
                 json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
             ),
+        );
+
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(*stop_reason, STOP_END_TURN);
+    }
+
+    #[test]
+    fn completed_terminal_followed_by_ping_remains_valid() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
+            ),
+            sse("ping", json!({"cost":"0"})),
         );
 
         let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();

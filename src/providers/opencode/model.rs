@@ -15,6 +15,10 @@ pub struct ModelSpec {
 
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
+        id: "grok-4.6",
+        endpoint: EndpointKind::Responses,
+    },
+    ModelSpec {
         id: "grok-4.5",
         endpoint: EndpointKind::ChatCompletions,
     },
@@ -24,6 +28,14 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "glm-5.2",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "glm-5.3-flash",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "glm-5.3",
         endpoint: EndpointKind::ChatCompletions,
     },
     ModelSpec {
@@ -51,11 +63,31 @@ pub const MODELS: &[ModelSpec] = &[
         endpoint: EndpointKind::ChatCompletions,
     },
     ModelSpec {
+        id: "longcat-2.0",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
         id: "deepseek-v4-pro",
         endpoint: EndpointKind::ChatCompletions,
     },
     ModelSpec {
         id: "deepseek-v4-flash",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "deepseek-flash",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "deepseek-v4-flash-vision-exp",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "mimo-v2-pro",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "mimo-v2-omni",
         endpoint: EndpointKind::ChatCompletions,
     },
     ModelSpec {
@@ -83,6 +115,10 @@ pub const MODELS: &[ModelSpec] = &[
         endpoint: EndpointKind::Messages,
     },
     ModelSpec {
+        id: "qwen3.8-flash",
+        endpoint: EndpointKind::Messages,
+    },
+    ModelSpec {
         id: "qwen3.7-max",
         endpoint: EndpointKind::Messages,
     },
@@ -102,6 +138,26 @@ pub const MODELS: &[ModelSpec] = &[
         id: "hy3",
         endpoint: EndpointKind::ChatCompletions,
     },
+    ModelSpec {
+        id: "hy4-preview",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "hy3-preview",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "muse-spark-1.3-contributor",
+        endpoint: EndpointKind::Responses,
+    },
+    ModelSpec {
+        id: "muse-spark-1.2-contributor",
+        endpoint: EndpointKind::Responses,
+    },
+    ModelSpec {
+        id: "omen-alpha",
+        endpoint: EndpointKind::ChatCompletions,
+    },
 ];
 
 pub fn resolve(raw: &str) -> Option<ModelSpec> {
@@ -114,7 +170,7 @@ pub fn advertised_models() -> Vec<String> {
     for model in MODELS {
         if !matches!(
             model.id,
-            "gpt-5.6-luna" | "grok-4.5" | "kimi-k3" | "kimi-k2.6"
+            "gpt-5.6-luna" | "grok-4.6" | "grok-4.5" | "kimi-k3" | "kimi-k2.6"
         ) {
             result.push(model.id.to_string());
         }
@@ -142,19 +198,35 @@ mod tests {
             .iter()
             .filter(|model| model.endpoint == EndpointKind::Responses)
             .count();
-        assert_eq!(chat, 13);
-        assert_eq!(messages, 8);
-        assert_eq!(responses, 1);
+        assert_eq!(chat, 23);
+        assert_eq!(messages, 9);
+        assert_eq!(responses, 4);
     }
 
     #[test]
     fn refreshed_models_resolve_and_are_advertised() {
         let advertised = advertised_models();
         for (id, endpoint) in [
+            ("glm-5.3-flash", EndpointKind::ChatCompletions),
+            ("glm-5.3", EndpointKind::ChatCompletions),
             ("glm-5", EndpointKind::ChatCompletions),
+            ("longcat-2.0", EndpointKind::ChatCompletions),
             ("kimi-k2.5", EndpointKind::ChatCompletions),
+            ("deepseek-flash", EndpointKind::ChatCompletions),
+            (
+                "deepseek-v4-flash-vision-exp",
+                EndpointKind::ChatCompletions,
+            ),
+            ("mimo-v2-pro", EndpointKind::ChatCompletions),
+            ("mimo-v2-omni", EndpointKind::ChatCompletions),
             ("qwen3.8-max", EndpointKind::Messages),
+            ("qwen3.8-flash", EndpointKind::Messages),
             ("qwen3.5-plus", EndpointKind::Messages),
+            ("hy4-preview", EndpointKind::ChatCompletions),
+            ("hy3-preview", EndpointKind::ChatCompletions),
+            ("muse-spark-1.3-contributor", EndpointKind::Responses),
+            ("muse-spark-1.2-contributor", EndpointKind::Responses),
+            ("omen-alpha", EndpointKind::ChatCompletions),
         ] {
             let qualified = format!("{MODEL_PREFIX}{id}");
             assert_eq!(
@@ -187,7 +259,14 @@ mod tests {
     #[test]
     fn conflicting_provider_ids_are_only_advertised_with_prefix() {
         let models = advertised_models();
-        for id in ["gpt-5.6-luna", "grok-4.5", "kimi-k3", "kimi-k2.6"] {
+        for id in [
+            "gpt-5.6-luna",
+            "grok-4.6",
+            "grok-4.5",
+            "kimi-k3",
+            "kimi-k2.6",
+        ] {
+            assert!(resolve(id).is_some());
             assert!(!models.iter().any(|model| model == id));
             assert!(
                 models

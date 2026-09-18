@@ -1076,6 +1076,8 @@ mod tests {
     fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let result = codex_transport();
         assert_eq!(result, CodexTransport::WebSocket);
     }
@@ -1084,6 +1086,8 @@ mod tests {
     fn codex_transport_reads_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
         }
@@ -1094,6 +1098,8 @@ mod tests {
     fn codex_transport_env_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
         }
@@ -1104,6 +1110,8 @@ mod tests {
     fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
@@ -1114,6 +1122,8 @@ mod tests {
     fn codex_transport_empty_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }

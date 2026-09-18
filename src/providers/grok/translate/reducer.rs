@@ -28,7 +28,9 @@ pub enum ReducerEvent {
     Citation(usize, Value),
     Finish {
         stop_reason: String,
-        input_tokens: u64,
+        // `None` when the provider omitted, emptied, or malformed the input
+        // usage field. A present zero is a real provider-reported value.
+        input_tokens: Option<u64>,
         output_tokens: u64,
         web_search_requests: u64,
         x_search_requests: u64,
@@ -339,10 +341,7 @@ impl Reducer {
                 let mut out = self.close_active()?;
                 let response = value.get("response").unwrap_or(&value);
                 let usage = response.get("usage").unwrap_or(&Value::Null);
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let input = usage.get("input_tokens").and_then(Value::as_u64);
                 let output = usage
                     .get("output_tokens")
                     .and_then(Value::as_u64)
@@ -506,7 +505,7 @@ mod tests {
             events.last(),
             Some(ReducerEvent::Finish {
                 stop_reason,
-                input_tokens: 4,
+                input_tokens: Some(4),
                 output_tokens: 2,
                 ..
             }) if stop_reason == "max_tokens"
@@ -520,10 +519,44 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(ReducerEvent::Finish {
-                input_tokens: 4,
+                input_tokens: Some(4),
                 output_tokens: 2,
                 ..
             })
         ));
+    }
+
+    fn finish_input_tokens(response: &str) -> Option<u64> {
+        let input =
+            format!("data: {{\"type\":\"response.completed\",\"response\":{response}}}\n\n");
+        let events = reduce_upstream_bytes(input.as_bytes()).unwrap();
+        match events.last() {
+            Some(ReducerEvent::Finish { input_tokens, .. }) => *input_tokens,
+            other => panic!("expected a finish event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grok_reducer_preserves_input_usage_presence() {
+        assert_eq!(
+            finish_input_tokens("{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}"),
+            Some(4)
+        );
+        // A provider-reported zero stays a value, not a missing field.
+        assert_eq!(
+            finish_input_tokens("{\"usage\":{\"input_tokens\":0,\"output_tokens\":2}}"),
+            Some(0)
+        );
+        assert_eq!(finish_input_tokens("{\"usage\":{}}"), None);
+        assert_eq!(
+            finish_input_tokens("{\"usage\":{\"output_tokens\":2}}"),
+            None
+        );
+        assert_eq!(
+            finish_input_tokens("{\"usage\":{\"input_tokens\":\"4\"}}"),
+            None
+        );
+        // No usage object at all is also absent, not zero.
+        assert_eq!(finish_input_tokens("{}"), None);
     }
 }

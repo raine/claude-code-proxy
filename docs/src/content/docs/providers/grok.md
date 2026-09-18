@@ -32,6 +32,8 @@ ANTHROPIC_SMALL_FAST_MODEL=grok-4.6 \
   claude --model grok-4.6
 ```
 
+Grok 4.5 and Grok 4.6 have a 500,000 token context window. Claude Code treats unknown model IDs as 200,000 tokens, so set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` when using those IDs. Do not append `[1m]`; that is a one-million-token client hint.
+
 ## Reasoning and tools
 
 The proxy translates Claude messages, function tools, tool results, thinking controls, token usage, and streaming events. Grok reasoning text appears as Claude Code thinking blocks. Grok supports `none`, `low`, `medium`, and `high` effort levels. `xhigh` is forwarded for `grok-4.6`; higher compatibility levels are mapped to the highest supported Grok level for other registered models.

@@ -308,6 +308,14 @@ fn reasoning_summary_requested(summary: Option<&str>) -> bool {
     !matches!(summary, Some("off" | "none"))
 }
 
+/// Whether the resolved effort asks the upstream for reasoning output.
+/// `Effort::None` still names the effort so the wire request overrides the
+/// upstream default, but it must not request a summary or encrypted
+/// continuation content, which are reasoning artifacts.
+fn reasoning_requested(effort: Option<&Effort>) -> bool {
+    effort.is_some_and(|effort| *effort != Effort::None)
+}
+
 // ---------------------------------------------------------------------------
 // Compaction fast path
 // ---------------------------------------------------------------------------
@@ -352,8 +360,22 @@ pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
 /// native Claude Code compacts without extended thinking, so burning
 /// medium/high reasoning on a 200k-token summary only adds latency. The cap
 /// never raises effort — a request already below it is left alone.
+///
+/// A request naming no effort at all also takes the cap. Left unset it would
+/// run at the upstream default, which is the effort level the cap exists to
+/// avoid.
 fn compact_effort_cap() -> Option<Effort> {
     compact_effort_cap_from(std::env::var("CCP_COMPACT_EFFORT").ok().as_deref())
+}
+
+/// Applies the cap to a request's resolved effort. A missing effort takes
+/// the cap; an explicit effort at or below it is preserved.
+fn apply_compact_effort_cap(resolved: Option<Effort>, cap: Option<Effort>) -> Option<Effort> {
+    match (resolved, cap) {
+        (resolved, None) => resolved,
+        (Some(effort), Some(cap)) if effort <= cap => Some(effort),
+        (_, Some(cap)) => Some(cap),
+    }
 }
 
 fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
@@ -559,15 +581,12 @@ fn translate_request_inner(
     } else {
         codex_effort
     };
-    if apply_codex_config
-        && is_compact
-        && let Some(cap) = compact_effort_cap()
-        && resolved_effort.as_ref().is_some_and(|e| *e > cap)
-    {
-        resolved_effort = Some(cap);
+    if apply_codex_config && is_compact {
+        resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
     }
+    let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
-        let summary = if resolved_effort.is_some()
+        let summary = if wants_reasoning
             && (!apply_codex_config
                 || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
@@ -581,7 +600,7 @@ fn translate_request_inner(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if resolved_effort.is_some() {
+    if wants_reasoning {
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
 
@@ -700,7 +719,54 @@ fn codex_tool_description(name: &str, description: Option<String>) -> Option<Str
     Some(format!("{base}\n\n{}", read_offset_guidance()))
 }
 
+// OpenAI's regex dialect differs from schemas emitted by clients. Drop pattern
+// constraints rather than guessing backend compatibility with a local regex engine.
+// This relaxes tool argument validation, including otherwise compatible patterns.
+// Only visit schema-bearing keywords: defaults, examples and other literal data
+// must remain intact, as must names in property and definition maps.
+fn strip_tool_schema_patterns(schema: &mut Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    schema.remove("pattern");
+
+    for (keyword, value) in schema {
+        match keyword.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for schema in schemas.values_mut() {
+                        strip_tool_schema_patterns(schema);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for schema in schemas {
+                        strip_tool_schema_patterns(schema);
+                    }
+                } else if keyword == "items" {
+                    strip_tool_schema_patterns(value);
+                }
+            }
+            "additionalProperties"
+            | "additionalItems"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => strip_tool_schema_patterns(value),
+            _ => {}
+        }
+    }
+}
+
 fn codex_tool_parameters(name: &str, mut parameters: Value) -> Value {
+    strip_tool_schema_patterns(&mut parameters);
     if name != "Read" {
         return parameters;
     }
@@ -1457,6 +1523,153 @@ mod tests {
     }
 
     #[test]
+    fn translate_artifact_tool_strips_exact_incompatible_pattern() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "Artifact",
+                    "description": "Manage artifacts.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "field": {
+                                "type": "string",
+                                "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$",
+                                "minLength": 1,
+                                "maxLength": 200
+                            }
+                        },
+                        "required": ["field"],
+                        "additionalProperties": false
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let original_tools = req.extra["tools"].clone();
+        assert_eq!(
+            original_tools[0]["input_schema"]["properties"]["field"]["pattern"],
+            r#"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$"#
+        );
+        let mut expected = original_tools[0]["input_schema"].clone();
+        expected["properties"]["field"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pattern");
+
+        let normal = translate_request(&req, opts()).unwrap();
+        let compatible =
+            translate_openai_compatible_request(&req, "gpt-5.5".to_string(), None).unwrap();
+        let lite = translate_request(
+            &req,
+            TranslateOptions {
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        for out in [normal, compatible, lite] {
+            let wire = serde_json::to_value(out).unwrap();
+            let tool = if wire["tools"].is_array() {
+                &wire["tools"][0]
+            } else {
+                &wire["input"][0]["tools"][0]
+            };
+            assert_eq!(
+                tool,
+                &json!({
+                    "type": "function",
+                    "name": "Artifact",
+                    "description": "Manage artifacts.",
+                    "parameters": expected,
+                    "strict": false
+                })
+            );
+        }
+        assert_eq!(req.extra["tools"], original_tools);
+    }
+
+    #[test]
+    fn tool_schema_patterns_are_removed_only_from_schema_locations() {
+        let literal = json!({
+            "pattern": "literal pattern",
+            "properties": {"pattern": {"pattern": "also literal"}},
+            "items": [{"pattern": "literal item"}]
+        });
+        let leaf = json!({
+            "type": "string",
+            "pattern": "^[a-z]+$",
+            "description": "Keep metadata and literal data.",
+            "default": literal,
+            "examples": [literal],
+            "const": literal,
+            "enum": [literal],
+            "x-custom": literal
+        });
+        let mut clean_leaf = leaf.clone();
+        clean_leaf.as_object_mut().unwrap().remove("pattern");
+
+        let mut schema = json!({"pattern": "^root$", "required": ["pattern"]});
+        let mut expected = json!({"required": ["pattern"]});
+        for keyword in [
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            schema[keyword] = json!({
+                "pattern": leaf,
+                "properties": {"properties": {"pattern": leaf}},
+                "booleanSchema": false
+            });
+            expected[keyword] = json!({
+                "pattern": clean_leaf,
+                "properties": {"properties": {"pattern": clean_leaf}},
+                "booleanSchema": false
+            });
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems", "items"] {
+            schema[keyword] = json!([leaf, true, false]);
+            expected[keyword] = json!([clean_leaf, true, false]);
+        }
+        for keyword in [
+            "additionalProperties",
+            "additionalItems",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "contains",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contentSchema",
+        ] {
+            schema[keyword] = leaf.clone();
+            expected[keyword] = clean_leaf.clone();
+        }
+        schema["dependencies"]["literalDependency"] = json!(["pattern"]);
+        expected["dependencies"]["literalDependency"] = json!(["pattern"]);
+        schema["$ref"] = json!("#/$defs/pattern");
+        expected["$ref"] = json!("#/$defs/pattern");
+        assert_eq!(codex_tool_parameters("Custom", schema), expected);
+
+        let nested = json!({"items": {"properties": {"pattern": leaf}}});
+        let expected = json!({"items": {"properties": {"pattern": clean_leaf}}});
+        assert_eq!(codex_tool_parameters("Custom", nested), expected);
+        for unchanged in [json!({}), json!(true), json!(false)] {
+            assert_eq!(
+                codex_tool_parameters("Custom", unchanged.clone()),
+                unchanged
+            );
+        }
+    }
+
+    #[test]
     fn translate_read_tool_adds_codex_offset_guidance() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
@@ -1467,7 +1680,7 @@ mod tests {
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "file_path": {"type": "string"},
+                        "file_path": {"type": "string", "pattern": "^/"},
                         "offset": {"type": "integer", "description": "old offset"},
                         "limit": {"type": "integer", "description": "old limit"}
                     },
@@ -1491,6 +1704,7 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .unwrap();
+        assert_eq!(props["file_path"], json!({"type": "string"}));
         assert_eq!(
             props
                 .get("offset")
@@ -1695,6 +1909,54 @@ mod tests {
             compact_effort_cap_from(Some("bogus")),
             Some(Effort::Low)
         ));
+    }
+
+    #[test]
+    fn compact_effort_cap_defaults_a_missing_effort() {
+        // No effort named: take the cap instead of the upstream default.
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::None)),
+            Some(Effort::None)
+        ));
+        // An explicit effort at or below the cap survives.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::None), Some(Effort::Low)),
+            Some(Effort::None)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::Low), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        // Above the cap is lowered.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        // Cap disabled: the request is left exactly as it asked.
+        assert!(apply_compact_effort_cap(None, None).is_none());
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), None),
+            Some(Effort::High)
+        ));
+    }
+
+    #[test]
+    fn only_a_non_none_effort_requests_reasoning_artifacts() {
+        assert!(!reasoning_requested(None));
+        assert!(!reasoning_requested(Some(&Effort::None)));
+        for effort in [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ] {
+            assert!(reasoning_requested(Some(&effort)));
+        }
     }
 
     #[test]

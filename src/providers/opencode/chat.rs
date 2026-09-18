@@ -350,9 +350,11 @@ fn map_reasoning_effort(req: &MessagesRequest, model: &str) -> anyhow::Result<Op
         return Ok(None);
     };
     let id = model.to_ascii_lowercase();
-    if ["glm-5.2", "glm-5-2", "glm-5p2"]
-        .iter()
-        .any(|needle| id.contains(needle))
+    if [
+        "glm-5.2", "glm-5-2", "glm-5p2", "glm-5.3", "glm-5-3", "glm-5p3",
+    ]
+    .iter()
+    .any(|needle| id.contains(needle))
     {
         return match effort {
             "high" => Ok(Some("high".into())),

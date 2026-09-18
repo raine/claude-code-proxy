@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::config::AliasProvider;
 use crate::logging::REDACT_KEYS;
 use crate::paths;
+use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
 
 #[derive(Debug)]
 pub struct TrafficCapture {
@@ -369,6 +370,22 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     // Anthropic image blocks carry raw base64 under
                     // `source.data`; redact it for the same reason.
                     out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "encrypted_content" {
+                    // Codex `compaction` and `reasoning` items carry an opaque
+                    // blob that replays a whole conversation's context; it is
+                    // bulk payload, not debug signal, so only its size stays.
+                    out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "signature"
+                    && value.as_str().is_some_and(is_proxy_reasoning_signature)
+                {
+                    // The Codex translator replays reasoning as an Anthropic
+                    // thinking signature of the form
+                    // `ccp:codex:v1:<encoded-id>:<encrypted_content>`, which
+                    // carries the same opaque conversation handle as the
+                    // `encrypted_content` key. Only proxy-owned signatures are
+                    // touched; foreign ones (for example, real Anthropic
+                    // signatures) are preserved.
+                    out.insert(key.clone(), redact_traffic_value(value));
                 } else if REDACT_KEYS.contains(&normalized.as_str())
                     || matches!(
                         normalized.as_str(),
@@ -524,6 +541,177 @@ mod tests {
         assert!(rendered.contains("redacted"));
         // Structure is preserved.
         assert!(rendered.contains("image/png"));
+    }
+
+    #[test]
+    fn redact_traffic_strips_compaction_encrypted_content() {
+        // Server-side compaction replays the transcript as an opaque blob in
+        // the upstream request; it must not persist, but its size should.
+        let value = serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                {"type": "compaction", "encrypted_content": "gAAAAABopaque-compacted-transcript"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hello"}
+                ]}
+            ]
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("gAAAAA"),
+            "encrypted_content leaked: {rendered}"
+        );
+        assert_eq!(
+            redacted["input"][0]["encrypted_content"],
+            "[redacted len=34]"
+        );
+        assert_eq!(redacted["input"][0]["type"], "compaction");
+        assert_eq!(redacted["input"][1]["content"][0]["text"], "hello");
+        assert_eq!(redacted["model"], "gpt-5");
+    }
+
+    #[test]
+    fn redact_traffic_strips_reasoning_encrypted_content_in_events() {
+        // Upstream response items carry the same blob under `reasoning`.
+        let value = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAAAopaque"}
+        });
+        let redacted = redact_traffic(&value);
+        assert_eq!(redacted["item"]["encrypted_content"], "[redacted len=12]");
+        assert_eq!(redacted["item"]["id"], "rs_1");
+    }
+
+    #[test]
+    fn redact_traffic_strips_proxy_signature_delta_in_downstream_event() {
+        // The Codex translator emits a 050 downstream `signature_delta` whose
+        // signature is `ccp:codex:v1:<encoded-id>:<encrypted_content>`.
+        let signature = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
+        let value = serde_json::json!({
+            "event": "content_block_delta",
+            "data": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": signature}
+            }
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("ccp:codex:v1:"),
+            "proxy signature leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("gAAAAABopaque"),
+            "encrypted payload leaked: {rendered}"
+        );
+        assert_eq!(
+            redacted["data"]["delta"]["signature"],
+            format!("[redacted len={}]", signature.len())
+        );
+        // Neighboring structure survives.
+        assert_eq!(redacted["data"]["delta"]["type"], "signature_delta");
+        assert_eq!(redacted["data"]["index"], 0);
+    }
+
+    #[test]
+    fn redact_traffic_strips_proxy_signature_in_thinking_blocks() {
+        // Buffered downstream content and the replayed incoming Anthropic
+        // request both carry the signature on a `thinking` block.
+        let signature = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
+        let value = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "reasoned", "signature": signature},
+                {"type": "text", "text": "answer"}
+            ]
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("ccp:codex:v1:"),
+            "proxy signature leaked: {rendered}"
+        );
+        assert_eq!(
+            redacted["content"][0]["signature"],
+            format!("[redacted len={}]", signature.len())
+        );
+        assert_eq!(redacted["content"][0]["thinking"], "reasoned");
+        assert_eq!(redacted["content"][1]["text"], "answer");
+    }
+
+    #[test]
+    fn redact_traffic_keeps_foreign_signatures() {
+        // Real Anthropic signatures and other opaque values are not
+        // proxy-owned and must survive capture redaction unchanged.
+        let value = serde_json::json!({
+            "delta": {"type": "signature_delta", "signature": "ErUBCkYIBRgCIkA-real"},
+            "content": [{"type": "thinking", "signature": "another-opaque-signature"}]
+        });
+        let redacted = redact_traffic(&value);
+        assert_eq!(redacted["delta"]["signature"], "ErUBCkYIBRgCIkA-real");
+        assert_eq!(
+            redacted["content"][0]["signature"],
+            "another-opaque-signature"
+        );
+    }
+
+    #[test]
+    fn traffic_capture_redacts_proxy_signatures_at_json_boundary() {
+        // Exercise write_json_event (050 downstream) and write_json (010
+        // incoming request) end to end, where redaction is actually applied.
+        let temp = tempfile::TempDir::new().unwrap();
+        let capture = test_capture(temp.path().join("traffic"));
+        let signature = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
+        let foreign = "ErUBCkYIBRgCIkA-real-anthropic-signature";
+
+        capture.write_json_event(
+            "050-downstream-event",
+            &serde_json::json!({
+                "event": "content_block_delta",
+                "data": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "signature_delta", "signature": signature}
+                }
+            }),
+        );
+        capture.write_json(
+            "010-anthropic-request",
+            &serde_json::json!({
+                "messages": [{
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "kept", "signature": signature},
+                        {"type": "thinking", "thinking": "kept", "signature": foreign}
+                    ]
+                }]
+            }),
+        );
+
+        let mut captured = String::new();
+        for dir in [capture.root().to_path_buf(), capture.root().join("events")] {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    captured.push_str(&std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+
+        assert!(
+            !captured.contains("ccp:codex:v1:"),
+            "proxy signature leaked to capture: {captured}"
+        );
+        assert!(
+            !captured.contains("gAAAAABopaque"),
+            "encrypted payload leaked to capture: {captured}"
+        );
+        assert!(
+            captured.contains(foreign),
+            "foreign signature lost: {captured}"
+        );
+        assert!(captured.contains("kept"));
     }
 
     #[test]

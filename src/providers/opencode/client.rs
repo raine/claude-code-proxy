@@ -78,6 +78,7 @@ impl OpenCodeClient {
         body: &T,
         stream: bool,
         traffic: Option<Arc<TrafficCapture>>,
+        session_id: Option<&str>,
     ) -> Result<OpenCodeResponse, OpenCodeError> {
         let Some(api_key) = self.api_key.as_deref().filter(|key| !key.is_empty()) else {
             return Err(OpenCodeError {
@@ -92,6 +93,11 @@ impl OpenCodeClient {
         } else {
             "application/json"
         };
+
+        let session_header_value = session_id
+            .filter(|value| http::HeaderValue::from_str(value).is_ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         if let Some(capture) = traffic.as_ref() {
             let value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
@@ -110,7 +116,8 @@ impl OpenCodeClient {
                     "headers": {
                         "accept": accept,
                         auth_header: "[redacted]",
-                        "content-type": "application/json"
+                        "content-type": "application/json",
+                        "x-opencode-session": session_header_value
                     }
                 }),
             );
@@ -121,6 +128,7 @@ impl OpenCodeClient {
             .post(url)
             .header(http::header::ACCEPT, accept)
             .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-opencode-session", &session_header_value)
             .json(body);
         match endpoint {
             EndpointKind::ChatCompletions | EndpointKind::Responses => {
@@ -239,6 +247,7 @@ mod tests {
         authorization: String,
         x_api_key: String,
         anthropic_version: String,
+        x_opencode_session: String,
         body: serde_json::Value,
     }
 
@@ -264,6 +273,11 @@ mod tests {
                 .to_string(),
             anthropic_version: headers
                 .get("anthropic-version")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+            x_opencode_session: headers
+                .get("x-opencode-session")
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string(),
@@ -308,10 +322,10 @@ mod tests {
         let client =
             OpenCodeClient::new(format!("http://{address}/v1"), Some("test-key".to_string()))
                 .unwrap();
-        for (endpoint, model) in [
-            (EndpointKind::ChatCompletions, "glm-5.2"),
-            (EndpointKind::Messages, "minimax-m3"),
-            (EndpointKind::Responses, "gpt-5.6-luna"),
+        for (endpoint, model, session_id) in [
+            (EndpointKind::ChatCompletions, "glm-5.2", Some("sess-abc")),
+            (EndpointKind::Messages, "minimax-m3", None),
+            (EndpointKind::Responses, "gpt-5.6-luna", Some("sess-xyz")),
         ] {
             client
                 .post(
@@ -319,6 +333,7 @@ mod tests {
                     &serde_json::json!({"model": model, "messages": []}),
                     false,
                     None,
+                    session_id,
                 )
                 .await
                 .unwrap()
@@ -345,5 +360,9 @@ mod tests {
         assert_eq!(seen[0].body["model"], "glm-5.2");
         assert_eq!(seen[1].body["model"], "minimax-m3");
         assert_eq!(seen[2].body["model"], "gpt-5.6-luna");
+        assert_eq!(seen[0].x_opencode_session, "sess-abc");
+        assert!(!seen[1].x_opencode_session.is_empty());
+        assert_ne!(seen[1].x_opencode_session, "sess-abc");
+        assert_eq!(seen[2].x_opencode_session, "sess-xyz");
     }
 }

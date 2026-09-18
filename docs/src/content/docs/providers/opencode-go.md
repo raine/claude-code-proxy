@@ -34,9 +34,9 @@ ANTHROPIC_SMALL_FAST_MODEL=opencode-go/glm-5.2 \
   claude --model opencode-go/glm-5.2
 ```
 
-The bare IDs `gpt-5.6-luna`, `grok-4.5`, `kimi-k3`, and `kimi-k2.6` remain
-owned by the existing Codex, Grok, or Kimi providers. Prefix those IDs with
-`opencode-go/` to select the OpenCode Go version.
+The bare IDs `gpt-5.6-luna`, `grok-4.5`, `grok-4.6`, `kimi-k3`, and `kimi-k2.6`
+remain owned by the existing Codex, Grok, or Kimi providers. Prefix those IDs
+with `opencode-go/` to select the OpenCode Go version.
 
 ## Tools and streaming
 
@@ -46,10 +46,9 @@ streamed incrementally and reassembled into Anthropic `tool_use` blocks.
 Upstream tool behavior remains model-dependent.
 
 Models served through the Anthropic-compatible endpoint retain their native
-messages stream. GPT 5.6 Luna uses OpenCode Go's Responses endpoint and is
-translated to the same Anthropic event stream as other providers. The proxy
-handles `/v1/messages/count_tokens` locally and does not send that request to
-OpenCode Go.
+messages stream. Responses-backed models are translated to the same Anthropic
+event stream as other providers. The proxy handles `/v1/messages/count_tokens`
+locally and does not send that request to OpenCode Go.
 
 ## Configuration
 

@@ -112,6 +112,7 @@ impl Provider for GrokProvider {
                 upstream,
                 format!("msg_{}", uuid::Uuid::new_v4().simple()),
                 requested,
+                count_tokens::count_tokens(&translated),
                 ctx.monitor.clone(),
                 ctx.req_id.clone(),
                 ctx.traffic.clone(),
@@ -226,6 +227,7 @@ impl Provider for GrokProvider {
             upstream,
             format!("msg_{}", uuid::Uuid::new_v4().simple()),
             requested,
+            count_tokens::count_tokens(&translated),
             ctx.monitor.clone(),
             ctx.req_id.clone(),
             ctx.traffic.clone(),
@@ -241,6 +243,7 @@ fn stream_response(
     response: client::GrokResponse,
     message_id: String,
     model: String,
+    estimated_input_tokens: u64,
     monitor: Option<MonitorHandle>,
     req_id: String,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
@@ -249,6 +252,7 @@ fn stream_response(
         response.into_stream(),
         message_id,
         model,
+        estimated_input_tokens,
         monitor,
         req_id,
         traffic,
@@ -259,6 +263,7 @@ fn stream_body<S>(
     upstream: S,
     message_id: String,
     model: String,
+    estimated_input_tokens: u64,
     monitor: Option<MonitorHandle>,
     req_id: String,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
@@ -270,7 +275,8 @@ where
         upstream,
         decoder: SseDecoder::default(),
         reducer: translate::reducer::Reducer::default(),
-        translator: StreamTranslator::new(message_id, model),
+        translator: StreamTranslator::new(message_id, model)
+            .with_estimated_input_tokens(estimated_input_tokens),
         terminal: false,
         error_sent: false,
         monitor,
@@ -383,7 +389,7 @@ where
                 if let Some((input_tokens, output_tokens)) = usage
                     && let Some(monitor) = self.monitor.as_ref()
                 {
-                    monitor.usage_updated(&self.req_id, Some(input_tokens), Some(output_tokens));
+                    monitor.usage_updated(&self.req_id, input_tokens, Some(output_tokens));
                 }
                 if self.reducer.finished() {
                     self.terminal = true;
@@ -618,6 +624,7 @@ mod tests {
             upstream,
             "msg_1".into(),
             "grok-4.5".into(),
+            0,
             Some(monitor.clone()),
             "req_1".into(),
             None,
@@ -644,12 +651,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_body_seeds_estimated_input_on_message_start() {
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+        ))]);
+        let response = stream_body(
+            upstream,
+            "msg_1".into(),
+            "grok-4.5".into(),
+            321,
+            None,
+            "req_1".into(),
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let events: Vec<serde_json::Value> = crate::anthropic::sse::parse_sse_events(&body)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str(&event.data).ok())
+            .collect();
+        let started = events
+            .iter()
+            .find(|value| value["type"] == "message_start")
+            .unwrap();
+        let finished = events
+            .iter()
+            .find(|value| value["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(
+            started.pointer("/message/usage/input_tokens"),
+            Some(&serde_json::json!(321))
+        );
+        assert_eq!(
+            finished.pointer("/usage/input_tokens"),
+            Some(&serde_json::json!(12))
+        );
+        assert_eq!(
+            finished.pointer("/usage/output_tokens"),
+            Some(&serde_json::json!(3))
+        );
+    }
+
+    /// Streams one estimated response and returns the monitor's published
+    /// input and output usage. `None` means the field was never set.
+    async fn monitored_usage(completed_response: &str) -> (Option<u64>, Option<u64>) {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("req_1", None, Some(1), EndpointKind::Messages);
+        monitor.provider_selected("req_1", "grok", "grok-4.5", None);
+        monitor.request_completed("req_1", 200, None, None);
+        let payload = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{completed_response}}}\n\n"
+        );
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from(payload))]);
+        let response = stream_body(
+            upstream,
+            "msg_1".into(),
+            "grok-4.5".into(),
+            321,
+            Some(monitor.clone()),
+            "req_1".into(),
+            None,
+        );
+        let _ = response.into_body().collect().await.unwrap();
+        let snapshot = monitor.snapshot();
+        let request = snapshot
+            .recent
+            .iter()
+            .find(|request| request.request_id == "req_1")
+            .unwrap();
+        (request.input_tokens, request.output_tokens)
+    }
+
+    #[tokio::test]
+    async fn missing_provider_input_usage_does_not_zero_the_monitor() {
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}").await,
+            (Some(12), Some(3))
+        );
+        // A provider-reported zero is preserved rather than treated as missing.
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"input_tokens\":0,\"output_tokens\":3}}").await,
+            (Some(0), Some(3))
+        );
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"output_tokens\":3}}").await,
+            (None, Some(3))
+        );
+        assert_eq!(monitored_usage("{\"usage\":{}}").await, (None, Some(0)));
+        assert_eq!(monitored_usage("{}").await, (None, Some(0)));
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"input_tokens\":\"12\"}}").await,
+            (None, Some(0))
+        );
+    }
+
+    #[tokio::test]
     async fn downstream_event_arrives_before_upstream_completion() {
         let (tx, rx) = mpsc::channel(2);
         let response = stream_body(
             ChannelStream(rx),
             "msg_1".into(),
             "grok-4.5".into(),
+            0,
             None,
             "req_1".into(),
             None,
@@ -713,6 +815,7 @@ mod tests {
             upstream,
             "msg_1".into(),
             "grok-4.5".into(),
+            0,
             None,
             "req_1".into(),
             None,
@@ -733,6 +836,7 @@ mod tests {
             ChannelStream(rx),
             "msg_1".into(),
             "grok-4.5".into(),
+            0,
             None,
             "req_1".into(),
             Some(traffic),
@@ -782,6 +886,7 @@ mod tests {
             upstream,
             "msg_1".into(),
             "grok-4.5".into(),
+            0,
             None,
             "req_1".into(),
             Some(traffic),
@@ -820,6 +925,7 @@ mod tests {
             upstream,
             "msg_1".into(),
             "grok-4.5".into(),
+            0,
             None,
             "req_1".into(),
             Some(traffic),
@@ -847,6 +953,7 @@ mod tests {
                 futures_util::stream::iter(vec![Ok(Bytes::copy_from_slice(payload))]),
                 "msg_1".into(),
                 "grok-4.5".into(),
+                0,
                 None,
                 "req_1".into(),
                 Some(traffic),

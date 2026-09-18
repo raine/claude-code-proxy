@@ -5,6 +5,16 @@ const PREFIX: &str = "ccp:codex:v1:";
 const MAX_ID_BYTES: usize = 4 * 1024;
 const MAX_ENCRYPTED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Whether `signature` was produced by this proxy's Codex reasoning replay
+/// encoder.
+///
+/// These signatures embed the opaque `encrypted_content` replay blob, so
+/// traffic captures redact the whole value. Keeping the check beside the
+/// encoder keeps the format definition in one place.
+pub(crate) fn is_proxy_reasoning_signature(signature: &str) -> bool {
+    signature.starts_with(PREFIX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasoningReplay {
     pub id: String,

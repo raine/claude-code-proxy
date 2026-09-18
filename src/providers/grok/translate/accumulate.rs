@@ -198,7 +198,11 @@ pub fn accumulate_response_with_options(
                 x_search_requests: x_requests,
             } => {
                 stop = stop_reason;
-                input = input_tokens;
+                // The non-streaming response always carries an input count, so
+                // a missing provider field falls back to zero here rather than
+                // dropping the key. The streaming path preserves absence
+                // instead, because it must not erase the seeded estimate.
+                input = input_tokens.unwrap_or(0);
                 output = output_tokens;
                 web_search_requests = web_requests;
                 x_search_requests = x_requests;

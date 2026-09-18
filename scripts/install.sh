@@ -178,7 +178,7 @@ install_from_release() {
 
 	if [ -f "$install_dir/${BIN_NAME}" ]; then
 		local existing_version
-		existing_version=$("$install_dir/${BIN_NAME}" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+		existing_version=$("$install_dir/${BIN_NAME}" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
 		log_info "Existing installation found: $existing_version"
 		log_info "Upgrading to: $version"
 	fi

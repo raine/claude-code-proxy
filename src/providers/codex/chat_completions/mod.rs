@@ -454,6 +454,7 @@ mod tests {
             message: "Rate limited".into(),
             detail: Some("Try later".into()),
             retry_after: Some("7".into()),
+            usage_limit: None,
             origin: super::super::client::CodexErrorOrigin::Http,
         });
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -464,6 +465,7 @@ mod tests {
             message: "Auth error".into(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: super::super::client::CodexErrorOrigin::Auth,
         });
         assert_eq!(auth.status, StatusCode::UNAUTHORIZED);

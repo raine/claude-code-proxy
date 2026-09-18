@@ -37,6 +37,8 @@ sets the ChatGPT context limit to 272K tokens. Set
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.6-sol[1m]` so Claude Code
 compacts before the upstream limit.
 
+Grok 4.5 and Grok 4.6 are 500,000 tokens. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` and omit `[1m]`.
+
 For a provider and model with a different real context limit, choose a safe value or omit the override. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
 
 ## Persistent Claude Code settings

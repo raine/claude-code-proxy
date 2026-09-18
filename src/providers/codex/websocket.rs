@@ -210,6 +210,7 @@ impl WebSocketProxyConfig {
             message: error.message,
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
         if !http_url.starts_with("https://") {
@@ -749,6 +750,7 @@ pub(super) async fn codex_websocket_request(
         message: e.message,
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let body_json = serde_json::to_string(body_value).unwrap_or_default();
@@ -836,6 +838,7 @@ pub(super) async fn codex_websocket_request(
                 message: format!("WebSocket send error: {error}"),
                 detail: None,
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::WebSocket,
             }
         })?;
@@ -874,6 +877,7 @@ pub(super) async fn codex_websocket_request(
             message: "Previous response not found".to_string(),
             detail: Some("previous_response_not_found".to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         });
     }
@@ -974,6 +978,7 @@ pub(super) async fn prepare_codex_websocket(
         message: error.message,
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let requires_origin = continuation
@@ -1025,6 +1030,7 @@ fn pooled_validation_error(detail: String) -> CodexError {
         message: format!("WebSocket pooled connection validation failed: {detail}"),
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1074,6 +1080,7 @@ pub(super) fn start_codex_websocket_events(
                     message: format!("WebSocket send error: {error}"),
                     detail: None,
                     retry_after: None,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }))
                 .await;
@@ -1123,6 +1130,7 @@ pub(super) async fn codex_websocket_event_stream(
         message: "Failed to serialize WebSocket request".to_string(),
         detail: Some(error.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let ready = prepare_codex_websocket(
@@ -1151,6 +1159,7 @@ fn continuation_socket_missing_error() -> CodexError {
         message: "Previous response socket is no longer available".to_string(),
         detail: Some(WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1161,6 +1170,7 @@ fn missing_terminal_error() -> CodexError {
         message: "WebSocket connection closed before terminal Codex response event".to_string(),
         detail: Some(WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1171,6 +1181,7 @@ fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
         message: format!("WebSocket response start timeout after {timeout_ms}ms"),
         detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1288,6 +1299,7 @@ fn websocket_protocol_error(message: &str) -> CodexError {
         message: message.to_string(),
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1420,6 +1432,7 @@ fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
         message: message.to_string(),
         detail: proxy_tunnel_rejected.then(|| WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1516,6 +1529,7 @@ fn tunnel_error(status: u16, retry_after: Option<String>) -> CodexError {
             Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string())
         },
         retry_after,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1526,6 +1540,7 @@ fn invalid_tunnel_response(message: &str) -> CodexError {
         message: message.to_string(),
         detail: Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1591,6 +1606,7 @@ async fn establish_connect_tunnel(
         message: "WebSocket proxy tunnel request failed".to_string(),
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
 
@@ -1649,6 +1665,7 @@ async fn tls_connect(
             message: format!("WebSocket TLS connection to {peer} failed"),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
     Ok(Box::new(stream))
@@ -1675,6 +1692,7 @@ async fn connect_to_http_proxy(
             message: "WebSocket proxy connection failed".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
     let stream: BoxedWebSocketIo = Box::new(stream);
@@ -1719,6 +1737,7 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
             message: format!("WebSocket upgrade rejected with status {status}"),
             detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
             retry_after,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
     }
@@ -1727,6 +1746,7 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
         message: "WebSocket upgrade request failed".to_string(),
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1800,6 +1820,7 @@ async fn connect_via_http_upgrade(
         message: error.message,
         detail: None,
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let websocket_key = generate_key();
@@ -1838,6 +1859,7 @@ async fn connect_via_http_upgrade(
             message: format!("WebSocket upgrade rejected with status {status}"),
             detail: Some(detail),
             retry_after,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         });
     }
@@ -2046,6 +2068,7 @@ where
                         message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
                         detail: None,
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::WebSocket,
                     });
                 }
@@ -2070,6 +2093,7 @@ where
                         message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
                         detail: None,
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }
                 } else {
@@ -2083,6 +2107,7 @@ where
                     message: format!("WebSocket keepalive error: {error}"),
                     detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
                     retry_after: None,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2141,6 +2166,7 @@ where
                     message: "WebSocket binary frames not supported".to_string(),
                     detail: None,
                     retry_after: None,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2169,6 +2195,7 @@ where
                     message: format!("WebSocket stream error: {e}"),
                     detail: None,
                     retry_after: None,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2218,6 +2245,7 @@ where
                             message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
                             detail: None,
                             retry_after: None,
+                            usage_limit: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }
                     } else {
@@ -2243,6 +2271,7 @@ where
                             message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
                             detail: None,
                             retry_after: None,
+                            usage_limit: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }
                     } else {
@@ -2256,6 +2285,7 @@ where
                         message: format!("WebSocket keepalive error: {error}"),
                         detail: None,
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }));
                     break;
@@ -2302,6 +2332,7 @@ where
                             message: "Previous response not found".to_string(),
                             detail: Some("previous_response_not_found".to_string()),
                             retry_after: None,
+                            usage_limit: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }));
                     } else {
@@ -2322,6 +2353,7 @@ where
                     message: "WebSocket binary frames not supported".to_string(),
                     detail: None,
                     retry_after: None,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }));
                 break;
@@ -2340,6 +2372,7 @@ where
                     message: format!("WebSocket stream error: {error}"),
                     detail: None,
                     retry_after: None,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }));
                 break;
@@ -2466,6 +2499,7 @@ mod tests {
             message: format!("handshake failed with status {status}"),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         }
     }
@@ -2752,6 +2786,7 @@ mod tests {
                             message: "second forbidden".to_string(),
                             detail: Some("second-detail".to_string()),
                             retry_after: Some("7".to_string()),
+                            usage_limit: None,
                             origin: CodexErrorOrigin::WebSocketHandshake,
                         }))
                     }

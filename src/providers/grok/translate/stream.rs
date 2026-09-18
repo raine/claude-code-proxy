@@ -99,6 +99,9 @@ pub struct StreamTranslator {
     started: bool,
     finished: bool,
     search_blocks: GrokSearchBlocks,
+    // Seeds Claude Code's live usage counter until the provider returns
+    // authoritative usage in the terminal message_delta.
+    estimated_input_tokens: u64,
 }
 
 pub struct LiveStreamTranslator {
@@ -109,10 +112,19 @@ pub struct LiveStreamTranslator {
 
 impl LiveStreamTranslator {
     pub fn new(message_id: String, model: String) -> Self {
+        Self::with_estimated_input_tokens(message_id, model, 0)
+    }
+
+    pub fn with_estimated_input_tokens(
+        message_id: String,
+        model: String,
+        estimated_input_tokens: u64,
+    ) -> Self {
         Self {
             decoder: SseDecoder::default(),
             reducer: Reducer::default(),
-            renderer: StreamTranslator::new(message_id, model),
+            renderer: StreamTranslator::new(message_id, model)
+                .with_estimated_input_tokens(estimated_input_tokens),
         }
     }
 
@@ -152,7 +164,13 @@ impl StreamTranslator {
             started: false,
             finished: false,
             search_blocks,
+            estimated_input_tokens: 0,
         }
+    }
+
+    pub fn with_estimated_input_tokens(mut self, estimated_input_tokens: u64) -> Self {
+        self.estimated_input_tokens = estimated_input_tokens;
+        self
     }
 
     pub fn render(&mut self, events: Vec<ReducerEvent>) -> anyhow::Result<Vec<u8>> {
@@ -175,7 +193,7 @@ impl StreamTranslator {
                 emit(
                     &mut out,
                     "message_start",
-                    serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}),
+                    serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":self.estimated_input_tokens,"output_tokens":0}}}),
                 );
             }
             if matches!(event, ReducerEvent::Finish { .. }) {
@@ -360,16 +378,23 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, search_blocks: GrokSearchBlock
         }
         ReducerEvent::Finish {
             stop_reason,
+            input_tokens,
             output_tokens,
             web_search_requests,
             x_search_requests,
-            ..
         } => {
             let hosted_search_requests = web_search_requests + x_search_requests;
+            // Emit input usage only when the provider actually reported it.
+            // Claude Code keeps the seeded message_start value when the field
+            // is absent, whereas a synthesized zero would erase the estimate.
+            let mut usage = serde_json::json!({"output_tokens":output_tokens,"server_tool_use":{"web_search_requests":hosted_search_requests,"x_search_requests":x_search_requests}});
+            if let Some(input_tokens) = input_tokens {
+                usage["input_tokens"] = serde_json::json!(input_tokens);
+            }
             emit(
                 out,
                 "message_delta",
-                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"server_tool_use":{"web_search_requests":hosted_search_requests,"x_search_requests":x_search_requests}}}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":usage}),
             );
             emit(
                 out,
@@ -531,5 +556,144 @@ mod tests {
             .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n")
             .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("first"));
+    }
+
+    #[test]
+    fn estimated_input_is_visible_at_start_and_provider_usage_is_exact_at_finish() {
+        let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
+            "msg_1".into(),
+            "grok-4.5".into(),
+            321,
+        );
+        let started = translator
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+            .unwrap();
+        let started = crate::anthropic::sse::parse_sse_events(&started)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_start")
+            })
+            .unwrap();
+        assert_eq!(
+            started.pointer("/message/usage/input_tokens"),
+            Some(&serde_json::json!(321))
+        );
+
+        let finished = translator
+            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n")
+            .unwrap();
+        let finished = crate::anthropic::sse::parse_sse_events(&finished)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_delta")
+            })
+            .unwrap();
+        assert_eq!(
+            finished.pointer("/usage/input_tokens"),
+            Some(&serde_json::json!(12))
+        );
+        assert_eq!(
+            finished.pointer("/usage/output_tokens"),
+            Some(&serde_json::json!(3))
+        );
+    }
+
+    #[test]
+    fn provider_input_tokens_are_visible_on_message_delta() {
+        let mut translator = LiveStreamTranslator::new("msg_1".into(), "grok-4.5".into());
+        let _ = translator
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+            .unwrap();
+        let finished = translator
+            .push(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n")
+            .unwrap();
+        let finished = crate::anthropic::sse::parse_sse_events(&finished)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_delta")
+            })
+            .unwrap();
+        assert_eq!(
+            finished.pointer("/usage/input_tokens"),
+            Some(&serde_json::json!(12))
+        );
+        assert_eq!(
+            finished.pointer("/usage/output_tokens"),
+            Some(&serde_json::json!(3))
+        );
+    }
+
+    /// Renders one estimated stream and returns the input usage seeded at
+    /// `message_start`, plus the input and output usage published at
+    /// `message_delta`. `None` means the field was omitted downstream.
+    fn streamed_usage(completed_response: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+        let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
+            "msg_1".into(),
+            "grok-4.5".into(),
+            321,
+        );
+        let started = translator
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+            .unwrap();
+        let started = crate::anthropic::sse::parse_sse_events(&started)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_start")
+            })
+            .unwrap();
+        let payload = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{completed_response}}}\n\n"
+        );
+        let finished = translator.push(payload.as_bytes()).unwrap();
+        let finished = crate::anthropic::sse::parse_sse_events(&finished)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("message_delta")
+            })
+            .unwrap();
+        let value = |pointer: &str| {
+            finished
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_u64)
+        };
+        (
+            started
+                .pointer("/message/usage/input_tokens")
+                .and_then(serde_json::Value::as_u64),
+            value("/usage/input_tokens"),
+            value("/usage/output_tokens"),
+        )
+    }
+
+    #[test]
+    fn missing_provider_input_usage_keeps_the_seeded_estimate() {
+        // Exact provider usage replaces the estimate.
+        assert_eq!(
+            streamed_usage("{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}"),
+            (Some(321), Some(12), Some(3))
+        );
+        // A provider-reported zero is a real value and replaces the estimate.
+        assert_eq!(
+            streamed_usage("{\"usage\":{\"input_tokens\":0,\"output_tokens\":3}}"),
+            (Some(321), Some(0), Some(3))
+        );
+        // Absent, empty, output-only, and non-numeric input usage must not
+        // publish a zero. The terminal delta omits the field so the client
+        // keeps the seeded estimate, while output usage still flows.
+        assert_eq!(streamed_usage("{\"usage\":{}}"), (Some(321), None, Some(0)));
+        assert_eq!(
+            streamed_usage("{\"usage\":{\"output_tokens\":3}}"),
+            (Some(321), None, Some(3))
+        );
+        assert_eq!(streamed_usage("{}"), (Some(321), None, Some(0)));
+        assert_eq!(
+            streamed_usage("{\"usage\":{\"input_tokens\":\"12\"}}"),
+            (Some(321), None, Some(0))
+        );
     }
 }
