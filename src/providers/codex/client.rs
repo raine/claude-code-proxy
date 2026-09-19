@@ -2411,6 +2411,8 @@ impl CodexHttpClient {
                 }
             })?;
 
+        super::rate_limits::record(super::rate_limits::telemetry_headers(resp.headers()));
+
         Ok((resp, started_at))
     }
 
@@ -2421,6 +2423,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<CodexResponse, CodexError> {
         let status = resp.status().as_u16();
+        super::rate_limits::record(super::rate_limits::telemetry_headers(resp.headers()));
         let headers: Vec<(String, String)> = resp
             .headers()
             .iter()
