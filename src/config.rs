@@ -969,21 +969,29 @@ mod tests {
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn clear_env() {
-        unsafe {
-            std::env::remove_var("CCP_BIND_ADDRESS");
-            std::env::remove_var("CCP_CODEX_TRANSPORT");
-            std::env::remove_var("CCP_CONFIG_DIR");
-            std::env::remove_var("CCP_LOG_VERBOSE");
-            std::env::remove_var("CCP_LOG_STDERR");
-            std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
-            std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
-            std::env::remove_var("CCP_CODEX_RESPONSES_API");
-            std::env::remove_var("CCP_CODEX_IMAGES_API");
-            std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
-            std::env::remove_var("CCP_CODEX_TRANSCRIPTIONS_API");
-            std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
-        }
+    /// Clears the environment knobs the config accessors read and points the
+    /// config dir at `config`, so neither the developer's shell nor their real
+    /// config.json can leak into the test. Every change is restored when the
+    /// guards drop, including `CCP_CONFIG_DIR`: a plain `remove_var` here would
+    /// strip a `CCP_CONFIG_DIR` the developer exported to isolate the whole
+    /// run, and every later test in the process that reads config through
+    /// `paths::config_dir()` would fall back to the real config file.
+    fn isolated_env(config: &tempfile::TempDir) -> Vec<EnvGuard> {
+        let mut guards = vec![
+            EnvGuard::unset("CCP_BIND_ADDRESS"),
+            EnvGuard::unset("CCP_CODEX_TRANSPORT"),
+            EnvGuard::unset("CCP_LOG_VERBOSE"),
+            EnvGuard::unset("CCP_LOG_STDERR"),
+            EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
+            EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
+            EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
+            EnvGuard::unset("CCP_CODEX_IMAGES_API"),
+            EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
+            EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
+            EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+        ];
+        guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
+        guards
     }
 
     fn config_env(config: &tempfile::TempDir) -> HashMap<String, String> {
@@ -1059,6 +1067,14 @@ mod tests {
             }
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -1073,11 +1089,23 @@ mod tests {
     }
 
     #[test]
+    fn isolated_env_restores_an_exported_config_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let exported = tempfile::TempDir::new().unwrap();
+        let _exported_env = EnvGuard::set("CCP_CONFIG_DIR", exported.path());
+        {
+            let config = tempfile::TempDir::new().unwrap();
+            let _env = isolated_env(&config);
+            assert_eq!(paths::config_dir(), config.path());
+        }
+        assert_eq!(paths::config_dir(), exported.path());
+    }
+
+    #[test]
     fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         let result = codex_transport();
         assert_eq!(result, CodexTransport::WebSocket);
     }
@@ -1085,9 +1113,8 @@ mod tests {
     #[test]
     fn codex_transport_reads_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
         }
@@ -1097,9 +1124,8 @@ mod tests {
     #[test]
     fn codex_transport_env_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
         }
@@ -1109,9 +1135,8 @@ mod tests {
     #[test]
     fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
@@ -1121,9 +1146,8 @@ mod tests {
     #[test]
     fn codex_transport_empty_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
@@ -1180,9 +1204,8 @@ mod tests {
     #[test]
     fn codex_responses_api_defaults_to_disabled() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(!codex_responses_api());
     }
@@ -1190,14 +1213,13 @@ mod tests {
     #[test]
     fn codex_responses_api_reads_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"responsesApi":true}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(codex_responses_api());
         let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", "false");
@@ -1207,9 +1229,8 @@ mod tests {
     #[test]
     fn codex_responses_api_accepts_enabled_env_values() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         for value in ["1", "true", "TRUE", "yes"] {
             let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", value);
@@ -1220,14 +1241,13 @@ mod tests {
     #[test]
     fn codex_images_api_defaults_to_disabled_and_env_overrides_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"imagesApi":true,"imagesBaseUrl":"https://chatgpt.com/backend-api/codex-custom"}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(codex_images_api());
         assert_eq!(
@@ -1249,14 +1269,13 @@ mod tests {
     #[test]
     fn codex_transcriptions_api_defaults_to_disabled_and_env_overrides_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"transcriptionsApi":true}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(codex_transcriptions_api());
         let _enabled_env = EnvGuard::set("CCP_CODEX_TRANSCRIPTIONS_API", "false");
@@ -1266,14 +1285,13 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_reads_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"reasoningSummary":"off"}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
     }
@@ -1281,14 +1299,13 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_env_overrides_config_and_empty_falls_through() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"codex":{"reasoningSummary":"off"}}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
         {
             let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "auto");
             assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
@@ -1302,14 +1319,13 @@ mod tests {
     #[test]
     fn auto_review_model_reads_top_level_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
             r#"{"autoReviewModel":"grok-4.5"}"#,
         )
         .unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         {
@@ -1325,9 +1341,8 @@ mod tests {
     #[test]
     fn codex_server_compaction_defaults_and_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
         let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _env = isolated_env(&config);
 
         assert!(!codex_server_compaction());
         {
