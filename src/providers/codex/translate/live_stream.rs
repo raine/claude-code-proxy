@@ -67,6 +67,7 @@ pub struct LiveStreamTranslator {
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
     semantic_output_started: bool,
+    text_output_started: bool,
     // Seeds Claude Code's live subagent counter until the provider returns
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
@@ -99,6 +100,7 @@ impl LiveStreamTranslator {
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
             semantic_output_started: false,
+            text_output_started: false,
             estimated_input_tokens,
             incomplete_response_policy: IncompleteResponsePolicy::Error,
             finished: false,
@@ -196,6 +198,26 @@ impl LiveStreamTranslator {
 
     pub fn has_semantic_output(&self) -> bool {
         self.semantic_output_started
+    }
+
+    /// Only thinking has been exposed. Text and tool blocks cannot be replayed
+    /// safely because the consumer may already have acted on them.
+    pub fn can_reconnect(&self) -> bool {
+        !self.finished
+            && !self.text_output_started
+            && !self.saw_tool_use
+            && self.web_search_requests == 0
+            && self.blocks_by_output_index.is_empty()
+    }
+
+    pub fn prepare_reconnect(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.close_thinking(traffic, &mut out);
+        self.reasoning_by_output_index.clear();
+        self.item_id_to_output_index.clear();
+        // Preserve message_started and anthropic_index: one downstream message,
+        // with fresh block indices for the replacement generation.
+        out
     }
 
     pub fn ping_chunk(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
@@ -461,6 +483,7 @@ impl LiveStreamTranslator {
             return;
         }
         self.semantic_output_started = true;
+        self.text_output_started = true;
 
         let output_index = payload
             .get("output_index")

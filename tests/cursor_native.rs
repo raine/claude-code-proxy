@@ -877,6 +877,7 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
     .unwrap();
 
     let ctx = RequestContext {
+        notification_id: None,
         req_id: "test-req".into(),
         session_id: None,
         session_seq: None,

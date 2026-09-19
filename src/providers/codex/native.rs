@@ -610,6 +610,7 @@ mod tests {
 
     fn observer_context() -> RequestContext {
         RequestContext {
+            notification_id: None,
             req_id: "native-test".into(),
             session_id: None,
             session_seq: None,

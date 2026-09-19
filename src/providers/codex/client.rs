@@ -3192,6 +3192,7 @@ mod tests {
 
     fn http_test_context() -> RequestContext {
         RequestContext {
+            notification_id: None,
             req_id: "http-body-test".into(),
             session_id: None,
             session_seq: None,
@@ -5169,6 +5170,7 @@ mod tests {
             expires: u64::MAX,
         };
         let ctx = RequestContext {
+            notification_id: None,
             req_id: "r".into(),
             session_id: Some("s".into()),
             session_seq: None,
@@ -5198,6 +5200,7 @@ mod tests {
             expires: u64::MAX,
         };
         let ctx = RequestContext {
+            notification_id: None,
             req_id: "r".into(),
             session_id: None,
             session_seq: None,
@@ -5225,6 +5228,7 @@ mod tests {
             expires: u64::MAX,
         };
         let ctx = RequestContext {
+            notification_id: None,
             req_id: "r".into(),
             session_id: None,
             session_seq: None,
@@ -5246,6 +5250,7 @@ mod tests {
             expires: u64::MAX,
         };
         let ctx = RequestContext {
+            notification_id: None,
             req_id: "r".into(),
             session_id: Some("bad\nsession".into()),
             session_seq: None,
@@ -5340,6 +5345,7 @@ mod tests {
             expires: u64::MAX,
         };
         let ctx = RequestContext {
+            notification_id: None,
             req_id: "r".into(),
             session_id: None,
             session_seq: None,
