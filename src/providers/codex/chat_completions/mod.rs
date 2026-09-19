@@ -365,7 +365,6 @@ mod tests {
             format!("http://{address}/v1/responses"),
             1_000,
             1_000,
-            0,
         );
         client.auth_manager().set_test_auth(StoredAuth {
             access: "test-token".into(),

@@ -521,6 +521,9 @@ const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
+/// Marks the error raised when the wait for the Codex response headers runs
+/// out, so the retry classifiers can tell it apart from a transport failure.
+const HTTP_RESPONSE_HEADERS_DETAIL: &str = "http_response_headers";
 
 #[derive(Clone)]
 struct ProxyEnvironment {
@@ -694,8 +697,6 @@ pub struct CodexHttpClient {
     base_url: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
-    #[allow(dead_code)]
-    header_timeout_retries: u32,
 }
 
 impl Default for CodexHttpClient {
@@ -721,7 +722,6 @@ impl CodexHttpClient {
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
-            header_timeout_retries: 1,
         }
     }
 
@@ -744,7 +744,6 @@ impl CodexHttpClient {
             base_url,
             header_timeout_ms: config::codex_header_timeout_ms(),
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
-            header_timeout_retries: 1,
         }
     }
 
@@ -754,7 +753,6 @@ impl CodexHttpClient {
         base_url: String,
         header_timeout_ms: u64,
         body_idle_timeout_ms: u64,
-        header_timeout_retries: u32,
     ) -> Self {
         Self {
             native_client: test_native_http_client(),
@@ -766,7 +764,6 @@ impl CodexHttpClient {
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
-            header_timeout_retries,
         }
     }
 
@@ -2384,7 +2381,7 @@ impl CodexHttpClient {
                     "Timed out waiting {}ms for Codex response headers",
                     self.header_timeout_ms
                 ),
-                detail: None,
+                detail: Some(HTTP_RESPONSE_HEADERS_DETAIL.to_string()),
                 retry_after: None,
                 usage_limit: None,
                 origin: CodexErrorOrigin::Http,
@@ -2956,6 +2953,14 @@ fn log_buffered_retry_exhausted(
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
+    // Running out of patience for the response headers is not a transport
+    // failure. The request reached Codex, which is holding the head while the
+    // model reasons, so re-sending it starts that reasoning again from scratch
+    // and the new attempt runs out of time exactly like the last one. Wait
+    // longer with CCP_CODEX_HEADER_TIMEOUT_MS instead.
+    if err.detail.as_deref() == Some(HTTP_RESPONSE_HEADERS_DETAIL) {
+        return false;
+    }
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
@@ -3207,7 +3212,6 @@ mod tests {
             base_url,
             100,
             body_idle_timeout_ms,
-            0,
         )
     }
 
@@ -3668,6 +3672,62 @@ mod tests {
         assert_eq!(limit.resets_at, Some(1789466238));
         assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_stream_does_not_resend_after_a_header_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut attempts = 0_u32;
+            // Hold every accepted connection open. Closing one would look like
+            // a transport failure and mask the header timeout under test.
+            let mut held = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(400), listener.accept()).await
+            {
+                let mut request = [0_u8; 16 * 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                attempts += 1;
+                held.push(stream);
+            }
+            attempts
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let started_at = Instant::now();
+        let error = match client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+        {
+            Ok(_) => panic!("a silent upstream must fail the request"),
+            Err(error) => error,
+        };
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(error.status, 0);
+        assert!(
+            error
+                .message
+                .contains("Timed out waiting 100ms for Codex response headers"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(HTTP_RESPONSE_HEADERS_DETAIL),
+            "the header timeout must stay distinguishable from a transport failure"
+        );
+        assert!(
+            elapsed < Duration::from_millis(crate::retry::RETRY_INITIAL_DELAY_MS),
+            "the header timeout must fail before the first retry backoff, took {elapsed:?}"
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            1,
+            "a header timeout must not re-send the request"
+        );
     }
 
     #[tokio::test]
@@ -5028,6 +5088,21 @@ mod tests {
         let display = format!("{err}");
         assert!(display.contains("429"));
         assert!(display.contains("Rate limited"));
+    }
+
+    #[test]
+    fn header_timeout_is_not_retried_by_either_classifier() {
+        let err = CodexError {
+            status: 0,
+            message: "Timed out waiting 300000ms for Codex response headers".to_string(),
+            detail: Some(HTTP_RESPONSE_HEADERS_DETAIL.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Http,
+        };
+
+        assert!(!is_retryable_transport_error(&err));
+        assert!(!retryable_http_stream_error(&err));
     }
 
     #[test]

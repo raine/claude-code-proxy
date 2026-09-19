@@ -457,7 +457,6 @@ mod tests {
             format!("http://{addr}/responses"),
             1_000,
             1_000,
-            0,
         );
         client
             .auth_manager()
