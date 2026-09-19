@@ -76,6 +76,8 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+    #[serde(rename = "headerTimeoutMs")]
+    pub header_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -366,6 +368,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.transcriptions_api == Some(true) {
                 out.push("codex.transcriptionsApi: true".to_string());
+            }
+            if let Some(ms) = codex.header_timeout_ms {
+                out.push(format!("codex.headerTimeoutMs: {ms}"));
             }
         }
     }
@@ -892,6 +897,40 @@ pub fn codex_transport() -> CodexTransport {
     CodexTransport::WebSocket
 }
 
+/// How long an HTTP-transport request waits for the Codex response headers.
+///
+/// Codex withholds the response head until the model produces its first
+/// output, so the wait tracks how much reasoning the request asks for rather
+/// than the health of the connection. A large request to a high-effort model
+/// can hold the head for minutes, and the timeout firing fails the request
+/// outright, so the default is generous. Lower it only where a request that
+/// slow is better failed than waited out. Values below
+/// `CODEX_MIN_HEADER_TIMEOUT_MS` are ignored rather than clamped, so a typo
+/// does not hide behind a working default.
+pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
+pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
+
+pub fn codex_header_timeout_ms() -> u64 {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(ms) = env
+        .get("CCP_CODEX_HEADER_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(ms) = codex
+            .header_timeout_ms
+            .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    CODEX_DEFAULT_HEADER_TIMEOUT_MS
+}
+
 // ---------------------------------------------------------------------------
 // Cursor config
 // ---------------------------------------------------------------------------
@@ -988,6 +1027,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
+            EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
@@ -1152,6 +1192,35 @@ mod tests {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_header_timeout_defaults_overrides_and_floors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"headerTimeoutMs":600000}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_header_timeout_ms(), 600_000);
+        {
+            let _timeout_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "120000");
+            assert_eq!(codex_header_timeout_ms(), 120_000);
+        }
+        // Below the floor is ignored, not clamped: a value that small is a typo,
+        // and clamping it would hide the typo behind a working default.
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"headerTimeoutMs":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
+        let _timeout_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "0");
+        assert_eq!(codex_header_timeout_ms(), CODEX_DEFAULT_HEADER_TIMEOUT_MS);
     }
 
     #[test]

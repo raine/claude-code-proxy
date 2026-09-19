@@ -706,7 +706,7 @@ impl Default for CodexHttpClient {
 
 impl CodexHttpClient {
     pub fn new() -> Self {
-        let timeout_ms = 60_000;
+        let timeout_ms = config::codex_header_timeout_ms();
         let proxy_environment = ProxyEnvironment::from_env();
         Self {
             client: proxy_environment
@@ -742,7 +742,7 @@ impl CodexHttpClient {
             client,
             auth_manager,
             base_url,
-            header_timeout_ms: 60_000,
+            header_timeout_ms: config::codex_header_timeout_ms(),
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             header_timeout_retries: 1,
         }
