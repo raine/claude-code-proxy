@@ -15,7 +15,7 @@ Claude Code binds its base URL and client auth when the process starts. A **back
 ## One-shot aliases
 
 ```sh
-alias csol='ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+alias csol='ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 alias cgrok='ANTHROPIC_BASE_URL=http://127.0.0.1:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 ```
 
@@ -35,7 +35,7 @@ flag="$HOME/.claude/claude-code-proxy-enabled"
 model_file="$HOME/.claude/claude-code-proxy-model"
 
 if [ -f "$flag" ]; then
-  model="gpt-5.6-sol[1m]"
+  model="gpt-6-sol[1m]"
   [ ! -f "$model_file" ] || model="$(tr -d '[:space:]' <"$model_file")"
 
   export ANTHROPIC_BASE_URL="http://127.0.0.1:18765"
@@ -66,7 +66,7 @@ New processes read the flag and model. Running processes retain their launch env
 With the base URL already pointing to the proxy:
 
 ```text
-/model gpt-5.6-sol-fast[1m]
+/model gpt-6-sol-fast[1m]
 /model kimi-for-coding[1m]
 /model grok-4.5
 /model cursor:gpt-5.5

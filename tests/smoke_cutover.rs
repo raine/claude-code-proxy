@@ -1584,7 +1584,7 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
 
     let sent = captured.lock().unwrap();
     assert_eq!(sent.len(), 3);
-    assert_eq!(sent[0]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[0]["model"], "gpt-6-luna");
     assert_eq!(sent[1]["model"], "gpt-5.6-terra");
     assert_eq!(sent[2]["model"], "gpt-5.6-sol");
 }

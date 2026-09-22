@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
-const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
+const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -2335,8 +2335,8 @@ mod auto_review_tests {
         let route = apply_auto_review_model(&mut classifier, false, None, "codex")
             .expect("classifier should be routed");
         assert_eq!(route.requested_model, "gpt-5.6-sol");
-        assert_eq!(route.override_model, "gpt-5.6-luna");
-        assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(route.override_model, "gpt-6-luna");
+        assert_eq!(classifier.model.as_deref(), Some("gpt-6-luna"));
     }
 
     #[test]

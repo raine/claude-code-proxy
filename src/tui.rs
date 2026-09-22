@@ -1760,8 +1760,8 @@ pub fn setup_text(port: u16, registry: &Registry) -> String {
         "export ANTHROPIC_BASE_URL=\"http://localhost:{port}\""
     ));
     lines.push("export ANTHROPIC_AUTH_TOKEN=\"anything\"".to_string());
-    lines.push("export ANTHROPIC_MODEL=\"gpt-5.6-sol\"".to_string());
-    lines.push("export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-5.6-luna\"".to_string());
+    lines.push("export ANTHROPIC_MODEL=\"gpt-6-sol\"".to_string());
+    lines.push("export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-6-luna\"".to_string());
     lines.push("export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1".to_string());
     lines.join("\n")
 }

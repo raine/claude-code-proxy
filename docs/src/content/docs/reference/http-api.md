@@ -56,12 +56,12 @@ Returns Anthropic-shaped model discovery:
   "data": [
     {
       "type": "model",
-      "id": "gpt-5.6-sol",
-      "display_name": "gpt-5.6-sol (codex)"
+      "id": "gpt-6-sol",
+      "display_name": "gpt-6-sol (codex)"
     }
   ],
   "has_more": false,
-  "first_id": "gpt-5.6-sol",
+  "first_id": "gpt-6-sol",
   "last_id": "cursor:gpt-5.5"
 }
 ```

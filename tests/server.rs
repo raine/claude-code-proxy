@@ -203,7 +203,7 @@ impl Provider for IdentityCaptureProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+        vec!["gpt-5.5".to_string(), "gpt-6-luna".to_string()]
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {

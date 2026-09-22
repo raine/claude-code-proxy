@@ -1501,7 +1501,7 @@ async fn auto_review_with_agent_headers_is_stateless() {
         &classifier,
         &[("developer", review_system), ("user", &review)],
     );
-    assert_eq!(classifier.body["model"], "gpt-5.6-luna");
+    assert_eq!(classifier.body["model"], "gpt-6-luna");
     assert_eq!(first.socket_ordinal, 1);
     assert_eq!(classifier.socket_ordinal, 2);
     assert_delta_input(&second, &a_response, first.socket_ordinal, &a2);

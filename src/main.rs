@@ -382,8 +382,8 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     println!("Configure Claude Code (pick a model from above):");
     println!("  export ANTHROPIC_BASE_URL=\"http://localhost:{port}\"");
     println!("  export ANTHROPIC_AUTH_TOKEN=\"anything\"");
-    println!("  export ANTHROPIC_MODEL=\"gpt-5.6-sol\"");
-    println!("  export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-5.6-luna\"");
+    println!("  export ANTHROPIC_MODEL=\"gpt-6-sol\"");
+    println!("  export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-6-luna\"");
     println!("  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
 }
 

@@ -99,7 +99,7 @@ impl CodexProvider {
     ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let model = body.model.as_deref().unwrap_or("gpt-6-sol");
 
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
@@ -558,7 +558,7 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let model = body.model.as_deref().unwrap_or("gpt-6-sol");
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
         if let Err(e) = assert_allowed_model(&resolved.model) {
@@ -1874,6 +1874,8 @@ mod tests {
             ("gpt-5.6-luna", "gpt-5.6-sol"),
             ("gpt-5.6-sol", "gpt-5.6-sol"),
             ("gpt-5.6-terra", "gpt-5.6-terra"),
+            ("gpt-6-luna", "gpt-6-sol"),
+            ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-5.4", "gpt-5.4"),
         ] {
             let mut model = resolved.to_string();
@@ -1891,6 +1893,8 @@ mod tests {
         for (resolved, lite_expected) in [
             ("gpt-5.6-luna", true),
             ("gpt-5.6-sol", true),
+            ("gpt-6-luna", true),
+            ("gpt-6-sol", true),
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
@@ -2066,6 +2070,9 @@ mod tests {
         assert!(models.contains(&"gpt-5.6-sol-fast".to_string()));
         assert!(models.contains(&"gpt-5.6-terra".to_string()));
         assert!(models.contains(&"gpt-5.6-luna".to_string()));
+        assert!(models.contains(&"gpt-6-sol".to_string()));
+        assert!(models.contains(&"gpt-6-sol-fast".to_string()));
+        assert!(models.contains(&"gpt-6-luna".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
     }
