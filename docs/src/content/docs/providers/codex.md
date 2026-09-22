@@ -84,7 +84,9 @@ This is most useful for long coding sessions where continuity after `/compact` o
 4. Claude Code completes its normal summary request. The proxy uses the resulting summary as an exact anchor.
 5. On subsequent matching turns, the proxy replaces the portable summary with the encrypted item, retained recent context, and post-compaction messages.
 
-The encrypted item remains opaque to the proxy. It is stored only in memory and sent back to Codex as native Responses input.
+When a later compaction boundary is reached from an anchored conversation, the proxy compacts the native history rather than the portable summary, so each new encrypted item carries the previous one forward and the new portable summary is written with it in context.
+
+The encrypted item remains opaque to the proxy. By default it is stored only in memory and sent back to Codex as native Responses input.
 
 ### Enable server compaction
 
@@ -104,9 +106,13 @@ Or enable it for one proxy process:
 CCP_CODEX_SERVER_COMPACTION=1 claude-code-proxy serve
 ```
 
+### Persist server compaction
+
+In-memory state is lost after 30 minutes without matching activity and on every proxy restart, which is most of the time for a session that sits idle between turns. `codex.serverCompactionPersist` (or `CCP_CODEX_SERVER_COMPACTION_PERSIST=1`) also writes each anchored state to `<state dir>/codex-compaction/<session id>.json` with owner-only permissions, and reloads it when the in-memory copy is missing. The file holds the encrypted item, the retained recent messages in plain text, and the portable summary anchor. A new compaction boundary, a failed replay, or disabling server compaction deletes it.
+
 ### Fallbacks and visibility
 
-Replay requires the same Claude Code session and Codex model with append-only history. A branch, proxy restart, provider or model change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
+Replay requires the same Claude Code session and Codex model with append-only history. Requests in the same session that do not match, such as subagents or a different model, skip replay and leave the state in place. A malformed response, upstream failure, or memory limit discards the native state; without persistence, so do a proxy restart and 30 minutes without matching activity. Claude Code's portable summary is used instead.
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 
