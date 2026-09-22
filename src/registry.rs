@@ -22,6 +22,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-opus-5",
     "fable",
     "claude-fable-5",
+    "claude-fable-5-1",
 ];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
@@ -372,6 +373,7 @@ mod tests {
             "claude-opus-5",
             "fable",
             "claude-fable-5",
+            "claude-fable-5-1",
         ] {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");

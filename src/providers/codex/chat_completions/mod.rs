@@ -304,6 +304,7 @@ mod tests {
             EndpointKind::ChatCompletions,
         );
         RequestContext {
+            notification_id: None,
             req_id: "chat-test".into(),
             session_id: Some("session".into()),
             session_seq: None,

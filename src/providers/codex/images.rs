@@ -809,6 +809,7 @@ mod tests {
                 ImageOperation::Generation,
                 prepare_json_request(ImageOperation::Generation, br#"{"prompt":"x"}"#).unwrap(),
                 crate::provider::RequestContext {
+                    notification_id: None,
                     req_id: "oversized".into(),
                     session_id: None,
                     session_seq: None,
@@ -869,6 +870,7 @@ mod tests {
                 ImageOperation::Generation,
                 prepared,
                 crate::provider::RequestContext {
+                    notification_id: None,
                     req_id: "image-test".into(),
                     session_id: None,
                     session_seq: None,

@@ -366,6 +366,7 @@ mod tests {
 
     fn context() -> crate::provider::RequestContext {
         crate::provider::RequestContext {
+            notification_id: None,
             req_id: "transcription-test".to_string(),
             session_id: None,
             session_seq: None,

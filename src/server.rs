@@ -99,9 +99,24 @@ fn apply_auto_review_model(
     let override_model = configured_model
         .filter(|model| !model.is_empty())
         .or((original_provider == "codex").then_some(CODEX_AUTO_REVIEW_MODEL))?;
+    let requested_model = body.model.clone()?;
+    let fast_override = format!(
+        "{}-fast",
+        override_model
+            .strip_suffix("-fast")
+            .unwrap_or(override_model)
+    );
+    let override_model = if requested_model.ends_with("-fast")
+        && crate::providers::codex::translate::model_allowlist::is_valid_model_for_codex(
+            &fast_override,
+        ) {
+        fast_override
+    } else {
+        override_model.to_owned()
+    };
     let route = AutoReviewRoute {
-        requested_model: body.model.clone()?,
-        override_model: override_model.to_string(),
+        requested_model,
+        override_model,
     };
     body.model = Some(route.override_model.clone());
     Some(route)
@@ -576,6 +591,7 @@ async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<
         }
     };
     let context = RequestContext {
+        notification_id: None,
         req_id: req_id.clone(),
         session_id,
         session_seq: None,
@@ -751,6 +767,7 @@ async fn dispatch_image_request(
         monitor.provider_selected(&req_id, "codex", &model, None);
     }
     let context = RequestContext {
+        notification_id: None,
         req_id: req_id.clone(),
         session_id,
         session_seq: None,
@@ -1027,6 +1044,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         }
     }
     let context = RequestContext {
+        notification_id: None,
         req_id: req_id.clone(),
         session_id,
         session_seq: current.map(|session| session.seq),
@@ -1267,6 +1285,7 @@ async fn handler_chat_completions(
         }
     }
     let context = RequestContext {
+        notification_id: None,
         req_id: req_id.clone(),
         session_id,
         session_seq: current.map(|session| session.seq),
@@ -1753,6 +1772,10 @@ async fn dispatch_request(
     }
 
     let context = RequestContext {
+        notification_id: headers
+            .get("x-clodex-notification-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
         req_id: req_id.clone(),
         session_id,
         session_seq: current.map(|s| s.seq),
@@ -1935,7 +1958,7 @@ async fn record_failed_response(
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
-            log.info(
+            log.error(
                 "request_failed",
                 Some(serde_json::Map::from_iter([
                     ("reqId".to_string(), json!(ctx.req_id)),
@@ -1984,7 +2007,7 @@ async fn record_failed_response(
     if let Some(path) = error_file.as_ref() {
         fields.insert("errorFile".to_string(), json!(path.display().to_string()));
     }
-    log.info("request_failed", Some(fields));
+    log.error("request_failed", Some(fields));
 
     (
         Response::from_parts(parts, Body::from(bytes)),
@@ -2337,6 +2360,25 @@ mod auto_review_tests {
         assert_eq!(route.requested_model, "gpt-5.6-sol");
         assert_eq!(route.override_model, "gpt-5.6-luna");
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn classifier_preserves_priority_on_supported_codex_override() {
+        for (configured, expected) in [
+            (None, "gpt-5.6-luna-fast"),
+            (Some("gpt-5.6-sol"), "gpt-5.6-sol-fast"),
+            (Some("grok-4.5"), "grok-4.5"),
+        ] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            classifier.model = Some("gpt-6-astra-fast".into());
+            let route =
+                apply_auto_review_model(&mut classifier, false, configured, "codex").unwrap();
+            assert_eq!(route.override_model, expected);
+        }
     }
 
     #[test]

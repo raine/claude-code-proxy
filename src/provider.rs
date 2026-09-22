@@ -117,6 +117,7 @@ pub trait CliHandlers: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
+    pub notification_id: Option<String>,
     pub req_id: String,
     pub session_id: Option<String>,
     pub session_seq: Option<u64>,
