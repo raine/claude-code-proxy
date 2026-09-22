@@ -59,6 +59,8 @@ struct CodexConfig {
     pub previous_response_id: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
+    #[serde(rename = "serverCompactionPersist")]
+    pub server_compaction_persist: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
     #[serde(rename = "imagesApi")]
@@ -356,6 +358,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if let Some(enabled) = codex.server_compaction_persist {
+                out.push(format!("codex.serverCompactionPersist: {enabled}"));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -711,6 +716,28 @@ pub fn codex_server_compaction() -> bool {
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.server_compaction
+    {
+        return enabled;
+    }
+    false
+}
+
+/// Whether anchored server compaction state is also written to disk, so it
+/// survives the in-memory TTL and proxy restarts. Off by default: the state
+/// holds an encrypted Codex artifact of the conversation.
+pub fn codex_server_compaction_persist() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION_PERSIST") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.server_compaction_persist
     {
         return enabled;
     }
