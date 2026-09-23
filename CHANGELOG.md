@@ -3,6 +3,27 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+Aligning Grok's proxy behavior with original Anthropic model:
+
+- web_search: Unmapped Anthropic hosted-search options follow `CCP_SEARCH_CONSTRAINTS`:
+  `system_prompt` (default), `warning`, `reject`. Old tokens `soft` / `hard`
+  still parse.
+- web_search: Mapping original Anthropic `allowed_domains` / `blocked_domains`
+  constraints into native Grok `filters` (`blocked_domains` ->
+  `excluded_domains`). Maximum 5 domains per list is supported natively by
+  the Grok API. A list over 5 is supported via `system_prompt` (always copies
+  into Grok `instructions` field).
+- web_search: Mapping original Anthropic `user_location` onto Grok
+  `web_search.user_location`.
+- web_search: Anthropic `max_uses` ignored with warning. Unaffected by
+  `CCP_SEARCH_CONSTRAINTS`.
+
+Minor update:
+
+- tests: `cancellation_while_replacement_startup_is_blocked_aborts_request_state`
+  hit a timeout on slow machines. Timeout increased from 2 to 5 seconds.
 ## v0.1.42 (2026-09-23)
 
 - Codex users can select GPT-6 Sol and GPT-6 Luna, including their `-fast`

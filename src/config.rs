@@ -512,6 +512,50 @@ pub fn grok_search_blocks() -> GrokSearchBlocks {
     parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
 }
 
+// ---------------------------------------------------------------------------
+// Hosted-search constraints that a provider cannot enforce
+// (CCP_SEARCH_CONSTRAINTS)
+// ---------------------------------------------------------------------------
+
+/// How the proxy treats Anthropic hosted-search options that the upstream
+/// provider cannot enforce (a domain list over Grok's 5-name cap, a
+/// non-object `user_location`, and unknown hosted `web_search` fields). A
+/// nested `user_location` object and one domain list of length 1..=5 map onto
+/// Grok `web_search`. Anthropic `blocked_domains` maps onto Grok
+/// `excluded_domains`. Both domain lists return 400. Overflow domain lists
+/// always copy into `instructions`. A valid `max_uses` value is always
+/// dropped: Grok has no field for it. The proxy logs that Grok ignores it
+/// and continues. `max_uses` does not follow this policy.
+///
+/// Applies to unmapped hosted-search options only. First provider: Grok.
+/// Codex maps domain filters natively and does not use this policy.
+///
+/// `SystemPrompt` is the default: drop the fields and copy them into a prompt
+/// hint. `Warning` drops them, logs, and continues with no hint. `Reject`
+/// returns 400. Unknown, missing, or empty values fall back to `SystemPrompt`.
+/// The env tokens `soft` and `hard` remain aliases of `system_prompt` and
+/// `reject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchConstraints {
+    SystemPrompt,
+    Warning,
+    Reject,
+}
+
+pub fn parse_search_constraints(raw: Option<&str>) -> SearchConstraints {
+    match raw.map(str::trim) {
+        Some("reject") | Some("hard") => SearchConstraints::Reject,
+        Some("warning") => SearchConstraints::Warning,
+        // `system_prompt` is the named default. `soft` is the old token.
+        // Missing, empty, and unknown values also fall back here.
+        _ => SearchConstraints::SystemPrompt,
+    }
+}
+
+pub fn search_constraints() -> SearchConstraints {
+    parse_search_constraints(std::env::var("CCP_SEARCH_CONSTRAINTS").ok().as_deref())
+}
+
 struct ResolvedOpenCodeConfig {
     api_key: Option<String>,
     api_key_source: Option<&'static str>,
@@ -1234,6 +1278,46 @@ mod tests {
         assert_eq!(parse_codex_transport(""), None);
         assert_eq!(parse_codex_transport("HTTP"), None);
         assert_eq!(parse_codex_transport("ws"), None);
+    }
+
+    #[test]
+    fn parse_search_constraints_flag_values() {
+        assert_eq!(
+            parse_search_constraints(None),
+            SearchConstraints::SystemPrompt
+        );
+        assert_eq!(
+            parse_search_constraints(Some("")),
+            SearchConstraints::SystemPrompt
+        );
+        assert_eq!(
+            parse_search_constraints(Some("system_prompt")),
+            SearchConstraints::SystemPrompt
+        );
+        assert_eq!(
+            parse_search_constraints(Some("soft")),
+            SearchConstraints::SystemPrompt
+        );
+        assert_eq!(
+            parse_search_constraints(Some("reject")),
+            SearchConstraints::Reject
+        );
+        assert_eq!(
+            parse_search_constraints(Some("hard")),
+            SearchConstraints::Reject
+        );
+        assert_eq!(
+            parse_search_constraints(Some("warning")),
+            SearchConstraints::Warning
+        );
+        assert_eq!(
+            parse_search_constraints(Some("bogus")),
+            SearchConstraints::SystemPrompt
+        );
+        assert_eq!(
+            parse_search_constraints(Some(" reject ")),
+            SearchConstraints::Reject
+        );
     }
 
     #[test]

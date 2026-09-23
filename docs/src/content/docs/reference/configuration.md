@@ -71,6 +71,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
 | `CCP_TRAFFIC_LOG` | none | `false` | Enables full request captures for `1`, `true`, or `yes`. |
 | `XDG_STATE_HOME` | none | `~/.local/state` | State base on macOS and Linux. |
+| `CCP_SEARCH_CONSTRAINTS` | none | `system_prompt` | How Grok treats Anthropic hosted-search options it cannot map. Values: `system_prompt` (default), `warning`, `reject`. Old tokens `soft` and `hard` still parse. See [Grok](#grok). |
 
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
@@ -134,9 +135,34 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | --- | --- | --- | --- |
 | `CCP_GROK_BASE_URL` | `grok.baseUrl` | `https://cli-chat-proxy.grok.com/v1` | Changes the Responses API base URL. |
 | `CCP_GROK_CLIENT_VERSION` | `grok.clientVersion` | `0.2.93` | Changes the Grok client version header. |
-| `CCP_GROK_TOOL_IMAGE` | none | `omit` | Selects `omit`, `reattach`, `inline`, or `reject` image handling. |
+| `CCP_GROK_TOOL_IMAGE` | none | `omit` | How pasted images in Claude Code chat reach Grok: `omit` (default, pixels become `[image omitted]`), `reattach`, `inline`, or `reject`. Use `inline` to match native Claude Code vision. |
 | `CCP_GROK_HOSTED_SEARCH` | none | off | Set to `1`, `on`, or `true` to let hosted search tools replace the caller's own search tools and force them on an explicit search turn. |
 | `CCP_GROK_SEARCH_BLOCKS` | none | `text` | Selects how a hosted search is reported: `text` for a text block, `native` for `server_tool_use` plus a `*_tool_result` block. |
+| `CCP_SEARCH_CONSTRAINTS` | none | `system_prompt` | How Grok treats Anthropic hosted-search options it cannot map. |
+
+Claude Code sends Anthropic hosted-search options. The proxy maps them onto Grok where it can.
+
+Mapped automatically:
+
+- Nested `user_location` copies onto Grok `web_search.user_location`.
+- One of `allowed_domains` or `blocked_domains`, up to 5 names, maps onto Grok `filters`. Anthropic `blocked_domains` becomes Grok `excluded_domains`. Both lists on one tool return HTTP 400.
+
+Not supported:
+
+- Anthropic `max_uses`. Grok has no field for it. The proxy drops it with a warning. This does not follow `CCP_SEARCH_CONSTRAINTS`.
+
+Supported via Grok `instructions` (the system prompt):
+
+- A domain list over 5 names. Always copied into `instructions`.
+- A non-object `user_location`, and unknown hosted `web_search` keys. These follow `CCP_SEARCH_CONSTRAINTS`.
+
+| Value | What happens |
+| --- | --- |
+| `system_prompt` (default; old token `soft`) | Drop the unmapped option and copy it into the Grok `instructions` field. |
+| `warning` | Drop it, log, continue. |
+| `reject` (old token `hard`) | Return HTTP 400. |
+
+Codex maps domain filters natively and ignores `CCP_SEARCH_CONSTRAINTS`.
 
 ## OpenCode Go
 
