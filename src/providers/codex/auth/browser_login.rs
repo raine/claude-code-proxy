@@ -116,7 +116,13 @@ pub fn run_browser_login_with_config(
 
         match listener.accept() {
             Ok((mut stream, _)) => {
-                return handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state);
+                match handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state) {
+                    // Ignore unrelated or malformed requests and keep waiting for
+                    // the actual OAuth callback.
+                    Ok(None) => continue,
+                    Ok(Some(tokens)) => return Ok(tokens),
+                    Err(e) => return Err(e),
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -134,7 +140,7 @@ fn handle_callback(
     redirect_uri: &str,
     pkce: &PkceCodes,
     state: &str,
-) -> Result<TokenResponse, anyhow::Error> {
+) -> Result<Option<TokenResponse>, anyhow::Error> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
@@ -142,13 +148,13 @@ fn handle_callback(
         Some(pair) => pair,
         None => {
             write_response(stream, 400, "text/plain", "Bad request");
-            anyhow::bail!("Bad request");
+            return Ok(None);
         }
     };
 
     if path != "/auth/callback" {
         write_response(stream, 404, "text/plain", "Not found");
-        anyhow::bail!("Not found");
+        return Ok(None);
     }
 
     let params = parse_query(&query);
@@ -180,7 +186,7 @@ fn handle_callback(
                 "text/html",
                 "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>",
             );
-            Ok(tokens)
+            Ok(Some(tokens))
         }
         Err(e) => {
             write_response(stream, 500, "text/plain", &e.to_string());
@@ -226,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_login_rejects_wrong_path() {
+    fn handle_callback_ignores_wrong_path() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -234,7 +240,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let _ = handle_callback(
+                    let result = handle_callback(
                         &mut stream,
                         "http://fake-issuer",
                         "http://localhost:1455/auth/callback",
@@ -243,6 +249,10 @@ mod tests {
                             challenge: "c".into(),
                         },
                         "test_state",
+                    );
+                    assert!(
+                        matches!(result, Ok(None)),
+                        "non-callback request must return Ok(None)"
                     );
                     break;
                 }
@@ -386,9 +396,11 @@ mod tests {
                         &pkce,
                         "expected_state",
                     );
-                    let stored = result
-                        .map(|tokens| (tokens.access_token, tokens.refresh_token))
-                        .map_err(|err| err.to_string());
+                    let stored = match result {
+                        Ok(Some(tokens)) => Ok((tokens.access_token, tokens.refresh_token)),
+                        Ok(None) => Err("callback ignored non-callback request".to_string()),
+                        Err(err) => Err(err.to_string()),
+                    };
                     *callback_result_thread.lock().unwrap() = Some(stored);
                     break;
                 }
@@ -465,6 +477,48 @@ mod tests {
             "unexpected response: {response}"
         );
         drop(fail_server);
+    }
+
+    #[test]
+    fn browser_login_ignores_non_callback_request() {
+        // A non-callback request must not terminate an in-flight login.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = BrowserLoginConfig {
+            issuer: "http://fake-issuer".into(),
+            port,
+            timeout: Duration::from_secs(1),
+        };
+
+        let handle = std::thread::spawn(move || {
+            run_browser_login_with_config(&config).map_err(|err| err.to_string())
+        });
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        // Wait for the login thread to bind. A bare connect is itself a
+        // non-callback probe and must not kill the login either.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "login thread did not bind in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let response = test_http::send_get(addr, "/");
+        assert!(response.contains("404"), "unexpected response: {response}");
+
+        let result = handle.join().unwrap();
+        assert!(
+            matches!(result, Err(ref err) if err.contains("OAuth timeout")),
+            "non-callback request must not terminate browser login: {result:?}"
+        );
     }
 
     #[test]
