@@ -325,6 +325,7 @@ const COMPACT_SYSTEM_MARKER: &str =
 const COMPACT_MESSAGE_PREFIX: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
 const COMPACT_MESSAGE_TASK: &str =
     "Your task is to create a detailed summary of the conversation so far";
+const COMPACT_DETECTION_TAIL_MESSAGES: usize = 8;
 
 pub(crate) fn is_compact_request(instructions: Option<&str>) -> bool {
     instructions.is_some_and(|text| text.contains(COMPACT_SYSTEM_MARKER))
@@ -350,9 +351,12 @@ fn is_compact_message_content(content: &Value) -> bool {
 
 pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
     is_compact_request(flatten_system_text(request.extra.get("system")).as_deref())
-        || request.messages.last().is_some_and(|message| {
-            message.role == "user" && is_compact_message_content(&message.content)
-        })
+        || request
+            .messages
+            .iter()
+            .rev()
+            .take(COMPACT_DETECTION_TAIL_MESSAGES)
+            .any(|message| message.role == "user" && is_compact_message_content(&message.content))
 }
 
 /// Reasoning-effort cap applied to compaction requests, or None when the
@@ -1853,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_message_markers_must_be_in_final_user_message() {
+    fn compact_request_detected_when_context_follows_compact_message() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "messages": [
@@ -1864,11 +1868,44 @@ mod tests {
                         "Your task is to create a detailed summary of the conversation so far."
                     )
                 },
-                {"role": "user", "content": "continue normally"}
+                {"role": "assistant", "content": "context appended after compact prompt"}
             ],
             "system": "You are Claude Code."
         }))
         .unwrap();
+
+        assert!(is_compact_messages_request(&req));
+    }
+
+    #[test]
+    fn historical_compact_message_outside_detection_tail_is_ignored() {
+        let mut messages = vec![
+            serde_json::from_value(json!({
+                "role": "user",
+                "content": concat!(
+                    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n",
+                    "Your task is to create a detailed summary of the conversation so far."
+                )
+            }))
+            .unwrap(),
+        ];
+        messages.extend((0..COMPACT_DETECTION_TAIL_MESSAGES).map(|index| {
+            serde_json::from_value(json!({
+                "role": "user",
+                "content": format!("ordinary message {index}")
+            }))
+            .unwrap()
+        }));
+
+        let req = MessagesRequest {
+            model: Some("gpt-5.6-sol".to_string()),
+            messages,
+            ..serde_json::from_value(json!({
+                "model": "gpt-5.6-sol",
+                "messages": []
+            }))
+            .unwrap()
+        };
 
         assert!(!is_compact_messages_request(&req));
     }

@@ -90,6 +90,17 @@ impl CodexProvider {
     }
 }
 
+fn transport_for_request(
+    configured: config::CodexTransport,
+    compact_boundary: bool,
+) -> config::CodexTransport {
+    if compact_boundary {
+        config::CodexTransport::Http
+    } else {
+        configured
+    }
+}
+
 impl CodexProvider {
     async fn handle_messages_inner(
         &self,
@@ -293,7 +304,8 @@ impl CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id();
-        let configured_transport = config::codex_transport();
+        let configured_transport =
+            transport_for_request(config::codex_transport(), compact_boundary);
         let transport = configured_transport.as_str();
         let upstream_started_at = Instant::now();
         let log = create_logger("codex");
@@ -1667,6 +1679,22 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
+
+    #[test]
+    fn compact_boundary_uses_http_without_rerouting_ordinary_websocket_requests() {
+        assert_eq!(
+            transport_for_request(config::CodexTransport::WebSocket, true),
+            config::CodexTransport::Http
+        );
+        assert_eq!(
+            transport_for_request(config::CodexTransport::Auto, true),
+            config::CodexTransport::Http
+        );
+        assert_eq!(
+            transport_for_request(config::CodexTransport::WebSocket, false),
+            config::CodexTransport::WebSocket
+        );
+    }
 
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
         translate::request::ResponsesRequest {
