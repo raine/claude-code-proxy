@@ -274,7 +274,7 @@ mod tests {
         for model in ULTRAFAST_MODELS {
             let name = format!("{model}-ultrafast");
             assert!(is_valid_model_for_codex(&name), "{name}");
-            let r = resolve_model_request(&name);
+            let r = resolve_with_model_override(&name, None);
             assert_eq!(r.model, *model);
             assert_eq!(r.service_tier, Some(ServiceTier::Ultrafast));
             assert!(assert_allowed_model(&r.model).is_ok());
@@ -290,7 +290,7 @@ mod tests {
             let name = format!("{model}-ultrafast");
             assert!(!is_valid_model_for_codex(&name), "{name}");
             assert_eq!(split_tier_suffix(&name), None, "{name}");
-            let r = resolve_model_request(&name);
+            let r = resolve_with_model_override(&name, None);
             assert_eq!(r.service_tier, None, "{name}");
             assert!(assert_allowed_model(&r.model).is_err(), "{name}");
         }
@@ -352,6 +352,18 @@ mod tests {
         let cases: &[(&str, Option<&str>, &str, Option<ServiceTier>)] = &[
             ("gpt-6-sol", None, "gpt-6-sol", None),
             ("gpt-6-sol", Some(""), "gpt-6-sol", None),
+            (
+                "gpt-6-sol-fast",
+                None,
+                "gpt-6-sol",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                "gpt-6-sol",
+                Some("gpt-6-astra-fast"),
+                "gpt-6-astra",
+                Some(ServiceTier::Priority),
+            ),
             (
                 "gpt-6-sol-fast",
                 Some("gpt-6-astra"),
