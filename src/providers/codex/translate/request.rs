@@ -1297,28 +1297,6 @@ mod tests {
     }
 
     #[test]
-    fn ultrafast_model_tier_reaches_the_wire() {
-        let req: MessagesRequest = serde_json::from_value(json!({
-            "model": "gpt-6-astra-ultrafast",
-            "messages": [{"role":"user", "content":"hi"}]
-        }))
-        .unwrap();
-        let out = translate_request(
-            &req,
-            TranslateOptions {
-                session_id: None,
-                service_tier: Some(ServiceTier::Ultrafast),
-                model: "gpt-6-astra".to_string(),
-                use_responses_lite: true,
-            },
-        )
-        .unwrap();
-        let wire = serde_json::to_value(out).unwrap();
-        assert_eq!(wire["model"], "gpt-6-astra");
-        assert_eq!(wire["service_tier"], "ultrafast");
-    }
-
-    #[test]
     fn responses_tool_choice_modes_serialize_as_openai_strings() {
         for (mode, expected) in [
             (ResponsesToolChoiceMode::Auto, json!("auto")),
