@@ -11,6 +11,7 @@ use crate::providers::translate_shared::{
     read_effort,
 };
 
+use super::model_allowlist::service_tier_for_model;
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
@@ -46,6 +47,7 @@ impl std::fmt::Display for Effort {
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
     Priority,
+    Ultrafast,
     Flex,
 }
 
@@ -387,29 +389,39 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
     }
 }
 
-const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex"];
+const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "ultrafast", "flex"];
 
 fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
-    if !VALID_SERVICE_TIERS.contains(&tier) {
-        anyhow::bail!(
+    match tier {
+        "fast" | "priority" => Ok(ServiceTier::Priority),
+        "ultrafast" => Ok(ServiceTier::Ultrafast),
+        "flex" => Ok(ServiceTier::Flex),
+        _ => anyhow::bail!(
             "Invalid service tier override: \"{tier}\". Must be one of: {}",
             VALID_SERVICE_TIERS.join(", ")
-        );
-    }
-    match tier {
-        "flex" => Ok(ServiceTier::Flex),
-        _ => Ok(ServiceTier::Priority),
+        ),
     }
 }
 
 fn resolve_service_tier(
     model_tier: Option<ServiceTier>,
+    model: &str,
 ) -> Result<Option<ServiceTier>, anyhow::Error> {
-    let tier = config::codex_service_tier();
-    match tier {
-        Some(ref val) => Ok(Some(normalize_service_tier(val)?)),
-        None => Ok(model_tier),
-    }
+    pick_service_tier(config::codex_service_tier().as_deref(), model_tier, model)
+}
+
+/// The configured override wins over the tier implied by the model name. Either
+/// one is narrowed to a tier the upstream `model` offers.
+fn pick_service_tier(
+    override_tier: Option<&str>,
+    model_tier: Option<ServiceTier>,
+    model: &str,
+) -> Result<Option<ServiceTier>, anyhow::Error> {
+    let tier = match override_tier {
+        Some(value) => Some(normalize_service_tier(value)?),
+        None => model_tier,
+    };
+    Ok(tier.map(|tier| service_tier_for_model(model, tier)))
 }
 
 pub fn normalize_strict_json_schema(schema: &Value) -> Value {
@@ -568,7 +580,7 @@ fn translate_request_inner(
     }
 
     if apply_codex_config {
-        let service_tier = resolve_service_tier(opts.service_tier)?;
+        let service_tier = resolve_service_tier(opts.service_tier, &out.model)?;
         if let Some(ref tier) = service_tier {
             out.service_tier = Some(tier.clone());
         }
@@ -1210,6 +1222,78 @@ mod tests {
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
         }
+    }
+
+    #[test]
+    fn service_tier_override_values_normalize_to_wire_tiers() {
+        for (value, tier, wire) in [
+            ("fast", ServiceTier::Priority, "priority"),
+            ("priority", ServiceTier::Priority, "priority"),
+            ("ultrafast", ServiceTier::Ultrafast, "ultrafast"),
+            ("flex", ServiceTier::Flex, "flex"),
+        ] {
+            let normalized = normalize_service_tier(value).unwrap();
+            assert_eq!(normalized, tier, "{value}");
+            assert_eq!(serde_json::to_value(normalized).unwrap(), json!(wire));
+        }
+        for value in ["", "default", "Ultrafast", "ultra-fast", "turbo"] {
+            let error = normalize_service_tier(value).unwrap_err().to_string();
+            assert!(error.contains("ultrafast"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn service_tier_override_wins_and_narrows_to_the_model() {
+        let cases = [
+            (None, None, "gpt-6-astra", None),
+            (
+                None,
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                None,
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-sol",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                Some("ultrafast"),
+                None,
+                "gpt-6-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                Some("ultrafast"),
+                Some(ServiceTier::Priority),
+                "gpt-6-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                Some("ultrafast"),
+                None,
+                "gpt-6-luna",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                Some("fast"),
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-astra",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                Some("flex"),
+                Some(ServiceTier::Ultrafast),
+                "gpt-6-astra",
+                Some(ServiceTier::Flex),
+            ),
+        ];
+        for (override_tier, model_tier, model, expected) in cases {
+            let picked = pick_service_tier(override_tier, model_tier.clone(), model).unwrap();
+            assert_eq!(picked, expected, "{override_tier:?} {model_tier:?} {model}");
+        }
+        assert!(pick_service_tier(Some("turbo"), None, "gpt-6-astra").is_err());
     }
 
     #[test]

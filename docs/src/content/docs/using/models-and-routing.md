@@ -9,7 +9,7 @@ The model ID in each request selects its provider. One proxy listener can serve 
 
 | Pattern | Provider |
 | --- | --- |
-| Registered `gpt-*` IDs and their `-fast` forms | Codex |
+| Registered `gpt-*` IDs and their `-fast` and `-ultrafast` forms | Codex |
 | `kimi-for-coding`, `kimi-k2.6`, `k2.6` | Kimi |
 | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6` | Grok |
 | Non-conflicting registered OpenCode Go IDs and every `opencode-go/<model-id>` | OpenCode Go |
@@ -37,7 +37,11 @@ curl http://127.0.0.1:18765/v1/models
 
 ## Codex fast mode
 
-Every registered Codex model also has a local `-fast` form. The proxy removes `-fast` from the upstream model and requests the priority service tier. A configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins.
+Every registered Codex model also has a local `-fast` form. The proxy removes `-fast` from the upstream model and requests the priority service tier.
+
+Models that offer the ultrafast tier also have a local `-ultrafast` form, which requests the ultrafast service tier. Today that is `gpt-6-astra-ultrafast` only. An `-ultrafast` name on any other model is not a registered ID.
+
+For Claude Code requests on `/v1/messages`, a configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins over both suffixes. When the forced tier is `ultrafast` and the model does not offer it, the proxy requests priority instead.
 
 ## The `[1m]` hint
 

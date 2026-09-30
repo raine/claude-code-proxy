@@ -51,7 +51,7 @@ use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    uses_responses_lite,
+    tier_model_variants, uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -532,7 +532,7 @@ impl Provider for CodexProvider {
             .map(|m| m.to_string())
             .collect();
         for m in registry::CODEX_MODELS {
-            models.push(format!("{m}-fast"));
+            models.extend(tier_model_variants(m));
         }
         models.sort_unstable();
         models.dedup();
@@ -2077,6 +2077,9 @@ mod tests {
         assert!(models.contains(&"gpt-6.1-sol-fast".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
+        assert!(models.contains(&"gpt-6-astra-fast".to_string()));
+        assert!(models.contains(&"gpt-6-astra-ultrafast".to_string()));
+        assert!(!models.contains(&"gpt-6-sol-ultrafast".to_string()));
     }
 
     #[test]
