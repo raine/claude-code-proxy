@@ -458,6 +458,37 @@ mod tests {
     }
 
     #[test]
+    fn tier_suffix_sets_service_tier() {
+        for (model, upstream_model, tier) in [
+            ("gpt-6-astra", "gpt-6-astra", None),
+            ("gpt-6-astra-fast", "gpt-6-astra", Some("priority")),
+            ("gpt-6-astra-ultrafast", "gpt-6-astra", Some("ultrafast")),
+            (
+                "gpt-6-astra-ultrafast[1m]",
+                "gpt-6-astra",
+                Some("ultrafast"),
+            ),
+        ] {
+            let mut body = base();
+            body["model"] = json!(model);
+            let translated = translate_request(body).unwrap();
+            assert_eq!(translated.upstream["model"], upstream_model, "{model}");
+            assert_eq!(
+                translated
+                    .upstream
+                    .get("service_tier")
+                    .and_then(Value::as_str),
+                tier,
+                "{model}"
+            );
+        }
+
+        let mut body = base();
+        body["model"] = json!("gpt-6-sol-ultrafast");
+        assert!(translate_request(body).is_err());
+    }
+
+    #[test]
     fn none_effort_retains_context() {
         let mut body = base();
         body["reasoning_effort"] = json!("none");
