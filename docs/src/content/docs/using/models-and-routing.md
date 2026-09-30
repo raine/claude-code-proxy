@@ -41,7 +41,7 @@ Every registered Codex model also has a local `-fast` form. The proxy removes `-
 
 Models that offer the ultrafast tier also have a local `-ultrafast` form, which requests the ultrafast service tier. Today that is `gpt-6-astra-ultrafast` only. An `-ultrafast` name on any other model is not a registered ID.
 
-A configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins over both suffixes. When the forced tier is `ultrafast` and the model does not offer it, the proxy requests priority instead.
+For Claude Code requests on `/v1/messages`, a configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins over both suffixes. When the forced tier is `ultrafast` and the model does not offer it, the proxy requests priority instead.
 
 ## The `[1m]` hint
 
