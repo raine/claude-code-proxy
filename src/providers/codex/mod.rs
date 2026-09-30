@@ -226,6 +226,13 @@ impl CodexProvider {
             && compact_boundary
             && let Some(session_id) = ctx.session_id.as_deref()
         {
+            // A boundary reached from an already-anchored conversation compacts
+            // the native history rather than the portable summary standing in
+            // for it. Otherwise each native artifact survives only until the
+            // next boundary, and the new portable summary is written without it.
+            if let Some(replay) = apply_compaction_replay(Some(session_id), &translated) {
+                translated = replay.request;
+            }
             let attempt = begin_compaction(session_id, &translated.model);
             compaction_attempt = Some(attempt);
             log_compaction_event(

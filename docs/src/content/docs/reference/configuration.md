@@ -27,6 +27,7 @@ These settings configure the proxy process. Claude Code client settings such as 
     "headerTimeoutMs": 300000,
     "previousResponseId": false,
     "serverCompaction": false,
+    "serverCompactionPersist": false,
     "responsesApi": false,
     "imagesApi": false,
     "imagesBaseUrl": "https://chatgpt.com/backend-api/codex"
@@ -112,6 +113,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | Sets how long an HTTP-transport request waits for the Codex response headers. Values below `1000` are ignored. |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
 | `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |
+| `CCP_CODEX_SERVER_COMPACTION_PERSIST` | `codex.serverCompactionPersist` | `false` | Also stores anchored native compaction state on disk so it survives idle time and restarts. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_BASE_URL` | `codex.imagesBaseUrl` | `https://chatgpt.com/backend-api/codex` | Sets the trusted Codex Images API root; production use is restricted to HTTPS `chatgpt.com/backend-api/codex`. |

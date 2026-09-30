@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::anthropic::sse::parse_sse_events;
+use crate::logging::create_logger;
 use crate::provider::RequestContext;
+use crate::{config, paths};
 use crate::providers::codex::client::{CodexError, CodexHttpClient};
 
 use super::translate::request::{
@@ -17,6 +22,7 @@ const MAX_STATES: usize = 1_000;
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_STATE_BYTES: usize = 20_000_000;
 const MIN_PORTABLE_SUMMARY_BYTES: usize = 32;
+const PERSISTED_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug)]
 pub enum CompactionError {
@@ -105,6 +111,7 @@ pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
     evict_states(registry, now);
     registry.states.insert(session_id.to_string(), state);
     evict_states(registry, now);
+    remove_persisted(session_id);
     attempt
 }
 
@@ -178,6 +185,7 @@ pub fn activate_compaction(
         update_total_bytes(registry);
         return false;
     }
+    persist_anchored(session_id, state);
     evict_states(registry, now);
     registry.states.contains_key(session_id)
 }
@@ -189,31 +197,29 @@ pub fn apply_compaction_replay(
     let session_id = session_id?;
     let now = now_ms();
     let mut guard = REGISTRY.lock().unwrap();
-    let registry = guard.as_mut()?;
+    let registry = guard.get_or_insert_with(CompactionRegistry::default);
     evict_states(registry, now);
-    let state = registry.states.get_mut(session_id)?;
-    if !matches!(state.phase, CompactionPhase::Anchored { .. }) {
-        return None;
-    }
-    if state.model != request.model {
-        registry.states.remove(session_id);
+    if !registry.states.contains_key(session_id)
+        && let Some(state) = load_persisted(session_id)
+    {
+        registry.states.insert(session_id.to_string(), state);
         update_total_bytes(registry);
-        return None;
     }
+    let state = registry.states.get_mut(session_id)?;
     let CompactionPhase::Anchored { portable_summary } = &state.phase else {
         return None;
     };
+    // Subagents and small-fast-model side requests share the session header
+    // but not the model or the anchored conversation. They skip replay; they
+    // must not discard the main conversation's state.
+    if state.model != request.model {
+        return None;
+    }
 
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
-    let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
-    };
-    if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+    let text = message_text(summary_item)?;
+    if text.match_indices(portable_summary.as_str()).count() != 1 {
         return None;
     }
     if conversation.len() == 1 {
@@ -230,6 +236,7 @@ pub fn apply_compaction_replay(
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
         registry.states.remove(session_id);
         update_total_bytes(registry);
+        remove_persisted(session_id);
         return None;
     }
     state.updated_at = now;
@@ -254,6 +261,7 @@ pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<Compac
     {
         registry.states.remove(session_id);
         update_total_bytes(registry);
+        remove_persisted(session_id);
     }
 }
 
@@ -262,6 +270,88 @@ pub fn clear_compaction(session_id: &str) {
     if let Some(registry) = guard.as_mut() {
         registry.states.remove(session_id);
         update_total_bytes(registry);
+    }
+    remove_persisted(session_id);
+}
+
+/// On-disk form of an anchored state. The in-memory registry stays the
+/// working copy; the file only lets a state outlive `STATE_TTL_MS` and
+/// proxy restarts, which matter for sessions that sit idle between turns.
+#[derive(Serialize, Deserialize)]
+struct PersistedCompaction {
+    version: u32,
+    model: String,
+    portable_summary: String,
+    native_history: Vec<ResponsesInputItem>,
+}
+
+fn persisted_path(session_id: &str) -> Option<PathBuf> {
+    if !config::codex_server_compaction_persist() {
+        return None;
+    }
+    let file_safe = !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    file_safe.then(|| {
+        paths::state_dir()
+            .join("codex-compaction")
+            .join(format!("{session_id}.json"))
+    })
+}
+
+fn persist_anchored(session_id: &str, state: &CompactionState) {
+    let CompactionPhase::Anchored { portable_summary } = &state.phase else {
+        return;
+    };
+    let Some(path) = persisted_path(session_id) else {
+        return;
+    };
+    let record = PersistedCompaction {
+        version: PERSISTED_FORMAT_VERSION,
+        model: state.model.clone(),
+        portable_summary: portable_summary.clone(),
+        native_history: state.native_history.clone(),
+    };
+    if let Err(error) = crate::auth::write_atomically(&path.to_string_lossy(), &record) {
+        create_logger("codex").warn(
+            "server_compaction_persist_failed",
+            Some(serde_json::Map::from_iter([(
+                "error".to_string(),
+                serde_json::json!(error.to_string()),
+            )])),
+        );
+    }
+}
+
+fn load_persisted(session_id: &str) -> Option<CompactionState> {
+    let path = persisted_path(session_id)?;
+    let bytes = std::fs::read(&path).ok()?;
+    let record: PersistedCompaction = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    if record.version != PERSISTED_FORMAT_VERSION {
+        return None;
+    }
+    Some(CompactionState {
+        attempt: CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed)),
+        model: record.model,
+        native_history: record.native_history,
+        phase: CompactionPhase::Anchored {
+            portable_summary: record.portable_summary,
+        },
+        updated_at: now_ms(),
+    })
+}
+
+fn remove_persisted(session_id: &str) {
+    if let Some(path) = persisted_path(session_id) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -853,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_clears_on_missing_or_duplicate_anchor() {
+    fn replay_skips_on_missing_or_duplicate_anchor() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         for text in [
             "different conversation without the expected summary".to_string(),
@@ -878,6 +968,11 @@ mod tests {
             ]));
             assert!(apply_compaction_replay(Some("session"), &changed).is_none());
             assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+            let anchored = request(json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+            ]));
+            assert!(apply_compaction_replay(Some("session"), &anchored).is_some());
         }
     }
 
@@ -929,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_clears_on_model_change() {
+    fn replay_skips_on_model_change() {
         let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
         clear_all_compactions_for_tests();
         let attempt = stored_compaction(
@@ -950,6 +1045,107 @@ mod tests {
         ]));
         changed.model = "gpt-5.4".to_string();
         assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+        changed.model = "gpt-5.6-sol".to_string();
+        assert!(apply_compaction_replay(Some("session"), &changed).is_some());
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_state_survives_registry_loss_and_clears_with_it() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let state_home = tempfile::TempDir::new().unwrap();
+        let config_home = tempfile::TempDir::new().unwrap();
+        let _env = [
+            EnvGuard::set("XDG_STATE_HOME", state_home.path()),
+            EnvGuard::set("CCP_CONFIG_DIR", config_home.path()),
+            EnvGuard::set("CCP_CODEX_SERVER_COMPACTION_PERSIST", "on"),
+        ];
+        clear_all_compactions_for_tests();
+        let attempt = stored_compaction(
+            "persisted-session",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        );
+        assert!(activate_compaction(
+            Some("persisted-session"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+        let file = state_home
+            .path()
+            .join("claude-code-proxy/codex-compaction/persisted-session.json");
+        assert!(file.exists());
+
+        // Stands in for STATE_TTL_MS eviction and for a proxy restart.
+        clear_all_compactions_for_tests();
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("persisted-session"), &next).unwrap();
+        assert!(matches!(
+            replay.request.input[0],
+            ResponsesInputItem::Compaction { .. }
+        ));
+
+        // An upstream failure on the replayed request drops both copies.
+        abort_compaction_attempt(Some("persisted-session"), Some(replay.attempt));
+        assert!(!file.exists());
+        clear_all_compactions_for_tests();
+        assert!(apply_compaction_replay(Some("persisted-session"), &next).is_none());
+    }
+
+    #[test]
+    fn persistence_is_off_by_default() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let state_home = tempfile::TempDir::new().unwrap();
+        let config_home = tempfile::TempDir::new().unwrap();
+        let _env = [
+            EnvGuard::set("XDG_STATE_HOME", state_home.path()),
+            EnvGuard::set("CCP_CONFIG_DIR", config_home.path()),
+            EnvGuard::set("CCP_CODEX_SERVER_COMPACTION_PERSIST", "off"),
+        ];
+        clear_all_compactions_for_tests();
+        let attempt = stored_compaction(
+            "memory-only",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        );
+        assert!(activate_compaction(
+            Some("memory-only"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+        assert!(!state_home.path().join("claude-code-proxy").exists());
     }
 
     #[test]

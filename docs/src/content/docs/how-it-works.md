@@ -39,7 +39,7 @@ Routing happens per request, not per server process or API surface. Codex IDs, K
 
 ## Session state
 
-Claude Code sends `x-claude-code-session-id`. The proxy uses it for monitor grouping and provider features that need continuity. Cursor conversation IDs, optional Codex `previous_response_id`, and optional Codex server compaction state live in memory. A proxy restart clears that state and portable Claude Code history remains the fallback.
+Claude Code sends `x-claude-code-session-id`. The proxy uses it for monitor grouping and provider features that need continuity. Cursor conversation IDs, optional Codex `previous_response_id`, and optional Codex server compaction state live in memory; server compaction state can also be persisted to disk. A proxy restart clears in-memory state and portable Claude Code history remains the fallback.
 
 ## Count tokens
 
