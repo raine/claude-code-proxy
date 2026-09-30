@@ -20,7 +20,7 @@ use crate::traffic::{
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
     ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
-    split_tier_suffix, uses_responses_lite,
+    service_tier_for_model, split_tier_suffix, uses_responses_lite,
 };
 use super::translate::request::ServiceTier;
 
@@ -129,7 +129,10 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     if let Some(tier) = service_tier
         && !object.contains_key("service_tier")
     {
-        object.insert("service_tier".to_string(), json!(tier));
+        object.insert(
+            "service_tier".to_string(),
+            json!(service_tier_for_model(&model, tier)),
+        );
     }
 
     Ok(NativeResolved {
