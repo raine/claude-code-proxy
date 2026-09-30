@@ -30,7 +30,11 @@ Use `claude-code-proxy models` as the current catalog. Model access depends on y
 
 Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus`, `fable`, `claude-opus-*` (including `claude-opus-5-5`), and `claude-fable-*` to `gpt-6-sol`.
 
-Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
+Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.
+
+Append `-ultrafast` to a model that offers the ultrafast tier to request `service_tier: "ultrafast"`. Only `gpt-6-astra` offers it today, so `gpt-6-astra-ultrafast` is the one ultrafast ID.
+
+`CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence over either suffix. A forced `ultrafast` applies to models that offer it, and the proxy requests `priority` for the others.
 
 ## Reasoning
 
