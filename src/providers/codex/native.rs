@@ -20,8 +20,9 @@ use crate::traffic::{
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
     ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
-    uses_responses_lite,
+    split_tier_suffix, uses_responses_lite,
 };
+use super::translate::request::ServiceTier;
 
 pub struct CodexNativeBackend {
     client: Arc<CodexHttpClient>,
@@ -118,15 +119,17 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
         .as_object_mut()
         .expect("validated native Responses body must be an object");
 
-    let (mut model, priority) = resolve_native_model(&requested);
+    let (mut model, service_tier) = resolve_native_model(&requested);
 
     let hosted_web_search = has_native_hosted_web_search(object);
     if hosted_web_search {
         model = full_lane_web_search_model(&model).to_string();
     }
     object.insert("model".to_string(), Value::String(model.clone()));
-    if priority && !object.contains_key("service_tier") {
-        object.insert("service_tier".to_string(), json!("priority"));
+    if let Some(tier) = service_tier
+        && !object.contains_key("service_tier")
+    {
+        object.insert("service_tier".to_string(), json!(tier));
     }
 
     Ok(NativeResolved {
@@ -139,17 +142,17 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     })
 }
 
-fn resolve_native_model(requested: &str) -> (String, bool) {
-    let (requested, priority) = match requested.strip_suffix("-fast") {
-        Some(base) if ALLOWED_MODELS.contains(&base) => (base, true),
-        _ => (requested, false),
+fn resolve_native_model(requested: &str) -> (String, Option<ServiceTier>) {
+    let (requested, service_tier) = match split_tier_suffix(requested) {
+        Some((base, tier)) => (base, Some(tier)),
+        None => (requested, None),
     };
     let model = MODEL_ALIASES
         .iter()
         .find(|(alias, _)| *alias == requested)
         .map(|(_, target)| *target)
         .unwrap_or(requested);
-    (model.to_string(), priority)
+    (model.to_string(), service_tier)
 }
 
 fn has_native_hosted_web_search(object: &Map<String, Value>) -> bool {
@@ -714,6 +717,30 @@ mod tests {
             shape_native_request(&mut body).unwrap();
             assert_eq!(body["parallel_tool_calls"], parallel);
         }
+    }
+
+    #[test]
+    fn native_request_resolves_ultrafast_tier() {
+        let mut body = request(json!({"model":"gpt-6-astra-ultrafast","input":[]}));
+        let resolved = shape_native_request(&mut body).unwrap();
+        assert_eq!(resolved.model, "gpt-6-astra");
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert_eq!(body["service_tier"], "ultrafast");
+
+        let mut explicit = request(json!({
+            "model":"gpt-6-astra-ultrafast",
+            "service_tier":"priority",
+            "input":[]
+        }));
+        shape_native_request(&mut explicit).unwrap();
+        assert_eq!(explicit["service_tier"], "priority");
+    }
+
+    #[test]
+    fn native_request_rejects_ultrafast_suffix_without_the_tier() {
+        let mut body = request(json!({"model":"gpt-6-sol-ultrafast","input":[]}));
+        let response = shape_native_request(&mut body).err().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
