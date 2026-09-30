@@ -34,7 +34,7 @@ Append `-fast` to any registered Codex model to request `service_tier: "priority
 
 Append `-ultrafast` to a model that offers the ultrafast tier to request `service_tier: "ultrafast"`. Only `gpt-6-astra` offers it today, so `gpt-6-astra-ultrafast` is the one ultrafast ID.
 
-`CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence over either suffix. A forced `ultrafast` applies to models that offer it, and the proxy requests `priority` for the others.
+On `/v1/messages`, `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence over either suffix. A forced `ultrafast` applies to models that offer it, and the proxy requests `priority` for the others. The OpenAI-compatible routes use only the suffix or, on `/v1/responses`, the request's own `service_tier`.
 
 ## Reasoning
 
