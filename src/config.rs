@@ -894,7 +894,7 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::WebSocket
+    CodexTransport::Auto
 }
 
 /// How long an HTTP-transport request waits for the Codex response headers.
