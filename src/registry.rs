@@ -361,7 +361,11 @@ mod tests {
     #[test]
     fn ultrafast_variant_routes_to_codex_only_where_offered() {
         let registry = Registry::new(AliasProvider::Codex);
-        for model in ["gpt-6-astra-ultrafast", "gpt-6-astra-ultrafast[1m]"] {
+        for model in [
+            "gpt-6-astra-ultrafast",
+            "gpt-6-astra-ultrafast[1m]",
+            "gpt-6.1-sol-ultrafast",
+        ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
                 "codex"

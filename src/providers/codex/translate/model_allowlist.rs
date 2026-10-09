@@ -42,7 +42,7 @@ pub struct ResolvedModel {
 
 /// Models whose Codex catalog entry offers the `ultrafast` service tier.
 /// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
-pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra"];
+pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
 
 const FAST_SUFFIX: &str = "-fast";
 const ULTRAFAST_SUFFIX: &str = "-ultrafast";
@@ -313,6 +313,11 @@ mod tests {
             ),
             ("gpt-6-astra", ServiceTier::Priority, ServiceTier::Priority),
             ("gpt-6-astra", ServiceTier::Flex, ServiceTier::Flex),
+            (
+                "gpt-6.1-sol",
+                ServiceTier::Ultrafast,
+                ServiceTier::Ultrafast,
+            ),
             ("gpt-6-sol", ServiceTier::Ultrafast, ServiceTier::Priority),
             ("gpt-6-luna", ServiceTier::Ultrafast, ServiceTier::Priority),
             ("gpt-6-sol", ServiceTier::Priority, ServiceTier::Priority),
