@@ -89,7 +89,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
-| Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |
+| Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models, `-fast`/`-ultrafast` |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
 | OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
