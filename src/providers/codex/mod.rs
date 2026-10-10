@@ -766,6 +766,7 @@ async fn live_stream_response(
     transport: config::CodexTransport,
 ) -> Response {
     let model = model.to_string();
+    let started_at = Instant::now();
     let request_continuation = continuation.clone();
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
@@ -865,11 +866,37 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                    if is_empty_completion_error(&error) {
+                        create_logger("codex").warn(
+                            "codex_empty_completion_exhausted",
+                            Some(empty_completion_exhausted_fields(
+                                &ctx.req_id,
+                                transport.as_str(),
+                                &model,
+                                attempt + 1,
+                                "max_attempts",
+                                started_at.elapsed().as_millis(),
+                            )),
+                        );
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
+                    if is_empty_completion_error(&error) {
+                        create_logger("codex").warn(
+                            "codex_empty_completion_exhausted",
+                            Some(empty_completion_exhausted_fields(
+                                &ctx.req_id,
+                                transport.as_str(),
+                                &model,
+                                attempt + 1,
+                                "backoff_budget",
+                                started_at.elapsed().as_millis(),
+                            )),
+                        );
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -1315,6 +1342,12 @@ where
         (http::header::CONNECTION, "keep-alive"),
     ];
     (headers, Body::from_stream(stream)).into_response()
+}
+
+/// True when *error* is the empty-completion 503 rather than some other
+/// retryable failure sharing the live-stream retry loop.
+fn is_empty_completion_error(error: &client::CodexError) -> bool {
+    error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL)
 }
 
 /// Log fields for giving up on an empty completion, on either exit.
