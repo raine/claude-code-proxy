@@ -9,9 +9,16 @@ LLM docs: <https://claude-code-proxy.raine.dev/llms.txt>
 
 <img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
-> [!TIP]
-> I'm building [aven](https://github.com/raine/aven), a local-first task manager
-> for power users and agents.
+<a href="https://aventasks.dev/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://aventasks.dev/readme/aven-banner-dark.webp">
+    <img src="https://aventasks.dev/readme/aven-banner-light.webp" alt="aven: one task queue for you and your coding agents" width="100%">
+  </picture>
+</a>
+
+<sub>Also from the author of claude-code-proxy: <a href="https://aventasks.dev/"><b>aven</b></a>, one
+queue for every project, with a keyboard-driven TUI for you and a CLI for your
+agents.</sub>
 
 ## Why?
 
