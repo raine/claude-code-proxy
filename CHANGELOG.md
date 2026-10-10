@@ -3,7 +3,7 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
-## Unreleased
+## v0.1.45 (2026-10-10)
 
 - Codex users can request the ultrafast service tier with
   `gpt-6-astra-ultrafast` or `gpt-6.1-sol-ultrafast`, or set
