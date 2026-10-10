@@ -1497,6 +1497,7 @@ async fn smoke_codex_http_empty_completions_exhaust_to_service_unavailable() {
 
     let response = call_messages("gpt-5.5").await;
     let status = response.status();
+    let should_retry = response.headers().get("x-should-retry").cloned();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1506,6 +1507,11 @@ async fn smoke_codex_http_empty_completions_exhaust_to_service_unavailable() {
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         "exhausted empty completions must surface an explicit error: {body_text}"
+    );
+    assert_eq!(
+        should_retry.as_ref().and_then(|v| v.to_str().ok()),
+        Some("false"),
+        "the proxy already retried; the client must not multiply it"
     );
     assert!(
         body_text.contains("Codex completed without producing output"),

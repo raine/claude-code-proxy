@@ -1481,7 +1481,17 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
         return map_codex_failure_to_response(message);
     }
     if err.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message);
+        // The proxy has already spent its own retry budget on this request, so
+        // a client retry only multiplies it: Claude Code resends a 503 up to
+        // ten times, each one repeating the proxy's full retry loop.
+        return (
+            [(
+                HeaderName::from_static("x-should-retry"),
+                HeaderValue::from_static("false"),
+            )],
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message),
+        )
+            .into_response();
     }
 
     match err.status {
@@ -2166,10 +2176,9 @@ mod tests {
 
         assert_eq!(err.status, 503);
         assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
-        assert_eq!(
-            map_codex_error_to_response(&err).status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        let response = map_codex_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["x-should-retry"], "false");
     }
 
     #[test]
