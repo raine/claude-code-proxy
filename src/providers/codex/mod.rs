@@ -404,16 +404,56 @@ impl CodexProvider {
             let error = empty_buffered_completion_error();
             drop_live_continuation_for_retry(&mut continuation);
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
+                log.warn(
+                    "codex_empty_completion_exhausted",
+                    Some(empty_completion_exhausted_fields(
+                        &req_id,
+                        transport,
+                        &resolved.model,
+                        attempt + 1,
+                        "max_attempts",
+                        upstream_started_at.elapsed().as_millis(),
+                    )),
+                );
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
+                log.warn(
+                    "codex_empty_completion_exhausted",
+                    Some(empty_completion_exhausted_fields(
+                        &req_id,
+                        transport,
+                        &resolved.model,
+                        attempt + 1,
+                        "backoff_budget",
+                        upstream_started_at.elapsed().as_millis(),
+                    )),
+                );
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
+            log.warn(
+                "codex_empty_completion_retry",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&req_id)),
+                    ("transport".to_string(), serde_json::json!(transport)),
+                    ("model".to_string(), serde_json::json!(&resolved.model)),
+                    ("failedAttempt".to_string(), serde_json::json!(attempt + 1)),
+                    (
+                        "maxAttempts".to_string(),
+                        serde_json::json!(MAX_EMPTY_COMPLETION_RETRIES + 1),
+                    ),
+                    ("delayMs".to_string(), serde_json::json!(delay.wait_ms)),
+                    (
+                        "ms".to_string(),
+                        serde_json::json!(upstream_started_at.elapsed().as_millis()),
+                    ),
+                ])),
+            );
             attempt += 1;
             sleep(delay.wait_ms).await;
         };
@@ -726,6 +766,7 @@ async fn live_stream_response(
     transport: config::CodexTransport,
 ) -> Response {
     let model = model.to_string();
+    let started_at = Instant::now();
     let request_continuation = continuation.clone();
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
@@ -825,11 +866,37 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                    if is_empty_completion_error(&error) {
+                        create_logger("codex").warn(
+                            "codex_empty_completion_exhausted",
+                            Some(empty_completion_exhausted_fields(
+                                &ctx.req_id,
+                                transport.as_str(),
+                                &model,
+                                attempt + 1,
+                                "max_attempts",
+                                started_at.elapsed().as_millis(),
+                            )),
+                        );
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
+                    if is_empty_completion_error(&error) {
+                        create_logger("codex").warn(
+                            "codex_empty_completion_exhausted",
+                            Some(empty_completion_exhausted_fields(
+                                &ctx.req_id,
+                                transport.as_str(),
+                                &model,
+                                attempt + 1,
+                                "backoff_budget",
+                                started_at.elapsed().as_millis(),
+                            )),
+                        );
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -943,6 +1010,18 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
+            create_logger("codex").warn(
+                "codex_empty_completion_retry",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    (
+                        "transport".to_string(),
+                        serde_json::json!(config::codex_transport().as_str()),
+                    ),
+                    ("model".to_string(), serde_json::json!(model)),
+                    ("stream".to_string(), serde_json::json!(true)),
+                ])),
+            );
             return provider_retry(&upstream_events, empty_live_completion_error());
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
@@ -1263,6 +1342,36 @@ where
         (http::header::CONNECTION, "keep-alive"),
     ];
     (headers, Body::from_stream(stream)).into_response()
+}
+
+/// True when *error* is the empty-completion 503 rather than some other
+/// retryable failure sharing the live-stream retry loop.
+fn is_empty_completion_error(error: &client::CodexError) -> bool {
+    error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL)
+}
+
+/// Log fields for giving up on an empty completion, on either exit.
+///
+/// `reason` separates the two: `"max_attempts"` when the retry budget ran
+/// out, `"backoff_budget"` when the next delay would have exceeded the
+/// backoff budget. They produce the same 503, so the log is the only place
+/// the difference is visible.
+fn empty_completion_exhausted_fields(
+    req_id: &str,
+    transport: &str,
+    model: &str,
+    attempts: u32,
+    reason: &str,
+    elapsed_ms: u128,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        ("transport".to_string(), serde_json::json!(transport)),
+        ("model".to_string(), serde_json::json!(model)),
+        ("attempts".to_string(), serde_json::json!(attempts)),
+        ("reason".to_string(), serde_json::json!(reason)),
+        ("ms".to_string(), serde_json::json!(elapsed_ms)),
+    ])
 }
 
 fn empty_buffered_completion_error() -> client::CodexError {
@@ -2179,6 +2288,34 @@ mod tests {
         let response = map_codex_error_to_response(&err);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["x-should-retry"], "false");
+    }
+
+    #[test]
+    fn empty_completion_exhausted_fields_distinguish_the_two_give_up_reasons() {
+        let max = empty_completion_exhausted_fields(
+            "req-1",
+            "websocket",
+            "gpt-6-sol",
+            11,
+            "max_attempts",
+            157_000,
+        );
+        assert_eq!(max["reqId"], "req-1");
+        assert_eq!(max["transport"], "websocket");
+        assert_eq!(max["model"], "gpt-6-sol");
+        assert_eq!(max["attempts"], 11);
+        assert_eq!(max["reason"], "max_attempts");
+        assert_eq!(max["ms"], 157_000);
+
+        let budget = empty_completion_exhausted_fields(
+            "req-1",
+            "websocket",
+            "gpt-6-sol",
+            4,
+            "backoff_budget",
+            20_000,
+        );
+        assert_eq!(budget["reason"], "backoff_budget");
     }
 
     #[test]
