@@ -3,6 +3,13 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Codex users can request the ultrafast service tier with
+  `gpt-6-astra-ultrafast` or `gpt-6.1-sol-ultrafast`, or set
+  `CCP_CODEX_SERVICE_TIER=ultrafast` for Messages requests.
+  ([#170](https://github.com/raine/claude-code-proxy/pull/170))
+
 ## v0.1.43 (2026-09-30)
 
 - Codex users can select GPT-6.1 Sol with `gpt-6.1-sol` or its
