@@ -15,6 +15,8 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -221,6 +223,149 @@ async fn read_http_head(stream: &mut TcpStream) -> String {
     String::from_utf8(request).unwrap()
 }
 
+async fn spawn_transport_origin(
+    close_after_send: bool,
+) -> (
+    String,
+    Arc<Mutex<Vec<String>>>,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let task_captured = captured.clone();
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                _ = &mut stop_rx => break,
+                accepted = listener.accept() => accepted,
+            };
+            let (mut stream, _) = accepted.unwrap();
+            let mut method = [0_u8; 1];
+            assert_eq!(stream.peek(&mut method).await.unwrap(), 1);
+            if method[0] == b'G' && close_after_send {
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = websocket.next().await.unwrap().unwrap();
+                let Message::Text(request) = request else {
+                    panic!("expected response.create text frame");
+                };
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(request["type"], "response.create");
+                task_captured.lock().unwrap().push("response.create".into());
+                websocket.close(None).await.unwrap();
+            } else {
+                let request = read_http_head(&mut stream).await;
+                let (head, received_body) = request.split_once("\r\n\r\n").unwrap();
+                let target = head.lines().next().unwrap().to_string();
+                if target.starts_with("POST ") {
+                    let content_length: usize = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    let mut remaining = vec![0; content_length - received_body.len()];
+                    stream.read_exact(&mut remaining).await.unwrap();
+                    let body = concat!(
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_transport\"}}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"transport fallback ok\"}\n\n",
+                        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_transport\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
+                    );
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len(),
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(target.starts_with("GET "));
+                    assert!(
+                        head.lines()
+                            .any(|line| line.eq_ignore_ascii_case("upgrade: websocket"))
+                    );
+                    stream
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                task_captured.lock().unwrap().push(target);
+            }
+        }
+    });
+    (format!("http://{addr}/responses"), captured, stop_tx, task)
+}
+
+async fn check_transport_policy(
+    config_dir: &Path,
+    transport: Option<&str>,
+    close_after_send: bool,
+) {
+    clear_codex_websocket_pool_for_tests();
+    let (origin_url, captured, stop, task) = spawn_transport_origin(close_after_send).await;
+    let result = {
+        let _retry_delay = ZeroRetryDelayGuard::new();
+        let mut guards = clear_proxy_environment();
+        guards.extend(configure_codex(config_dir, &origin_url));
+        guards.push(match transport {
+            Some(value) => EnvGuard::set("CCP_CODEX_TRANSPORT", value),
+            None => EnvGuard::unset("CCP_CODEX_TRANSPORT"),
+        });
+        tokio::time::timeout(Duration::from_secs(10), call_messages("transport-policy")).await
+    };
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, body) = result.expect("loopback transport request must finish");
+    let captured = captured.lock().unwrap();
+    let posts = captured
+        .iter()
+        .filter(|request| request.starts_with("POST "))
+        .count();
+    if close_after_send {
+        assert!(!status.is_success());
+        assert!(captured.iter().any(|request| request == "response.create"));
+        assert_eq!(posts, 0, "an in-flight request must not replay over HTTP");
+    } else if transport == Some("websocket") {
+        assert!(!status.is_success());
+        assert_eq!(posts, 0, "explicit WebSocket must stay strict");
+        assert_eq!(
+            captured.as_slice(),
+            ["GET /responses HTTP/1.1", "GET /responses HTTP/1.1"]
+        );
+    } else {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "transport {transport:?} must use HTTP after an upstream handshake 403: {body}"
+        );
+        assert!(body.contains("transport fallback ok"));
+        assert_eq!(posts, 1);
+        let expected = if transport == Some("http") {
+            vec!["POST /responses HTTP/1.1"]
+        } else {
+            vec![
+                "GET /responses HTTP/1.1",
+                "GET /responses HTTP/1.1",
+                "POST /responses HTTP/1.1",
+            ]
+        };
+        assert_eq!(*captured, expected);
+    }
+    clear_codex_websocket_pool_for_tests();
+}
+
 async fn spawn_rejecting_proxy(
     response: &'static [u8],
 ) -> (
@@ -267,6 +412,7 @@ async fn spawn_rejecting_proxy(
 
 #[tokio::test]
 async fn codex_websocket_inherits_environment_proxy_configuration() {
+    let _env_lock = ENV_LOCK.lock().await;
     let config_dir = TempDir::new().unwrap();
     write_codex_auth(config_dir.path());
 
@@ -474,5 +620,21 @@ async fn codex_websocket_inherits_environment_proxy_configuration() {
             .is_err()
     );
 
+    // Explicit choices characterize the existing policy before testing the default.
+    check_transport_policy(config_dir.path(), Some("auto"), false).await;
+    check_transport_policy(config_dir.path(), Some("websocket"), false).await;
+    check_transport_policy(config_dir.path(), Some("http"), false).await;
+    check_transport_policy(config_dir.path(), Some("auto"), true).await;
+
     clear_codex_websocket_pool_for_tests();
+}
+
+#[tokio::test]
+async fn codex_default_transport_falls_back_before_send_but_not_in_flight() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+
+    check_transport_policy(config_dir.path(), None, false).await;
+    check_transport_policy(config_dir.path(), None, true).await;
 }
