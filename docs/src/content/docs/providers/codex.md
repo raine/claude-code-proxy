@@ -47,6 +47,15 @@ Claude Code summary compaction requests are capped at low effort by default beca
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
+- With Claude Code's tool search on (`ENABLE_TOOL_SEARCH=true`, see [Configure Claude Code](/using/configure-claude-code/#mcp-tool-search)),
+  a deferred tool reaches the model once `ToolSearch` loads it. On the Responses
+  Lite lane, the proxy appends each loaded tool as its own `additional_tools` item
+  right after the result that loaded it, as Codex's incremental tools do, so
+  earlier input is never rewritten and stays in the prompt cache. Deferred tools
+  with no load in the visible history, such as tools loaded before a compaction,
+  stay in the leading tool list. `tool_reference` blocks render as
+  `Tool loaded: <name>`, and Claude Code's `DeferredToolPlaceholder` stub is not
+  forwarded.
 - Claude Code's forced `web_search_20250305` subrequest uses Codex's standalone
   `/alpha/search` endpoint. It keeps the resolved model, omits search reasoning,
   and preserves non-empty domain filters, so Luna searches do not require a Sol
