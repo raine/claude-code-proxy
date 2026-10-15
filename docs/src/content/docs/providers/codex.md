@@ -42,6 +42,8 @@ Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`,
 
 When reasoning is enabled, the proxy requests an automatic reasoning summary and translates summary deltas into Claude Code thinking blocks. Codex may omit a summary for a simple prompt. `CCP_CODEX_REASONING_SUMMARY=off` suppresses summaries while preserving effort and encrypted continuation content.
 
+Detected auto-review classifier requests default to `low` effort, the effort Codex's own approval reviewer uses, unless the request already sets `output_config.effort`.
+
 Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
 
 ## Tools and multimodal input
@@ -72,7 +74,7 @@ WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `
 
 An absent, malformed, or ambiguous identity does not reject the HTTP request; that request proceeds without continuation or WebSocket reuse. If the originating socket is missing, dead, or has been replaced, the proxy retries once with the full translated input and without the stale response ID. Continuation and connection state is held only in memory and is lost when the proxy restarts.
 
-Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership.
+Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership. Their `prompt_cache_key` is `guardian:<session id>`, the reviewer-scoped key Codex uses for its own approval reviewer, so they do not share the main conversation's cache key.
 
 ## Server compaction
 
