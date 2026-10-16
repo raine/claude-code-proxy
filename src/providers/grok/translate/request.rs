@@ -408,7 +408,9 @@ fn requests_web_search(req: &MessagesRequest) -> bool {
 fn map_reasoning_effort(effort: &str, model: &str) -> String {
     match effort {
         "none" | "low" | "medium" | "high" => effort.to_string(),
-        "xhigh" | "max" if model == "grok-4.6" => "xhigh".to_string(),
+        "xhigh" | "max" if matches!(model, "grok-4.6" | "grok-4.7" | "grok-4.7-build-fast") => {
+            "xhigh".to_string()
+        }
         "xhigh" | "max" => "high".to_string(),
         _ => unreachable!("read_effort_with_allowed validates the effort"),
     }
@@ -1331,6 +1333,10 @@ mod tests {
             ("grok-4.5", "max", "high"),
             ("grok-4.6", "xhigh", "xhigh"),
             ("grok-4.6", "max", "xhigh"),
+            ("grok-4.7", "xhigh", "xhigh"),
+            ("grok-4.7", "max", "xhigh"),
+            ("grok-4.7-build-fast", "xhigh", "xhigh"),
+            ("grok-4.7-build-fast", "max", "xhigh"),
         ];
         for (model, requested, expected) in cases {
             let request: MessagesRequest = serde_json::from_value(serde_json::json!({
