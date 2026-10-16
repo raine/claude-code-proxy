@@ -1079,13 +1079,14 @@ mod tests {
         (addr, server)
     }
 
-    /// Waits for the fake upstream with a bound, so a request that never
-    /// reaches it fails the test instead of hanging on `accept`.
-    async fn received(server: tokio::task::JoinHandle<UpstreamRequest>) -> UpstreamRequest {
-        tokio::time::timeout(Duration::from_secs(10), server)
+    /// Bounds one step of an exchange with the fake upstream. The test client
+    /// has no request timeout and the fake upstream awaits `accept` and reads
+    /// without one, so an unbounded step would hang the test instead of
+    /// failing it.
+    async fn bounded<T>(step: impl Future<Output = T>, what: &str) -> T {
+        tokio::time::timeout(Duration::from_secs(10), step)
             .await
-            .expect("the request never reached the fake upstream")
-            .unwrap()
+            .unwrap_or_else(|_| panic!("{what} did not finish within 10 s"))
     }
 
     /// Builds a provider that talks to `addr` with a stored session that never
@@ -1148,18 +1149,25 @@ mod tests {
         let (addr, server) = fake_upstream().await;
         let provider = provider_for_fake_upstream(addr, &auth_dir);
 
-        let response = provider
-            .handle_messages(fast_alias_request(false), fake_upstream_context())
-            .await;
-        let status = response.status();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let (status, bytes) = bounded(
+            async {
+                let response = provider
+                    .handle_messages(fast_alias_request(false), fake_upstream_context())
+                    .await;
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, bytes)
+            },
+            "the messages request",
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::OK,
             "{}",
             String::from_utf8_lossy(&bytes)
         );
-        let upstream = received(server).await;
+        let upstream = bounded(server, "the fake upstream").await.unwrap();
 
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["model"], "grok-4.7-fast");
@@ -1181,17 +1189,22 @@ mod tests {
         let (addr, server) = fake_upstream().await;
         let provider = provider_for_fake_upstream(addr, &auth_dir);
 
-        let generation = provider
-            .generate_anthropic_stream(fast_alias_request(true), fake_upstream_context())
-            .await
-            .unwrap_or_else(|_| panic!("generation against the fake upstream failed"));
+        let generation = bounded(
+            provider.generate_anthropic_stream(fast_alias_request(true), fake_upstream_context()),
+            "the generation request",
+        )
+        .await
+        .unwrap_or_else(|_| panic!("generation against the fake upstream failed"));
         // OpenAI-compatible routes copy this value into the response `model`.
         assert_eq!(generation.resolved_model, "grok-4.7-build-fast");
         let GenerationBody::LiveSse(body) = generation.body else {
             panic!("Grok generations stream live");
         };
-        let bytes = body.collect().await.unwrap().to_bytes();
-        let upstream = received(server).await;
+        let bytes = bounded(body.collect(), "the generation body")
+            .await
+            .unwrap()
+            .to_bytes();
+        let upstream = bounded(server, "the fake upstream").await.unwrap();
 
         assert_eq!(upstream.body["model"], "grok-4.7-build-fast");
         let started = crate::anthropic::sse::parse_sse_events(&bytes)
