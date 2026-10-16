@@ -24,7 +24,7 @@ The proxy owns and refreshes its Grok tokens. It does not read `~/.grok/auth.jso
 
 ## Models
 
-The registered IDs are `grok-composer-2.5-fast`, `grok-4.5`, and `grok-4.6`. Account and regional access can vary. Use the same concrete Grok ID for `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`.
+The registered IDs are `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6`, `grok-4.7`, and `grok-4.7-build-fast`, plus the local alias `grok-4.7-fast`, which the proxy sends as `grok-4.7-build-fast`. Account and regional access can vary. Use the same concrete Grok ID for `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`.
 
 ```sh
 ANTHROPIC_MODEL=grok-4.6 \
@@ -34,9 +34,19 @@ ANTHROPIC_SMALL_FAST_MODEL=grok-4.6 \
 
 Grok 4.5 and Grok 4.6 have a 500,000 token context window. Claude Code treats unknown model IDs as 200,000 tokens, so set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` when using those IDs. Do not append `[1m]`; that is a one-million-token client hint.
 
+The Grok 4.7 models (`grok-4.7`, `grok-4.7-build-fast`, and the `grok-4.7-fast` alias) run with a 256,000 token context window through the proxy, so set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=256000` for them. The backend catalog also offers 500,000 tokens for these models, but the proxy has no way to select it, and a conversation that grows past 256,000 tokens fails upstream.
+
+### Grok 4.7 Fast
+
+`grok-4.7-fast` (sent as `grok-4.7-build-fast`) serves the same model on faster infrastructure.
+
+- It costs twice the standard rate, or 1.5 times for long-context requests. Usage is billed to a Grok Build plan; the free tier does not include it, and an account without access receives the upstream error.
+- `service_tier` does not select Fast. The backend treats it as priority processing at a higher price, so the Messages route accepts and drops it, and the OpenAI-compatible routes reject it as an unsupported field. Choose the model ID instead.
+- Anthropic Messages responses report the requested name, such as `grok-4.7-fast`. OpenAI-compatible responses report the backend ID, `grok-4.7-build-fast`.
+
 ## Reasoning and tools
 
-The proxy translates Claude messages, function tools, tool results, thinking controls, token usage, and streaming events. Grok reasoning text appears as Claude Code thinking blocks. Grok supports `none`, `low`, `medium`, and `high` effort levels. `xhigh` is forwarded for `grok-4.6`; higher compatibility levels are mapped to the highest supported Grok level for other registered models.
+The proxy translates Claude messages, function tools, tool results, thinking controls, token usage, and streaming events. Grok reasoning text appears as Claude Code thinking blocks. Grok supports `none`, `low`, `medium`, and `high` effort levels. `xhigh` is forwarded for `grok-4.6`, `grok-4.7`, and `grok-4.7-build-fast`; higher compatibility levels are mapped to the highest supported Grok level for other registered models.
 
 Search reaches Grok-native tools when the caller asks for it:
 
