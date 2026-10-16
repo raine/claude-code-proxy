@@ -89,7 +89,7 @@ For Kimi, Grok, OpenCode Go, and Cursor, the route accepts:
 - `reasoning_effort`
 - streaming, non-streaming responses, and `stream_options.include_usage`
 
-For Grok, `reasoning_effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`. `xhigh` is available at full strength on `grok-4.6`; `xhigh` and `max` map to `high` for other registered Grok models.
+For Grok, `reasoning_effort` accepts `none`, `low`, `medium`, `high`, `xhigh`, and `max`. `xhigh` is available at full strength on `grok-4.6`, `grok-4.7`, and `grok-4.7-build-fast` (including the `grok-4.7-fast` alias); `xhigh` and `max` map to `high` for other registered Grok models.
 
 Codex uses its own compatibility path. It supports text messages, `reasoning_effort`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Reasoning effort defaults to `medium`, and the proxy-wide Codex effort setting takes precedence. Function calls, images, audio, log probabilities, multiple choices, storage, and output token limits are not supported on the Codex Chat Completions path.
 
