@@ -390,6 +390,9 @@ pub fn grok_base_url() -> String {
     "https://cli-chat-proxy.grok.com/v1".to_string()
 }
 
+/// Backends reject client versions older than 1.0.13 with HTTP 426.
+pub(crate) const DEFAULT_GROK_CLIENT_VERSION: &str = "1.0.60";
+
 pub fn grok_client_version() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {
@@ -400,7 +403,7 @@ pub fn grok_client_version() -> String {
     {
         return version;
     }
-    "0.2.93".to_string()
+    DEFAULT_GROK_CLIENT_VERSION.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,6 +1095,24 @@ mod tests {
         assert_eq!(load_config_for_env(&env).bind_address, "192.0.2.10");
         env.insert("CCP_BIND_ADDRESS".to_string(), "0.0.0.0".to_string());
         assert_eq!(load_config_for_env(&env).bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn grok_client_version_defaults_to_a_version_the_backend_accepts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let mut guards = isolated_env(&config);
+        guards.push(EnvGuard::unset("CCP_GROK_CLIENT_VERSION"));
+
+        assert_eq!(grok_client_version(), DEFAULT_GROK_CLIENT_VERSION);
+        let parts: Vec<u32> = DEFAULT_GROK_CLIENT_VERSION
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect();
+        assert!(
+            parts >= vec![1, 0, 13],
+            "{DEFAULT_GROK_CLIENT_VERSION} is below the backend minimum 1.0.13"
+        );
     }
 
     struct EnvGuard {
