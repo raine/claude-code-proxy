@@ -56,8 +56,14 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
-pub(crate) const GROK_MODELS: &[&str] =
-    &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6", "grok-4.7"];
+pub(crate) const GROK_MODELS: &[&str] = &[
+    "grok-composer-2.5-fast",
+    "grok-4.5",
+    "grok-4.6",
+    "grok-4.7",
+    "grok-4.7-build-fast",
+    "grok-4.7-fast",
+];
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -446,6 +452,23 @@ mod tests {
                 .unwrap()
                 .name(),
             "grok"
+        );
+    }
+
+    #[test]
+    fn grok_4_7_fast_ids_route_to_grok() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in ["grok-4.7-build-fast", "grok-4.7-fast", "grok-4.7-fast[1m]"] {
+            assert_eq!(
+                registry.provider_for_model(model, None).unwrap().name(),
+                "grok",
+                "{model}"
+            );
+        }
+        assert!(
+            registry
+                .provider_for_model("opencode-go/grok-4.7-fast", None)
+                .is_none()
         );
     }
 

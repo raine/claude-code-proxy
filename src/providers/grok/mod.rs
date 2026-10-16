@@ -1017,6 +1017,191 @@ mod tests {
         captured
     }
 
+    struct UpstreamRequest {
+        /// The request head with names and values lowercased.
+        head: String,
+        body: serde_json::Value,
+    }
+
+    /// Accepts one request on a loopback port and answers it with a completed
+    /// Grok Responses stream whose `response.model` is the backend's Fast ID.
+    async fn fake_upstream() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<UpstreamRequest>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let head_end = loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before the request head ended");
+                raw.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8(raw[..head_end].to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse().unwrap())
+                .expect("the upstream request carries a content-length");
+            while raw.len() < head_end + content_length {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before the request body ended");
+                raw.extend_from_slice(&chunk[..read]);
+            }
+            let body = serde_json::from_slice(&raw[head_end..head_end + content_length]).unwrap();
+            let sse = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"grok-4.7-build-fast\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            UpstreamRequest { head, body }
+        });
+        (addr, server)
+    }
+
+    /// Waits for the fake upstream with a bound, so a request that never
+    /// reaches it fails the test instead of hanging on `accept`.
+    async fn received(server: tokio::task::JoinHandle<UpstreamRequest>) -> UpstreamRequest {
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the request never reached the fake upstream")
+            .unwrap()
+    }
+
+    /// Builds a provider that talks to `addr` with a stored session that never
+    /// needs a refresh, so no request leaves the loopback interface.
+    fn provider_for_fake_upstream(addr: std::net::SocketAddr, auth_dir: &TempDir) -> GrokProvider {
+        let file = auth_dir
+            .path()
+            .join("auth.json")
+            .to_string_lossy()
+            .into_owned();
+        let store = auth::token_store::GrokTokenStore::new(crate::auth::FileAuthStore::new(
+            file.clone(),
+            file,
+        ));
+        let manager = auth::manager::GrokAuthManager::new(store).unwrap();
+        manager
+            .store()
+            .save_auth(auth::token_store::StoredAuth {
+                access: "test-access".into(),
+                refresh: "test-refresh".into(),
+                expires_at_ms: u64::MAX,
+                issuer: auth::login::CANONICAL_ISSUER.into(),
+                client_id: auth::login::CLIENT_ID.into(),
+            })
+            .unwrap();
+        GrokProvider::with_client(
+            client::GrokClient::new_for_test(
+                format!("http://{addr}/v1"),
+                crate::config::DEFAULT_GROK_CLIENT_VERSION.into(),
+                Arc::new(manager),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn fake_upstream_context() -> RequestContext {
+        RequestContext {
+            req_id: "grok-fast-test".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "grok".into(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    fn fast_alias_request(stream: bool) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "grok-4.7-fast",
+            "max_tokens": 16,
+            "stream": stream,
+            "messages": [{"role":"user","content":"hello"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fast_alias_messages_send_backend_id_and_answer_with_requested_name() {
+        let auth_dir = TempDir::new().unwrap();
+        let (addr, server) = fake_upstream().await;
+        let provider = provider_for_fake_upstream(addr, &auth_dir);
+
+        let response = provider
+            .handle_messages(fast_alias_request(false), fake_upstream_context())
+            .await;
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let upstream = received(server).await;
+
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["model"], "grok-4.7-fast");
+        assert_eq!(value["content"][0]["text"], "ok");
+        assert_eq!(upstream.body["model"], "grok-4.7-build-fast");
+        assert!(
+            upstream
+                .head
+                .lines()
+                .any(|line| line == "x-grok-client-version: 1.0.60"),
+            "{}",
+            upstream.head
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_alias_generation_reports_backend_id_as_resolved_model() {
+        let auth_dir = TempDir::new().unwrap();
+        let (addr, server) = fake_upstream().await;
+        let provider = provider_for_fake_upstream(addr, &auth_dir);
+
+        let generation = provider
+            .generate_anthropic_stream(fast_alias_request(true), fake_upstream_context())
+            .await
+            .unwrap_or_else(|_| panic!("generation against the fake upstream failed"));
+        // OpenAI-compatible routes copy this value into the response `model`.
+        assert_eq!(generation.resolved_model, "grok-4.7-build-fast");
+        let GenerationBody::LiveSse(body) = generation.body else {
+            panic!("Grok generations stream live");
+        };
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let upstream = received(server).await;
+
+        assert_eq!(upstream.body["model"], "grok-4.7-build-fast");
+        let started = crate::anthropic::sse::parse_sse_events(&bytes)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|value| value["type"] == "message_start")
+            .unwrap();
+        assert_eq!(started["message"]["model"], "grok-4.7-fast");
+    }
+
     #[test]
     fn non_streaming_capture_writes_response_and_redacts_secrets() {
         let temp = TempDir::new().unwrap();

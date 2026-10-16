@@ -1346,6 +1346,27 @@ mod tests {
     }
 
     #[test]
+    fn grok_translation_accepts_and_drops_service_tier() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "grok-4.7-build-fast",
+            "service_tier": "priority",
+            "messages": [{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let translated = translate_request_with_options(
+            &request,
+            "grok-4.7-build-fast".into(),
+            crate::config::GrokToolImageMode::Omit,
+            false,
+        );
+        let value = serde_json::to_value(translated.unwrap()).unwrap();
+        // The backend bills service_tier as priority processing rather than
+        // selecting Fast, so it must never be forwarded.
+        assert!(value.get("service_tier").is_none());
+        assert_eq!(value["model"], "grok-4.7-build-fast");
+    }
+
+    #[test]
     fn grok_translation_omits_reasoning_without_effort() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
