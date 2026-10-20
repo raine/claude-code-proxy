@@ -13,6 +13,7 @@ if ! systemctl --user show-environment >/dev/null 2>&1; then
   echo "error: 'systemctl --user' isn't available. This installer is Linux/WSL only — it uses systemd." >&2
   echo "       macOS has no systemd (it would need a launchd agent instead); this script doesn't set that up." >&2
   echo "       WSL: set systemd=true in /etc/wsl.conf, then 'wsl --shutdown' and reopen." >&2
+  echo "       If systemd is already on ('Failed to connect to bus'): see Troubleshooting in scripts/ccp/README.md." >&2
   exit 1
 fi
 
@@ -47,6 +48,18 @@ cat > "$wrapper" <<'EOF'
 set -euo pipefail
 
 svc="claude-code-proxy.service"
+
+if [[ "${1:-status}" != health ]] && ! systemctl --user show-environment >/dev/null 2>&1; then
+  if systemctl is-active --quiet "user@$UID.service"; then
+    echo "ccp: the systemd user manager is running but /run/user/$UID/bus isn't visible." >&2
+    echo "     On WSL a tmpfs mounted over /run/user/$UID can hide it; 'sudo systemctl restart user@$UID' recreates it (until the next boot)." >&2
+  else
+    echo "ccp: the systemd user manager isn't running (no /run/user/$UID/bus)." >&2
+    echo "     Start it with 'sudo systemctl start user@$UID'." >&2
+  fi
+  echo "     See Troubleshooting in scripts/ccp/README.md." >&2
+  exit 1
+fi
 
 case "${1:-status}" in
   start)

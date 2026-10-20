@@ -47,3 +47,10 @@ The unit runs `... serve` with no TUI (no TTY as a service) and `CCP_LOG_STDERR=
 - **Go back to direct Anthropic:** `ccp off` and remove/comment the proxy env from Claude Code's settings.
 
 Verify which one is live: `ccp status` (should say `active (running)`) and `ccp health` (should print `ok`/200). When off, `ccp health` fails to connect — that's expected.
+
+## Troubleshooting
+
+**`Failed to connect to bus: No such file or directory`** — `systemctl --user` can't find the user manager's socket at `/run/user/<uid>/bus`. Two causes, both seen on WSL:
+
+- `user@<uid>.service` isn't running (check with `systemctl status user@$(id -u)`): start it with `sudo systemctl start user@$(id -u)`.
+- It is running but a tmpfs mounted over `/run/user/<uid>` (WSLg does this) hides the socket: `sudo systemctl restart user@$(id -u)` recreates it in the visible mount, until the next reboot.
