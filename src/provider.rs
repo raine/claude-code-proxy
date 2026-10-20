@@ -22,6 +22,7 @@ pub enum AuthCommand {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn supported_models(&self) -> Vec<String>;
