@@ -34,9 +34,12 @@ ANTHROPIC_SMALL_FAST_MODEL=opencode-go/glm-5.2 \
   claude --model opencode-go/glm-5.2
 ```
 
-The bare IDs `gpt-5.6-luna`, `grok-4.5`, `grok-4.6`, `kimi-k3`, and `kimi-k2.6`
-remain owned by the existing Codex, Grok, or Kimi providers. Prefix those IDs
-with `opencode-go/` to select the OpenCode Go version.
+The bare IDs `gpt-6-luna`, `gpt-5.6-luna`, `grok-4.5`, `grok-4.6`, `grok-4.7`,
+`kimi-k3`, and `kimi-k2.6` remain owned by the existing Codex, Grok, or Kimi
+providers. Prefix those IDs with `opencode-go/` to select the OpenCode Go
+version. `claude-haiku-5-5` is likewise only available as
+`opencode-go/claude-haiku-5-5`, so a Claude-style model name never routes to
+OpenCode Go implicitly.
 
 ## Tools and streaming
 
