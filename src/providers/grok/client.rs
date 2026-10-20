@@ -84,6 +84,23 @@ impl GrokClient {
         ))
     }
 
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        base_url: String,
+        client_version: String,
+        auth: Arc<GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>>,
+    ) -> anyhow::Result<Self> {
+        // A developer's HTTP proxy settings would otherwise capture requests
+        // meant for the local fake upstream.
+        let client = Arc::new(reqwest::Client::builder().no_proxy().build()?);
+        Ok(Self::with_shared(
+            url_for(base_url)?,
+            client_version,
+            client,
+            auth,
+        ))
+    }
+
     fn with_shared(
         url: String,
         client_version: String,
