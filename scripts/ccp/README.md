@@ -29,6 +29,8 @@ The unit runs `... serve` with no TUI (no TTY as a service) and `CCP_LOG_STDERR=
 
 | Command | What it does |
 |-|-|
+| `ccp` | Show whether the service is active, plus this command list |
+| `ccp --help` | Print the command list (also `-h`, `help`) |
 | `ccp start` | Start the proxy now (this boot only) |
 | `ccp stop` | Stop the proxy now |
 | `ccp restart` | Restart — use after reinstalling the binary or editing the unit (`daemon-reload` first for unit edits) |

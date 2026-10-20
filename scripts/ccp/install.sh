@@ -49,7 +49,22 @@ set -euo pipefail
 
 svc="claude-code-proxy.service"
 
-if [[ "${1:-status}" != health ]] && ! systemctl --user show-environment >/dev/null 2>&1; then
+usage() {
+  cat <<'USAGE'
+Usage: ccp [command]
+
+  on         enable + start (also starts on login)
+  off        disable + stop
+  start      start now (this boot only)
+  stop       stop now
+  restart    restart (after reinstalling the binary)
+  status     service state
+  logs [-f]  journal logs, -f to follow
+  health     curl /healthz
+USAGE
+}
+
+if [[ "${1:-}" != @(health|help|-h|--help) ]] && ! systemctl --user show-environment >/dev/null 2>&1; then
   if systemctl is-active --quiet "user@$UID.service"; then
     echo "ccp: the systemd user manager is running but /run/user/$UID/bus isn't visible." >&2
     echo "     On WSL a tmpfs mounted over /run/user/$UID can hide it; 'sudo systemctl restart user@$UID' recreates it (until the next boot)." >&2
@@ -61,7 +76,16 @@ if [[ "${1:-status}" != health ]] && ! systemctl --user show-environment >/dev/n
   exit 1
 fi
 
-case "${1:-status}" in
+case "${1:-}" in
+  "")
+    state=$(systemctl --user is-active "$svc" || true)
+    echo "claude-code-proxy: $state"
+    echo
+    usage
+    ;;
+  help|-h|--help)
+    usage
+    ;;
   start)
     systemctl --user start "$svc"
     ;;
@@ -72,7 +96,11 @@ case "${1:-status}" in
     systemctl --user restart "$svc"
     ;;
   status)
-    systemctl --user status "$svc" --no-pager
+    if ! systemctl --user status "$svc" --no-pager; then
+      echo >&2
+      echo "ccp: not running. 'ccp start' for this boot, 'ccp on' to also start on login." >&2
+      exit 3
+    fi
     ;;
   logs)
     if [[ "${2:-}" == "-f" || "${2:-}" == "--follow" ]]; then
@@ -91,7 +119,7 @@ case "${1:-status}" in
     curl -fsS http://127.0.0.1:18765/healthz && echo
     ;;
   *)
-    echo "Usage: ccp {start|stop|restart|status|logs [-f]|on|off|health}"
+    usage >&2
     exit 2
     ;;
 esac
