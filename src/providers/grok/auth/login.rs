@@ -47,7 +47,13 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
     let auth_url = authorize_url(&discovery, &redirect_uri, &pkce, &state)?;
 
     println!("Open this URL in your browser to authorize:\n\n  {auth_url}\n");
-    open_browser(&auth_url);
+    if let Err(err) = open_browser(
+        &auth_url,
+        std::env::consts::OS,
+        std::process::Command::spawn,
+    ) {
+        println!("Could not open browser automatically: {err}");
+    }
     let code = wait_for_callback(&listener, &state, LOGIN_TIMEOUT)?;
     let tokens = exchange_code(&client, &discovery, &code, &pkce, &redirect_uri)?;
     validate_tokens(&tokens)?;
@@ -280,20 +286,34 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let command = ("open", vec![url]);
-    #[cfg(target_os = "linux")]
-    let command = ("xdg-open", vec![url]);
-    #[cfg(target_os = "windows")]
-    let command = ("cmd", vec!["/C", "start", "", url]);
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        let _ = std::process::Command::new(command.0)
-            .args(command.1)
-            .spawn();
-    }
+fn open_browser(
+    url: &str,
+    platform: &str,
+    execute: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::Child>,
+) -> anyhow::Result<()> {
+    let command = match platform {
+        "macos" => ("open", vec![url]),
+        "linux" => ("xdg-open", vec![url]),
+        "windows" => windows_browser_command(url),
+        _ => return Ok(()),
+    };
+    execute(std::process::Command::new(command.0).args(command.1))?;
+    Ok(())
 }
+
+fn windows_browser_command(url: &str) -> (&str, Vec<&str>) {
+    // Keep URL metacharacters out of a command interpreter.
+    ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url])
+}
+
+#[cfg(test)]
+use open_browser as open_login_url;
+
+// Run the shared assertions against each provider's private launcher.
+#[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "../../../../tests/support/oauth_browser_launch.rs"]
+mod browser_launch_tests;
 
 fn now_ms() -> u64 {
     SystemTime::now()

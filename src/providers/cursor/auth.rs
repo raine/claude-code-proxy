@@ -196,7 +196,11 @@ pub fn run_cursor_login() -> anyhow::Result<Option<CursorAuth>> {
     println!("Open this URL to authenticate with Cursor:");
     println!("{}", login.login_url);
     println!();
-    if let Err(err) = open_cursor_login_url(&login.login_url) {
+    if let Err(err) = open_cursor_login_url(
+        &login.login_url,
+        std::env::consts::OS,
+        std::process::Command::status,
+    ) {
         println!("Could not open browser automatically: {err}");
     }
     println!("Waiting for Cursor login...");
@@ -337,21 +341,38 @@ fn parse_jwt_claims(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&decoded).ok()
 }
 
-fn open_cursor_login_url(url: &str) -> anyhow::Result<()> {
-    let status = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()?
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .status()?
+fn open_cursor_login_url(
+    url: &str,
+    platform: &str,
+    execute: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::ExitStatus>,
+) -> anyhow::Result<()> {
+    let command = if platform == "macos" {
+        ("open", vec![url])
+    } else if platform == "windows" {
+        windows_browser_command(url)
     } else {
-        std::process::Command::new("xdg-open").arg(url).status()?
+        ("xdg-open", vec![url])
     };
+    let status = execute(std::process::Command::new(command.0).args(command.1))?;
     if !status.success() {
         anyhow::bail!("open command exited with {status}");
     }
     Ok(())
 }
+
+fn windows_browser_command(url: &str) -> (&str, Vec<&str>) {
+    // Keep URL metacharacters out of a command interpreter.
+    ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url])
+}
+
+#[cfg(test)]
+use open_cursor_login_url as open_login_url;
+
+// Run the shared assertions against each provider's private launcher.
+#[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "../../../tests/support/oauth_browser_launch.rs"]
+mod browser_launch_tests;
 
 fn random_base64_url(len: usize) -> String {
     let mut bytes = vec![0u8; len];
