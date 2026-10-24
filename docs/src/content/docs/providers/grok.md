@@ -40,9 +40,30 @@ The proxy translates Claude messages, function tools, tool results, thinking con
 
 Search reaches Grok-native tools when the caller asks for it:
 
-- Anthropic's `web_search_20250305` declaration maps to Grok hosted web search.
-  The Grok CLI endpoint accepts the minimal declaration without domain or
-  location constraints.
+- Anthropic `web_search_20250305` maps to Grok hosted web search.
+  Claude Code sends Anthropic search options. The proxy maps them onto Grok
+  where it can.
+  - Mapped automatically:
+    - Nested `user_location` copies onto Grok `web_search.user_location`.
+    - Anthropic constraints `allowed_domains` or `blocked_domains`, up to 5 names
+      per list, map onto Grok `filters`. Anthropic `blocked_domains` becomes Grok
+      `excluded_domains`. Grok only accepts one of these at the same time.
+      Specifying both lists on one tool returns HTTP 400.
+
+  - Emulated via Grok's system prompt (`instructions`):
+    - A domain list over 5 names. Always copied into `instructions`.
+    - A non-object `user_location`, and unknown hosted keys. These follow
+      `CCP_SEARCH_CONSTRAINTS`:
+      - `system_prompt` (default; old `soft`) copies them into `instructions`.
+      - `warning` drops them and logs.
+      - `reject` (old `hard`) returns HTTP 400.
+
+  - Not supported:
+    - Anthropic `max_uses`. Grok has no field for it. The proxy drops it with
+      a warning.
+    - Grok `enable_image_understanding` on hosted web search. Claude Code
+      hosted search is text-only, so the proxy does not send this flag.
+
 - A caller-managed search tool remains a function tool for the caller to run.
 - An X or Twitter query is additionally offered hosted `x_search`, which the
   model can use or ignore alongside the caller's tools.
@@ -82,17 +103,22 @@ Traffic captures redact Anthropic image data and upstream image data URLs.
 
 - `CCP_GROK_BASE_URL` or `grok.baseUrl` changes the API base URL.
 - `CCP_GROK_CLIENT_VERSION` or `grok.clientVersion` changes the client version header.
-- `CCP_GROK_TOOL_IMAGE` selects `omit`, `reattach`, `inline`, or `reject`.
+- `CCP_GROK_TOOL_IMAGE` selects `omit` (default), `reattach`, `inline`, or
+  `reject`. Native Claude Code sends pasted images. `omit` strips pixels.
+  Use `inline` to match that chat behaviour.
 - `CCP_GROK_HOSTED_SEARCH` enables hosted search replacement and forcing.
 - `CCP_GROK_SEARCH_BLOCKS` selects `text` or `native` hosted-search reporting.
+- `CCP_SEARCH_CONSTRAINTS` selects `system_prompt` (default; old `soft`),
+  `warning`, or `reject` (old `hard`) for options that can go through the
+  Grok `instructions` field. Native mapping and `max_uses` do not follow
+  this setting.
 
 See [Configuration](/reference/configuration/) for defaults.
 
 ## Limitations and troubleshooting
 
-The Grok CLI hosted web-search endpoint has no equivalent for Anthropic's
-`max_uses`, domain filters, or user location. The proxy accepts and omits a
-valid `max_uses` value, while non-null domain and location constraints return a
-request error rather than weakening the requested search scope.
+Hosted Grok web search has no `max_uses` field, so that Anthropic option is
+dropped. See the mapping story above for what maps automatically and what can
+go through the Grok `instructions` field.
 
 A successful login does not guarantee every model is enabled for the account or region. Model rejection and upstream errors are surfaced to Claude Code. Use `grok auth status` for token state, inspect the failed request in the monitor, and use the structured log or error capture for the full redacted response.
