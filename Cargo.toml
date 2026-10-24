@@ -46,6 +46,10 @@ ratatui = "0.29"
 crossterm = "0.28"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 tiktoken-rs = { version = "0.12", default-features = false }
+jsonschema = { version = "=0.59.0", default-features = false, features = ["idna"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.186"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

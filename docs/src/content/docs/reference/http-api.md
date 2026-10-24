@@ -68,6 +68,57 @@ Returns Anthropic-shaped model discovery:
 
 An optional `limit` query truncates `data` and sets `has_more`. The route does not expose a pagination cursor.
 
+Optional `include_capabilities=true` adds the following safe descriptor while
+retaining the normal fields. Without this query, the default-off catalog JSON
+and all existing provider entries are unchanged.
+
+```json
+{
+  "capabilities": {
+    "schema_version": 1,
+    "providers": {
+      "antigravity": {
+        "supported": true,
+        "enabled": false,
+        "mode": "native",
+        "experimental": true,
+        "supported_apis": ["messages", "count_tokens"],
+        "session_policy": "fixed-model",
+        "context_window": 200000,
+        "backend_window_verified": false,
+        "status": {
+          "configuration": "valid",
+          "auth": "missing",
+          "project": "missing",
+          "configuration_ready": false,
+          "live_verified": false
+        }
+      }
+    }
+  }
+}
+```
+
+`configuration` is `valid|invalid`; `auth` is
+`missing|invalid|unreadable|ready|refresh_required|login_required`; `project` is
+`missing|configured`. `configuration_ready` requires valid local configuration,
+a usable access token or refresh-capable credentials, and a local project. It
+is independent of `enabled`, and **never an entitlement or live-access check**.
+`live_verified` remains false. No actual project/account IDs, private paths,
+expiry details, tokens or replay state are exposed. The query performs no network,
+refresh, writes or directory creation. An absent or malformed descriptor must not
+be interpreted as confirmed disabled/ready state.
+
+Antigravity uses native Messages/count-tokens only; optional OpenAI generation is
+explicitly HTTP 501. Its streaming is buffered-turn SSE, not incremental native
+text delivery. The selected tier wins over advisory `output_config.effort`, and
+`x-antigravity-reasoning-tier` plus monitor metadata expose the effective tier.
+Counts use a local semantic-byte estimate (roughly bytes/3) of validated native
+history, including hidden retained thoughts and recorded argument/name codecs.
+The estimate is invariant to full/omitted display, supported assistant fragments
+and opaque signature size; it is not a native tokenizer/billing value. See the
+[full experimental contract](/reference/compatibility-and-limitations/#experimental-native-antigravity-argon).
+
 Claude Code gateway discovery filters IDs according to its own model rules. See [Models and routing](/using/models-and-routing/).
 
 ## `POST /v1/chat/completions`
