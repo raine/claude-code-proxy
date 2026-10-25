@@ -570,6 +570,299 @@ fn antigravity_integer_exclusive_projection_keeps_fractional_inclusive_constrain
     assert_eq!(properties["upper"]["maximum"], -2);
 }
 
+fn property_names_tool(schema: Value) -> ToolSet {
+    ToolSet::compile(&json!([{"name":"record","input_schema":schema}])).unwrap()
+}
+
+fn property_names_call(args: Value) -> Value {
+    json!([{"role":"model","parts":[{"functionCall":{"name":"record","args":args},"thoughtSignature":"unchanged"}]}])
+}
+
+#[test]
+fn antigravity_property_names_records_keep_complete_codec_and_replay() {
+    let record =
+        json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}});
+    let set = property_names_tool(
+        json!({"type":"object","properties":{"metadata":record},"required":["metadata"]}),
+    );
+    let native = &set.declarations[0]["parameters"]["properties"]["metadata"];
+    assert_eq!(native["type"], "STRING");
+    assert!(
+        native["description"]
+            .as_str()
+            .unwrap()
+            .contains(&serde_json::to_string(&record).unwrap())
+    );
+    let metadata = json!({"a/b~雪":{"nested":[null,true,17,"value"]},"empty":{},"":[]});
+    let contents =
+        property_names_call(json!({"metadata":serde_json::to_string(&metadata).unwrap()}));
+    let mapping = set.mapping(&contents).unwrap();
+    assert_eq!(mapping[0]["codec_paths"], json!(["/metadata"]));
+    let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+    assert_eq!(blocks[1]["input"], json!({"metadata":metadata}));
+    assert_eq!(
+        replay::decode(&blocks, &binding()).unwrap()["contents"],
+        contents
+    );
+    for raw in ["{", r#"{"x":1,"x":2}"#, "null", "[]"] {
+        assert!(
+            set.mapping(&property_names_call(json!({"metadata":raw})))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn antigravity_property_names_static_cli_record_shapes_compile_without_weakening() {
+    // Relevant record shapes from the pinned CLI's static tool definitions, not
+    // a claim that every optional tool is present in every actual-CLI request.
+    let metadata =
+        json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}});
+    let answers = json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{"type":"string"}});
+    let annotations = json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{
+        "type":"object","properties":{"preview":{"type":"string"},"notes":{"type":"string"}},"additionalProperties":false
+    }});
+    let set = ToolSet::compile(&json!([
+        {"name":"TaskCreate","input_schema":{"type":"object","properties":{"metadata":metadata},"additionalProperties":false}},
+        {"name":"TaskUpdate","input_schema":{"type":"object","properties":{"metadata":metadata},"additionalProperties":false}},
+        {"name":"AskUserQuestion","input_schema":{"type":"object","properties":{"answers":answers,"annotations":annotations},"additionalProperties":false}}
+    ])).unwrap();
+    for (index, property, source) in [
+        (0, "metadata", &metadata),
+        (1, "metadata", &metadata),
+        (2, "answers", &answers),
+        (2, "annotations", &annotations),
+    ] {
+        let native = &set.declarations[index]["parameters"]["properties"][property];
+        assert_eq!(native["type"], "STRING");
+        assert!(
+            native["description"]
+                .as_str()
+                .unwrap()
+                .contains(&serde_json::to_string(source).unwrap())
+        );
+    }
+    for (answers, annotations, valid) in [
+        (
+            json!({"question":"answer"}),
+            json!({"question":{"preview":"preview","notes":"notes"}}),
+            true,
+        ),
+        (json!({}), json!({"question":{}}), true),
+        (json!({"question":17}), json!({}), false),
+        (json!({}), json!({"question":{"preview":17}}), false),
+        (
+            json!({}),
+            json!({"question":{"extra":"not allowed"}}),
+            false,
+        ),
+    ] {
+        let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"AskUserQuestion","args":{
+            "answers":serde_json::to_string(&answers).unwrap(),"annotations":serde_json::to_string(&annotations).unwrap()
+        }}}]}]);
+        assert_eq!(set.mapping(&contents).is_ok(), valid);
+    }
+}
+
+#[test]
+fn antigravity_property_names_structured_guidance_validates_every_key_and_value() {
+    for dialect in [
+        "https://json-schema.org/draft/2020-12/schema",
+        "http://json-schema.org/draft-07/schema#",
+    ] {
+        let names = json!({"type":"string","pattern":"^ok","minLength":3});
+        let schema = json!({"$schema":dialect,"type":"object","properties":{
+            "ok_known":{"type":"integer"},"bad_known":{"type":"integer"},
+            "ok_default":{"type":"integer","default":17}
+        },"propertyNames":names});
+        let set = property_names_tool(schema);
+        let parameters = &set.declarations[0]["parameters"];
+        assert_eq!(parameters["type"], "OBJECT");
+        assert!(
+            parameters["description"]
+                .as_str()
+                .unwrap()
+                .contains(&format!(
+                    "\"propertyNames\":{}",
+                    serde_json::to_string(&names).unwrap()
+                ))
+        );
+        for args in [json!({}), json!({"ok_known":17}), json!({"ok_extra":true})] {
+            let contents = property_names_call(args.clone());
+            let mapping = set.mapping(&contents).unwrap();
+            assert_eq!(mapping[0]["codec_paths"], json!([]));
+            let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+            assert_eq!(blocks[1]["input"], args, "defaults must not be inserted");
+        }
+        for args in [
+            json!({"bad_known":17}),
+            json!({"bad_extra":17}),
+            json!({"ok":17}),
+            json!({"ok_known":"17"}),
+        ] {
+            assert_eq!(
+                set.mapping(&property_names_call(args)).err(),
+                Some("upstream tool arguments violate original schema")
+            );
+        }
+    }
+}
+
+#[test]
+fn antigravity_property_names_standard_applicability_and_boolean_schemas() {
+    for (names, populated) in [
+        (json!(true), true),
+        (json!(false), false),
+        (json!({"type":"integer"}), false),
+    ] {
+        let set = property_names_tool(
+            json!({"type":"object","properties":{"value":{"propertyNames":names}},"required":["value"]}),
+        );
+        for (value, valid) in [
+            (json!({}), true),
+            (json!({"x":1}), populated),
+            (json!(17), true),
+            (json!([1]), true),
+            (json!(null), true),
+        ] {
+            // Tool inputs remain objects; only this unconstrained nested value
+            // varies, so non-object applicability is tested without violating
+            // the existing root-codec object transport contract.
+            let contents =
+                property_names_call(json!({"value":serde_json::to_string(&value).unwrap()}));
+            assert_eq!(
+                set.mapping(&contents).is_ok(),
+                valid,
+                "legal propertyNames applicability changed for {value}"
+            );
+        }
+    }
+    let set = property_names_tool(
+        json!({"type":"object","properties":{"value":{"type":"integer","propertyNames":false}},"required":["value"]}),
+    );
+    assert!(
+        set.mapping(&property_names_call(json!({"value":17})))
+            .is_ok()
+    );
+    assert!(
+        set.mapping(&property_names_call(json!({"value":"17"})))
+            .is_err()
+    );
+    let set = property_names_tool(
+        json!({"type":"object","additionalProperties":false,"propertyNames":false}),
+    );
+    assert!(set.declarations[0].get("parameters").is_none());
+    assert!(set.mapping(&property_names_call(json!({}))).is_ok());
+    assert!(set.mapping(&property_names_call(json!({"x":1}))).is_err());
+}
+
+#[test]
+fn antigravity_property_names_enums_and_freeform_value_constraints_are_original() {
+    let schema = json!({"type":"object","propertyNames":{"enum":["allowed"]},"additionalProperties":{"type":"integer","minimum":1,"default":17}});
+    let set = property_names_tool(schema.clone());
+    let native = &set.declarations[0]["parameters"]["properties"]["json"];
+    assert_eq!(native["type"], "STRING");
+    assert!(
+        native["description"]
+            .as_str()
+            .unwrap()
+            .contains(&serde_json::to_string(&schema).unwrap())
+    );
+    for (value, valid) in [
+        (json!({}), true),
+        (json!({"allowed":1}), true),
+        (json!({"other":1}), false),
+        (json!({"allowed":0}), false),
+        (json!({"allowed":"1"}), false),
+        (json!({"allowed":null}), false),
+    ] {
+        let contents = property_names_call(json!({"json":serde_json::to_string(&value).unwrap()}));
+        assert_eq!(set.mapping(&contents).is_ok(), valid);
+        if valid {
+            let mapping = set.mapping(&contents).unwrap();
+            let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+            assert_eq!(blocks[1]["input"], value);
+        }
+    }
+}
+
+#[test]
+fn antigravity_property_names_traversal_rejects_unsupported_descendants_and_malformed_values() {
+    for child in [
+        json!({"$ref":"#/$defs/name"}),
+        json!({"$ref":"https://example.invalid/schema"}),
+        json!({"$defs":{}}),
+        json!({"definitions":{}}),
+        json!({"$dynamicRef":"#name"}),
+        json!({"examples":[]}),
+        json!({"unknownConstraint":true}),
+        json!({"anyOf":[{"type":"string"},{"$ref":"#"}]}),
+    ] {
+        assert_eq!(
+            ToolSet::compile(&json!([{"name":"record","input_schema":{"propertyNames":child}}]))
+                .err(),
+            Some("unsupported schema keyword or reference")
+        );
+    }
+    for child in [json!(null), json!(17), json!("string"), json!([])] {
+        assert_eq!(
+            ToolSet::compile(&json!([{"name":"record","input_schema":{"propertyNames":child}}]))
+                .err(),
+            Some("schema must be object or boolean")
+        );
+    }
+    for child in [json!({"type":"invented"}), json!({"minLength":-1})] {
+        assert_eq!(
+            ToolSet::compile(&json!([{"name":"record","input_schema":{"propertyNames":child}}]))
+                .err(),
+            Some("invalid original tool schema")
+        );
+    }
+    let set = property_names_tool(
+        json!({"type":"object","properties":{"propertyNames":{"type":"string"}},"required":["propertyNames"],"additionalProperties":false}),
+    );
+    assert!(
+        set.mapping(&property_names_call(
+            json!({"propertyNames":"ordinary domain field"})
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn antigravity_property_names_traversal_preserves_depth_node_byte_and_guidance_limits() {
+    let compile = |schema| ToolSet::compile(&json!([{"name":"record","input_schema":schema}]));
+    let mut deep = json!(true);
+    for _ in 0..32 {
+        deep = json!({"propertyNames":deep});
+    }
+    assert!(compile(deep.clone()).is_ok());
+    assert_eq!(
+        compile(json!({"propertyNames":deep})).err(),
+        Some("schema depth/node limit")
+    );
+    let properties = (0..8190)
+        .map(|i| (format!("p{i}"), json!(true)))
+        .collect::<serde_json::Map<_, _>>();
+    let mut wide = json!({"type":"object","properties":properties,"propertyNames":true});
+    assert!(compile(wide.clone()).is_ok());
+    wide["properties"]["extra"] = json!(true);
+    assert_eq!(compile(wide).err(), Some("schema depth/node limit"));
+    assert_eq!(
+        compile(json!({"propertyNames":{"description":"x".repeat(256*1024)}})).err(),
+        Some("schema byte limit")
+    );
+    for schema in [
+        json!({"propertyNames":{"description":"x".repeat(16384)}}),
+        json!({"type":"object","properties":{"x":{"type":"integer"}},"propertyNames":{"description":"x".repeat(16384)}}),
+    ] {
+        assert_eq!(
+            compile(schema).err(),
+            Some("complete schema guidance exceeds the 16 KiB limit")
+        );
+    }
+}
+
 #[test]
 fn antigravity_schema_preserves_original_dialects_and_constraints() {
     for dialect in [

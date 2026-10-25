@@ -185,6 +185,96 @@ fn client() -> reqwest::Client {
 }
 
 #[tokio::test]
+async fn antigravity_property_names_http_preflight_never_refreshes_or_generates() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let upstream_calls = Arc::new(AtomicUsize::new(0));
+    let observed = upstream_calls.clone();
+    let upstream = Server::start(Router::new().fallback(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path().join("antigravity/auth.json"));
+    let lock = store.lock(Duration::from_secs(1)).await.unwrap();
+    store
+        .save(
+            &lock,
+            &Credential {
+                profile_id: "profile".into(),
+                project_id: Some("project".into()),
+                access_token: "synthetic-expired-access".into(),
+                refresh_token: Some("synthetic-refresh".into()),
+                expires_at: 1,
+            },
+        )
+        .unwrap();
+    drop(lock);
+    let config = Config {
+        base_url: upstream.url.clone(),
+        token_url: upstream.url.join("token").unwrap(),
+        client_id: Some("synthetic-client".into()),
+        ..Config::read(&directory.path().join("config.json"), |_| None).unwrap()
+    };
+    let proxy = proxy(
+        AntigravityProvider::with_auth(Auth::new(config, store).unwrap()),
+        None,
+    )
+    .await;
+    let mut body = request(false);
+    body["tools"] = json!([{"name":"TaskCreate","input_schema":{"type":"object","properties":{
+        "metadata":{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}}
+    },"additionalProperties":false}}]);
+    let response = client()
+        .post(proxy.url.join("/v1/messages/count_tokens").unwrap())
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(
+        response.json::<Value>().await.unwrap()["input_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "count_tokens must not access expired credentials"
+    );
+    for stream in [false, true] {
+        body["stream"] = json!(stream);
+        body["tools"][0]["input_schema"]["properties"]["metadata"]["propertyNames"] =
+            json!({"$ref":"#/$defs/name"});
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            let response = client()
+                .post(proxy.url.join(path).unwrap())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"type":"error","error":{
+                    "type":"invalid_request_error","message":"unsupported schema keyword or reference"
+                }})
+            );
+            assert_eq!(
+                upstream_calls.load(Ordering::SeqCst),
+                0,
+                "schema rejection must precede refresh and generation"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn antigravity_consumer_selected_origin_serves_discovery_and_generation() {
     for stream in [false, true] {
         let operations = Arc::new(Mutex::new(Vec::new()));

@@ -207,6 +207,7 @@ fn validate_source(schema: &Value, depth: usize, nodes: &mut usize) -> Result<()
         "$schema",
         "type",
         "properties",
+        "propertyNames",
         "required",
         "items",
         "additionalProperties",
@@ -285,7 +286,7 @@ fn validate_source(schema: &Value, depth: usize, nodes: &mut usize) -> Result<()
             validate_source(child, depth + 1, nodes)?;
         }
     }
-    for key in ["items", "additionalProperties"] {
+    for key in ["items", "additionalProperties", "propertyNames"] {
         if let Some(child) = object.get(key) {
             validate_source(child, depth + 1, nodes)?;
         }
@@ -446,6 +447,7 @@ fn project(schema: &Value) -> Result<(Value, Codec)> {
     }
     let local = [
         "additionalProperties",
+        "propertyNames",
         "allOf",
         "format",
         "multipleOf",
