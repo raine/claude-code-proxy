@@ -400,7 +400,7 @@ pub fn grok_client_version() -> String {
     {
         return version;
     }
-    "0.2.93".to_string()
+    "1.0.13".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1029,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+            EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
         guards
@@ -1426,5 +1427,25 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn grok_client_version_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert_eq!(grok_client_version(), "1.0.13");
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"clientVersion":"0.9.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(grok_client_version(), "0.9.0");
+        {
+            let _version_env = EnvGuard::set("CCP_GROK_CLIENT_VERSION", "1.2.3");
+            assert_eq!(grok_client_version(), "1.2.3");
+        }
+        assert_eq!(grok_client_version(), "0.9.0");
     }
 }
