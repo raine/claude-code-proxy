@@ -105,6 +105,33 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
 
+An additional **experimental, default-off native Antigravity Argon adapter** supports
+only `antigravity/gemini-4-argon-low`, `antigravity/gemini-4-argon-medium`, and
+`antigravity/gemini-4-argon-high`. It does not run or import credentials from `agy`.
+Its default HTTP User-Agent is `claude-code-proxy/<package version>`. An explicit
+provider-specific override affects only native generation/project discovery,
+not OAuth; it is compatibility metadata, not verified official-client identity.
+Use a fresh session for every model/tier/profile change. Real Google OAuth,
+entitlement, native tool round trips and all three tiers remain live-validation
+gates; offline tests are not evidence of account access. See the
+[Antigravity limitations](docs/src/content/docs/reference/compatibility-and-limitations.md#experimental-native-antigravity-argon)
+and [configuration](docs/src/content/docs/reference/configuration.md#experimental-antigravity)
+before explicitly enabling it. Existing provider defaults and aliases are unchanged.
+
+Antigravity login defaults to automatic browser/loopback completion. On Unix,
+`claude-code-proxy antigravity auth login --manual` instead prints a browser URL
+and accepts the **code displayed by the completion page** through visible input in
+your local foreground terminal. The code is sensitive: keep your screen,
+scrollback and recordings private. Short codes are fully visible; longer input
+shows its end with a `<` marker and total character count. A known terminal width
+of at least 10 columns is required; changing width cancels. It does not open a
+browser or callback listener.
+The explicitly configured OAuth client must permit
+`https://antigravity.google/oauth-callback`; a loopback-only client may not work.
+Cancel on browser errors or no displayed code; there is no automatic fallback.
+Never paste a code/token into chat, shell arguments or logs. See the configuration
+reference for PKCE/state distinctions, terminal bounds and unverified live gates.
+
 > [!WARNING]
 > The proxy accepts local requests without client authentication. It binds to
 > `127.0.0.1` by default. Protect any non-loopback listener with a firewall or

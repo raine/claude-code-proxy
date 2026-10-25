@@ -99,6 +99,9 @@ fn apply_auto_review_model(
     let override_model = configured_model
         .filter(|model| !model.is_empty())
         .or((original_provider == "codex").then_some(CODEX_AUTO_REVIEW_MODEL))?;
+    if original_provider == "antigravity" && !override_model.starts_with("antigravity/") {
+        return None;
+    }
     let route = AutoReviewRoute {
         requested_model: body.model.clone()?,
         override_model: override_model.to_string(),
@@ -167,14 +170,19 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
-    axum::serve(
+    let registry = Arc::new(Registry::with_default_alias());
+    let app = app_with_monitor(registry.clone(), monitor);
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
-    .await?;
-    Ok(())
+    .await;
+    // Request futures/body-owned inference are already quiescent. Only bounded
+    // credential maintenance may remain, and validated writes must be joined.
+    let maintained = registry.finish_maintenance().await;
+    served?;
+    maintained
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
@@ -346,6 +354,8 @@ async fn healthz() -> Json<serde_json::Value> {
 #[derive(serde::Deserialize)]
 struct ModelsQuery {
     limit: Option<usize>,
+    #[serde(default)]
+    include_capabilities: bool,
 }
 
 /// Anthropic-shaped model listing so Claude Code's gateway model discovery
@@ -374,13 +384,24 @@ async fn handler_models(
     if let Some(limit) = query.limit {
         data.truncate(limit);
     }
-    Json(json!({
+    let mut response = json!({
         "object": "list",
         "data": data,
         "has_more": has_more,
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
-    }))
+    });
+    if query.include_capabilities {
+        let serving_provider = state.registry.provider("antigravity");
+        let mut capability = serving_provider
+            .as_ref()
+            .and_then(|provider| provider.local_capability())
+            .unwrap_or_else(crate::providers::antigravity::capability);
+        capability["enabled"] = json!(serving_provider.is_some());
+        response["capabilities"] =
+            json!({"schema_version":1,"providers":{"antigravity":capability}});
+    }
+    Json(response)
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -1410,6 +1431,28 @@ fn log_native_request_completed(
     );
 }
 
+fn antigravity_context_error(
+    model: &str,
+    original_model: &str,
+    headers: &http::HeaderMap,
+) -> Option<&'static str> {
+    if !model.starts_with("antigravity/") {
+        return None;
+    }
+    let raw_hint = model.to_ascii_lowercase().contains("[1m]")
+        || original_model.to_ascii_lowercase().contains("[1m]");
+    let beta_hint = headers.get_all("anthropic-beta").iter().any(|value| {
+        value.to_str().map_or(true, |value| {
+            value
+                .split(',')
+                .any(|token| token.trim() == "context-1m-2025-08-07")
+        })
+    });
+    (raw_hint || beta_hint).then_some(
+        "Antigravity does not support the 1m context hint; use its conservative 200k client window",
+    )
+}
+
 async fn dispatch_request(
     state: Arc<AppState>,
     req: Request<Body>,
@@ -1590,6 +1633,15 @@ async fn dispatch_request(
         }
     };
 
+    if let Some(message) = antigravity_context_error(model, model, &headers) {
+        return monitor_response_body(
+            json_error(StatusCode::BAD_REQUEST, "invalid_request_error", message),
+            request_guard,
+        );
+    }
+    // Retain the original selector and the one original byte buffer until the
+    // effective provider (including auto-review routing) has been selected.
+    let original_model = model.to_string();
     let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
     let session_state = if let Some(session_id) = session_id.as_deref() {
@@ -1613,6 +1665,16 @@ async fn dispatch_request(
         )
     });
     if auto_review_route.is_some() {
+        if let Some(message) = antigravity_context_error(
+            body.model.as_deref().expect("override model"),
+            &original_model,
+            &headers,
+        ) {
+            return monitor_response_body(
+                json_error(StatusCode::BAD_REQUEST, "invalid_request_error", message),
+                request_guard,
+            );
+        }
         normalized_model = normalize_incoming_model(body.model.as_deref().expect("override model"));
         body.model = Some(normalized_model.clone());
     }
@@ -1636,10 +1698,14 @@ async fn dispatch_request(
             let response = json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!(
-                    "Unknown model \"{normalized_model}\". {}",
-                    state.registry.unknown_model_message()
-                ),
+                if crate::providers::antigravity::known_model(&normalized_model) {
+                    "Antigravity is experimental and disabled; explicitly set CCP_ANTIGRAVITY_ENABLED=1 after configuring its own auth, then start a fresh fixed-model session".to_string()
+                } else {
+                    format!(
+                        "Unknown model \"{normalized_model}\". {}",
+                        state.registry.unknown_model_message()
+                    )
+                },
             );
             log_request_completed(
                 &log,
@@ -1677,6 +1743,15 @@ async fn dispatch_request(
         }
     };
 
+    if provider.name() == "antigravity"
+        && let Err(message) = crate::providers::antigravity::request::validate_raw(&body_bytes)
+    {
+        return monitor_response_body(
+            json_error(StatusCode::BAD_REQUEST, "invalid_request_error", message),
+            request_guard,
+        );
+    }
+
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
 
     if let Some(route) = auto_review_route.as_ref() {
@@ -1699,10 +1774,15 @@ async fn dispatch_request(
         crate::providers::codex::clear_session_compaction(session_id);
     }
 
-    let effort = crate::providers::translate_shared::read_effort(&body)
-        .ok()
-        .flatten()
-        .map(str::to_string);
+    let effort = if provider.name() == "antigravity" {
+        crate::providers::antigravity::request::effective_tier(&normalized_model)
+            .map(str::to_string)
+    } else {
+        crate::providers::translate_shared::read_effort(&body)
+            .ok()
+            .flatten()
+            .map(str::to_string)
+    };
     let current = session::record_session_request_with_affinity_update(
         session_id.as_deref(),
         session_state.as_ref(),
@@ -1954,7 +2034,7 @@ async fn record_failed_response(
         }
     };
 
-    let response_body = response_body_value(&bytes);
+    let response_body = redact_error_value(response_body_value(&bytes));
     let message = error_message_from_response(&response_body)
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
     let document = json!({
@@ -2056,13 +2136,21 @@ fn redact_error_value(value: Value) -> Value {
         Value::Object(fields) => {
             let mut out = Map::new();
             for (key, value) in fields {
-                if REDACT_KEYS.contains(&key.to_lowercase().as_str()) {
+                if REDACT_KEYS.contains(&key.to_lowercase().as_str())
+                    || matches!(
+                        key.to_lowercase().as_str(),
+                        "thoughtsignature" | "thought_signature" | "client_secret"
+                    )
+                {
                     out.insert(key, redact_error_key(value));
                 } else {
                     out.insert(key, redact_error_value(value));
                 }
             }
             Value::Object(out)
+        }
+        Value::String(text) if text.contains("ccp:antigravity:") => {
+            Value::String(format!("[redacted len={}]", text.len()))
         }
         value => value,
     }
@@ -2362,6 +2450,131 @@ mod auto_review_tests {
             .expect("configured classifier should be routed");
         assert_eq!(route.override_model, "grok-4.5");
         assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn antigravity_error_capture_redacts_recursive_native_and_carrier_metadata() {
+        let value = json!({"error":{"details":[{"thoughtSignature":"native-secret"}],
+            "message":"ccp:antigravity:v1:opaque-secret",
+            "signature":"ccp:antigravity:v1:carrier-secret",
+            "code_verifier":"verifier-secret", "client_secret":"oauth-client-secret"}});
+        let redacted = super::redact_error_value(value).to_string();
+        for secret in [
+            "native-secret",
+            "opaque-secret",
+            "carrier-secret",
+            "verifier-secret",
+            "oauth-client-secret",
+        ] {
+            assert!(!redacted.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn antigravity_classifier_ignores_cross_provider_review_overrides() {
+        for override_model in [
+            "gpt-6-luna",
+            "grok-4.7",
+            "kimi-k2.6",
+            "cursor:gpt-5.5",
+            "opencode-go/kimi-k2.6",
+            "claude-opus-5",
+            "sonnet",
+        ] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            classifier.model = Some("antigravity/gemini-4-argon-low".to_string());
+            let before = serde_json::to_value(&classifier).unwrap();
+            assert!(
+                apply_auto_review_model(
+                    &mut classifier,
+                    false,
+                    Some(override_model),
+                    "antigravity",
+                )
+                .is_none(),
+                "an explicit Antigravity request must not become {override_model}"
+            );
+            assert_eq!(serde_json::to_value(&classifier).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn antigravity_same_provider_review_override_preserves_history_for_validation() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        classifier.model = Some("antigravity/gemini-4-argon-low".to_string());
+        let before = serde_json::to_value(&classifier).unwrap();
+        let route = apply_auto_review_model(
+            &mut classifier,
+            false,
+            Some("antigravity/gemini-4-argon-high"),
+            "antigravity",
+        )
+        .expect("same-provider routing still reaches strict provider replay validation");
+        assert_eq!(route.requested_model, "antigravity/gemini-4-argon-low");
+        assert_eq!(route.override_model, "antigravity/gemini-4-argon-high");
+        let mut expected = before;
+        expected["model"] = json!("antigravity/gemini-4-argon-high");
+        assert_eq!(serde_json::to_value(&classifier).unwrap(), expected);
+        // This checks routing only, not permission to replay a signed low-tier
+        // turn as high. The native provider must reject that model mismatch.
+    }
+
+    #[test]
+    fn antigravity_review_defaults_and_count_tokens_keep_the_selected_model() {
+        for (count_tokens, override_model) in [
+            (false, None),
+            (false, Some("")),
+            (true, Some("gpt-6-luna")),
+            (true, Some("antigravity/gemini-4-argon-high")),
+        ] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            classifier.model = Some("antigravity/gemini-4-argon-low".to_string());
+            assert!(
+                apply_auto_review_model(
+                    &mut classifier,
+                    count_tokens,
+                    override_model,
+                    "antigravity",
+                )
+                .is_none()
+            );
+            assert_eq!(
+                classifier.model.as_deref(),
+                Some("antigravity/gemini-4-argon-low")
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_review_exception_preserves_existing_provider_overrides() {
+        for original_provider in ["codex", "kimi", "cursor", "grok", "opencode"] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            let route = apply_auto_review_model(
+                &mut classifier,
+                false,
+                Some("grok-4.7"),
+                original_provider,
+            )
+            .expect("existing provider override behavior is unchanged");
+            assert_eq!(route.override_model, "grok-4.7");
+            assert_eq!(classifier.model.as_deref(), Some("grok-4.7"));
+        }
     }
 
     #[test]

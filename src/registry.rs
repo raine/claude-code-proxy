@@ -86,9 +86,21 @@ impl Registry {
             crate::providers::opencode::advertised_models(),
         );
 
+        if crate::providers::antigravity::enabled() {
+            models.insert(
+                "antigravity".into(),
+                crate::providers::antigravity::request::MODELS
+                    .iter()
+                    .map(|m| (*m).to_string())
+                    .collect(),
+            );
+        }
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
+                "antigravity" => {
+                    Arc::new(crate::providers::antigravity::AntigravityProvider::new())
+                }
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
@@ -132,6 +144,13 @@ impl Registry {
         let mut names: Vec<String> = self.handlers.keys().cloned().collect();
         names.sort_unstable();
         names
+    }
+
+    pub async fn finish_maintenance(&self) -> Result<()> {
+        for provider in self.handlers.values() {
+            provider.finish_maintenance().await?;
+        }
+        Ok(())
     }
 
     pub fn provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
@@ -347,6 +366,96 @@ fn build_cursor_models() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_default_off_preserves_existing_provider_catalog() {
+        for alias_provider in [AliasProvider::Codex, AliasProvider::Kimi] {
+            let registry = Registry::new(alias_provider);
+            assert_eq!(
+                registry.list_provider_names(),
+                ["codex", "cursor", "grok", "kimi", "opencode"]
+            );
+            assert!(registry.provider("antigravity").is_none());
+            assert!(registry.supported_models_for("antigravity").is_empty());
+            assert!(!registry.grouped_models().contains_key("antigravity"));
+            assert!(
+                registry
+                    .all_supported_models()
+                    .iter()
+                    .all(|(model, owner)| {
+                        owner != "antigravity" && !model.starts_with("antigravity/")
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_does_not_claim_existing_models_or_alias_affinity() {
+        for alias_provider in [AliasProvider::Codex, AliasProvider::Kimi] {
+            let registry = Registry::new(alias_provider);
+            for alias in ANTHROPIC_STYLE_ALIASES {
+                assert_eq!(
+                    registry.provider_for_model(alias, None).unwrap().name(),
+                    alias_provider.as_str()
+                );
+                for affinity in [AliasProvider::Codex, AliasProvider::Kimi] {
+                    assert_eq!(
+                        registry
+                            .provider_for_model(alias, Some(&affinity))
+                            .unwrap()
+                            .name(),
+                        affinity.as_str()
+                    );
+                }
+            }
+            for (model, owner) in [
+                ("gpt-6-astra-ultrafast", "codex"),
+                ("kimi-k2.6", "kimi"),
+                ("grok-4.7", "grok"),
+                ("cursor:gpt-5.5", "cursor"),
+                ("opencode-go/kimi-k2.6", "opencode"),
+            ] {
+                for affinity in [
+                    None,
+                    Some(&AliasProvider::Codex),
+                    Some(&AliasProvider::Kimi),
+                ] {
+                    assert_eq!(
+                        registry.provider_for_model(model, affinity).unwrap().name(),
+                        owner
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_disabled_and_unknown_selectors_never_fall_back() {
+        for alias_provider in [AliasProvider::Codex, AliasProvider::Kimi] {
+            let registry = Registry::new(alias_provider);
+            for model in [
+                "antigravity/gemini-4-argon-low",
+                "antigravity/gemini-4-argon-medium",
+                "antigravity/gemini-4-argon-high",
+                "antigravity/gemini-4-argon-low[1m]",
+                "antigravity/gemini-4-argon",
+                "antigravity/gemini-4-argon-ultra",
+                "antigravity/claude-opus-5",
+                "gemini-4-argon-low",
+            ] {
+                for affinity in [
+                    None,
+                    Some(&AliasProvider::Codex),
+                    Some(&AliasProvider::Kimi),
+                ] {
+                    assert!(
+                        registry.provider_for_model(model, affinity).is_none(),
+                        "{model} must not route to an existing provider"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn normalize_model_trims_hint() {

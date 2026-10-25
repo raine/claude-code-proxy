@@ -1579,3 +1579,573 @@ async fn models_endpoint_tolerates_unknown_query_params() {
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[cfg(test)]
+mod antigravity_entry_tests {
+    use super::*;
+
+    const MODELS: &[&str] = &[
+        "antigravity/gemini-4-argon-low",
+        "antigravity/gemini-4-argon-medium",
+        "antigravity/gemini-4-argon-high",
+    ];
+    const ENDPOINTS: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
+    type Dispatches = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+    // This provider deliberately accepts every dispatched request. A rejection
+    // therefore proves the server gate ran, not provider-local validation or an
+    // unknown-model lookup caused by the real provider being disabled.
+    struct EntryCaptureProvider {
+        name: &'static str,
+        models: Vec<String>,
+        dispatches: Dispatches,
+    }
+
+    impl EntryCaptureProvider {
+        fn record(
+            &self,
+            endpoint: &'static str,
+            body: MessagesRequest,
+        ) -> axum::response::Response {
+            let model = body.model.expect("server must resolve the model");
+            self.dispatches
+                .lock()
+                .unwrap()
+                .push((endpoint, model.clone()));
+            axum::Json(json!({"model": model, "provider": self.name})).into_response()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for EntryCaptureProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn supported_models(&self) -> Vec<String> {
+            self.models.clone()
+        }
+
+        fn cli(&self) -> &'static dyn CliHandlers {
+            &FAKE_CLI
+        }
+
+        async fn handle_messages(
+            &self,
+            body: MessagesRequest,
+            _ctx: RequestContext,
+        ) -> axum::response::Response {
+            self.record("/v1/messages", body)
+        }
+
+        async fn handle_count_tokens(
+            &self,
+            body: MessagesRequest,
+            _ctx: RequestContext,
+        ) -> axum::response::Response {
+            self.record("/v1/messages/count_tokens", body)
+        }
+    }
+
+    fn capture_app(name: &'static str, models: &[&str]) -> (axum::Router, Dispatches) {
+        let dispatches = Arc::new(Mutex::new(Vec::new()));
+        let registry = Registry::from_providers(
+            AliasProvider::Kimi,
+            [Arc::new(EntryCaptureProvider {
+                name,
+                models: models.iter().map(|model| (*model).to_string()).collect(),
+                dispatches: dispatches.clone(),
+            }) as Arc<dyn Provider>],
+        );
+        (
+            app_with_features(Arc::new(registry), None, AppFeatures::default()),
+            dispatches,
+        )
+    }
+
+    async fn post(
+        app: &axum::Router,
+        endpoint: &str,
+        model: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(endpoint)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "max_tokens": 32,
+                            "messages": [{"role": "user", "content": "synthetic entry test"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn assert_context_rejected(response: axum::response::Response, dispatches: &Dispatches) {
+        assert!(
+            dispatches.lock().unwrap().is_empty(),
+            "unsupported context must fail before either provider handler"
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!request_id(&response).is_empty());
+        let body = error_body(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.to_ascii_lowercase().contains("antigravity"));
+        assert!(
+            message.contains("1m"),
+            "actionable context error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_raw_1m_is_rejected_before_normalization_on_both_endpoints() {
+        let (app, dispatches) = capture_app("antigravity", MODELS);
+        for endpoint in ENDPOINTS {
+            for model in MODELS {
+                for suffix in ["[1m]", "[1M]"] {
+                    let response = post(&app, endpoint, &format!("{model}{suffix}"), &[]).await;
+                    assert_context_rejected(response, &dispatches).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_1m_beta_is_rejected_in_every_header_on_both_endpoints() {
+        let (app, dispatches) = capture_app("antigravity", MODELS);
+        let header_cases = [
+            vec![("anthropic-beta", "context-1m-2025-08-07")],
+            vec![(
+                "anthropic-beta",
+                "prompt-caching-2024-07-31, context-1m-2025-08-07 ,other-beta",
+            )],
+            vec![
+                ("anthropic-beta", "prompt-caching-2024-07-31"),
+                ("anthropic-beta", "context-1m-2025-08-07"),
+            ],
+            vec![
+                ("AnThRoPiC-BeTa", "context-1m-2025-08-07"),
+                ("anthropic-beta", "prompt-caching-2024-07-31"),
+            ],
+        ];
+        for endpoint in ENDPOINTS {
+            for model in MODELS {
+                for headers in &header_cases {
+                    let response = post(&app, endpoint, model, headers).await;
+                    assert_context_rejected(response, &dispatches).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_exact_models_and_unrelated_betas_reach_the_provider() {
+        let (app, dispatches) = capture_app("antigravity", MODELS);
+        for endpoint in ENDPOINTS {
+            for model in MODELS {
+                for beta in [
+                    None,
+                    Some("prompt-caching-2024-07-31"),
+                    Some("context-1m-2025-08-07-extra"),
+                    Some("not-context-1m-2025-08-07"),
+                ] {
+                    let headers: Vec<_> = beta
+                        .map(|value| ("anthropic-beta", value))
+                        .into_iter()
+                        .collect();
+                    let response = post(&app, endpoint, model, &headers).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = error_body(response).await;
+                    assert_eq!(body, json!({"model": model, "provider": "antigravity"}));
+                    assert_eq!(
+                        std::mem::take(&mut *dispatches.lock().unwrap()),
+                        vec![(*endpoint, (*model).to_string())]
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_unknown_selector_never_dispatches_to_a_known_tier() {
+        let (app, dispatches) = capture_app("antigravity", MODELS);
+        for endpoint in ENDPOINTS {
+            for model in [
+                "antigravity/gemini-4-argon",
+                "antigravity/gemini-4-argon-ultra",
+                "gemini-4-argon-low",
+                "antigravity/claude-opus-5",
+            ] {
+                let response = post(&app, endpoint, model, &[]).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(dispatches.lock().unwrap().is_empty());
+                let body = error_body(response).await;
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_entry_gate_preserves_existing_provider_context_behavior() {
+        for (provider, model) in [
+            ("codex", "gpt-6-astra-ultrafast"),
+            ("kimi", "kimi-k2.6"),
+            ("cursor", "cursor:gpt-5.5"),
+            ("grok", "grok-4.7"),
+            ("opencode", "opencode-go/kimi-k2.6"),
+        ] {
+            let (app, dispatches) = capture_app(provider, &[model]);
+            for endpoint in ENDPOINTS {
+                for suffix in ["", "[1m]", "[1M]"] {
+                    let response = post(
+                        &app,
+                        endpoint,
+                        &format!("{model}{suffix}"),
+                        &[("anthropic-beta", "context-1m-2025-08-07")],
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::OK, "{provider} {endpoint}");
+                    assert_eq!(
+                        error_body(response).await,
+                        json!({"model": model, "provider": provider})
+                    );
+                    assert_eq!(
+                        std::mem::take(&mut *dispatches.lock().unwrap()),
+                        vec![(*endpoint, model.to_string())]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_inbound_review_override_validates_original_bytes_in_isolated_process() {
+        for target in ["antigravity/gemini-4-argon-low", "grok-4.7"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "antigravity_entry_tests::antigravity_inbound_review_override_child",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("CCP_ANTIGRAVITY_TEST_REVIEW_CHILD", "1")
+                .env("CCP_AUTO_REVIEW_MODEL", target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_inbound_review_override_child() {
+        if std::env::var("CCP_ANTIGRAVITY_TEST_REVIEW_CHILD").is_err() {
+            return;
+        }
+        let native = std::env::var("CCP_AUTO_REVIEW_MODEL")
+            .unwrap()
+            .starts_with("antigravity/");
+        let dispatches = Arc::new(Mutex::new(Vec::new()));
+        let providers = [
+            ("codex", "gpt-6-luna"),
+            ("grok", "grok-4.7"),
+            ("antigravity", MODELS[0]),
+        ]
+        .map(|(name, model)| {
+            Arc::new(EntryCaptureProvider {
+                name,
+                models: vec![model.into()],
+                dispatches: dispatches.clone(),
+            }) as Arc<dyn Provider>
+        });
+        let app = app_with_features(
+            Arc::new(Registry::from_providers(AliasProvider::Codex, providers)),
+            None,
+            AppFeatures::default(),
+        );
+        let raw = |model: &str, message: &str| {
+            format!(
+                r#"{{"model":"{model}","max_tokens":32,"system":[{{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}}],"messages":[{message}]}}"#
+            )
+        };
+        let cases = [
+            (
+                raw(
+                    "gpt-6-luna",
+                    r#"{"role":"user","content":"review","unsupported":true}"#,
+                ),
+                Vec::new(),
+            ),
+            (
+                raw(
+                    "gpt-6-luna",
+                    r#"{"role":"user","content":[{"type":"text","text":"first","text":"second"}]}"#,
+                ),
+                Vec::new(),
+            ),
+            (
+                raw("gpt-6-luna[1m]", r#"{"role":"user","content":"review"}"#),
+                Vec::new(),
+            ),
+            (
+                raw("gpt-6-luna", r#"{"role":"user","content":"review"}"#),
+                vec!["unrelated", "other, context-1m-2025-08-07"],
+            ),
+        ];
+        for (body, betas) in cases {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json");
+            for beta in betas {
+                request = request.header("anthropic-beta", beta);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if native {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let calls = std::mem::take(&mut *dispatches.lock().unwrap());
+            assert_eq!(
+                calls.len(),
+                if native { 0 } else { 1 },
+                "invalid native reroute reached provider"
+            );
+        }
+        let body = raw("gpt-6-luna", r#"{"role":"user","content":"review"}"#);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::mem::take(&mut *dispatches.lock().unwrap())[0].1,
+            if native { MODELS[0] } else { "grok-4.7" }
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(dispatches.lock().unwrap()[0].1, "gpt-6-luna");
+    }
+
+    #[test]
+    fn antigravity_logout_removes_only_its_store_despite_invalid_network_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let own = directory.path().join("antigravity/auth.json");
+        let other = directory.path().join("codex/auth.json");
+        claude_code_proxy::auth::write_atomically(
+            other.to_str().unwrap(),
+            &json!({"sentinel":"unrelated-provider"}),
+        )
+        .unwrap();
+        for config in [
+            r#"{"antigravity":{"baseUrl":"http://not-allowed.invalid"}}"#,
+            "not JSON",
+        ] {
+            claude_code_proxy::auth::write_atomically(own.to_str().unwrap(), &json!({"profile_id":"owned","project_id":"owned-project","access_token":"synthetic","refresh_token":"synthetic-refresh","expires_at":0})).unwrap();
+            std::fs::write(directory.path().join("config.json"), config).unwrap();
+            let output =
+                std::process::Command::new(assert_cmd::cargo::cargo_bin!("claude-code-proxy"))
+                    .args(["antigravity", "auth", "logout"])
+                    .env("CCP_CONFIG_DIR", directory.path())
+                    .output()
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "logout must not validate network config: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!own.exists());
+            assert!(directory.path().join("antigravity/auth.lock").is_file());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&std::fs::read(&other).unwrap()).unwrap(),
+                json!({"sentinel":"unrelated-provider"})
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_opt_in_catalog_is_exact_and_other_provider_cli_is_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let run = |enabled: &str, args: &[&str]| {
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("claude-code-proxy"))
+                .args(args)
+                .env("CCP_CONFIG_DIR", directory.path())
+                .env("CCP_ANTIGRAVITY_ENABLED", enabled)
+                .output()
+                .unwrap()
+        };
+        let plain = run("0", &["models"]);
+        let enabled = run("1", &["models"]);
+        assert!(plain.status.success() && enabled.status.success());
+        let enabled = String::from_utf8(enabled.stdout).unwrap();
+        let retained = enabled
+            .lines()
+            .filter(|line| !line.starts_with("antigravity:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(retained.as_bytes(), plain.stdout);
+        let line = enabled
+            .lines()
+            .find(|line| line.starts_with("antigravity:"))
+            .unwrap();
+        assert_eq!(
+            line,
+            "antigravity: antigravity/gemini-4-argon-high, antigravity/gemini-4-argon-low, antigravity/gemini-4-argon-medium"
+        );
+        assert!(
+            !run("0", &["codex", "auth", "status", "--json"])
+                .status
+                .success()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn antigravity_auth_status_json_is_available_disabled_and_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("claude-code-proxy"))
+            .args(["antigravity", "auth", "status", "--json"])
+            .env("CCP_CONFIG_DIR", directory.path())
+            .env("CCP_ANTIGRAVITY_ENABLED", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["provider"], "antigravity");
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["status"]["auth"], "missing");
+        assert_eq!(value["status"]["live_verified"], false);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn antigravity_capability_query_reports_only_local_safe_readiness() {
+        let registry = Arc::new(Registry::new(AliasProvider::Codex));
+        let app = app_with_features(registry, None, AppFeatures::default());
+        let (_, plain) = get_models(app.clone(), "/v1/models").await;
+        assert!(plain.get("capabilities").is_none());
+        let (status, mut inspected) = get_models(app, "/v1/models?include_capabilities=true").await;
+        assert_eq!(status, StatusCode::OK);
+        let capabilities = inspected.as_object_mut().unwrap().remove("capabilities");
+        assert_eq!(inspected, plain);
+        assert_eq!(
+            capabilities,
+            Some(json!({
+                "schema_version": 1,
+                "providers": {"antigravity": {
+                    "supported": true, "enabled": false, "mode": "native", "experimental": true,
+                    "supported_apis": ["messages", "count_tokens"], "session_policy": "fixed-model",
+                    "context_window": 200000, "backend_window_verified": false,
+                    "status": {"configuration": "valid", "auth": "missing", "project": "missing",
+                        "configuration_ready": false, "live_verified": false}
+                }}
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_disabled_requests_explain_the_opt_in_on_both_endpoints() {
+        let app = app_with_features(
+            Arc::new(Registry::new(AliasProvider::Codex)),
+            None,
+            AppFeatures::default(),
+        );
+        for endpoint in ENDPOINTS {
+            for model in MODELS {
+                let response = post(&app, endpoint, model, &[]).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = error_body(response).await;
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("CCP_ANTIGRAVITY_ENABLED")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_default_models_json_remains_unchanged() {
+        for alias in [AliasProvider::Codex, AliasProvider::Kimi] {
+            let registry = Arc::new(Registry::new(alias));
+            let data: Vec<Value> = registry
+                .all_supported_models()
+                .into_iter()
+                .map(|(model, provider)| {
+                    assert_ne!(provider, "antigravity");
+                    assert!(!model.starts_with("antigravity/"));
+                    json!({
+                        "type": "model",
+                        "object": "model",
+                        "id": model,
+                        "display_name": format!("{model} ({provider})")
+                    })
+                })
+                .collect();
+            assert!(!data.is_empty());
+            let expected = json!({
+                "object": "list",
+                "data": data,
+                "has_more": false,
+                "first_id": data.first().unwrap()["id"],
+                "last_id": data.last().unwrap()["id"]
+            });
+            let app = app_with_features(registry, None, AppFeatures::default());
+            for uri in ["/v1/models", "/v1/models?include_capabilities=false"] {
+                let (status, actual) = get_models(app.clone(), uri).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+}
