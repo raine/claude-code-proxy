@@ -107,6 +107,25 @@ fn apply_auto_review_model(
     Some(route)
 }
 
+/// Mirrors Codex's own approval reviewer: Low effort (`ext/guardian-reviewer/src/model.rs`)
+/// and a reviewer-scoped `guardian:{parent}` prompt cache key (`core/src/guardian/review_session.rs`).
+fn apply_codex_auto_review_defaults(
+    body: &mut crate::anthropic::schema::MessagesRequest,
+    session_id: Option<&str>,
+) {
+    let output_config = body
+        .extra
+        .entry("output_config")
+        .or_insert_with(|| json!({}));
+    if let Some(config) = output_config.as_object_mut() {
+        config.entry("effort").or_insert_with(|| json!("low"));
+    }
+    body.prompt_cache_key_override = session_id.map(|id| format!("guardian:{id}"));
+    // The classifier reads only its text verdict; a reasoning summary or encrypted
+    // reasoning would be generated and returned for nothing.
+    body.omit_reasoning_artifacts = true;
+}
+
 pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
@@ -1678,6 +1697,9 @@ async fn dispatch_request(
     };
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    if body.bypass_provider_model_override {
+        apply_codex_auto_review_defaults(&mut body, session_id.as_deref());
+    }
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(
@@ -2278,7 +2300,10 @@ mod request_id_header_tests {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
+    use super::{
+        apply_auto_review_model, apply_codex_auto_review_defaults, headers_to_record,
+        is_claude_auto_review_request,
+    };
     use crate::anthropic::schema::MessagesRequest;
     use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
     use http::{HeaderMap, HeaderValue};
@@ -2337,6 +2362,58 @@ mod auto_review_tests {
         assert_eq!(route.requested_model, "gpt-5.6-sol");
         assert_eq!(route.override_model, "gpt-6-luna");
         assert_eq!(classifier.model.as_deref(), Some("gpt-6-luna"));
+    }
+
+    #[test]
+    fn codex_classifier_gets_low_effort_and_guardian_cache_key() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        apply_codex_auto_review_defaults(&mut classifier, Some("sess-1"));
+        assert_eq!(classifier.extra["output_config"]["effort"], "low");
+        assert_eq!(
+            classifier.prompt_cache_key_override.as_deref(),
+            Some("guardian:sess-1")
+        );
+        let translated = crate::providers::codex::translate::request::translate_request(
+            &classifier,
+            crate::providers::codex::translate::request::TranslateOptions {
+                session_id: Some("sess-1".to_string()),
+                service_tier: None,
+                model: "gpt-6-luna".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            translated.prompt_cache_key.as_deref(),
+            Some("guardian:sess-1")
+        );
+        let reasoning = serde_json::to_value(&translated.reasoning).unwrap();
+        assert_eq!(reasoning["effort"], "low");
+        assert!(
+            reasoning
+                .get("summary")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert!(translated.include.is_none());
+    }
+
+    #[test]
+    fn codex_classifier_keeps_explicit_effort() {
+        let mut classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            false,
+            json!([]),
+        );
+        classifier
+            .extra
+            .insert("output_config".to_string(), json!({"effort": "high"}));
+        apply_codex_auto_review_defaults(&mut classifier, None);
+        assert_eq!(classifier.extra["output_config"]["effort"], "high");
+        assert!(classifier.prompt_cache_key_override.is_none());
     }
 
     #[test]

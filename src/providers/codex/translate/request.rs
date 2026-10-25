@@ -578,6 +578,9 @@ fn translate_request_inner(
     if let Some(sid) = opts.session_id {
         out.prompt_cache_key = Some(sid);
     }
+    if let Some(key) = req.prompt_cache_key_override.clone() {
+        out.prompt_cache_key = Some(key);
+    }
 
     if apply_codex_config {
         let service_tier = resolve_service_tier(opts.service_tier, &out.model)?;
@@ -599,6 +602,7 @@ fn translate_request_inner(
     let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if wants_reasoning
+            && !req.omit_reasoning_artifacts
             && (!apply_codex_config
                 || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
@@ -612,7 +616,7 @@ fn translate_request_inner(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if wants_reasoning {
+    if wants_reasoning && !req.omit_reasoning_artifacts {
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
 

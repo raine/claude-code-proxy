@@ -168,6 +168,8 @@ pub fn parse_request(
             messages,
             stream: true,
             bypass_provider_model_override: false,
+            prompt_cache_key_override: None,
+            omit_reasoning_artifacts: false,
             extra,
         },
         requested_model,
