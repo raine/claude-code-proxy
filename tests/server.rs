@@ -1533,6 +1533,8 @@ async fn models_endpoint_lists_supported_models() {
     assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
     assert!(!ids.contains(&"gpt-6-sol-ultrafast"));
     assert!(ids.contains(&"grok-4.6"));
+    assert!(ids.contains(&"grok-4.7-build-fast"));
+    assert!(ids.contains(&"grok-4.7-fast"));
     for entry in data {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());
