@@ -53,6 +53,7 @@ env -u ANTHROPIC_API_KEY \
   CLAUDE_CODE_AUTO_MODE_SERVER=0 \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
   CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  CLAUDE_CODE_MAX_RETRIES=0 \
   claude
 ```
 
@@ -100,8 +101,24 @@ Legal SSE media-type parameters are accepted. A missing Content-Type requires a
 complete, bounded Responses SSE event; a successful HTTP status alone is not
 proof of a valid response. Only `response.completed` completes inference.
 
-Inference POSTs are never automatically replayed. Identical failed request bodies
-are blocked for 60 seconds in the same proxy process, and responses include
+Claude Code has a separate API retry layer. In an isolated test with native
+Claude Code 2.1.310, a local 503 mock received six requests, including the initial
+request, in 35.05 seconds despite `x-should-retry: false`. Setting
+`CLAUDE_CODE_MAX_RETRIES=0` in the SIWC test subprocess reduced the same case to
+one request. This was a Mock test, not a real upstream overload or quota test.
+
+The command above scopes this variable to the Claude Code process using SIWC.
+It disables that client's automatic API retries; it does not change the proxy's
+retry policy or provide strict exactly-once execution. Disabling retries reduces
+automatic recovery from transient failures, so inspect the reported error before
+retrying manually. Keep the variable in the SIWC-specific invocation; do not add
+it to shell startup files or native Claude Code global settings. See Anthropic's
+[retry settings](https://code.claude.com/docs/en/env-vars).
+`CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` only disables fallback after a
+mid-stream failure and does not disable the client's API retry layer.
+
+The proxy never automatically replays inference POSTs. Identical failed request
+bodies are blocked for 60 seconds in the same proxy process, and responses include
 `x-should-retry: false`. This is a bounded retry guard, not durable idempotency.
 Model-catalog GETs may use bounded backoff. A plan usage-limit error pauses new
 inference until the proxy restarts; check [ChatGPT usage settings](https://chatgpt.com/settings/usage)
