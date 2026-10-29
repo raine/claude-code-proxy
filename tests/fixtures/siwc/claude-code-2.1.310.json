@@ -1,0 +1,484 @@
+{
+  "model": "gpt-test",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Synthetic fixture text."
+        },
+        {
+          "type": "text",
+          "text": "Synthetic fixture text."
+        }
+      ]
+    },
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "Synthetic fixture text.",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "system": [
+    {
+      "type": "text",
+      "text": "Synthetic fixture text."
+    },
+    {
+      "type": "text",
+      "text": "Synthetic fixture text.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    },
+    {
+      "type": "text",
+      "text": "Synthetic fixture text.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "Agent",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "description": "Synthetic fixture text.",
+          "prompt": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "subagent_type": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "model": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "enum": [
+              "sonnet",
+              "opus",
+              "haiku",
+              "fable"
+            ]
+          },
+          "effort": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          },
+          "run_in_background": {
+            "description": "Synthetic fixture text.",
+            "type": "boolean"
+          },
+          "isolation": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "enum": [
+              "worktree",
+              "remote"
+            ]
+          }
+        },
+        "required": [
+          "description",
+          "prompt"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Bash",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Synthetic fixture text.",
+            "type": "number"
+          },
+          "description": "Synthetic fixture text.",
+          "run_in_background": {
+            "description": "Synthetic fixture text.",
+            "type": "boolean"
+          },
+          "dangerouslyDisableSandbox": {
+            "description": "Synthetic fixture text.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Edit",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "new_string": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "replace_all": {
+            "description": "Synthetic fixture text.",
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_path",
+          "old_string",
+          "new_string"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ListAgents",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "channel": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "maxLength": 256
+          },
+          "q": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Read",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "offset": {
+            "description": "Synthetic fixture text.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "limit": {
+            "description": "Synthetic fixture text.",
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "pages": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "allow_large": {
+            "description": "Synthetic fixture text.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ReportFindings",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "level": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ]
+          },
+          "findings": {
+            "description": "Synthetic fixture text.",
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string"
+                },
+                "line": {
+                  "description": "Synthetic fixture text.",
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "summary": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string"
+                },
+                "short_summary": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string",
+                  "maxLength": 60
+                },
+                "failure_scenario": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string"
+                },
+                "category": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string",
+                  "maxLength": 40
+                },
+                "verdict": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string",
+                  "enum": [
+                    "CONFIRMED",
+                    "PLAUSIBLE"
+                  ]
+                },
+                "outcome": {
+                  "description": "Synthetic fixture text.",
+                  "type": "string",
+                  "enum": [
+                    "fixed",
+                    "skipped",
+                    "no_change_needed"
+                  ]
+                }
+              },
+              "required": [
+                "file",
+                "summary",
+                "failure_scenario"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "findings"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ScheduleWakeup",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "delaySeconds": {
+            "description": "Synthetic fixture text.",
+            "type": "number"
+          },
+          "reason": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "stop": {
+            "description": "Synthetic fixture text.",
+            "type": "boolean"
+          },
+          "noop": {
+            "description": "Synthetic fixture text.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Skill",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "skill": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "args": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "ToolSearch",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "max_results": {
+            "description": "Synthetic fixture text.",
+            "default": 5,
+            "type": "number"
+          }
+        },
+        "required": [
+          "query",
+          "max_results"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "Workflow",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "script": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "maxLength": 524288
+          },
+          "name": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "description": "Synthetic fixture text.",
+          "title": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "args": {
+            "description": "Synthetic fixture text."
+          },
+          "scriptPath": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "resumeFromRunId": {
+            "description": "Synthetic fixture text.",
+            "type": "string",
+            "pattern": "^wf_[a-z0-9-]{6,}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "DeferredToolPlaceholder",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      },
+      "defer_loading": true
+    },
+    {
+      "name": "Write",
+      "description": "Synthetic fixture text.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          },
+          "content": {
+            "description": "Synthetic fixture text.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_path",
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "metadata": {
+    "user_id": "fixture"
+  },
+  "max_tokens": 32000,
+  "thinking": {
+    "type": "adaptive",
+    "display": "omitted"
+  },
+  "context_management": {
+    "edits": [
+      {
+        "type": "clear_thinking_20251015",
+        "keep": "all"
+      }
+    ]
+  },
+  "output_config": {
+    "effort": "high"
+  },
+  "stream": true
+}

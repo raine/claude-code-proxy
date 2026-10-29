@@ -36,6 +36,44 @@ pub(super) struct Prepared {
     pub tool_names: HashSet<String>,
 }
 
+/// Only structural counts and fixed categories; never prompts, names or arguments.
+pub(super) fn request_shape(body: &Value) -> Value {
+    let input = body["input"].as_array().cloned().unwrap_or_default();
+    let tools: Vec<_> = input
+        .iter()
+        .filter(|v| v["type"] == "additional_tools")
+        .filter_map(|v| v["tools"].as_array())
+        .flatten()
+        .collect();
+    let count = |kind: &str| input.iter().filter(|v| v["type"] == kind).count();
+    let role_count = |role: &str| input.iter().filter(|v| v["role"] == role).count();
+    let choice = match body["tool_choice"]
+        .as_str()
+        .or_else(|| body["tool_choice"]["type"].as_str())
+    {
+        Some("auto") => "auto",
+        Some("none") => "none",
+        Some("required") => "required",
+        Some("function") => "function",
+        None => "absent",
+        _ => "other",
+    };
+    // A caller-provided unknown model must not become arbitrary diagnostic text.
+    let model = body["model"].as_str().filter(|s| {
+        s.len() <= 128
+            && s.starts_with("gpt-")
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+    });
+    json!({"model":model,"store":body["store"].as_bool(),"stream":body["stream"].as_bool(),
+        "body_bytes":body.to_string().len(),"input_count":input.len(),"instructions_bytes":body["instructions"].as_str().map(str::len).unwrap_or(0),
+        "message_count":count("message"),"function_call_count":count("function_call"),"function_output_count":count("function_call_output"),
+        "system_items":role_count("system"),"developer_items":role_count("developer"),"user_items":role_count("user"),"assistant_items":role_count("assistant"),
+        "additional_tools_items":count("additional_tools"),"tool_count":tools.len(),
+        "tool_schema_bytes":tools.iter().map(|v| v["parameters"].to_string().len()).sum::<usize>(),
+        "top_level_tools":body.get("tools").is_some(),"tool_choice":choice})
+}
+
 pub(super) fn prepare(request: &MessagesRequest, model: String) -> Result<Prepared> {
     for key in FORBIDDEN {
         ensure!(
