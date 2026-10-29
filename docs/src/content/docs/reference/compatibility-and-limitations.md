@@ -42,10 +42,20 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 
 - Local registration does not guarantee account access to a model.
 - Unknown model IDs have no implicit provider fallback.
-- Anthropic-style aliases route only to the configured Codex or Kimi alias provider.
+- In the default registry, Anthropic-style aliases route to the configured Codex or Kimi alias provider. Isolated SIWC mode uses its configured default model.
 - `[1m]` is a Claude Code client hint and does not change upstream context.
 - Provider context limits can be lower than Claude Code's local threshold.
 - Switching provider or model can clear provider-specific continuation assumptions while Claude Code retains portable history.
+
+## Sign in with ChatGPT
+
+- SIWC is explicitly selected and isolated from the other provider registry.
+- It uses the official public Responses endpoint with separate OAuth credentials.
+- Only Unix credential storage is implemented; macOS is the locally tested platform.
+- It requires terminal `response.completed`, validates local function calls, and fails explicitly for unsupported tools or input.
+- Token counts are estimates, inference is never automatically replayed, and portable client history is sent on every request.
+- Traffic capture and persistent upstream error-body capture are disabled for SIWC.
+- See the [SIWC guide](/providers/chatgpt-siwc/) for precise supported input, lifecycle, retry, and validation limits.
 
 ## Codex
 

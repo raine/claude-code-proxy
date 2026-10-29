@@ -84,6 +84,25 @@ A missing credential makes `auth status` exit with status 1. Other provider comm
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
 
+## `siwc`
+
+```sh
+claude-code-proxy siwc auth login [--profile <LABEL>] [--consent] [--no-browser]
+claude-code-proxy siwc auth status [--profile <LABEL>]
+claude-code-proxy siwc auth logout [--profile <LABEL>]
+claude-code-proxy siwc models [--profile <LABEL>]
+claude-code-proxy siwc serve [--profile <LABEL>] [--model <MODEL>] [--port <PORT>]
+```
+
+The profile defaults to `default`; the isolated listener defaults to
+`127.0.0.1:18765`. Its `--port` option is independent of the general `serve` port
+configuration. `--model` takes precedence over `CCP_SIWC_MODEL` and `siwc.model`.
+Use a slug from `siwc models`. Login is browser PKCE; device-code login is not
+implemented. Status succeeds even when signed out and reports permission state.
+Logout attempts remote revocation and retains registration and host identity.
+See the [SIWC guide](/providers/chatgpt-siwc/) for its separate storage, Unix
+requirement, process-scoped Claude Code configuration, and retry policy.
+
 ## Development commands
 
 From a source checkout:
