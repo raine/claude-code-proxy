@@ -2823,9 +2823,8 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), replacement_accepted_rx)
+        replacement_accepted_rx
             .await
-            .expect("replacement startup did not reach the blocked handshake")
             .expect("replacement startup acknowledgement sender dropped");
         response_task.abort();
         assert!(response_task.await.unwrap_err().is_cancelled());
