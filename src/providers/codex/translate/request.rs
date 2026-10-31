@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -532,15 +532,16 @@ fn translate_request_inner(
         if let Some(ref tools) = tools
             && !tools.is_empty()
         {
-            let tools = tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()?;
-            prefix.push(ResponsesInputItem::AdditionalTools {
-                id: None,
-                role: "developer".to_string(),
-                tools,
-            });
+            let loads = tool_reference_loads(req);
+            let (prefix_tools, loaded_tools) = split_loaded_deferred_tools(req, tools, &loads)?;
+            if !prefix_tools.is_empty() {
+                prefix.push(ResponsesInputItem::AdditionalTools {
+                    id: None,
+                    role: "developer".to_string(),
+                    tools: prefix_tools,
+                });
+            }
+            append_loaded_tools(&mut out.input, &loads, loaded_tools);
         }
         if let Some(instructions) = out.instructions.take()
             && !instructions.is_empty()
@@ -557,7 +558,14 @@ fn translate_request_inner(
     } else if let Some(tools) = tools
         && !tools.is_empty()
     {
-        out.tools = Some(tools);
+        let deferred = deferred_tool_names(req);
+        let tools: Vec<ResponsesTool> = tools
+            .into_iter()
+            .filter(|tool| !is_deferred_placeholder(tool, &deferred))
+            .collect();
+        if !tools.is_empty() {
+            out.tools = Some(tools);
+        }
     }
 
     // Never force a web_search tool_choice the request didn't register —
@@ -645,6 +653,127 @@ fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
         "json_object" => Some(ResponsesTextFormat::JsonObject),
         _ => Some(ResponsesTextFormat::Text),
     }
+}
+
+/// Claude Code sends this deferred stub only to keep Anthropic's deferred loading on.
+const DEFERRED_TOOL_PLACEHOLDER: &str = "DeferredToolPlaceholder";
+
+fn responses_tool_name(tool: &ResponsesTool) -> Option<&str> {
+    match tool {
+        ResponsesTool::Function(function) => Some(function.name.as_str()),
+        ResponsesTool::WebSearch(_) => None,
+    }
+}
+
+fn deferred_tool_names(req: &MessagesRequest) -> HashSet<String> {
+    req.extra
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.get("defer_loading").and_then(Value::as_bool) == Some(true))
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+fn is_deferred_placeholder(tool: &ResponsesTool, deferred: &HashSet<String>) -> bool {
+    responses_tool_name(tool)
+        .is_some_and(|name| name == DEFERRED_TOOL_PLACEHOLDER && deferred.contains(name))
+}
+
+/// Tool names each `tool_result` loaded through `tool_reference` blocks, keyed by tool_use_id.
+fn tool_reference_loads(req: &MessagesRequest) -> HashMap<String, Vec<String>> {
+    let mut loads: HashMap<String, Vec<String>> = HashMap::new();
+    for msg in req.messages.iter().filter(|msg| msg.role == "user") {
+        let Some(blocks) = msg.content.as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let names = block
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|child| child.get("type").and_then(Value::as_str) == Some("tool_reference"))
+                .filter_map(|child| child.get("tool_name").and_then(Value::as_str));
+            loads
+                .entry(id.to_string())
+                .or_default()
+                .extend(names.map(str::to_string));
+        }
+    }
+    loads.retain(|_, names| !names.is_empty());
+    loads
+}
+
+/// Splits the catalog for the Responses Lite lane, the way Codex's incremental tools do:
+/// deferred tools that a `tool_reference` in the history loaded are taken out of the
+/// prefix so they can be appended at the point they were loaded, which keeps the cached
+/// prefix byte-identical across loads. Deferred tools with no visible load (e.g. loaded
+/// before a compaction) stay in the prefix so they remain callable.
+fn split_loaded_deferred_tools(
+    req: &MessagesRequest,
+    tools: &[ResponsesTool],
+    loads: &HashMap<String, Vec<String>>,
+) -> Result<(Vec<Value>, HashMap<String, Value>), anyhow::Error> {
+    let deferred = deferred_tool_names(req);
+    let loaded: HashSet<&str> = loads.values().flatten().map(String::as_str).collect();
+    let mut prefix = Vec::new();
+    let mut appended = HashMap::new();
+    for tool in tools {
+        if is_deferred_placeholder(tool, &deferred) {
+            continue;
+        }
+        let value = serde_json::to_value(tool)?;
+        match responses_tool_name(tool) {
+            Some(name) if deferred.contains(name) && loaded.contains(name) => {
+                appended.insert(name.to_string(), value);
+            }
+            _ => prefix.push(value),
+        }
+    }
+    Ok((prefix, appended))
+}
+
+fn append_loaded_tools(
+    input: &mut Vec<ResponsesInputItem>,
+    loads: &HashMap<String, Vec<String>>,
+    mut loaded_tools: HashMap<String, Value>,
+) {
+    if loaded_tools.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(input.len() + loads.len());
+    for item in input.drain(..) {
+        let names = match &item {
+            ResponsesInputItem::FunctionCallOutput { call_id, .. } => loads.get(call_id),
+            _ => None,
+        };
+        out.push(item);
+        let tools: Vec<Value> = names
+            .into_iter()
+            .flatten()
+            .filter_map(|name| loaded_tools.remove(name))
+            .collect();
+        if !tools.is_empty() {
+            out.push(ResponsesInputItem::AdditionalTools {
+                id: None,
+                role: "developer".to_string(),
+                tools,
+            });
+        }
+    }
+    debug_assert!(
+        loaded_tools.is_empty(),
+        "every loaded tool should follow the tool_result that loaded it"
+    );
+    *input = out;
 }
 
 fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
@@ -1121,6 +1250,10 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
         Some("image") => render_tool_result_image(block),
+        Some("tool_reference") => match block.get("tool_name").and_then(Value::as_str) {
+            Some(name) => RenderedToolResultPart::Text(format!("Tool loaded: {name}")),
+            None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block)),
+        },
         Some(other) => {
             RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
         }
@@ -2187,6 +2320,138 @@ mod tests {
         } else {
             panic!("expected JsonSchema format");
         }
+    }
+
+    fn tool_search_request(load: bool, extra_turn: bool) -> MessagesRequest {
+        let mut tools = vec![
+            json!({"name":"Bash","description":"run","input_schema":{"type":"object","properties":{}}}),
+            json!({"name":"ToolSearch","description":"search","input_schema":{"type":"object","properties":{}}}),
+            json!({"name":"DeferredToolPlaceholder","description":"never call","defer_loading":true,
+                   "input_schema":{"type":"object","properties":{}}}),
+        ];
+        let mut messages = vec![json!({"role":"user","content":"find the mail tool"})];
+        if load {
+            tools.push(json!({"name":"mcp__mail__search","description":"search mail","defer_loading":true,
+                              "input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}));
+            messages.push(
+                json!({"role":"assistant","content":[{"type":"tool_use","id":"tu_search",
+                "name":"ToolSearch","input":{"query":"select:mcp__mail__search"}}]}),
+            );
+            messages.push(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu_search",
+                 "content":[{"type":"tool_reference","tool_name":"mcp__mail__search"}]},
+                {"type":"text","text":"Tool loaded."}]}));
+        }
+        if extra_turn {
+            messages.push(
+                json!({"role":"assistant","content":[{"type":"tool_use","id":"tu_bash",
+                "name":"Bash","input":{"command":"ls"}}]}),
+            );
+            messages.push(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu_bash","content":"a.txt"}]}));
+        }
+        serde_json::from_value(json!({"model":"gpt-6-astra","messages":messages,"tools":tools}))
+            .unwrap()
+    }
+
+    fn lite_wire(req: &MessagesRequest) -> Value {
+        serde_json::to_value(
+            translate_request(
+                req,
+                TranslateOptions {
+                    model: "gpt-6-astra".to_string(),
+                    use_responses_lite: true,
+                    ..opts()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn additional_tool_names(item: &Value) -> Vec<String> {
+        item["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn loaded_deferred_tool_is_appended_after_its_tool_search_result() {
+        let wire = lite_wire(&tool_search_request(true, false));
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "additional_tools");
+        assert_eq!(additional_tool_names(&input[0]), vec!["Bash", "ToolSearch"]);
+        let output_at = input
+            .iter()
+            .position(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "tu_search"
+            })
+            .unwrap();
+        assert_eq!(input[output_at]["output"], "Tool loaded: mcp__mail__search");
+        assert_eq!(input[output_at + 1]["type"], "additional_tools");
+        assert_eq!(input[output_at + 1]["role"], "developer");
+        assert_eq!(
+            additional_tool_names(&input[output_at + 1]),
+            vec!["mcp__mail__search"]
+        );
+        assert!(!wire.to_string().contains("DeferredToolPlaceholder"));
+    }
+
+    #[test]
+    fn tool_load_keeps_the_earlier_request_as_a_prefix() {
+        let before = lite_wire(&tool_search_request(false, false));
+        let after = lite_wire(&tool_search_request(true, false));
+        let later = lite_wire(&tool_search_request(true, true));
+        let before_input = before["input"].as_array().unwrap();
+        let after_input = after["input"].as_array().unwrap();
+        let later_input = later["input"].as_array().unwrap();
+        assert_eq!(&after_input[..before_input.len()], &before_input[..]);
+        assert_eq!(&later_input[..after_input.len()], &after_input[..]);
+    }
+
+    #[test]
+    fn deferred_tool_without_a_visible_load_stays_in_the_prefix() {
+        let mut req = tool_search_request(false, false);
+        req.extra["tools"].as_array_mut().unwrap().push(json!({
+            "name":"mcp__mail__search","description":"search mail","defer_loading":true,
+            "input_schema":{"type":"object","properties":{}}
+        }));
+        let wire = lite_wire(&req);
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(
+            additional_tool_names(&input[0]),
+            vec!["Bash", "ToolSearch", "mcp__mail__search"]
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "additional_tools")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn full_lane_keeps_loaded_tools_and_drops_the_placeholder() {
+        let out = translate_request(&tool_search_request(true, false), opts()).unwrap();
+        let wire = serde_json::to_value(&out).unwrap();
+        let names: Vec<&str> = wire["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Bash", "ToolSearch", "mcp__mail__search"]);
+        assert!(
+            !wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "additional_tools")
+        );
     }
 
     #[test]
