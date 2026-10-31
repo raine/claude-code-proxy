@@ -1659,6 +1659,7 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
 #[tokio::test]
 async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _guard = env_lock();
+    let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "0");
     clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");

@@ -212,6 +212,25 @@ pub fn uses_responses_lite(model: &str) -> bool {
             .is_some_and(|entry| entry.supported_in_api && entry.use_responses_lite))
 }
 
+/// Opt known full-lane models out of Lite without overriding advisory catalog
+/// metadata for models whose full-lane availability is unknown.
+pub fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    if full_lane
+        && matches!(
+            model,
+            "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-6-astra"
+                | "gpt-6-sol"
+                | "gpt-6.1-sol"
+                | "gpt-6.1-terra"
+        )
+    {
+        return false;
+    }
+    uses_responses_lite(model)
+}
+
 /// Luna models exist only behind the Responses Lite lane; the full
 /// Responses API resolves them to a `-free` variant and returns 404 (Model not
 /// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
@@ -242,6 +261,29 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-6-luna");
+    }
+
+    #[test]
+    fn full_lane_covers_all_lite_models_except_luna() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"] {
+            assert!(!uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
     }
 
     #[test]

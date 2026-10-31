@@ -215,6 +215,42 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
         assert!(headers.contains_key("x-openai-internal-codex-responses-lite"));
         assert!(body.get("client_metadata").is_some());
     }
+    for full_lane in [false, true] {
+        std::fs::write(
+            dir.path().join("config.json"),
+            json!({"codex":{"fullLane":full_lane}}).to_string(),
+        )
+        .unwrap();
+        for (model, lite) in [("gpt-test-future", true), ("gpt-test-hidden", false)] {
+            for route in ["/v1/responses", "/v1/messages"] {
+                let body = if route == "/v1/responses" {
+                    json!({"model":model,"input":"synthetic"})
+                } else {
+                    json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":"synthetic"}]})
+                };
+                let response = client
+                    .post(format!("{url}{route}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    response.status().is_success(),
+                    "{model} {route} fullLane={full_lane}"
+                );
+                let (headers, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    headers.contains_key("x-openai-internal-codex-responses-lite"),
+                    lite,
+                    "catalog lane must remain authoritative for {model} fullLane={full_lane}"
+                );
+            }
+        }
+    }
+    std::fs::remove_file(dir.path().join("config.json")).unwrap();
     for rejected in [
         "gpt-test-denied",
         "gpt-test-incomplete",

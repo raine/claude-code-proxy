@@ -72,6 +72,23 @@ The snapshot is event-derived, not synthesized from HTTP quota headers, so it
 may be absent depending on the upstream transport. Streaming terminal usage
 and non-streaming message usage use the same shape.
 
+## Responses lanes and parallel tools
+
+The gpt-5.6 and gpt-6 families use Responses Lite by default. Lite requires
+`parallel_tool_calls: false`, so function tools run serially. Set
+`codex.fullLane: true` or `CCP_CODEX_FULL_LANE=1` to use the full Responses lane
+for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`,
+and `gpt-6.1-terra`. This permits parallel calls; the model still decides whether to batch tools, and explicit
+client restrictions on parallel tools remain effective.
+
+This is not a universal lane override: catalog-only models keep the lane
+specified in the local Codex model cache. Luna models stay on Lite.
+Automatic hosted web search uses the full lane
+regardless of this setting and remaps Luna to its Sol sibling. Forced standalone
+search uses `/alpha/search` instead. `/v1/responses` honors the setting;
+text-only `/v1/chat/completions` keeps its default lane. Full-lane availability
+and quota accounting depend on the upstream subscription; this setting is opt-in.
+
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
