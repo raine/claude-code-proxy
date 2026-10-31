@@ -344,6 +344,7 @@ impl CodexProvider {
                     attempt: compaction_attempt,
                 },
                 configured_transport,
+                tail_is_successful_tool_result(&body),
             )
             .await;
             log.info(
@@ -367,6 +368,7 @@ impl CodexProvider {
         let request_continuation = continuation.clone();
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
+        let successful_tool_tail = tail_is_successful_tool_result(&body);
         let upstream = loop {
             let response = match client
                 .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
@@ -397,6 +399,10 @@ impl CodexProvider {
                 }
             };
             if !is_empty_codex_success_completion(&response.body) {
+                break response;
+            }
+            if accept_empty_completion(successful_tool_tail, attempt) {
+                // A repeated empty success can end a fully resolved tool exchange.
                 break response;
             }
             // A successful terminal event with no output would translate into
@@ -767,10 +773,13 @@ async fn live_stream_response(
     continuation: ContinuationReservation,
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
+    successful_tool_tail: bool,
 ) -> Response {
     let model = model.to_string();
     let started_at = Instant::now();
     let request_continuation = continuation.clone();
+    // Transport failures interrupt the consecutive empty-success sequence.
+    let mut empty_completion_attempts = 0_u32;
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
         ctx.session_id.clone(),
@@ -808,6 +817,7 @@ async fn live_stream_response(
                 return map_codex_error_to_response(&err);
             }
             Err(err) if retryable_live_start_codex_error(&err) => {
+                empty_completion_attempts = 0;
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&err) {
                     attempt += 1;
@@ -841,6 +851,7 @@ async fn live_stream_response(
             request_body.clone(),
             compaction,
             transport,
+            accept_empty_completion(successful_tool_tail, empty_completion_attempts),
         )
         .await
         {
@@ -859,6 +870,11 @@ async fn live_stream_response(
                 if error.origin == client::CodexErrorOrigin::Http {
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
+                }
+                if error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
+                    empty_completion_attempts += 1;
+                } else {
+                    empty_completion_attempts = 0;
                 }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
@@ -933,6 +949,7 @@ async fn live_stream_response_once(
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
     configured_transport: config::CodexTransport,
+    accept_empty: bool,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -1014,6 +1031,7 @@ async fn live_stream_response_once(
         if terminal
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
+            && !accept_empty
         {
             create_logger("codex").warn(
                 "codex_empty_completion_retry",
@@ -1085,6 +1103,72 @@ async fn live_stream_response_once(
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
+}
+
+/// Empty success is eligible only when the last exchange resolves every tool call.
+/// Text and system messages may contain new instructions, even when added by hooks.
+fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
+    use std::collections::HashSet;
+
+    let [.., assistant, user] = body.messages.as_slice() else {
+        return false;
+    };
+    if assistant.role != "assistant" || user.role != "user" {
+        return false;
+    }
+    let (Some(calls), Some(results)) = (assistant.content.as_array(), user.content.as_array())
+    else {
+        return false;
+    };
+    let mut pending = HashSet::new();
+    for block in calls {
+        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+            let Some(id) = block
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                return false;
+            };
+            if !pending.insert(id) {
+                return false;
+            }
+        }
+    }
+    if pending.is_empty() {
+        return false;
+    }
+    for block in results {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("text")
+                if block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|text| text.trim().is_empty()) => {}
+            Some("tool_result") => {
+                if !matches!(
+                    block.get("is_error"),
+                    None | Some(serde_json::Value::Bool(false))
+                ) {
+                    return false;
+                }
+                let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                if !pending.remove(id) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    pending.is_empty()
+}
+
+/// Retry once with full context before permitting an empty successful tool follow-up.
+/// Repetition is a heuristic, not proof that the tool delivered a user-visible answer.
+fn accept_empty_completion(successful_tool_tail: bool, empty_attempts: u32) -> bool {
+    successful_tool_tail && empty_attempts >= 1
 }
 
 fn empty_live_completion_error() -> client::CodexError {
@@ -1984,6 +2068,290 @@ mod tests {
         assert!(!is_empty_codex_success_completion(&upstream_sse(&[])));
     }
 
+    fn request_with_tail(messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "messages": messages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn successful_tool_result_tail_is_detected() {
+        let body = request_with_tail(serde_json::json!([
+            {"role":"user","content":"ping"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"reply","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sent"}]}
+        ]));
+        assert!(tail_is_successful_tool_result(&body));
+    }
+
+    #[test]
+    fn error_tool_result_tail_is_excluded() {
+        let body = request_with_tail(serde_json::json!([
+            {"role":"user","content":"ping"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"run","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true}]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&body));
+    }
+
+    #[test]
+    fn non_tool_tails_are_excluded() {
+        // plain-text user tail
+        let text = request_with_tail(serde_json::json!([{"role":"user","content":"ping"}]));
+        assert!(!tail_is_successful_tool_result(&text));
+        // assistant tail
+        let assistant = request_with_tail(serde_json::json!([
+            {"role":"user","content":"ping"},
+            {"role":"assistant","content":[{"type":"text","text":"pong"}]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&assistant));
+        // tool_result present but NOT the last block
+        let not_last = request_with_tail(serde_json::json!([
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"sent"},
+                {"type":"text","text":"and also this"}
+            ]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&not_last));
+        // empty conversation
+        let empty = request_with_tail(serde_json::json!([]));
+        assert!(!tail_is_successful_tool_result(&empty));
+    }
+
+    #[test]
+    fn tool_tail_requires_complete_successful_matching_results() {
+        let calls = serde_json::json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"a","name":"reply","input":{}},
+            {"type":"tool_use","id":"b","name":"reply","input":{}}
+        ]});
+        let results = serde_json::json!([
+            {"type":"tool_result","tool_use_id":"a","content":"sent"},
+            {"type":"tool_result","tool_use_id":"b","content":"sent"}
+        ]);
+        let make = |content| {
+            request_with_tail(serde_json::json!([
+                calls.clone(), {"role":"user","content":content}
+            ]))
+        };
+        assert!(tail_is_successful_tool_result(&make(results.clone())));
+        let mut whitespace = results.clone();
+        whitespace
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"text","text":" \n\t"}));
+        assert!(tail_is_successful_tool_result(&make(whitespace)));
+        let mut cases = vec![
+            serde_json::json!([results[0]]),
+            serde_json::json!([results[0], results[0]]),
+        ];
+        for key in ["is_error", "tool_use_id"] {
+            let mut invalid = results.clone();
+            invalid[0][key] = if key == "is_error" {
+                serde_json::json!(true)
+            } else {
+                serde_json::json!("unknown")
+            };
+            cases.push(invalid);
+        }
+        for text in [
+            "continue working",
+            "<system-reminder>PostToolUse hook: continue</system-reminder>",
+        ] {
+            let mut invalid = results.clone();
+            invalid
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"type":"text","text":text}));
+            cases.push(invalid);
+        }
+        for case in cases {
+            assert!(
+                !tail_is_successful_tool_result(&make(case.clone())),
+                "{case}"
+            );
+        }
+        for role in ["user", "system"] {
+            let mut body = make(results.clone());
+            let trailing = request_with_tail(
+                serde_json::json!([{"role":role,"content":"PostToolUse hook: continue"}]),
+            );
+            body.messages.extend(trailing.messages);
+            assert!(!tail_is_successful_tool_result(&body));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepting_empty_does_not_accept_failed_or_incomplete_terminals() {
+        for status in ["failed", "incomplete"] {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            let payload = serde_json::json!({
+                "type":"response.done", "response":{"id":"r", "status":status,"output":[]}
+            });
+            assert!(!is_empty_codex_success_completion(&upstream_sse(
+                std::slice::from_ref(&payload)
+            )));
+            tx.send(Ok(payload)).await.unwrap();
+            match live_stream_response_once(
+                rx,
+                "msg_test".into(),
+                "gpt-5.6-sol",
+                ctx,
+                ContinuationReservation::for_owner_turn(None, None),
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                true,
+            )
+            .await
+            {
+                LiveStreamStart::Retry { error, .. } => assert!(!is_empty_completion_error(&error)),
+                LiveStreamStart::Response(response) => assert!(!response.status().is_success()),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_completion_is_accepted_only_after_one_retry_and_only_with_the_tail() {
+        // Require a full-context retry before permitting empty success.
+        assert!(
+            !accept_empty_completion(true, 0),
+            "first empty must retry once"
+        );
+        assert!(
+            accept_empty_completion(true, 1),
+            "second consecutive empty is the turn's end"
+        );
+        assert!(accept_empty_completion(true, 2));
+        assert!(
+            !accept_empty_completion(false, 0),
+            "no tool tail: unchanged #70/#71 behavior"
+        );
+        assert!(
+            !accept_empty_completion(false, 5),
+            "no tool tail: never accepted"
+        );
+    }
+
+    fn empty_terminal_fixture() -> (
+        tokio::sync::mpsc::Sender<Result<serde_json::Value, client::CodexError>>,
+        websocket::CodexWebSocketEventStream,
+        RequestContext,
+        translate::request::ResponsesRequest,
+    ) {
+        let body = request_with_tools(serde_json::json!([]));
+        let request_body = translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "empty-terminal".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        (tx, rx, ctx, request_body)
+    }
+
+    #[tokio::test]
+    async fn empty_terminal_without_accept_flag_still_retries() {
+        let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": [], "usage": {}}
+        })))
+        .await
+        .unwrap();
+        let continuation = ContinuationReservation::for_owner_turn(None, None);
+        match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+            config::CodexTransport::WebSocket,
+            false,
+        )
+        .await
+        {
+            LiveStreamStart::Retry { error, .. } => {
+                assert_eq!(error.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
+            }
+            LiveStreamStart::Response(_) => {
+                panic!("an empty completion without the accept flag must stay a retry")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_terminal_with_accept_flag_is_a_valid_response() {
+        use http_body_util::BodyExt as _;
+        let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": [], "usage": {}}
+        })))
+        .await
+        .unwrap();
+        let continuation = ContinuationReservation::for_owner_turn(None, None);
+        let response = match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+            config::CodexTransport::WebSocket,
+            true,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } => {
+                panic!(
+                    "accept flag set: the empty completion must be delivered, got retry: {error}"
+                )
+            }
+        };
+        let mut collected = Vec::new();
+        let mut body = response.into_body();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), body.frame()).await
+        {
+            if let Ok(data) = frame.unwrap().into_data() {
+                collected.extend_from_slice(&data);
+            }
+        }
+        let sse = String::from_utf8(collected).unwrap();
+        assert!(
+            sse.contains("event: message_stop"),
+            "delivered stream must terminate properly, got: {sse:?}"
+        );
+    }
+
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
             "model": "gpt-5.6-luna",
@@ -2164,6 +2532,7 @@ mod tests {
                 attempt: None,
             },
             config::CodexTransport::Http,
+            false,
         )
         .await
         {
@@ -2474,6 +2843,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             ),
         )
         .await
@@ -2589,6 +2959,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             )
             .await
         });
@@ -2674,6 +3045,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             ),
         )
         .await
@@ -2860,6 +3232,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             )
             .await
         });
