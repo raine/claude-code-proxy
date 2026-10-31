@@ -5120,6 +5120,32 @@ mod tests {
     }
 
     #[test]
+    fn auto_fallback_requires_an_eligible_pre_send_failure() {
+        for status in [0, 400, 401, 403, 407, 429, 502] {
+            for origin in [
+                CodexErrorOrigin::WebSocketHandshake,
+                CodexErrorOrigin::WebSocket,
+                CodexErrorOrigin::Auth,
+                CodexErrorOrigin::Http,
+            ] {
+                let err = CodexError {
+                    status,
+                    message: "transport failure".to_string(),
+                    detail: None,
+                    retry_after: None,
+                    usage_limit: None,
+                    origin,
+                };
+                assert_eq!(
+                    should_fallback_to_http(&err),
+                    origin == CodexErrorOrigin::WebSocketHandshake && status != 407,
+                    "status={status}, origin={origin:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn proxy_tunnel_rejection_is_not_retried_or_used_for_http_fallback() {
         let err = CodexError {
             status: 0,
