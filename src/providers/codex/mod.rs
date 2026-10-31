@@ -401,7 +401,9 @@ impl CodexProvider {
             if !is_empty_codex_success_completion(&response.body) {
                 break response;
             }
-            if accept_empty_completion(successful_tool_tail, attempt) {
+            if accept_empty_completion(successful_tool_tail, attempt)
+                && buffered_terminal_is_completed(&response.body)
+            {
                 // A repeated empty success can end a fully resolved tool exchange.
                 break response;
             }
@@ -1031,7 +1033,7 @@ async fn live_stream_response_once(
         if terminal
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
-            && !accept_empty
+            && !(accept_empty && terminal_status_is_completed(&payload))
         {
             create_logger("codex").warn(
                 "codex_empty_completion_retry",
@@ -1163,6 +1165,21 @@ fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
         }
     }
     pending.is_empty()
+}
+
+/// An empty end_turn must not hide a missing or contradictory upstream status.
+fn terminal_status_is_completed(payload: &serde_json::Value) -> bool {
+    payload.pointer("/response/status").and_then(|v| v.as_str()) == Some("completed")
+}
+
+fn buffered_terminal_is_completed(upstream_sse: &[u8]) -> bool {
+    crate::anthropic::sse::parse_sse_events(upstream_sse)
+        .into_iter()
+        .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+        .rfind(events::event_is_terminal)
+        .is_some_and(|payload| {
+            is_codex_success_terminal_event(&payload) && terminal_status_is_completed(&payload)
+        })
 }
 
 /// Retry once with full context before permitting an empty successful tool follow-up.
@@ -2180,6 +2197,50 @@ mod tests {
             body.messages.extend(trailing.messages);
             assert!(!tail_is_successful_tool_result(&body));
         }
+    }
+
+    #[tokio::test]
+    async fn empty_acceptance_requires_explicit_completed_status() {
+        for status in [
+            serde_json::json!("cancelled"),
+            serde_json::json!("in_progress"),
+            serde_json::Value::Null,
+        ] {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            let payload = serde_json::json!({
+                "type":"response.completed", "response":{"id":"r", "status":status,"output":[]}
+            });
+            assert!(!buffered_terminal_is_completed(&upstream_sse(
+                std::slice::from_ref(&payload)
+            )));
+            tx.send(Ok(payload)).await.unwrap();
+            match live_stream_response_once(
+                rx,
+                "msg_test".into(),
+                "gpt-5.6-sol",
+                ctx,
+                ContinuationReservation::for_owner_turn(None, None),
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                true,
+            )
+            .await
+            {
+                LiveStreamStart::Retry { error, .. } => assert!(is_empty_completion_error(&error)),
+                LiveStreamStart::Response(_) => {
+                    panic!("non-completed status must not end the turn")
+                }
+            }
+        }
+        assert!(!buffered_terminal_is_completed(&upstream_sse(&[
+            serde_json::json!({
+                "type":"response.done", "response":{"output":[]}
+            })
+        ])));
     }
 
     #[tokio::test]

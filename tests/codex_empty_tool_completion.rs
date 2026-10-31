@@ -12,6 +12,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 struct Script {
     attempts: usize,
     fail: bool,
+    contradictory_status: bool,
 }
 
 fn next_events(script: &Mutex<Script>) -> Vec<Value> {
@@ -31,7 +32,7 @@ fn next_events(script: &Mutex<Script>) -> Vec<Value> {
         events.push(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_recovered"}}));
     }
     events.push(json!({"type":"response.completed","response":{
-        "id":format!("resp_{}", script.attempts),"status":"completed","output":[],
+        "id":format!("resp_{}", script.attempts),"status":if script.contradictory_status && script.attempts < 3 { "in_progress" } else { "completed" },"output":[],
         "usage":{"input_tokens":1,"output_tokens":0}
     }}));
     events
@@ -154,10 +155,12 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
                 "unmatched",
                 "error",
                 "failed",
+                "non_completed",
             ] {
                 *script.lock().unwrap() = Script {
                     attempts: 0,
                     fail: case == "failed",
+                    contradictory_status: case == "non_completed",
                 };
                 let mut results =
                     vec![json!({"type":"tool_result","tool_use_id":"a","content":"sent"})];
