@@ -1042,6 +1042,15 @@ async fn antigravity_logout_during_browser_consent_prevents_exchange_and_resurre
 }
 
 #[test]
+fn antigravity_load_code_assist_payload_matches_exact_bootstrap_contract() {
+    assert_eq!(
+        auth::load_code_assist_payload(),
+        json!({"metadata":{"ideType":"ANTIGRAVITY"}}),
+        "bootstrap must not add pluginType, nulls, or other root/metadata fields"
+    );
+}
+
+#[test]
 fn antigravity_pkce_state_and_project_shapes_are_explicit() {
     let url = auth::authorization_url(
         &Config::default(),

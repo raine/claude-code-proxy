@@ -380,7 +380,7 @@ impl Auth {
                 .timeout(Duration::from_secs(30))
                 .bearer_auth(&credential.access_token)
                 .headers(self.config.native_headers())
-                .json(&json!({"metadata":{"ideType":"ANTIGRAVITY","pluginType":"GEMINI"}}))
+                .json(&load_code_assist_payload())
                 .send()
                 .await
                 .map_err(|_| "Antigravity project discovery transport failed")?;
@@ -390,6 +390,10 @@ impl Auth {
         self.store.save(&lock, &credential)?;
         Ok(())
     }
+}
+
+pub(crate) fn load_code_assist_payload() -> Value {
+    json!({"metadata":{"ideType":"ANTIGRAVITY"}})
 }
 
 pub(crate) fn authorization_url(

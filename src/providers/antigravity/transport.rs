@@ -47,6 +47,7 @@ const GOOGLE_REASONS: &[&str] = &[
 const GOOGLE_DOMAINS: &[&str] = &[
     "googleapis.com",
     "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
     "generativelanguage.googleapis.com",
     "aiplatform.googleapis.com",
 ];
@@ -634,4 +635,149 @@ pub(crate) fn sse(message: &Value) -> Result<Vec<u8>> {
         ));
     }
     Ok(wire.into_bytes())
+}
+
+#[cfg(test)]
+mod error_info_tests {
+    use super::*;
+
+    const DAILY: &str = "daily-cloudcode-pa.googleapis.com";
+    const PRIVATE: &str = "DO_NOT_REFLECT_private_project_consumer_email";
+
+    fn info(reason: Value, domain: Value) -> Value {
+        json!({"@type":"type.googleapis.com/google.rpc.ErrorInfo", "reason":reason,
+            "domain":domain, "message":PRIVATE, "metadata":{"project":PRIVATE,"consumer":PRIVATE}})
+    }
+
+    fn labels(details: Value) -> [String; 6] {
+        let body =
+            json!({"error":{"status":"RESOURCE_EXHAUSTED","message":PRIVATE,"details":details}});
+        let parsed = ErrorDiagnostics::parse(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let labels = [
+            parsed.status.into(),
+            parsed.reason.into(),
+            parsed.domain.into(),
+            parsed.quota.into(),
+            parsed.retry.label().into(),
+            parsed.retry.seconds(),
+        ];
+        assert!(labels.iter().all(|label| !label.contains(PRIVATE)));
+        labels
+    }
+
+    #[test]
+    fn daily_domain_preserves_known_reason_and_only_sanitized_labels() {
+        assert_eq!(
+            labels(json!([info(json!("RATE_LIMIT_EXCEEDED"), json!(DAILY))])),
+            [
+                "RESOURCE_EXHAUSTED",
+                "RATE_LIMIT_EXCEEDED",
+                DAILY,
+                "absent",
+                "absent",
+                "none"
+            ]
+        );
+        assert_eq!(
+            labels(json!([info(json!(PRIVATE), json!(DAILY))])),
+            [
+                "RESOURCE_EXHAUSTED",
+                "unclassified",
+                DAILY,
+                "absent",
+                "absent",
+                "none"
+            ]
+        );
+    }
+
+    #[test]
+    fn daily_domain_is_exact_not_a_suffix_url_or_normalized_alias() {
+        for domain in [
+            json!("daily-cloudcode-pa.googleapis.com.example.test"),
+            json!("tenant.daily-cloudcode-pa.googleapis.com"),
+            json!("notdaily-cloudcode-pa.googleapis.com"),
+            json!("DAILY-cloudcode-pa.googleapis.com"),
+            json!("https://daily-cloudcode-pa.googleapis.com"),
+            json!("daily-cloudcode-pa.googleapis.com:443"),
+            json!("daily-cloudcode-pa.googleapis.com."),
+            json!(" daily-cloudcode-pa.googleapis.com"),
+            json!("daily-cloudcode-pa.googleapis.com\n"),
+            json!("daily-cloudcode-pa.googléapis.com"),
+            json!("another.googleapis.com"),
+            json!(null),
+            json!([DAILY]),
+        ] {
+            assert_eq!(
+                labels(json!([info(json!("RATE_LIMIT_EXCEEDED"), domain)])),
+                [
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    "absent",
+                    "none"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn daily_malformed_or_multiple_error_info_keeps_quota_and_retry_independent() {
+        for infos in [
+            vec![info(json!(42), json!(DAILY))],
+            vec![info(json!(null), json!(DAILY))],
+            vec![json!({"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":DAILY})],
+            vec![info(json!("RATE_LIMIT_EXCEEDED"), json!(null))],
+            vec![
+                info(json!("RATE_LIMIT_EXCEEDED"), json!(DAILY)),
+                info(json!("RATE_LIMIT_EXCEEDED"), json!(DAILY)),
+            ],
+        ] {
+            let mut details = infos;
+            details.push(
+                json!({"@type":"type.googleapis.com/google.rpc.QuotaFailure",
+                "violations":[{"subject":PRIVATE,"description":PRIVATE}]}),
+            );
+            details.push(
+                json!({"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7s"}),
+            );
+            assert_eq!(
+                labels(json!(details)),
+                [
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "reported",
+                    "valid",
+                    "7"
+                ]
+            );
+        }
+        assert_eq!(
+            labels(json!([
+                info(json!(PRIVATE), json!(DAILY)),
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"subject":PRIVATE}]},
+                {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7s"}
+            ])),
+            [
+                "RESOURCE_EXHAUSTED",
+                "unclassified",
+                DAILY,
+                "reported",
+                "valid",
+                "7"
+            ]
+        );
+    }
+
+    #[test]
+    fn daily_error_info_does_not_bypass_body_or_detail_limits() {
+        let detail = info(json!("RATE_LIMIT_EXCEEDED"), json!(DAILY));
+        let body = json!({"error":{"details":vec![detail; 17]}});
+        assert!(ErrorDiagnostics::parse(&serde_json::to_vec(&body).unwrap()).is_none());
+        let body = json!({"error":{"message":"x".repeat(MAX_ERROR_BODY),
+            "details":[info(json!("RATE_LIMIT_EXCEEDED"), json!(DAILY))]}});
+        assert!(ErrorDiagnostics::parse(&serde_json::to_vec(&body).unwrap()).is_none());
+    }
 }
