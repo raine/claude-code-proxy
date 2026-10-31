@@ -62,6 +62,7 @@ pub(crate) const GROK_MODELS: &[&str] =
 
 pub struct Registry {
     alias_provider: AliasProvider,
+    dynamic_codex: bool,
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
 }
@@ -102,6 +103,7 @@ impl Registry {
 
         Self {
             alias_provider,
+            dynamic_codex: true,
             models,
             handlers,
         }
@@ -124,6 +126,7 @@ impl Registry {
         }
         Self {
             alias_provider,
+            dynamic_codex: false,
             models,
             handlers,
         }
@@ -140,7 +143,11 @@ impl Registry {
     }
 
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
-        let mut models = self.models.get(provider).cloned().unwrap_or_default();
+        let mut models = if self.dynamic_codex && provider == "codex" {
+            expand_codex_models()
+        } else {
+            self.models.get(provider).cloned().unwrap_or_default()
+        };
         if provider == self.alias_provider.as_str() {
             for alias in ANTHROPIC_STYLE_ALIASES {
                 if !models.iter().any(|value| value == alias) {
@@ -185,9 +192,20 @@ impl Registry {
         }
 
         for (name, models) in &self.models {
-            if models.iter().any(|candidate| candidate == &normalized) {
+            if !(self.dynamic_codex && name == "codex")
+                && models.iter().any(|candidate| candidate == &normalized)
+            {
                 return self.handlers.get(name).cloned();
             }
+        }
+
+        // Hidden catalog models are accepted explicitly without being advertised.
+        if self.dynamic_codex
+            && crate::providers::codex::translate::model_allowlist::is_valid_model_for_codex(
+                &normalized,
+            )
+        {
+            return self.handlers.get("codex").cloned();
         }
 
         None
@@ -319,14 +337,21 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
-fn expand_codex_models() -> Vec<String> {
+pub(crate) fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
     let mut out = Vec::new();
-    for model in CODEX_MODELS {
-        if set.insert((*model).to_string()) {
-            out.push((*model).to_string());
+    // Baseline ∪ models the Codex CLI advertises in its own model cache, so a
+    // model OpenAI ships to Codex routes here before a proxy release lists it.
+    let catalog = crate::providers::codex::translate::model_allowlist::listed_catalog_models();
+    for model in CODEX_MODELS
+        .iter()
+        .map(|model| (*model).to_string())
+        .chain(catalog)
+    {
+        if set.insert(model.clone()) {
+            out.push(model.clone());
         }
-        for variant in tier_model_variants(model) {
+        for variant in tier_model_variants(&model) {
             if set.insert(variant.clone()) {
                 out.push(variant);
             }

@@ -1,6 +1,7 @@
 pub mod accumulate;
 pub mod live_stream;
 pub mod model_allowlist;
+pub mod model_catalog;
 pub mod read_rewrite;
 pub mod reasoning_signature;
 pub mod reducer;

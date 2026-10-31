@@ -51,7 +51,7 @@ use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    tier_model_variants, uses_responses_lite,
+    uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -578,16 +578,7 @@ impl Provider for CodexProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = registry::CODEX_MODELS
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for m in registry::CODEX_MODELS {
-            models.extend(tier_model_variants(m));
-        }
-        models.sort_unstable();
-        models.dedup();
-        models
+        registry::expand_codex_models()
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {

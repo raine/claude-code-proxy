@@ -28,6 +28,18 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
+The proxy also reads the Codex CLI's optional `$CODEX_HOME/models_cache.json`
+(default `~/.codex/models_cache.json`) to recognize additional models. Listed
+entries marked `supported_in_api: true` appear in discovery; hidden entries
+with that flag can be requested explicitly. Catalog models use their
+`use_responses_lite` lane metadata. Built-in models and aliases are unchanged.
+
+The file is checked at most once per second. Missing, malformed, or oversized
+(over 8 MiB) files fall back to built-in models. Incomplete entries are skipped.
+The catalog is advisory: its age, CLI version, and account identity are not
+validated, and it does not guarantee access with the proxy's separate login.
+The proxy does not fetch models or read Codex CLI credentials.
+
 Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus`, `fable`, `claude-opus-*` (including `claude-opus-5-5`), and `claude-fable-*` to `gpt-6-sol`.
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.

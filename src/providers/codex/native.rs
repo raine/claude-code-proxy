@@ -19,7 +19,7 @@ use crate::traffic::{
 
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
-    ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
+    MODEL_ALIASES, allowed_models_display, assert_allowed_model, full_lane_web_search_model,
     service_tier_for_model, split_tier_suffix, uses_responses_lite,
 };
 use super::translate::request::ServiceTier;
@@ -103,7 +103,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
             format!(
                 "Model '{requested}' resolves to unsupported model '{}'. Supported: {}",
                 error.model,
-                ALLOWED_MODELS.join(", ")
+                allowed_models_display()
             ),
             Some("model"),
             Some("model_not_supported"),
