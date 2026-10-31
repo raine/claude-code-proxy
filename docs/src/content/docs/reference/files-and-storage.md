@@ -41,6 +41,20 @@ OpenCode Go is the exception: it reads its API key from
 
 The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores.
 
+### Sign in with ChatGPT
+
+SIWC uses `<configuration-root>/siwc/state.json` and `state.lock` on macOS and
+Linux, including when `CCP_CONFIG_DIR` is set. The directory must be `0700` and
+files `0600`. Private plaintext credentials are saved atomically under a
+cross-process lock; Windows storage is not implemented. Profiles, issued client
+IDs, and the stable installation host ID survive logout, while tokens are cleared.
+Other providers' credentials are not read or changed.
+
+SIWC does not create traffic captures or persistent upstream error-body files.
+Its logs contain structural counts and bounded diagnostics. `siwc auth status`
+displays account/registration identifiers and should be kept private. See the
+[SIWC guide](/providers/chatgpt-siwc/) for refresh and revocation behavior.
+
 ## Kimi device ID
 
 Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-backed setups. It is bound into the Kimi token and must remain paired with that login.
