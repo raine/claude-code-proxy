@@ -1794,6 +1794,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
+    use translate::request::ServiceTier;
 
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
         translate::request::ResponsesRequest {
@@ -2003,6 +2004,7 @@ mod tests {
             ("gpt-5.6-terra", "gpt-5.6-terra"),
             ("gpt-6-luna", "gpt-6-sol"),
             ("gpt-6-sol", "gpt-6-sol"),
+            ("gpt-6.1-terra", "gpt-6.1-terra"),
             ("gpt-5.4", "gpt-5.4"),
         ] {
             let mut model = resolved.to_string();
@@ -2022,12 +2024,48 @@ mod tests {
             ("gpt-5.6-sol", true),
             ("gpt-6-luna", true),
             ("gpt-6-sol", true),
+            ("gpt-6.1-terra", true),
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
             let lite = apply_model_lane_for_request(&mut model, &body);
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
+        }
+    }
+
+    #[test]
+    fn terra_translation_preserves_model_and_tier_across_lanes() {
+        for requested in ["gpt-6.1-terra", "gpt-6.1-terra-fast"] {
+            for hosted_search in [false, true] {
+                let tools = if hosted_search {
+                    serde_json::json!([{"type":"web_search_20250305", "name":"web_search"}])
+                } else {
+                    serde_json::json!([])
+                };
+                let mut body = request_with_tools(tools);
+                body.model = Some(requested.to_string());
+                let mut resolved = resolve_model_request_with_config_override(requested, false);
+                let lite = apply_model_lane_for_request(&mut resolved.model, &body);
+                let translated = translate_request(
+                    &body,
+                    TranslateOptions {
+                        session_id: None,
+                        service_tier: resolved.service_tier,
+                        model: resolved.model,
+                        use_responses_lite: lite,
+                    },
+                )
+                .unwrap();
+                assert_eq!(translated.model, "gpt-6.1-terra");
+                assert_eq!(translated.client_metadata.is_some(), !hosted_search);
+                assert_eq!(
+                    translated.service_tier,
+                    requested
+                        .ends_with("-fast")
+                        .then_some(ServiceTier::Priority)
+                );
+            }
         }
     }
 
@@ -2204,6 +2242,9 @@ mod tests {
         assert!(models.contains(&"gpt-6.1-sol".to_string()));
         assert!(models.contains(&"gpt-6.1-sol-fast".to_string()));
         assert!(models.contains(&"gpt-6.1-sol-ultrafast".to_string()));
+        assert!(models.contains(&"gpt-6.1-terra".to_string()));
+        assert!(models.contains(&"gpt-6.1-terra-fast".to_string()));
+        assert!(!models.contains(&"gpt-6.1-terra-ultrafast".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
         assert!(models.contains(&"gpt-6-astra-fast".to_string()));
