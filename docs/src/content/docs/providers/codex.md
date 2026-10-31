@@ -44,6 +44,22 @@ When reasoning is enabled, the proxy requests an automatic reasoning summary and
 
 Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
 
+## Usage reporting
+
+Terminal `/v1/messages` usage includes Codex reasoning counts in
+`output_tokens_details.thinking_tokens` and `output_tokens_details.reasoning_tokens`
+when available. Both fields report the same count, already included in
+`output_tokens`; do not add them to the output total.
+
+When a `codex.rate_limits` event supplies a subscription snapshot, usage also
+includes `codex_rate_limits`: optional `plan_type`, `limit_reached`, `primary`,
+and `secondary` fields. Windows contain available `used_percent`,
+`window_minutes`, and Unix-seconds `reset_at` values. This is a proxy extension,
+not a standard Anthropic field. Clients must tolerate unknown usage fields.
+The snapshot is event-derived, not synthesized from HTTP quota headers, so it
+may be absent depending on the upstream transport. Streaming terminal usage
+and non-streaming message usage use the same shape.
+
 ## Tools and multimodal input
 
 - Claude function tools and tool results map to Responses API function calls and outputs.
