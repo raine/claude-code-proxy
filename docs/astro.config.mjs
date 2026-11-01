@@ -44,6 +44,7 @@ export default defineConfig({
           label: 'Providers',
           items: [
             { label: 'Choosing a provider', slug: 'providers/choosing-a-provider' },
+            { label: 'Sign in with ChatGPT', slug: 'providers/chatgpt-siwc' },
             { label: 'Codex', slug: 'providers/codex' },
             { label: 'Kimi', slug: 'providers/kimi' },
             { label: 'Grok', slug: 'providers/grok' },

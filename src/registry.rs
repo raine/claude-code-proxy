@@ -69,6 +69,18 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(alias_provider: AliasProvider) -> Self {
+        if alias_provider == AliasProvider::Siwc {
+            return Self::from_providers(
+                alias_provider,
+                [Arc::new(
+                    crate::providers::chatgpt_siwc::SiwcProvider::new(
+                        "default".into(),
+                        crate::config::siwc_model(),
+                    )
+                    .expect("valid default SIWC profile"),
+                ) as Arc<dyn Provider>],
+            );
+        }
         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
         models.insert("codex".into(), expand_codex_models());
         models.insert(
@@ -111,6 +123,10 @@ impl Registry {
 
     pub fn with_default_alias() -> Self {
         Self::new(crate::config::alias_provider())
+    }
+
+    pub fn is_siwc(&self) -> bool {
+        self.handlers.len() == 1 && self.handlers.contains_key("siwc")
     }
 
     pub fn from_providers(
@@ -182,6 +198,9 @@ impl Registry {
         raw_model: &str,
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
+        if self.is_siwc() {
+            return (!raw_model.is_empty()).then(|| self.handlers["siwc"].clone());
+        }
         let normalized = normalize_incoming_model(raw_model);
         if is_anthropic_alias(&normalized) {
             let target = session_affinity.unwrap_or(&self.alias_provider);

@@ -42,6 +42,9 @@ pub fn traffic_capture_enabled_for_env(env: &std::collections::HashMap<String, S
 }
 
 pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapture> {
+    if opts.provider.as_deref() == Some("siwc") {
+        return None;
+    }
     if !traffic_capture_enabled() {
         return None;
     }

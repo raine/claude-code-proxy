@@ -66,7 +66,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_BIND_ADDRESS` | `bindAddress` | `127.0.0.1` | Listener IP address. |
 | `PORT` | `port` | `18765` | Listener port. |
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
-| `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |
+| `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`; `siwc` selects an isolated SIWC registry. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
@@ -76,6 +76,26 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
 Auto-review routing resolves the classifier's requested model first, not the main conversation's model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`; Grok and other providers do not establish alias affinity. Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
+
+SIWC bypasses auto-review model overrides and uses only its selected account and
+model. Codex endpoint, transport, identity, service-tier, and continuation settings
+do not apply to SIWC.
+
+## Sign in with ChatGPT
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_SIWC_MODEL` | `siwc.model` | unset | Maps `siwc` and Anthropic-style aliases to a real account model slug. |
+
+`siwc serve --model` overrides this default. Explicit model IDs pass through to
+OpenAI for account validation. `CCP_ALIAS_PROVIDER=siwc` also selects the isolated
+provider for general `serve`, requires a loopback bind, and disables native
+Codex/OpenAI-compatible extra routes. The dedicated `siwc serve` command is the
+recommended entry point and supports `--profile`.
+
+There are no SIWC endpoint or OAuth client-ID overrides. The provider uses the
+public OpenAI Responses API and its own dynamic OAuth registration. See the
+[SIWC guide](/providers/chatgpt-siwc/).
 
 ## Outbound proxies
 

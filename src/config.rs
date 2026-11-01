@@ -7,6 +7,7 @@ use crate::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasProvider {
+    Siwc,
     Codex,
     Kimi,
 }
@@ -14,6 +15,7 @@ pub enum AliasProvider {
 impl AliasProvider {
     pub fn as_str(&self) -> &str {
         match self {
+            AliasProvider::Siwc => "siwc",
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
         }
@@ -45,6 +47,19 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub siwc: Option<SiwcConfig>,
+}
+
+#[derive(Deserialize)]
+struct SiwcConfig {
+    model: Option<String>,
+}
+
+pub fn siwc_model() -> Option<String> {
+    std::env::var("CCP_SIWC_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| read_file_config(&paths::config_dir())?.siwc?.model)
 }
 
 #[derive(Deserialize, Clone)]
@@ -126,6 +141,7 @@ struct FileLog {
 
 fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
+        "siwc" => Some(AliasProvider::Siwc),
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
         _ => None,

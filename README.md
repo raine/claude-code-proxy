@@ -96,6 +96,7 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
+| [Sign in with ChatGPT](docs/src/content/docs/providers/chatgpt-siwc.md) | Eligible ChatGPT account with plan permission | Account-specific official catalog; isolated `siwc serve` |
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models, `-fast`/`-ultrafast` |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
@@ -104,6 +105,12 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
+
+For the official public Responses API, use the opt-in **Sign in with ChatGPT**
+provider: `claude-code-proxy siwc auth login --consent`, then
+`claude-code-proxy siwc models`. Follow the
+[SIWC guide](docs/src/content/docs/providers/chatgpt-siwc.md) to start an isolated
+local proxy and configure Claude Code with an available model.
 
 > [!WARNING]
 > The proxy accepts local requests without client authentication. It binds to

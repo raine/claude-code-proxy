@@ -72,6 +72,7 @@ pub struct LiveStreamTranslator {
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
     incomplete_response_policy: IncompleteResponsePolicy,
+    read_stall_repair: bool,
     finished: bool,
     // Latest `codex.rate_limits` event seen on this stream; handed to the
     // usage mapper at finish so the terminal usage block carries the meter.
@@ -105,6 +106,7 @@ impl LiveStreamTranslator {
             semantic_output_started: false,
             estimated_input_tokens,
             incomplete_response_policy: IncompleteResponsePolicy::Error,
+            read_stall_repair: true,
             finished: false,
             rate_limits: None,
         }
@@ -115,6 +117,12 @@ impl LiveStreamTranslator {
         policy: IncompleteResponsePolicy,
     ) -> Self {
         self.incomplete_response_policy = policy;
+        self
+    }
+
+    /// Disable the legacy Read repair that can finish before an upstream terminal event.
+    pub(crate) fn with_read_stall_repair(mut self, enabled: bool) -> Self {
+        self.read_stall_repair = enabled;
         self
     }
 
@@ -572,8 +580,9 @@ impl LiveStreamTranslator {
                     "Buffered {name} tool arguments exceeded safe limits"
                 ));
             }
-            if let Some(repaired) =
-                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
+            if self.read_stall_repair
+                && let Some(repaired) =
+                    repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
             {
                 *args_accum = repaired.clone();
                 *emitted_args = true;
