@@ -135,10 +135,12 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | --- | --- | --- | --- |
 | `CCP_GROK_BASE_URL` | `grok.baseUrl` | `https://cli-chat-proxy.grok.com/v1` | Changes the Responses API base URL. |
 | `CCP_GROK_CLIENT_VERSION` | `grok.clientVersion` | `0.2.93` | Changes the Grok client version header. |
-| `CCP_GROK_TOOL_IMAGE` | none | `omit` | How pasted images in Claude Code chat reach Grok: `omit` (default, pixels become `[image omitted]`), `reattach`, `inline`, or `reject`. Use `inline` to match native Claude Code vision. |
+| `CCP_GROK_TOOL_IMAGE` | none | `omit` | Selects `omit`, `reattach`, `inline`, or `reject` image handling. |
 | `CCP_GROK_HOSTED_SEARCH` | none | off | Set to `1`, `on`, or `true` to let hosted search tools replace the caller's own search tools and force them on an explicit search turn. |
 | `CCP_GROK_SEARCH_BLOCKS` | none | `text` | Selects how a hosted search is reported: `text` for a text block, `native` for `server_tool_use` plus a `*_tool_result` block. |
 | `CCP_SEARCH_CONSTRAINTS` | none | `system_prompt` | How Grok treats Anthropic hosted-search options it cannot map. |
+
+How pasted images in Claude Code chat reach Grok: `omit` (default, pixels become `[image omitted]`), `reattach`, `inline`, or `reject`. Use `inline` to match native Claude Code vision.
 
 Claude Code sends Anthropic hosted-search options. The proxy maps them onto Grok where it can.
 
