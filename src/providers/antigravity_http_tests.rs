@@ -54,6 +54,10 @@ struct Backend {
     headers: http::HeaderMap,
 }
 async fn backend(State(state): State<Arc<Backend>>, request: Request) -> Response {
+    assert_eq!(
+        request.uri().path_and_query().unwrap().as_str(),
+        "/v1internal:streamGenerateContent?alt=sse"
+    );
     let headers = request.headers().clone();
     let bytes = axum::body::to_bytes(request.into_body(), 32 * 1024 * 1024)
         .await
@@ -184,6 +188,88 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+async fn assert_generation_cap_ingress(stream: bool) {
+    let (upstream, captured) =
+        native(vec![(200, successful(json!([{"text":"cap response"}])))]).await;
+    let directory = tempfile::tempdir().unwrap();
+    let proxy = proxy(provider(directory.path(), &upstream.url).await, None).await;
+    let cases = [
+        (None, 65536),
+        (Some(Value::Null), 65536),
+        (Some(json!(1)), 1),
+        (Some(json!(512)), 512),
+        (Some(json!(65536)), 65536),
+    ];
+    for (cap, _) in &cases {
+        let mut body = request(stream);
+        body.as_object_mut().unwrap().remove("max_tokens");
+        if let Some(cap) = cap {
+            body["max_tokens"] = cap.clone();
+        }
+        body["system"] = json!([]);
+        let response = client()
+            .post(proxy.url.join("/v1/messages").unwrap())
+            .header("accept", "application/x-hostile-frontend")
+            .header("authorization", "Bearer frontend-credential")
+            .header("user-agent", "hostile-frontend-UA")
+            .header("cookie", "private-frontend-cookie")
+            .header("x-goog-api-client", "frontend-metadata")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["x-antigravity-reasoning-tier"], "low");
+        assert_eq!(
+            response.headers()["content-type"],
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            }
+        );
+        let text = response.text().await.unwrap();
+        assert!(text.contains("cap response"));
+        if stream {
+            assert!(text.contains("event: message_stop"));
+            assert!(!text.contains("event: error"));
+        } else {
+            let message: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(message["stop_reason"], "end_turn");
+        }
+    }
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), cases.len());
+    for ((headers, wire), (_, cap)) in captured.iter().zip(&cases) {
+        assert_eq!(headers["accept"], "text/event-stream");
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["authorization"], "Bearer proxy-owned-access");
+        assert_eq!(headers["user-agent"], expected_native_user_agent());
+        assert!(!headers.contains_key("cookie"));
+        assert!(!headers.contains_key("x-goog-api-client"));
+        assert_eq!(wire.as_object().unwrap().len(), 6);
+        assert_eq!(wire["model"], "gemini-4-argon-low");
+        assert_eq!(wire["userAgent"], "antigravity");
+        assert_eq!(wire["requestType"], "agent");
+        assert_eq!(wire["request"].as_object().unwrap().len(), 3);
+        assert_eq!(
+            wire["request"]["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts":true,"thinkingLevel":"LOW"})
+        );
+        assert_eq!(wire["request"]["generationConfig"]["maxOutputTokens"], *cap);
+    }
+}
+
+#[tokio::test]
+async fn antigravity_http_nonstream_omitted_cap_uses_agent_default() {
+    assert_generation_cap_ingress(false).await;
+}
+
+#[tokio::test]
+async fn antigravity_http_stream_omitted_cap_uses_agent_default() {
+    assert_generation_cap_ingress(true).await;
+}
+
 #[tokio::test]
 async fn antigravity_property_names_http_preflight_never_refreshes_or_generates() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -245,6 +331,59 @@ async fn antigravity_property_names_http_preflight_never_refreshes_or_generates(
         upstream_calls.load(Ordering::SeqCst),
         0,
         "count_tokens must not access expired credentials"
+    );
+    let mut estimates = Vec::new();
+    for cap in [
+        None,
+        Some(Value::Null),
+        Some(json!(1)),
+        Some(json!(512)),
+        Some(json!(65536)),
+    ] {
+        let mut counted = body.clone();
+        counted.as_object_mut().unwrap().remove("max_tokens");
+        if let Some(cap) = cap {
+            counted["max_tokens"] = cap;
+        }
+        let response = client()
+            .post(proxy.url.join("/v1/messages/count_tokens").unwrap())
+            .json(&counted)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        estimates.push(response.json::<Value>().await.unwrap()["input_tokens"].clone());
+    }
+    assert!(estimates.iter().all(|estimate| *estimate == estimates[0]));
+    for stream in [false, true] {
+        for cap in [
+            json!(0),
+            json!(65537),
+            json!(-1),
+            json!(1.5),
+            json!("512"),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let mut invalid = body.clone();
+            invalid["stream"] = json!(stream);
+            invalid["max_tokens"] = cap;
+            for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+                let response = client()
+                    .post(proxy.url.join(path).unwrap())
+                    .json(&invalid)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+            }
+        }
+    }
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "cap validation/counting must not refresh or generate with expired credentials"
     );
     for stream in [false, true] {
         body["stream"] = json!(stream);

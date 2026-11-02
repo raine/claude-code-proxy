@@ -965,7 +965,7 @@ fn antigravity_request_accepts_observed_options_without_changing_tier() {
 }
 
 #[test]
-fn antigravity_request_system_parts_keep_privilege_and_order() {
+fn antigravity_request_system_role_user_preserves_parts_and_order() {
     let mut request = request_value();
     request["system"] = json!([{"type":"text","text":"top"}]);
     request["messages"] = json!([
@@ -978,8 +978,8 @@ fn antigravity_request_system_parts_keep_privilege_and_order() {
     )
     .unwrap();
     assert_eq!(
-        prepared.wire["request"]["systemInstruction"]["parts"],
-        json!([{"text":"top"},{"text":"first"},{"text":"second"}])
+        prepared.wire["request"]["systemInstruction"],
+        json!({"role":"user","parts":[{"text":"top"},{"text":"first"},{"text":"second"}]})
     );
     assert_eq!(
         prepared.wire["request"]["contents"],
@@ -987,6 +987,189 @@ fn antigravity_request_system_parts_keep_privilege_and_order() {
     );
     request["messages"] = json!([{"role":"system","content":"only system"}]);
     assert!(prepare(&serde_json::from_value(request).unwrap(), &binding()).is_err());
+}
+
+#[test]
+fn antigravity_request_absent_cap_defaults_to_65536() {
+    for model in super::antigravity::request::MODELS {
+        let mut scope = binding();
+        scope.native_model = model.strip_prefix("antigravity/").unwrap().into();
+        for null in [false, true] {
+            let mut request = request_value();
+            request["model"] = json!(model);
+            request.as_object_mut().unwrap().remove("max_tokens");
+            if null {
+                request["max_tokens"] = Value::Null;
+            }
+            let prepared = prepare(&serde_json::from_value(request).unwrap(), &scope).unwrap();
+            assert_eq!(
+                prepared.wire["request"]["generationConfig"]["maxOutputTokens"], 65536,
+                "model={model}, null={null}"
+            );
+        }
+    }
+}
+
+#[test]
+fn antigravity_request_explicit_caps_are_exact_and_invalid_caps_reject() {
+    let mut estimates = Vec::new();
+    for stream in [false, true] {
+        for cap in [1, 512, 65536] {
+            let mut request = request_value();
+            request["max_tokens"] = json!(cap);
+            request["stream"] = json!(stream);
+            request["output_config"] = json!({"effort":"high"});
+            let prepared = prepare(&serde_json::from_value(request).unwrap(), &binding()).unwrap();
+            assert_eq!(
+                prepared.wire["request"]["generationConfig"]["maxOutputTokens"],
+                cap
+            );
+            assert_eq!(
+                prepared.wire["request"]["generationConfig"]["thinkingConfig"],
+                json!({"includeThoughts":true,"thinkingLevel":"LOW"})
+            );
+            estimates.push(prepared.estimate);
+        }
+    }
+    assert!(estimates.iter().all(|estimate| *estimate == estimates[0]));
+    for cap in [0, 65537] {
+        let mut request = request_value();
+        request["max_tokens"] = json!(cap);
+        assert_eq!(
+            prepare(&serde_json::from_value(request).unwrap(), &binding()).err(),
+            Some("max_tokens must be between 1 and 65536")
+        );
+    }
+    for cap in [
+        json!(-1),
+        json!(1.5),
+        json!("512"),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        let mut request = request_value();
+        request["max_tokens"] = cap;
+        assert!(
+            serde_json::from_value::<crate::anthropic::schema::MessagesRequest>(request).is_err()
+        );
+    }
+}
+
+#[test]
+fn antigravity_request_absent_and_empty_system_keep_exact_envelope() {
+    for system in [None, Some(json!([]))] {
+        let mut request = request_value();
+        if let Some(system) = system {
+            request["system"] = system;
+        }
+        let prepared = prepare(&serde_json::from_value(request).unwrap(), &binding()).unwrap();
+        assert_eq!(
+            prepared
+                .wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "project",
+                "model",
+                "request",
+                "requestId",
+                "userAgent",
+                "requestType"
+            ])
+        );
+        assert_eq!(
+            prepared.wire["request"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["contents", "sessionId", "generationConfig"])
+        );
+        assert_eq!(
+            prepared.wire["request"]["contents"],
+            json!([{"role":"user","parts":[{"text":"hello"}]}])
+        );
+        assert_eq!(prepared.wire["requestType"], "agent");
+        assert_eq!(prepared.wire["userAgent"], "antigravity");
+    }
+}
+
+#[test]
+fn antigravity_request_multiple_tools_have_one_declaration_per_object() {
+    let source = json!([
+        {"name":"caller/tool with spaces","description":"free-form input","input_schema":{"type":"object"}},
+        {"name":"empty","input_schema":{"type":"object","additionalProperties":false}},
+        {"name":"limited","input_schema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1}},"required":["limit"],"additionalProperties":false}}
+    ]);
+    let compiled = ToolSet::compile(&source).unwrap();
+    let mut request = request_value();
+    request["tools"] = source;
+    request["tool_choice"] = json!({"type":"auto"});
+    let prepared = prepare(&serde_json::from_value(request).unwrap(), &binding()).unwrap();
+    assert_eq!(prepared.tools.declarations, compiled.declarations);
+    let expected: Vec<Value> = compiled
+        .declarations
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|declaration| json!({"functionDeclarations":[declaration]}))
+        .collect();
+    assert_eq!(prepared.wire["request"]["tools"], json!(expected));
+    assert_eq!(prepared.wire["request"].as_object().unwrap().len(), 4);
+    assert_eq!(prepared.wire.as_object().unwrap().len(), 6);
+    assert!(prepared.wire["request"].get("toolConfig").is_none());
+    assert!(prepared.wire.get("labels").is_none());
+    let contents = json!([{"role":"model","parts":[
+        {"functionCall":{"name":compiled.declarations[0]["name"],"args":{"json":"{\"payload\":[1,true]}"}}},
+        {"functionCall":{"name":"empty","args":{}}},
+        {"functionCall":{"name":"limited","args":{"limit":1}}}
+    ]}]);
+    let mapping = prepared.tools.mapping(&contents).unwrap();
+    let blocks =
+        replay::encode(&contents, &binding(), &prepared.session, "full", &mapping).unwrap();
+    assert_eq!(blocks[1]["name"], "caller/tool with spaces");
+    assert_eq!(blocks[1]["input"], json!({"payload":[1,true]}));
+    assert_eq!(blocks[2]["input"], json!({}));
+    assert_eq!(blocks[3]["input"], json!({"limit":1}));
+    assert_eq!(
+        replay::decode(&blocks, &binding()).unwrap()["contents"],
+        contents
+    );
+}
+
+#[test]
+fn antigravity_request_zero_one_tools_and_choice_none_preserve_omission() {
+    let tool =
+        json!({"name":"empty","input_schema":{"type":"object","additionalProperties":false}});
+    for (source, choice, expected) in [
+        (json!([]), None, None),
+        (
+            json!([tool]),
+            None,
+            Some(json!([{"functionDeclarations":[{"name":"empty"}]}])),
+        ),
+        (json!([tool]), Some(json!({"type":"none"})), None),
+    ] {
+        let mut request = request_value();
+        request["tools"] = source;
+        if let Some(choice) = choice {
+            request["tool_choice"] = choice;
+        }
+        let prepared = prepare(&serde_json::from_value(request).unwrap(), &binding()).unwrap();
+        assert_eq!(prepared.wire["request"].get("tools"), expected.as_ref());
+        assert_eq!(
+            prepared.tools.declarations.as_array().unwrap().len(),
+            usize::from(expected.is_some())
+        );
+        assert!(prepared.wire["request"].get("toolConfig").is_none());
+        assert!(prepared.wire["request"].get("labels").is_none());
+        assert_eq!(prepared.wire.as_object().unwrap().len(), 6);
+    }
 }
 
 #[test]

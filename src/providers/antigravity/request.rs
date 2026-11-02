@@ -216,7 +216,7 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
         "antigravity/gemini-4-argon-medium" => "MEDIUM",
         _ => "HIGH",
     };
-    let cap = body.max_tokens.unwrap_or(8192);
+    let cap = body.max_tokens.unwrap_or(65536);
     if cap == 0 || cap > 65536 {
         return Err("max_tokens must be between 1 and 65536");
     }
@@ -422,10 +422,18 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
     let mut request = json!({"contents":contents,"sessionId":session,
         "generationConfig":{"maxOutputTokens":cap,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":tier}}});
     if !system.is_empty() {
-        request["systemInstruction"] = json!({"parts":system});
+        request["systemInstruction"] = json!({"role":"user","parts":system});
     }
     if !tools.declarations.as_array().unwrap().is_empty() {
-        request["tools"] = json!([{"functionDeclarations":tools.declarations}]);
+        request["tools"] = json!(
+            tools
+                .declarations
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|declaration| json!({"functionDeclarations":[declaration]}))
+                .collect::<Vec<_>>()
+        );
     }
     let wire = json!({"project":binding.project_id,"model":binding.native_model,"request":request,
         "requestId":format!("ccp-{}",uuid::Uuid::new_v4()),"userAgent":"antigravity","requestType":"agent"});
