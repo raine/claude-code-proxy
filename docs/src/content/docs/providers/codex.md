@@ -28,6 +28,18 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
+The proxy also reads the Codex CLI's optional `$CODEX_HOME/models_cache.json`
+(default `~/.codex/models_cache.json`) to recognize additional models. Listed
+entries marked `supported_in_api: true` appear in discovery; hidden entries
+with that flag can be requested explicitly. Catalog models use their
+`use_responses_lite` lane metadata. Built-in models and aliases are unchanged.
+
+The file is checked at most once per second. Missing, malformed, or oversized
+(over 8 MiB) files fall back to built-in models. Incomplete entries are skipped.
+The catalog is advisory: its age, CLI version, and account identity are not
+validated, and it does not guarantee access with the proxy's separate login.
+The proxy does not fetch models or read Codex CLI credentials.
+
 Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus`, `fable`, `claude-opus-*` (including `claude-opus-5-5`), and `claude-fable-*` to `gpt-6-sol`.
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.
@@ -43,6 +55,39 @@ Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`,
 When reasoning is enabled, the proxy requests an automatic reasoning summary and translates summary deltas into Claude Code thinking blocks. Codex may omit a summary for a simple prompt. `CCP_CODEX_REASONING_SUMMARY=off` suppresses summaries while preserving effort and encrypted continuation content.
 
 Claude Code summary compaction requests are capped at low effort by default because they perform extraction over a large transcript. `CCP_COMPACT_EFFORT=off` disables the cap, `none` removes reasoning, and another valid effort sets a different maximum. The cap never raises effort.
+
+## Usage reporting
+
+Terminal `/v1/messages` usage includes Codex reasoning counts in
+`output_tokens_details.thinking_tokens` and `output_tokens_details.reasoning_tokens`
+when available. Both fields report the same count, already included in
+`output_tokens`; do not add them to the output total.
+
+When a `codex.rate_limits` event supplies a subscription snapshot, usage also
+includes `codex_rate_limits`: optional `plan_type`, `limit_reached`, `primary`,
+and `secondary` fields. Windows contain available `used_percent`,
+`window_minutes`, and Unix-seconds `reset_at` values. This is a proxy extension,
+not a standard Anthropic field. Clients must tolerate unknown usage fields.
+The snapshot is event-derived, not synthesized from HTTP quota headers, so it
+may be absent depending on the upstream transport. Streaming terminal usage
+and non-streaming message usage use the same shape.
+
+## Responses lanes and parallel tools
+
+The gpt-5.6 and gpt-6 families use Responses Lite by default. Lite requires
+`parallel_tool_calls: false`, so function tools run serially. Set
+`codex.fullLane: true` or `CCP_CODEX_FULL_LANE=1` to use the full Responses lane
+for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`,
+and `gpt-6.1-terra`. This permits parallel calls; the model still decides whether to batch tools, and explicit
+client restrictions on parallel tools remain effective.
+
+This is not a universal lane override: catalog-only models keep the lane
+specified in the local Codex model cache. Luna models stay on Lite.
+Automatic hosted web search uses the full lane
+regardless of this setting and remaps Luna to its Sol sibling. Forced standalone
+search uses `/alpha/search` instead. `/v1/responses` honors the setting;
+text-only `/v1/chat/completions` keeps its default lane. Full-lane availability
+and quota accounting depend on the upstream subscription; this setting is opt-in.
 
 ## Tools and multimodal input
 
@@ -62,7 +107,7 @@ Claude Code summary compaction requests are capped at low effort by default beca
 
 ## Transport and continuation
 
-WebSocket is the default transport. Set `CCP_CODEX_TRANSPORT=http` for HTTP SSE, or `auto` to use WebSocket with HTTP fallback only when setup fails before a request is sent.
+`auto` is the default transport: it uses WebSocket with HTTP SSE fallback only when setup fails before a request is sent. Set `CCP_CODEX_TRANSPORT=websocket` for WebSocket-only behavior, or `http` for HTTP SSE. A failure after a request is sent does not trigger HTTP replay.
 
 On the HTTP transport, the proxy waits five minutes for the response headers before failing the request. Codex withholds the response head until the model produces its first output, so a large request to a high-effort model can hold it for minutes. `CCP_CODEX_HEADER_TIMEOUT_MS` or `codex.headerTimeoutMs` changes that bound.
 

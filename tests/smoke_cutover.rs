@@ -1,3 +1,6 @@
+#[path = "support/isolated_codex.rs"]
+mod isolated_codex;
+
 // End-to-end tests for local server health, provider routing, Kimi, Codex HTTP,
 // and Codex WebSocket through in-process mock upstreams with isolated auth.
 
@@ -960,12 +963,21 @@ async fn smoke_healthz_returns_ok() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn smoke_codex_model_routes_to_real_provider() {
+    if isolated_codex::rerun_without_credentials("smoke_codex_model_routes_to_real_provider") {
+        return;
+    }
     let _guard = env_lock();
     let response = call_messages("gpt-5.5").await;
-    // Should attempt auth (not return 501 placeholder)
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
     assert!(
-        response.status() != StatusCode::NOT_IMPLEMENTED,
-        "codex models must resolve to the real provider, not a placeholder"
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Not authenticated")
     );
 }
 
@@ -1647,6 +1659,7 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
 #[tokio::test]
 async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _guard = env_lock();
+    let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "0");
     clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");

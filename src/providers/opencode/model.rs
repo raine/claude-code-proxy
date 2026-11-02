@@ -15,6 +15,46 @@ pub struct ModelSpec {
 
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
+        id: "gpt-6-luna",
+        endpoint: EndpointKind::Responses,
+    },
+    ModelSpec {
+        id: "grok-4.7",
+        endpoint: EndpointKind::Responses,
+    },
+    ModelSpec {
+        id: "claude-haiku-5-5",
+        endpoint: EndpointKind::Messages,
+    },
+    ModelSpec {
+        id: "deepseek-v4.1-flash",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "mimo-v2.6-flash",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "mimo-v2.6-pro",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "minimax-m3.1-flash-free",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "longcat-2.5-preview-free",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "step-5-preview",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
+        id: "beam-free",
+        endpoint: EndpointKind::ChatCompletions,
+    },
+    ModelSpec {
         id: "grok-4.6",
         endpoint: EndpointKind::Responses,
     },
@@ -170,7 +210,14 @@ pub fn advertised_models() -> Vec<String> {
     for model in MODELS {
         if !matches!(
             model.id,
-            "gpt-5.6-luna" | "grok-4.6" | "grok-4.5" | "kimi-k3" | "kimi-k2.6"
+            "gpt-6-luna"
+                | "grok-4.7"
+                | "claude-haiku-5-5"
+                | "gpt-5.6-luna"
+                | "grok-4.6"
+                | "grok-4.5"
+                | "kimi-k3"
+                | "kimi-k2.6"
         ) {
             result.push(model.id.to_string());
         }
@@ -198,9 +245,9 @@ mod tests {
             .iter()
             .filter(|model| model.endpoint == EndpointKind::Responses)
             .count();
-        assert_eq!(chat, 23);
-        assert_eq!(messages, 9);
-        assert_eq!(responses, 4);
+        assert_eq!(chat, 30);
+        assert_eq!(messages, 10);
+        assert_eq!(responses, 6);
     }
 
     #[test]
@@ -227,6 +274,13 @@ mod tests {
             ("muse-spark-1.3-contributor", EndpointKind::Responses),
             ("muse-spark-1.2-contributor", EndpointKind::Responses),
             ("omen-alpha", EndpointKind::ChatCompletions),
+            ("deepseek-v4.1-flash", EndpointKind::ChatCompletions),
+            ("mimo-v2.6-flash", EndpointKind::ChatCompletions),
+            ("mimo-v2.6-pro", EndpointKind::ChatCompletions),
+            ("minimax-m3.1-flash-free", EndpointKind::ChatCompletions),
+            ("longcat-2.5-preview-free", EndpointKind::ChatCompletions),
+            ("step-5-preview", EndpointKind::ChatCompletions),
+            ("beam-free", EndpointKind::ChatCompletions),
         ] {
             let qualified = format!("{MODEL_PREFIX}{id}");
             assert_eq!(
@@ -260,6 +314,9 @@ mod tests {
     fn conflicting_provider_ids_are_only_advertised_with_prefix() {
         let models = advertised_models();
         for id in [
+            "gpt-6-luna",
+            "grok-4.7",
+            "claude-haiku-5-5",
             "gpt-5.6-luna",
             "grok-4.6",
             "grok-4.5",

@@ -206,7 +206,14 @@ impl GrokClient {
             return Err(GrokError {
                 status,
                 retry_after,
-                message: "Grok upstream rejected the request".into(),
+                message: if status == StatusCode::UPGRADE_REQUIRED {
+                    format!(
+                        "Grok rejected client version {} (upstream HTTP 426). Update the proxy or set CCP_GROK_CLIENT_VERSION (grok.clientVersion in config.json) to a supported Grok CLI version, then restart the proxy.",
+                        self.client_version,
+                    )
+                } else {
+                    "Grok upstream rejected the request".into()
+                },
             });
         }
         Ok(response)
@@ -297,7 +304,107 @@ fn auth_error(_: anyhow::Error) -> GrokError {
 
 #[cfg(test)]
 mod tests {
-    use super::responses_url;
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_requests_preserve_status_and_explain_upgrade_without_leaking_body() {
+        use axum::{Router, routing::post};
+        use http_body_util::BodyExt;
+
+        for status in [
+            StatusCode::UPGRADE_REQUIRED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::FORBIDDEN,
+            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move |headers: http::HeaderMap| async move {
+                    assert_eq!(headers["x-grok-client-version"], "0.2.93");
+                    (
+                        status,
+                        [("retry-after", "10")],
+                        axum::Json(serde_json::json!({"error": "private upstream detail"})),
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = super::super::auth::token_store::GrokTokenStore::new(
+                crate::auth::FileAuthStore::new(
+                    temp.path().join("auth.json").to_string_lossy().into_owned(),
+                    temp.path()
+                        .join("legacy.json")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
+            let client = GrokClient::with_shared(
+                url,
+                "0.2.93".into(),
+                Arc::new(reqwest::Client::new()),
+                Arc::new(GrokAuthManager::new(store).unwrap()),
+            );
+            let body = GrokResponsesRequest {
+                model: "grok-4.6".into(),
+                instructions: None,
+                input: vec![],
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                store: false,
+                stream: true,
+                max_output_tokens: None,
+            };
+            let capture = crate::traffic::test_capture(temp.path().join("traffic"));
+            for traffic in [None, Some(&capture)] {
+                let error = client
+                    .attempt("test-token", &body, 1, traffic)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(error.status, status);
+                assert_eq!(error.retry_after.as_deref(), Some("10"));
+                assert!(!error.message.contains("private upstream detail"));
+                if status == StatusCode::UPGRADE_REQUIRED {
+                    assert!(error.message.contains("0.2.93"));
+                    assert!(error.message.contains("HTTP 426"));
+                    assert!(error.message.contains("CCP_GROK_CLIENT_VERSION"));
+                    assert!(error.message.contains("restart"));
+                } else {
+                    assert_eq!(error.message, "Grok upstream rejected the request");
+                }
+
+                let expected_status = match status {
+                    StatusCode::UPGRADE_REQUIRED | StatusCode::INTERNAL_SERVER_ERROR => {
+                        StatusCode::BAD_GATEWAY
+                    }
+                    _ => status,
+                };
+                let message = error.message.clone();
+                let mapped = super::super::grok_provider_error(GrokError {
+                    status: error.status,
+                    retry_after: error.retry_after.clone(),
+                    message: message.clone(),
+                });
+                assert_eq!(mapped.status, expected_status);
+                assert_eq!(mapped.message, message);
+                let response = super::super::map_error(error);
+                assert_eq!(response.status(), expected_status);
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    assert_eq!(response.headers()["retry-after"], "10");
+                }
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(json["error"]["message"], message);
+            }
+            server.abort();
+        }
+    }
     #[test]
     fn responses_url_appends_responses_to_base_path() {
         assert_eq!(

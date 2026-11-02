@@ -526,6 +526,7 @@ fn translate_request_inner(
             "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
             "true".to_string(),
         )]));
+        // Responses Lite rejects parallel_tool_calls: true.
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();

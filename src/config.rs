@@ -61,6 +61,8 @@ struct CodexConfig {
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "imagesApi")]
     pub images_api: Option<bool>,
     #[serde(rename = "imagesBaseUrl")]
@@ -262,6 +264,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("codex.fullLane (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_IMAGES_API") {
         out.push("codex.imagesApi (env)".to_string());
     }
@@ -360,6 +365,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
             }
+            if codex.full_lane == Some(true) {
+                out.push("codex.fullLane: true".to_string());
+            }
             if codex.images_api == Some(true) {
                 out.push("codex.imagesApi: true".to_string());
             }
@@ -400,7 +408,7 @@ pub fn grok_client_version() -> String {
     {
         return version;
     }
-    "0.2.93".to_string()
+    "1.0.13".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +784,21 @@ pub fn codex_responses_api() -> bool {
     false
 }
 
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_images_api() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
@@ -938,7 +961,7 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::WebSocket
+    CodexTransport::Auto
 }
 
 /// How long an HTTP-transport request waits for the Codex response headers.
@@ -1068,11 +1091,13 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
             EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
+            EnvGuard::unset("CCP_CODEX_FULL_LANE"),
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+            EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
         guards
@@ -1083,6 +1108,24 @@ mod tests {
             "CCP_CONFIG_DIR".to_string(),
             config.path().to_string_lossy().into_owned(),
         )])
+    }
+
+    #[test]
+    fn grok_client_version_defaults_and_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _guards = isolated_env(&config);
+        assert_eq!(grok_client_version(), "1.0.13");
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"clientVersion":"1.0.14"}}"#,
+        )
+        .unwrap();
+        assert_eq!(grok_client_version(), "1.0.14");
+
+        let _version = EnvGuard::set("CCP_GROK_CLIENT_VERSION", "1.0.15");
+        assert_eq!(grok_client_version(), "1.0.15");
     }
 
     #[test]
@@ -1186,12 +1229,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_websocket() {
+    fn codex_transport_defaults_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        let result = codex_transport();
-        assert_eq!(result, CodexTransport::WebSocket);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
@@ -1199,9 +1241,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
-        }
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
         assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
@@ -1210,32 +1250,72 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
-        }
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_websocket() {
+    fn codex_transport_invalid_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
-        }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "invalid");
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
-    fn codex_transport_empty_env_falls_back_to_websocket() {
+    fn codex_transport_empty_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "");
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "");
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[test]
+    fn codex_transport_file_and_env_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for (file_value, expected) in [
+            ("http", CodexTransport::Http),
+            ("websocket", CodexTransport::WebSocket),
+            ("auto", CodexTransport::Auto),
+        ] {
+            std::fs::write(
+                config.path().join("config.json"),
+                serde_json::json!({"codex": {"transport": file_value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), expected);
+            for env_value in ["", "invalid"] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", env_value);
+                assert_eq!(codex_transport(), expected);
+            }
+            for (env_value, expected) in [
+                ("http", CodexTransport::Http),
+                ("websocket", CodexTransport::WebSocket),
+                ("auto", CodexTransport::Auto),
+            ] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", env_value);
+                assert_eq!(codex_transport(), expected);
+            }
         }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_transport_invalid_or_empty_file_falls_back_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for value in ["", "invalid"] {
+            std::fs::write(
+                config.path().join("config.json"),
+                serde_json::json!({"codex": {"transport": value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
     }
 
     #[test]
@@ -1377,6 +1457,38 @@ mod tests {
         assert!(codex_responses_api());
         let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", "false");
         assert!(!codex_responses_api());
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_off_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+        let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
+        assert!(!codex_full_lane());
+    }
+
+    #[test]
+    fn codex_full_lane_accepts_boolean_env_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for value in ["1", "true", "TRUE", "yes"] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(codex_full_lane(), "{value}");
+        }
+        for value in ["0", "false", "no", "invalid", ""] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(!codex_full_lane(), "{value}");
+        }
     }
 
     #[test]
