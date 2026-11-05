@@ -3,6 +3,54 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.48 (2026-11-01)
+
+- Codex users can select GPT-6.1 Terra with `gpt-6.1-terra` or its
+  `gpt-6.1-terra-fast` priority-tier variant.
+  ([#197](https://github.com/raine/claude-code-proxy/pull/197))
+- New API-supported models in the local Codex CLI catalog are recognized
+  without waiting for a proxy release; account access is still required.
+  ([#130](https://github.com/raine/claude-code-proxy/pull/130))
+- Codex users can enable parallel tool calls on supported Sol, Terra, and Astra
+  models with `CCP_CODEX_FULL_LANE=1`; the default remains unchanged.
+  ([#36](https://github.com/raine/claude-code-proxy/issues/36),
+  [#77](https://github.com/raine/claude-code-proxy/pull/77))
+- Codex now falls back to HTTP automatically when eligible WebSocket setup
+  failures occur before a request is sent, unless a transport is explicitly set.
+  ([#172](https://github.com/raine/claude-code-proxy/issues/172),
+  [#173](https://github.com/raine/claude-code-proxy/pull/173))
+- Codex turns that finish without text after all tool calls succeed can end
+  normally after one retry, instead of repeatedly retrying and failing.
+  ([#122](https://github.com/raine/claude-code-proxy/pull/122))
+- Codex usage reports include reasoning-token counts and subscription quota
+  usage when supplied by the upstream service.
+  ([#149](https://github.com/raine/claude-code-proxy/pull/149))
+- OpenCode Go accepts its expanded model catalog, including DeepSeek V4.1 Flash,
+  MiMo V2.6, GPT-6 Luna, Grok 4.7, and Claude Haiku 5.5. Use the `opencode-go/`
+  prefix to select models shared with other providers.
+  ([#188](https://github.com/raine/claude-code-proxy/pull/188))
+
+## v0.1.47 (2026-10-25)
+
+- Grok requests no longer fail with HTTP 502 because of the outdated default
+  client version; version rejections now include instructions for updating it.
+  ([#180](https://github.com/raine/claude-code-proxy/issues/180))
+- Grok and Cursor browser login on Windows preserve the full login URL instead
+  of truncating it at `&`.
+  ([#106](https://github.com/raine/claude-code-proxy/issues/106),
+  [#192](https://github.com/raine/claude-code-proxy/pull/192))
+- Codex browser login keeps waiting for authentication after unrelated or
+  malformed requests reach its callback listener.
+  ([#167](https://github.com/raine/claude-code-proxy/pull/167))
+- Unsupported message-thread continuations are rejected before reaching a
+  provider, instead of silently treating partial history as a full conversation.
+  ([#148](https://github.com/raine/claude-code-proxy/issues/148),
+  [#191](https://github.com/raine/claude-code-proxy/pull/191))
+- Codex empty-completion retries and the final 503 now appear in server logs,
+  making these failures easier to diagnose without changing retry behavior.
+  ([#177](https://github.com/raine/claude-code-proxy/issues/177),
+  [#178](https://github.com/raine/claude-code-proxy/pull/178))
+
 ## v0.1.46 (2026-10-23)
 
 - Cursor models can read and write files and run shell commands without stopping

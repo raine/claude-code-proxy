@@ -1,3 +1,6 @@
+#[path = "support/isolated_codex.rs"]
+mod isolated_codex;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -194,6 +197,42 @@ type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
 
 struct IdentityCaptureProvider {
     captured: Arc<Mutex<Vec<CapturedIdentity>>>,
+}
+
+struct RequestCaptureProvider {
+    captured: Arc<Mutex<Vec<MessagesRequest>>>,
+}
+
+#[async_trait]
+impl Provider for RequestCaptureProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.captured.lock().unwrap().push(body);
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.handle_messages(body, ctx).await
+    }
 }
 
 #[async_trait]
@@ -473,6 +512,184 @@ async fn invalid_json_request_is_json_error() {
     assert_eq!(error_type, "invalid_request_error");
 }
 
+async fn message_thread_response(
+    body: Value,
+) -> (
+    axum::response::Response,
+    Vec<MessagesRequest>,
+    MonitorHandle,
+) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let registry = Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [Arc::new(RequestCaptureProvider {
+            captured: captured.clone(),
+        }) as Arc<dyn Provider>],
+    ));
+    let monitor = MonitorHandle::new(10);
+    let response = app_with_monitor(registry, Some(monitor.clone()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-beta", "message-threads-2026-08-12")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let requests = captured.lock().unwrap().clone();
+    (response, requests, monitor)
+}
+
+async fn assert_message_thread_rejected(body: Value) {
+    let (response, captured, monitor) = message_thread_response(body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!request_id(&response).is_empty());
+    assert_eq!(captured.len(), 0);
+    let state = monitor.snapshot();
+    assert!(state.active.is_empty());
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    assert_eq!(state.recent[0].http_status, Some(400));
+    assert!(
+        state.recent[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("capability_rejected: beta_header:message-threads-2026-08-12")
+    );
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("capability_rejected: beta_header:message-threads-2026-08-12")
+    );
+}
+
+async fn assert_message_thread_dispatched(mut body: Value) {
+    let (response, captured, _) = message_thread_response(body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(captured.len(), 1);
+    assert!(!captured[0].extra.contains_key("thread"));
+    body.as_object_mut().unwrap().remove("thread");
+    let expected: MessagesRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        serde_json::to_value(&captured[0]).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn message_thread_continue_tool_result_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "call_test", "content": "done"
+        }]}],
+        "thread": {"type": "continue", "previous_message_id": "msg_test"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_continue_text_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "next question"}],
+        "thread": {"type": "continue", "previous_message_id": "msg_test"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_unknown_type_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "thread": {"type": "fork"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_missing_type_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "thread": {}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_create_tool_result_dispatches_without_thread() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "system": "Keep the full history.",
+        "messages": [
+            {"role": "user", "content": "run the tool"},
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call_test", "name": "test", "input": {}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "call_test", "content": "done"
+            }]}
+        ],
+        "thread": {"type": "create"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_create_text_dispatches_without_thread() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "system": "Keep the full history.",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "next question"}
+        ],
+        "thread": {"type": "create"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_absent_text_dispatches_unchanged() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "system": "Keep the full history.",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn message_thread_absent_tool_result_dispatches_unchanged() {
+    assert_message_thread_dispatched(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "call_test", "content": "done"
+        }]}]
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn empty_body_is_invalid_json() {
     let app = app(Arc::new(Registry::with_default_alias()));
@@ -714,6 +931,9 @@ async fn anthropic_bodies_over_limit_return_request_too_large() {
 
 #[tokio::test]
 async fn known_model_reaches_codex_provider() {
+    if isolated_codex::rerun_without_credentials("known_model_reaches_codex_provider") {
+        return;
+    }
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -729,11 +949,14 @@ async fn known_model_reaches_codex_provider() {
         .await
         .unwrap();
 
-    // Codex provider is now concrete, so it should attempt auth before returning 501
-    let status = response.status();
+    // A known model reaches the concrete provider's authentication boundary.
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = error_body(response).await;
     assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "codex should no longer be a placeholder provider"
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Not authenticated")
     );
 }
 
@@ -1529,6 +1752,8 @@ async fn models_endpoint_lists_supported_models() {
     assert!(ids.contains(&"gpt-5.6-sol"));
     assert!(ids.contains(&"gpt-6.1-sol"));
     assert!(ids.contains(&"gpt-6.1-sol-fast"));
+    assert!(ids.contains(&"gpt-6.1-terra"));
+    assert!(ids.contains(&"gpt-6.1-terra-fast"));
     assert!(ids.contains(&"gpt-6-astra-ultrafast"));
     assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
     assert!(!ids.contains(&"gpt-6-sol-ultrafast"));

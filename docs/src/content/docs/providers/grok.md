@@ -34,6 +34,34 @@ ANTHROPIC_SMALL_FAST_MODEL=grok-4.6 \
 
 Grok 4.5 and Grok 4.6 have a 500,000 token context window. Claude Code treats unknown model IDs as 200,000 tokens, so set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` when using those IDs. Do not append `[1m]`; that is a one-million-token client hint.
 
+## Auto Mode Bash review
+
+Claude Code's Auto Mode can send Bash security-review requests with a different
+model ID from the main conversation. Selecting Grok as the main model does not
+force these requests onto Grok: recognized Claude model aliases default to
+Codex unless they have Kimi session affinity or the proxy uses
+`aliasProvider: "kimi"`.
+
+To route detected classifiers to Grok, set the override on the **proxy process**:
+
+```sh
+CCP_AUTO_REVIEW_MODEL=grok-4.6 claude-code-proxy serve
+```
+
+Alternatively, add `"autoReviewModel": "grok-4.6"` at the top level of the
+proxy's `config.json`. This setting applies to detected classifiers across all
+sessions served by that proxy, without changing normal message routing.
+
+For debugging, find `auto-review route selected` in the structured proxy log.
+Its `requestedModel`, `overrideModel`, and `provider` fields show the original
+model and selected route. Without an override, a classifier resolved to Codex
+uses `gpt-6-luna`; an explicit Grok model stays on Grok. The monitor also shows
+the selected provider and model.
+
+See [Configuration](/reference/configuration/) for log settings. Routing a
+classifier successfully does not establish that different models make
+equivalent security decisions.
+
 ## Reasoning and tools
 
 The proxy translates Claude messages, function tools, tool results, thinking controls, token usage, and streaming events. Grok reasoning text appears as Claude Code thinking blocks. Grok supports `none`, `low`, `medium`, and `high` effort levels. `xhigh` is forwarded for `grok-4.6`; higher compatibility levels are mapped to the highest supported Grok level for other registered models.

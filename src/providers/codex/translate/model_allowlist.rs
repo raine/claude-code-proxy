@@ -1,7 +1,13 @@
+use std::collections::BTreeSet;
+
 use crate::config;
 
+use super::model_catalog::{catalog_model, catalog_models};
 use super::request::ServiceTier;
 
+/// Baseline allowlist compiled into the binary. At runtime the Codex CLI's
+/// model cache (`model_catalog`) extends it, so models OpenAI ships to Codex
+/// work before a proxy release lists them.
 pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.2",
     "gpt-5.3-codex",
@@ -16,6 +22,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-6-sol",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -40,6 +47,40 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
+/// True for baseline models and for API-supported models from the Codex
+/// model cache.
+pub fn is_allowed_model(model: &str) -> bool {
+    ALLOWED_MODELS.contains(&model)
+        || catalog_model(model).is_some_and(|entry| entry.supported_in_api)
+}
+
+/// Baseline ∪ listed API-supported catalog models, sorted and de-duplicated —
+/// for listings and error messages.
+pub fn allowed_models() -> Vec<String> {
+    let mut set: BTreeSet<String> = ALLOWED_MODELS.iter().map(|m| (*m).to_string()).collect();
+    for entry in catalog_models() {
+        if entry.supported_in_api && entry.listed {
+            set.insert(entry.slug);
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Catalog models advertised by the Codex picker (`visibility == "list"`)
+/// and usable through the API — what `models` and the unknown-model hint
+/// should show in addition to the baseline.
+pub fn listed_catalog_models() -> Vec<String> {
+    catalog_models()
+        .into_iter()
+        .filter(|entry| entry.listed && entry.supported_in_api)
+        .map(|entry| entry.slug)
+        .collect()
+}
+
+pub fn allowed_models_display() -> String {
+    allowed_models().join(", ")
+}
+
 /// Models whose Codex catalog entry offers the `ultrafast` service tier.
 /// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
 pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
@@ -56,9 +97,7 @@ pub fn split_tier_suffix(model: &str) -> Option<(&str, ServiceTier)> {
             .then_some((base, ServiceTier::Ultrafast));
     }
     let base = model.strip_suffix(FAST_SUFFIX)?;
-    ALLOWED_MODELS
-        .contains(&base)
-        .then_some((base, ServiceTier::Priority))
+    is_allowed_model(base).then_some((base, ServiceTier::Priority))
 }
 
 /// Local tier-suffixed names advertised next to a registered model.
@@ -148,7 +187,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_allowed_model(model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -167,7 +206,29 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-luna"
             | "gpt-6-sol"
             | "gpt-6.1-sol"
-    )
+            | "gpt-6.1-terra"
+    ) || (!ALLOWED_MODELS.contains(&model)
+        && catalog_model(model)
+            .is_some_and(|entry| entry.supported_in_api && entry.use_responses_lite))
+}
+
+/// Opt known full-lane models out of Lite without overriding advisory catalog
+/// metadata for models whose full-lane availability is unknown.
+pub fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
+    if full_lane
+        && matches!(
+            model,
+            "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-6-astra"
+                | "gpt-6-sol"
+                | "gpt-6.1-sol"
+                | "gpt-6.1-terra"
+        )
+    {
+        return false;
+    }
+    uses_responses_lite(model)
 }
 
 /// Luna models exist only behind the Responses Lite lane; the full
@@ -183,7 +244,7 @@ pub fn full_lane_web_search_model(model: &str) -> &str {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_allowed_model(model) {
         return true;
     }
     if split_tier_suffix(model).is_some() {
@@ -200,6 +261,29 @@ mod tests {
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
         assert_eq!(r.model, "gpt-6-luna");
+    }
+
+    #[test]
+    fn full_lane_covers_all_lite_models_except_luna() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+            assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
+        for model in ["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5"] {
+            assert!(!uses_responses_lite_with_full_lane(model, false), "{model}");
+            assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
+        }
     }
 
     #[test]
@@ -248,7 +332,7 @@ mod tests {
 
     #[test]
     fn gpt_6_sol_fast_adds_priority() {
-        for model in ["gpt-6-sol", "gpt-6.1-sol"] {
+        for model in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"] {
             let r = resolve_model_request(&format!("{model}-fast"));
             assert_eq!(r.model, model);
             assert_eq!(r.service_tier, Some(ServiceTier::Priority));
@@ -260,6 +344,7 @@ mod tests {
         assert!(uses_responses_lite("gpt-6-sol"));
         assert!(uses_responses_lite("gpt-6-luna"));
         assert!(uses_responses_lite("gpt-6.1-sol"));
+        assert!(uses_responses_lite("gpt-6.1-terra"));
     }
 
     #[test]
@@ -422,10 +507,21 @@ mod tests {
         assert!(assert_allowed_model("gpt-6-astra").is_ok());
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
+        assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
     }
 
     #[test]
     fn not_allowed_rejected() {
         assert!(assert_allowed_model("gpt-7").is_err());
+        assert!(assert_allowed_model("gpt-7-fast").is_err());
+    }
+
+    #[test]
+    fn allowed_models_listing_contains_baseline() {
+        let listing = allowed_models();
+        for baseline in ALLOWED_MODELS {
+            assert!(listing.iter().any(|m| m == baseline), "{baseline} missing");
+        }
+        assert!(allowed_models_display().contains("gpt-6-astra"));
     }
 }

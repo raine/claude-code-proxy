@@ -118,6 +118,12 @@ gates; offline tests are not evidence of account access. See the
 and [configuration](docs/src/content/docs/reference/configuration.md#experimental-antigravity)
 before explicitly enabling it. Existing provider defaults and aliases are unchanged.
 
+Auto-review classifiers route by their own requested model, not the main conversation's
+model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`;
+Grok does not establish alias affinity. Explicit Antigravity requests ignore
+cross-provider auto-review overrides. Same-provider overrides still undergo native
+replay/model validation; signed history cannot silently change tiers.
+
 Antigravity login defaults to automatic browser/loopback completion. On Unix,
 `claude-code-proxy antigravity auth login --manual` instead prints a browser URL
 and accepts the **code displayed by the completion page** through visible input in

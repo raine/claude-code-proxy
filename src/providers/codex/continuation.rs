@@ -985,6 +985,40 @@ mod tests {
         assert!(!has_continuation_for_owner_for_tests(&owner));
     }
 
+    #[test]
+    fn lane_changes_reset_continuation_without_affecting_sibling_agents() {
+        let _registry_guard = lock_registry();
+        for original_lite in [false, true] {
+            let owner = main_owner("lane-session");
+            let sibling = agent_owner("lane-session", "agent");
+            let lane_fields = |lite| {
+                if lite {
+                    json!({"parallel_tool_calls": false, "client_metadata": {
+                        "ws_request_header_x_openai_internal_codex_responses_lite": "true"
+                    }})
+                } else {
+                    json!({"parallel_tool_calls": true})
+                }
+            };
+            let request = request_with_input(vec![input("one")], Some(lane_fields(original_lite)));
+            start_and_record(&owner, &request, "resp_main");
+            start_and_record(&sibling, &request, "resp_agent");
+            let changed = request_with_input(
+                vec![input("one"), input("two")],
+                Some(lane_fields(!original_lite)),
+            );
+            let reservation = continuation_candidate_for_owner(Some(&owner), &changed, true);
+            assert_eq!(
+                reservation.candidate().disabled_reason.as_deref(),
+                Some("prompt_changed")
+            );
+            assert_eq!(reservation.candidate().previous_response_id, None);
+            assert_eq!(reservation.origin_socket_id(), None);
+            assert!(!has_continuation_for_owner_for_tests(&owner));
+            assert!(has_continuation_for_owner_for_tests(&sibling));
+        }
+    }
+
     fn function_call(call_id: &str, name: &str, arguments: &str) -> ResponsesInputItem {
         ResponsesInputItem::FunctionCall {
             call_id: call_id.to_string(),

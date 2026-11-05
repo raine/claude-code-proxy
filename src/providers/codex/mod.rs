@@ -51,7 +51,7 @@ use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    tier_model_variants, uses_responses_lite,
+    uses_responses_lite_with_full_lane,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -192,7 +192,8 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, config::codex_full_lane());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -344,6 +345,7 @@ impl CodexProvider {
                     attempt: compaction_attempt,
                 },
                 configured_transport,
+                tail_is_successful_tool_result(&body),
             )
             .await;
             log.info(
@@ -367,6 +369,7 @@ impl CodexProvider {
         let request_continuation = continuation.clone();
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
+        let successful_tool_tail = tail_is_successful_tool_result(&body);
         let upstream = loop {
             let response = match client
                 .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
@@ -399,21 +402,70 @@ impl CodexProvider {
             if !is_empty_codex_success_completion(&response.body) {
                 break response;
             }
+            if accept_empty_completion(successful_tool_tail, attempt)
+                && buffered_terminal_is_completed(&response.body)
+            {
+                // A repeated empty success can end a fully resolved tool exchange.
+                break response;
+            }
             // A successful terminal event with no output would translate into
             // an empty end_turn; retry with full context instead.
             let error = empty_buffered_completion_error();
             drop_live_continuation_for_retry(&mut continuation);
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
+                log.warn(
+                    "codex_empty_completion_exhausted",
+                    Some(empty_completion_exhausted_fields(
+                        &req_id,
+                        transport,
+                        &resolved.model,
+                        attempt + 1,
+                        "max_attempts",
+                        upstream_started_at.elapsed().as_millis(),
+                    )),
+                );
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
+                log.warn(
+                    "codex_empty_completion_exhausted",
+                    Some(empty_completion_exhausted_fields(
+                        &req_id,
+                        transport,
+                        &resolved.model,
+                        attempt + 1,
+                        "backoff_budget",
+                        upstream_started_at.elapsed().as_millis(),
+                    )),
+                );
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
+            log.warn(
+                "codex_empty_completion_retry",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&req_id)),
+                    (
+                        "configuredTransport".to_string(),
+                        serde_json::json!(transport),
+                    ),
+                    ("model".to_string(), serde_json::json!(&resolved.model)),
+                    ("failedAttempt".to_string(), serde_json::json!(attempt + 1)),
+                    (
+                        "maxAttempts".to_string(),
+                        serde_json::json!(MAX_EMPTY_COMPLETION_RETRIES + 1),
+                    ),
+                    ("delayMs".to_string(), serde_json::json!(delay.wait_ms)),
+                    (
+                        "ms".to_string(),
+                        serde_json::json!(upstream_started_at.elapsed().as_millis()),
+                    ),
+                ])),
+            );
             attempt += 1;
             sleep(delay.wait_ms).await;
         };
@@ -527,16 +579,7 @@ impl Provider for CodexProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = registry::CODEX_MODELS
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for m in registry::CODEX_MODELS {
-            models.extend(tier_model_variants(m));
-        }
-        models.sort_unstable();
-        models.dedup();
-        models
+        registry::expand_codex_models()
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -571,7 +614,8 @@ impl Provider for CodexProvider {
                 ),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite =
+            apply_model_lane_for_request(&mut resolved.model, &body, config::codex_full_lane());
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -613,12 +657,16 @@ impl Provider for CodexProvider {
 /// run on the full Responses API (the lite lane rejects hosted tools), and
 /// lite-only models like gpt-5.6-luna don't exist there, so such requests
 /// are upgraded to a full-lane model. Returns whether to use the lite lane.
-fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+fn apply_model_lane_for_request(
+    model: &mut String,
+    body: &MessagesRequest,
+    full_lane: bool,
+) -> bool {
     if has_hosted_web_search(body) {
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
-    uses_responses_lite(model)
+    uses_responses_lite_with_full_lane(model, full_lane)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -724,9 +772,13 @@ async fn live_stream_response(
     continuation: ContinuationReservation,
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
+    successful_tool_tail: bool,
 ) -> Response {
     let model = model.to_string();
+    let started_at = Instant::now();
     let request_continuation = continuation.clone();
+    // Transport failures interrupt the consecutive empty-success sequence.
+    let mut empty_completion_attempts = 0_u32;
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
         ctx.session_id.clone(),
@@ -764,6 +816,7 @@ async fn live_stream_response(
                 return map_codex_error_to_response(&err);
             }
             Err(err) if retryable_live_start_codex_error(&err) => {
+                empty_completion_attempts = 0;
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&err) {
                     attempt += 1;
@@ -796,6 +849,8 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            transport,
+            accept_empty_completion(successful_tool_tail, empty_completion_attempts),
         )
         .await
         {
@@ -815,6 +870,11 @@ async fn live_stream_response(
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
+                if error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
+                    empty_completion_attempts += 1;
+                } else {
+                    empty_completion_attempts = 0;
+                }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
                     cleanup.abort();
@@ -825,11 +885,37 @@ async fn live_stream_response(
                     continue;
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                    if is_empty_completion_error(&error) {
+                        create_logger("codex").warn(
+                            "codex_empty_completion_exhausted",
+                            Some(empty_completion_exhausted_fields(
+                                &ctx.req_id,
+                                transport.as_str(),
+                                &model,
+                                attempt + 1,
+                                "max_attempts",
+                                started_at.elapsed().as_millis(),
+                            )),
+                        );
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
+                    if is_empty_completion_error(&error) {
+                        create_logger("codex").warn(
+                            "codex_empty_completion_exhausted",
+                            Some(empty_completion_exhausted_fields(
+                                &ctx.req_id,
+                                transport.as_str(),
+                                &model,
+                                attempt + 1,
+                                "backoff_budget",
+                                started_at.elapsed().as_millis(),
+                            )),
+                        );
+                    }
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -861,6 +947,8 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    configured_transport: config::CodexTransport,
+    accept_empty: bool,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -942,7 +1030,20 @@ async fn live_stream_response_once(
         if terminal
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
+            && !(accept_empty && terminal_status_is_completed(&payload))
         {
+            create_logger("codex").warn(
+                "codex_empty_completion_retry",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    (
+                        "configuredTransport".to_string(),
+                        serde_json::json!(configured_transport.as_str()),
+                    ),
+                    ("model".to_string(), serde_json::json!(model)),
+                    ("stream".to_string(), serde_json::json!(true)),
+                ])),
+            );
             return provider_retry(&upstream_events, empty_live_completion_error());
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
@@ -1001,6 +1102,87 @@ async fn live_stream_response_once(
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
+}
+
+/// Empty success is eligible only when the last exchange resolves every tool call.
+/// Text and system messages may contain new instructions, even when added by hooks.
+fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
+    use std::collections::HashSet;
+
+    let [.., assistant, user] = body.messages.as_slice() else {
+        return false;
+    };
+    if assistant.role != "assistant" || user.role != "user" {
+        return false;
+    }
+    let (Some(calls), Some(results)) = (assistant.content.as_array(), user.content.as_array())
+    else {
+        return false;
+    };
+    let mut pending = HashSet::new();
+    for block in calls {
+        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+            let Some(id) = block
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                return false;
+            };
+            if !pending.insert(id) {
+                return false;
+            }
+        }
+    }
+    if pending.is_empty() {
+        return false;
+    }
+    for block in results {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("text")
+                if block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|text| text.trim().is_empty()) => {}
+            Some("tool_result") => {
+                if !matches!(
+                    block.get("is_error"),
+                    None | Some(serde_json::Value::Bool(false))
+                ) {
+                    return false;
+                }
+                let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                if !pending.remove(id) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    pending.is_empty()
+}
+
+/// An empty end_turn must not hide a missing or contradictory upstream status.
+fn terminal_status_is_completed(payload: &serde_json::Value) -> bool {
+    payload.pointer("/response/status").and_then(|v| v.as_str()) == Some("completed")
+}
+
+fn buffered_terminal_is_completed(upstream_sse: &[u8]) -> bool {
+    crate::anthropic::sse::parse_sse_events(upstream_sse)
+        .into_iter()
+        .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+        .rfind(events::event_is_terminal)
+        .is_some_and(|payload| {
+            is_codex_success_terminal_event(&payload) && terminal_status_is_completed(&payload)
+        })
+}
+
+/// Retry once with full context before permitting an empty successful tool follow-up.
+/// Repetition is a heuristic, not proof that the tool delivered a user-visible answer.
+fn accept_empty_completion(successful_tool_tail: bool, empty_attempts: u32) -> bool {
+    successful_tool_tail && empty_attempts >= 1
 }
 
 fn empty_live_completion_error() -> client::CodexError {
@@ -1263,6 +1445,39 @@ where
         (http::header::CONNECTION, "keep-alive"),
     ];
     (headers, Body::from_stream(stream)).into_response()
+}
+
+/// True when *error* is the empty-completion 503 rather than some other
+/// retryable failure sharing the live-stream retry loop.
+fn is_empty_completion_error(error: &client::CodexError) -> bool {
+    error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL)
+}
+
+/// Log fields for giving up on an empty completion, on either exit.
+///
+/// `reason` separates the two: `"max_attempts"` when the retry budget ran
+/// out, `"backoff_budget"` when the next delay would have exceeded the
+/// backoff budget. They produce the same 503, so the log is the only place
+/// the difference is visible.
+fn empty_completion_exhausted_fields(
+    req_id: &str,
+    configured_transport: &str,
+    model: &str,
+    attempts: u32,
+    reason: &str,
+    elapsed_ms: u128,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        (
+            "configuredTransport".to_string(),
+            serde_json::json!(configured_transport),
+        ),
+        ("model".to_string(), serde_json::json!(model)),
+        ("attempts".to_string(), serde_json::json!(attempts)),
+        ("reason".to_string(), serde_json::json!(reason)),
+        ("ms".to_string(), serde_json::json!(elapsed_ms)),
+    ])
 }
 
 fn empty_buffered_completion_error() -> client::CodexError {
@@ -1677,6 +1892,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
+    use translate::request::ServiceTier;
 
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
         translate::request::ResponsesRequest {
@@ -1866,6 +2082,334 @@ mod tests {
         assert!(!is_empty_codex_success_completion(&upstream_sse(&[])));
     }
 
+    fn request_with_tail(messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "messages": messages
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn successful_tool_result_tail_is_detected() {
+        let body = request_with_tail(serde_json::json!([
+            {"role":"user","content":"ping"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"reply","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sent"}]}
+        ]));
+        assert!(tail_is_successful_tool_result(&body));
+    }
+
+    #[test]
+    fn error_tool_result_tail_is_excluded() {
+        let body = request_with_tail(serde_json::json!([
+            {"role":"user","content":"ping"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"run","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true}]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&body));
+    }
+
+    #[test]
+    fn non_tool_tails_are_excluded() {
+        // plain-text user tail
+        let text = request_with_tail(serde_json::json!([{"role":"user","content":"ping"}]));
+        assert!(!tail_is_successful_tool_result(&text));
+        // assistant tail
+        let assistant = request_with_tail(serde_json::json!([
+            {"role":"user","content":"ping"},
+            {"role":"assistant","content":[{"type":"text","text":"pong"}]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&assistant));
+        // tool_result present but NOT the last block
+        let not_last = request_with_tail(serde_json::json!([
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"sent"},
+                {"type":"text","text":"and also this"}
+            ]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&not_last));
+        // empty conversation
+        let empty = request_with_tail(serde_json::json!([]));
+        assert!(!tail_is_successful_tool_result(&empty));
+    }
+
+    #[test]
+    fn tool_tail_requires_complete_successful_matching_results() {
+        let calls = serde_json::json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"a","name":"reply","input":{}},
+            {"type":"tool_use","id":"b","name":"reply","input":{}}
+        ]});
+        let results = serde_json::json!([
+            {"type":"tool_result","tool_use_id":"a","content":"sent"},
+            {"type":"tool_result","tool_use_id":"b","content":"sent"}
+        ]);
+        let make = |content| {
+            request_with_tail(serde_json::json!([
+                calls.clone(), {"role":"user","content":content}
+            ]))
+        };
+        assert!(tail_is_successful_tool_result(&make(results.clone())));
+        let mut whitespace = results.clone();
+        whitespace
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"text","text":" \n\t"}));
+        assert!(tail_is_successful_tool_result(&make(whitespace)));
+        let mut cases = vec![
+            serde_json::json!([results[0]]),
+            serde_json::json!([results[0], results[0]]),
+        ];
+        for key in ["is_error", "tool_use_id"] {
+            let mut invalid = results.clone();
+            invalid[0][key] = if key == "is_error" {
+                serde_json::json!(true)
+            } else {
+                serde_json::json!("unknown")
+            };
+            cases.push(invalid);
+        }
+        for text in [
+            "continue working",
+            "<system-reminder>PostToolUse hook: continue</system-reminder>",
+        ] {
+            let mut invalid = results.clone();
+            invalid
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"type":"text","text":text}));
+            cases.push(invalid);
+        }
+        for case in cases {
+            assert!(
+                !tail_is_successful_tool_result(&make(case.clone())),
+                "{case}"
+            );
+        }
+        for role in ["user", "system"] {
+            let mut body = make(results.clone());
+            let trailing = request_with_tail(
+                serde_json::json!([{"role":role,"content":"PostToolUse hook: continue"}]),
+            );
+            body.messages.extend(trailing.messages);
+            assert!(!tail_is_successful_tool_result(&body));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_acceptance_requires_explicit_completed_status() {
+        for status in [
+            serde_json::json!("cancelled"),
+            serde_json::json!("in_progress"),
+            serde_json::Value::Null,
+        ] {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            let payload = serde_json::json!({
+                "type":"response.completed", "response":{"id":"r", "status":status,"output":[]}
+            });
+            assert!(!buffered_terminal_is_completed(&upstream_sse(
+                std::slice::from_ref(&payload)
+            )));
+            tx.send(Ok(payload)).await.unwrap();
+            match live_stream_response_once(
+                rx,
+                "msg_test".into(),
+                "gpt-5.6-sol",
+                ctx,
+                ContinuationReservation::for_owner_turn(None, None),
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                true,
+            )
+            .await
+            {
+                LiveStreamStart::Retry { error, .. } => assert!(is_empty_completion_error(&error)),
+                LiveStreamStart::Response(_) => {
+                    panic!("non-completed status must not end the turn")
+                }
+            }
+        }
+        assert!(!buffered_terminal_is_completed(&upstream_sse(&[
+            serde_json::json!({
+                "type":"response.done", "response":{"output":[]}
+            })
+        ])));
+    }
+
+    #[tokio::test]
+    async fn accepting_empty_does_not_accept_failed_or_incomplete_terminals() {
+        for status in ["failed", "incomplete"] {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            let payload = serde_json::json!({
+                "type":"response.done", "response":{"id":"r", "status":status,"output":[]}
+            });
+            assert!(!is_empty_codex_success_completion(&upstream_sse(
+                std::slice::from_ref(&payload)
+            )));
+            tx.send(Ok(payload)).await.unwrap();
+            match live_stream_response_once(
+                rx,
+                "msg_test".into(),
+                "gpt-5.6-sol",
+                ctx,
+                ContinuationReservation::for_owner_turn(None, None),
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                true,
+            )
+            .await
+            {
+                LiveStreamStart::Retry { error, .. } => assert!(!is_empty_completion_error(&error)),
+                LiveStreamStart::Response(response) => assert!(!response.status().is_success()),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_completion_is_accepted_only_after_one_retry_and_only_with_the_tail() {
+        // Require a full-context retry before permitting empty success.
+        assert!(
+            !accept_empty_completion(true, 0),
+            "first empty must retry once"
+        );
+        assert!(
+            accept_empty_completion(true, 1),
+            "second consecutive empty is the turn's end"
+        );
+        assert!(accept_empty_completion(true, 2));
+        assert!(
+            !accept_empty_completion(false, 0),
+            "no tool tail: unchanged #70/#71 behavior"
+        );
+        assert!(
+            !accept_empty_completion(false, 5),
+            "no tool tail: never accepted"
+        );
+    }
+
+    fn empty_terminal_fixture() -> (
+        tokio::sync::mpsc::Sender<Result<serde_json::Value, client::CodexError>>,
+        websocket::CodexWebSocketEventStream,
+        RequestContext,
+        translate::request::ResponsesRequest,
+    ) {
+        let body = request_with_tools(serde_json::json!([]));
+        let request_body = translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "empty-terminal".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        (tx, rx, ctx, request_body)
+    }
+
+    #[tokio::test]
+    async fn empty_terminal_without_accept_flag_still_retries() {
+        let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": [], "usage": {}}
+        })))
+        .await
+        .unwrap();
+        let continuation = ContinuationReservation::for_owner_turn(None, None);
+        match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+            config::CodexTransport::WebSocket,
+            false,
+        )
+        .await
+        {
+            LiveStreamStart::Retry { error, .. } => {
+                assert_eq!(error.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
+            }
+            LiveStreamStart::Response(_) => {
+                panic!("an empty completion without the accept flag must stay a retry")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_terminal_with_accept_flag_is_a_valid_response() {
+        use http_body_util::BodyExt as _;
+        let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": [], "usage": {}}
+        })))
+        .await
+        .unwrap();
+        let continuation = ContinuationReservation::for_owner_turn(None, None);
+        let response = match live_stream_response_once(
+            rx,
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            continuation,
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+            config::CodexTransport::WebSocket,
+            true,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } => {
+                panic!(
+                    "accept flag set: the empty completion must be delivered, got retry: {error}"
+                )
+            }
+        };
+        let mut collected = Vec::new();
+        let mut body = response.into_body();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), body.frame()).await
+        {
+            if let Ok(data) = frame.unwrap().into_data() {
+                collected.extend_from_slice(&data);
+            }
+        }
+        let sse = String::from_utf8(collected).unwrap();
+        assert!(
+            sse.contains("event: message_stop"),
+            "delivered stream must terminate properly, got: {sse:?}"
+        );
+    }
+
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
             "model": "gpt-5.6-luna",
@@ -1886,12 +2430,15 @@ mod tests {
             ("gpt-5.6-terra", "gpt-5.6-terra"),
             ("gpt-6-luna", "gpt-6-sol"),
             ("gpt-6-sol", "gpt-6-sol"),
+            ("gpt-6.1-terra", "gpt-6.1-terra"),
             ("gpt-5.4", "gpt-5.4"),
         ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
-            assert!(!lite, "{resolved} with web_search must use the full lane");
-            assert_eq!(model, expected);
+            for full_lane in [false, true] {
+                let mut model = resolved.to_string();
+                let lite = apply_model_lane_for_request(&mut model, &body, full_lane);
+                assert!(!lite, "{resolved} with web_search must use the full lane");
+                assert_eq!(model, expected);
+            }
         }
     }
 
@@ -1905,12 +2452,89 @@ mod tests {
             ("gpt-5.6-sol", true),
             ("gpt-6-luna", true),
             ("gpt-6-sol", true),
+            ("gpt-6.1-terra", true),
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request(&mut model, &body, false);
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
+        }
+    }
+
+    #[test]
+    fn full_lane_translation_preserves_parallel_tool_restrictions() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+        ] {
+            for full_lane in [false, true] {
+                for disable_parallel in [false, true] {
+                    let mut body = request_with_tools(serde_json::json!([
+                        {"name":"Read", "input_schema":{"type":"object"}}
+                    ]));
+                    body.extra.insert("tool_choice".to_string(),
+                        serde_json::json!({"type":"auto", "disable_parallel_tool_use":disable_parallel}),
+                    );
+                    let mut resolved = model.to_string();
+                    let lite = apply_model_lane_for_request(&mut resolved, &body, full_lane);
+                    let translated = translate_request(
+                        &body,
+                        TranslateOptions {
+                            session_id: None,
+                            service_tier: None,
+                            model: resolved,
+                            use_responses_lite: lite,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(translated.model, model);
+                    assert_eq!(translated.client_metadata.is_some(), lite);
+                    assert_eq!(translated.parallel_tool_calls, !lite && !disable_parallel);
+                    assert_eq!(translated.tools.is_some(), !lite);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terra_translation_preserves_model_and_tier_across_lanes() {
+        for requested in ["gpt-6.1-terra", "gpt-6.1-terra-fast"] {
+            for hosted_search in [false, true] {
+                let tools = if hosted_search {
+                    serde_json::json!([{"type":"web_search_20250305", "name":"web_search"}])
+                } else {
+                    serde_json::json!([])
+                };
+                let mut body = request_with_tools(tools);
+                body.model = Some(requested.to_string());
+                let mut resolved = resolve_model_request_with_config_override(requested, false);
+                let lite = apply_model_lane_for_request(&mut resolved.model, &body, false);
+                let translated = translate_request(
+                    &body,
+                    TranslateOptions {
+                        session_id: None,
+                        service_tier: resolved.service_tier,
+                        model: resolved.model,
+                        use_responses_lite: lite,
+                    },
+                )
+                .unwrap();
+                assert_eq!(translated.model, "gpt-6.1-terra");
+                assert_eq!(translated.client_metadata.is_some(), !hosted_search);
+                assert_eq!(
+                    translated.service_tier,
+                    requested
+                        .ends_with("-fast")
+                        .then_some(ServiceTier::Priority)
+                );
+            }
         }
     }
 
@@ -2008,6 +2632,8 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::Http,
+            false,
         )
         .await
         {
@@ -2086,6 +2712,9 @@ mod tests {
         assert!(models.contains(&"gpt-6.1-sol".to_string()));
         assert!(models.contains(&"gpt-6.1-sol-fast".to_string()));
         assert!(models.contains(&"gpt-6.1-sol-ultrafast".to_string()));
+        assert!(models.contains(&"gpt-6.1-terra".to_string()));
+        assert!(models.contains(&"gpt-6.1-terra-fast".to_string()));
+        assert!(!models.contains(&"gpt-6.1-terra-ultrafast".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
         assert!(models.contains(&"gpt-6-astra-fast".to_string()));
@@ -2179,6 +2808,35 @@ mod tests {
         let response = map_codex_error_to_response(&err);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["x-should-retry"], "false");
+    }
+
+    #[test]
+    fn empty_completion_exhausted_fields_distinguish_the_two_give_up_reasons() {
+        let max = empty_completion_exhausted_fields(
+            "req-1",
+            "auto",
+            "gpt-6-sol",
+            11,
+            "max_attempts",
+            157_000,
+        );
+        assert_eq!(max["reqId"], "req-1");
+        assert_eq!(max["configuredTransport"], "auto");
+        assert!(max.get("transport").is_none());
+        assert_eq!(max["model"], "gpt-6-sol");
+        assert_eq!(max["attempts"], 11);
+        assert_eq!(max["reason"], "max_attempts");
+        assert_eq!(max["ms"], 157_000);
+
+        let budget = empty_completion_exhausted_fields(
+            "req-1",
+            "websocket",
+            "gpt-6-sol",
+            4,
+            "backoff_budget",
+            20_000,
+        );
+        assert_eq!(budget["reason"], "backoff_budget");
     }
 
     #[test]
@@ -2286,6 +2944,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             ),
         )
         .await
@@ -2401,6 +3060,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             )
             .await
         });
@@ -2486,6 +3146,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             ),
         )
         .await
@@ -2672,6 +3333,7 @@ mod tests {
                     attempt: Some(compaction_attempt),
                 },
                 config::CodexTransport::WebSocket,
+                false,
             )
             .await
         });
