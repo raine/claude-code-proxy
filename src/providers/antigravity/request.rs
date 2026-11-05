@@ -1,4 +1,5 @@
 use super::{
+    config::RequestMetadata,
     replay::{self, Binding, Result, keys, nonempty},
     schema::ToolSet,
 };
@@ -22,12 +23,178 @@ pub(crate) fn effective_tier(model: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod effects {
+    use std::cell::Cell;
+    #[derive(Clone, Copy)]
+    pub(crate) enum Kind {
+        CredentialLoad,
+        Access,
+        Factory,
+        Clock,
+        NativeId,
+        LegacyId,
+    }
+    thread_local! { static COUNTS: Cell<[usize;6]> = const { Cell::new([0;6]) }; }
+    pub(crate) fn note(kind: Kind) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            counts[kind as usize] += 1;
+            cell.set(counts);
+        });
+    }
+    pub(crate) fn reset() {
+        COUNTS.with(|cell| cell.set([0; 6]));
+    }
+    pub(crate) fn snapshot() -> [usize; 6] {
+        COUNTS.with(Cell::get)
+    }
+    pub(crate) fn count(kind: Kind) -> usize {
+        snapshot()[kind as usize]
+    }
+}
+
+pub(crate) fn metadata_millis() -> Result<i64> {
+    #[cfg(test)]
+    effects::note(effects::Kind::Clock);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "invalid metadata clock")?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| "invalid metadata clock")
+}
+
+pub(crate) fn metadata_uuid() -> String {
+    #[cfg(test)]
+    effects::note(effects::Kind::NativeId);
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn legacy_session() -> String {
+    #[cfg(test)]
+    effects::note(effects::Kind::LegacyId);
+    replay::mint_session()
+}
+
+fn legacy_outer_id() -> String {
+    #[cfg(test)]
+    effects::note(effects::Kind::LegacyId);
+    format!("ccp-{}", uuid::Uuid::new_v4())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ServingScope {
+    pub profile_id: String,
+    pub project_id: String,
+}
+
+/// Immutable, nonsecret VALUE inputs only. No Auth, Store, client, clock or ID
+/// source is available to the estimate function. A missing serving scope does
+/// not authorize generation: carrier scope is then an untrusted consistency
+/// claim checked against the known model/configured project, never published.
+#[derive(Clone, Copy)]
+pub(crate) struct CountInputs<'a> {
+    pub serving_scope: Option<&'a ServingScope>,
+    pub configured_project: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Purpose {
+    Generate,
+    Estimate,
+}
+
+pub(crate) enum Metadata {
+    Legacy,
+    Fresh,
+    Continuation {
+        state: replay::v2::State,
+        new_user_execution: bool,
+        execution_ids: Vec<String>,
+    },
+    Ready(replay::v2::State),
+}
+
 pub(crate) struct Prepared {
     pub wire: Value,
     pub session: String,
     pub display: String,
     pub tools: ToolSet,
     pub estimate: u64,
+    pub metadata: Metadata,
+}
+
+impl Prepared {
+    /// Only called after unchanged access and actual binding validation. The ID
+    /// source is used at fresh/new-USER execution boundaries, NEVER to fabricate
+    /// last_execution_id at render time. Tool generations retain active/prior.
+    pub(crate) fn finalize_metadata(
+        &mut self,
+        unix_millis: i64,
+        mut uuid: impl FnMut() -> String,
+    ) -> Result<()> {
+        if unix_millis < 0 {
+            return Err("invalid metadata timestamp");
+        }
+        // LOW is runtime-observed. MEDIUM/HIGH enum values are compiled public
+        // ModelSource facts, not a claim that all tiers were runtime-observed.
+        let model_enum = match self.wire["model"].as_str() {
+            Some("gemini-4-argon-low") => "MODEL_PLACEHOLDER_M419",
+            Some("gemini-4-argon-medium") => "MODEL_PLACEHOLDER_M418",
+            Some("gemini-4-argon-high") => "MODEL_PLACEHOLDER_M417",
+            _ => return Err("unsupported metadata model"),
+        };
+        let state = match &self.metadata {
+            Metadata::Fresh => replay::v2::State {
+                lineage: replay::v2::Lineage::new(uuid(), uuid())?,
+                native_checkpoint_index: 0,
+                user_execution: replay::v2::UserExecution {
+                    active_id: uuid(),
+                    prior_recorded_id: None,
+                },
+            },
+            Metadata::Continuation {
+                state,
+                new_user_execution,
+                execution_ids,
+            } => {
+                let mut state = state.clone();
+                if *new_user_execution {
+                    let active = uuid();
+                    if execution_ids.contains(&active) {
+                        return Err("V2 USER execution UUID collision");
+                    }
+                    state.user_execution.active_id = active;
+                }
+                state
+            }
+            _ => return Err("metadata requires a fresh or validated continuation"),
+        };
+        state.validate()?;
+        let native_checkpoint_index = state.native_checkpoint_index;
+        let last_step = native_checkpoint_index
+            .checked_mul(2)
+            .ok_or("V2 step overflow")?;
+        let outer_step = last_step.checked_add(1).ok_or("V2 step overflow")?;
+        let lineage = &state.lineage;
+        self.wire["request"]["labels"] = json!({
+            "model_enum":model_enum, "used_claude":"false", "used_claude_conservative":"false",
+            "used_non_gemini_model":"false", "last_step_index":last_step.to_string(),
+            "cascade_id":lineage.conversation_id, "root_cascade_id":lineage.conversation_id,
+            "trajectory_id":lineage.trajectory_id, "request_id":format!("{}-{native_checkpoint_index}", lineage.trajectory_id)
+        });
+        if let Some(prior) = &state.user_execution.prior_recorded_id {
+            self.wire["request"]["labels"]["last_execution_id"] = json!(prior);
+        }
+        self.wire["requestId"] = json!(format!(
+            "agent/{}/{unix_millis}/{}/{outer_step}",
+            lineage.conversation_id, lineage.trajectory_id
+        ));
+        self.session = replay::v2::BACKEND_SESSION.to_owned();
+        self.wire["request"]["sessionId"] = json!(self.session);
+        self.metadata = Metadata::Ready(state);
+        Ok(())
+    }
 }
 
 pub(crate) fn cache_hint(value: Option<&Value>) -> Result<()> {
@@ -205,7 +372,200 @@ fn logical_messages(messages: &[Message]) -> Result<Vec<Cow<'_, Message>>> {
     Ok(output)
 }
 
+fn native_checkpoint_parts(envelope: &Value) -> Result<()> {
+    let contents = envelope["contents"].as_array().unwrap();
+    if contents.is_empty() {
+        return Err("V2 continuation requires native content");
+    }
+    // Preserve every raw content/signature and original codec. A completed
+    // assistant checkpoint counts once regardless of native SSE fragmentation.
+    for content in contents {
+        keys(content, &["role", "parts"], &["role", "parts"])?;
+        let parts = content["parts"].as_array().ok_or("invalid native parts")?;
+        if parts.is_empty() {
+            return Err("V2 continuation requires native parts");
+        }
+        for part in parts {
+            if part.get("functionCall").is_some() {
+                keys(
+                    part,
+                    &["functionCall", "thoughtSignature"],
+                    &["functionCall", "thoughtSignature"],
+                )?;
+                nonempty(&part["thoughtSignature"])?;
+            } else {
+                keys(part, &["text", "thought", "thoughtSignature"], &["text"])?;
+                if !part["text"].is_string() {
+                    return Err("unsupported V2 native part");
+                }
+            }
+            if part.get("thought").is_some_and(|v| !v.is_boolean())
+                || part.get("thoughtSignature").is_some_and(|v| !v.is_string())
+            {
+                return Err("unsupported V2 native part");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn continuation_input(envelope: &Value, user: &Message) -> Result<bool> {
+    native_checkpoint_parts(envelope)?;
+    match nonempty(&envelope["checkpoint_stop_reason"])? {
+        "end_turn" => {
+            if text_parts(&user.content)?.is_empty() {
+                return Err("V2 continuation requires ordinary text");
+            }
+            Ok(true)
+        }
+        "tool_use" => {
+            // Only the captured single complete, ID-bearing, successful string
+            // result is qualified here. Parallel/error/ID-less/compound batches
+            // must not acquire invented Go counter/grouping semantics.
+            let mapping = envelope["tool_mapping"].as_array().unwrap();
+            let calls = replay::calls(&envelope["contents"])?;
+            if mapping.len() != 1 || calls.len() != 1 || calls[0].2.get("id").is_none() {
+                return Err("unqualified V2 tool continuation shape");
+            }
+            let blocks = user
+                .content
+                .as_array()
+                .filter(|b| b.len() == 1)
+                .ok_or("V2 tool continuation requires one result")?;
+            let block = &blocks[0];
+            if block["type"] != "tool_result"
+                || block["tool_use_id"] != mapping[0]["local_id"]
+                || !block["content"].is_string()
+                || block
+                    .get("is_error")
+                    .is_some_and(|v| v.as_bool() != Some(false))
+            {
+                return Err("unqualified V2 tool result");
+            }
+            Ok(false)
+        }
+        _ => Err("unqualified continuation after incomplete V2 checkpoint"),
+    }
+}
+
+fn observed_continuation(
+    messages: &[Cow<'_, Message>],
+    envelopes: &[Value],
+    model: &str,
+) -> Result<Metadata> {
+    // The state machine is shared by the existing three source-defined tiers.
+    // Genuine official runtime reference/entitlement evidence remains LOW-only.
+    // Keep existing message/history limits and checked proxy-owned progression.
+    let ordered = messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .collect::<Vec<_>>();
+    if !MODELS.contains(&model)
+        || envelopes.is_empty()
+        || ordered.len() != envelopes.len().saturating_mul(2).saturating_add(1)
+        || ordered
+            .iter()
+            .enumerate()
+            .any(|(i, m)| m.role != if i % 2 == 0 { "user" } else { "assistant" })
+    {
+        return Err("unsupported V2 continuation role sequence");
+    }
+    if text_parts(&ordered[0].content)?.is_empty() {
+        return Err("V2 needs an initial text user");
+    }
+    let mut new_user_execution = false;
+    for (index, envelope) in envelopes.iter().enumerate() {
+        new_user_execution = continuation_input(envelope, ordered[(index + 1) * 2])?;
+    }
+    let last = envelopes.last().unwrap();
+    let mut state = replay::v2::State::from_envelope(last)?;
+    state.native_checkpoint_index = state
+        .native_checkpoint_index
+        .checked_add(1)
+        .filter(|n| *n < replay::v2::MAX_CHECKPOINTS)
+        .ok_or("V2 checkpoint limit")?;
+    if new_user_execution {
+        state.user_execution.prior_recorded_id = state
+            .recorded_after(nonempty(&last["checkpoint_stop_reason"])?)?
+            .map(str::to_owned);
+        // Active is replaced only at the post-access USER execution boundary.
+    }
+    let execution_ids = envelopes
+        .iter()
+        .map(|e| {
+            e["user_execution"]["active_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    Ok(Metadata::Continuation {
+        state,
+        new_user_execution,
+        execution_ids,
+    })
+}
+
+/// Local semantic estimate only, never generation admission. New-policy counts
+/// have no owner/profile reads, refresh/discovery, clock/ID allocation, lineage
+/// mutation or scope publication. Failed/unknown scope is not filled from a
+/// caller claim; successful serving is the sole publisher of trusted inputs.
+pub(crate) fn estimate(body: &MessagesRequest, inputs: CountInputs<'_>) -> Result<u64> {
+    let model = body.model.as_deref().ok_or("missing model")?;
+    if !MODELS.contains(&model) {
+        return Err("unsupported Antigravity model");
+    }
+    let native_model = model.strip_prefix("antigravity/").unwrap();
+    let binding = if let Some(scope) = inputs.serving_scope {
+        if scope.profile_id.is_empty()
+            || scope.project_id.is_empty()
+            || inputs
+                .configured_project
+                .is_some_and(|p| p != scope.project_id.as_str())
+        {
+            return Err("inconsistent published Antigravity scope");
+        }
+        Binding {
+            profile_id: scope.profile_id.clone(),
+            project_id: scope.project_id.clone(),
+            native_model: native_model.to_owned(),
+        }
+    } else {
+        let messages = logical_messages(&body.messages)?;
+        if let Some(turn) = messages.iter().find(|m| m.role == "assistant") {
+            replay::claimed_binding(&turn.content, native_model, inputs.configured_project)?
+        } else {
+            Binding {
+                profile_id: "unconfigured".into(),
+                project_id: inputs
+                    .configured_project
+                    .unwrap_or("unconfigured")
+                    .to_owned(),
+                native_model: native_model.to_owned(),
+            }
+        }
+    };
+    prepare_inner(body, &binding, RequestMetadata::Agy, Purpose::Estimate).map(|p| p.estimate)
+}
+
 pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepared> {
+    prepare_with_policy(body, binding, RequestMetadata::Legacy)
+}
+
+pub(crate) fn prepare_with_policy(
+    body: &MessagesRequest,
+    binding: &Binding,
+    policy: RequestMetadata,
+) -> Result<Prepared> {
+    prepare_inner(body, binding, policy, Purpose::Generate)
+}
+
+fn prepare_inner(
+    body: &MessagesRequest,
+    binding: &Binding,
+    policy: RequestMetadata,
+    purpose: Purpose,
+) -> Result<Prepared> {
     let model = body.model.as_deref().ok_or("missing model")?;
     if !MODELS.contains(&model) || model.strip_prefix("antigravity/") != Some(&binding.native_model)
     {
@@ -250,11 +610,64 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
         .filter(|m| m.role == "assistant")
         .map(|m| m.content.clone())
         .collect::<Vec<_>>();
-    let envelopes = replay::decode_history(&json!(turns), binding)?;
-    let session = envelopes
-        .first()
-        .map(|e| e["session_id"].as_str().unwrap().to_string())
-        .unwrap_or_else(replay::mint_session);
+    // Classify ONLY the leading carrier. V1 deliberately ignores noncarrier
+    // signatures, including strings that happen to look like another prefix.
+    let v2_turns = turns
+        .iter()
+        .filter(|turn| {
+            turn.get(0).is_some_and(|block| {
+                block["type"] == "thinking"
+                    && block["signature"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with(replay::v2::PREFIX))
+            })
+        })
+        .count();
+    let (envelopes, metadata) = if v2_turns != 0 {
+        if v2_turns != turns.len() {
+            return Err("mixed transcript carrier versions are unsupported");
+        }
+        if policy != RequestMetadata::Agy {
+            return Err("V2 history requires the agy request metadata policy");
+        }
+        let envelopes = replay::v2::decode_history(&json!(turns), binding)?;
+        let metadata = observed_continuation(&messages, &envelopes, model)?;
+        (envelopes, metadata)
+    } else {
+        let envelopes = replay::decode_history(&json!(turns), binding)?;
+        let metadata = if policy == RequestMetadata::Agy && turns.is_empty() {
+            let input = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .collect::<Vec<_>>();
+            if input.len() != 1
+                || input[0].role != "user"
+                || text_parts(&input[0].content)?.is_empty()
+            {
+                return Err("fresh agy execution requires one text user input");
+            }
+            Metadata::Fresh
+        } else {
+            Metadata::Legacy
+        };
+        (envelopes, metadata)
+    };
+    let session = if matches!(metadata, Metadata::Legacy) {
+        envelopes
+            .first()
+            .map(|e| e["session_id"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| {
+                if purpose == Purpose::Generate {
+                    legacy_session()
+                } else {
+                    String::new()
+                }
+            })
+    } else {
+        // No new-policy wire execution metadata is rendered before unchanged
+        // credential access and actual binding validation. Legacy stays as-is.
+        String::new()
+    };
     let mut history = envelopes.into_iter();
     let mut pending: Vec<(Value, Value)> = Vec::new();
     let mut contents = Vec::new();
@@ -442,13 +855,19 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
             request["toolConfig"] = json!({"functionCallingConfig":{"mode":"VALIDATED"}});
         }
     }
+    let outer_id = if matches!(metadata, Metadata::Legacy) && purpose == Purpose::Generate {
+        legacy_outer_id()
+    } else {
+        String::new()
+    };
     let wire = json!({"project":binding.project_id,"model":binding.native_model,"request":request,
-        "requestId":format!("ccp-{}",uuid::Uuid::new_v4()),"userAgent":"antigravity","requestType":"agent"});
+        "requestId":outer_id,"userAgent":"antigravity","requestType":"agent"});
     Ok(Prepared {
         wire,
         session,
         display,
         tools,
         estimate: ((estimate_bytes as u64).div_ceil(3)).max(1),
+        metadata,
     })
 }

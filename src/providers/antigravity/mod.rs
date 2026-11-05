@@ -27,11 +27,17 @@ use config::Config;
 use generation::GenerationClient;
 use replay::{Binding, Result};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 pub struct AntigravityProvider {
     auth: Result<Arc<Auth>>,
     generation: Result<GenerationClient>,
+    // Advisory nonsecret VALUE snapshot only. Not an owner/trajectory store and
+    // never populated from count requests or untrusted transcript scope claims.
+    serving_scope: Arc<RwLock<Option<request::ServingScope>>>,
 }
 impl Default for AntigravityProvider {
     fn default() -> Self {
@@ -40,6 +46,8 @@ impl Default for AntigravityProvider {
 }
 impl AntigravityProvider {
     pub fn new() -> Self {
+        #[cfg(test)]
+        request::effects::note(request::effects::Kind::Factory);
         let config = Config::load();
         let generation = config
             .as_ref()
@@ -48,15 +56,32 @@ impl AntigravityProvider {
         let auth = config
             .and_then(|config| Auth::new(config, Store::configured()))
             .map(Arc::new);
-        Self { auth, generation }
+        Self {
+            auth,
+            generation,
+            serving_scope: Arc::new(RwLock::new(None)),
+        }
     }
     #[cfg(test)]
     pub(crate) fn with_auth(auth: Auth) -> Self {
+        request::effects::note(request::effects::Kind::Factory);
         let generation = GenerationClient::new(&auth.config);
         Self {
             auth: Ok(Arc::new(auth)),
             generation,
+            serving_scope: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Effect-free clone of an immutable nonsecret serving value. In particular,
+    /// do not substitute local_capability()/Store getters, which read profiles.
+    /// Poisoned/unavailable snapshot stays unknown; count never repairs it from
+    /// a caller claim. It is an estimate input, never generation authorization.
+    pub(crate) fn count_scope_snapshot(&self) -> Option<request::ServingScope> {
+        self.serving_scope
+            .read()
+            .ok()
+            .and_then(|scope| scope.clone())
     }
 
     async fn generate(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -64,21 +89,26 @@ impl AntigravityProvider {
             Ok(auth) => auth,
             Err(_) => return invalid("Antigravity configuration is invalid"),
         };
+        #[cfg(test)]
+        request::effects::note(request::effects::Kind::CredentialLoad);
         let stored = match auth.store.load() {
             Ok(value) => value,
             Err(_) => return authentication("Antigravity credentials are invalid or unreadable"),
         };
         let binding = binding(auth, &body, stored.as_ref());
-        let prepared = match request::prepare(&body, &binding) {
-            Ok(p) => p,
-            Err(e) => return invalid(e),
-        };
+        let mut prepared =
+            match request::prepare_with_policy(&body, &binding, auth.config.request_metadata) {
+                Ok(p) => p,
+                Err(e) => return invalid(e),
+            };
         let generation = match &self.generation {
             Ok(client) => client,
             Err(_) => {
                 return upstream_error("Antigravity generation transport initialization failed");
             }
         };
+        #[cfg(test)]
+        request::effects::note(request::effects::Kind::Access);
         let credential = match auth.access().await {
             Ok(c) => c,
             Err(error) => {
@@ -107,6 +137,16 @@ impl AntigravityProvider {
             return invalid(
                 "Antigravity project missing; run auth login or configure your authorized project",
             );
+        }
+        if !matches!(prepared.metadata, request::Metadata::Legacy) {
+            // Fresh UUIDs are allocated only after access/discovery and actual
+            // scope validation. Observed text continuations keep carried IDs;
+            // legacy preparation and its existing nonce behavior are unchanged.
+            let metadata = request::metadata_millis()
+                .and_then(|millis| prepared.finalize_metadata(millis, request::metadata_uuid));
+            if let Err(error) = metadata {
+                return upstream_error(error);
+            }
         }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, body.model.as_deref().unwrap_or_default());
@@ -153,6 +193,8 @@ impl AntigravityProvider {
             return upstream_error("Antigravity returned an unexpected content type");
         }
         let model = body.model.unwrap_or_default();
+        let serving_scope = (auth.config.request_metadata == config::RequestMetadata::Agy)
+            .then(|| self.serving_scope.clone());
         let work = async move {
             let turn = tokio::time::timeout_at(request_deadline, transport::collect(upstream))
                 .await
@@ -165,13 +207,36 @@ impl AntigravityProvider {
                 );
             }
             let mapping = prepared.tools.mapping(&turn.contents)?;
-            let blocks = replay::encode(
-                &turn.contents,
-                &binding,
-                &prepared.session,
-                &prepared.display,
-                &mapping,
-            )?;
+            let blocks = match &prepared.metadata {
+                request::Metadata::Ready(state) => replay::v2::encode(
+                    &turn.contents,
+                    &binding,
+                    state,
+                    &turn.stop_reason,
+                    &prepared.display,
+                    &mapping,
+                )?,
+                request::Metadata::Legacy => replay::encode(
+                    &turn.contents,
+                    &binding,
+                    &prepared.session,
+                    &prepared.display,
+                    &mapping,
+                )?,
+                _ => return Err("native metadata was not finalized"),
+            };
+            // Only actual successful access/binding plus a fully validated native
+            // turn/projection may publish these nonsecret count inputs. Errors or
+            // cancellation before this point publish nothing; no carrier claim is
+            // authoritative and this snapshot never authorizes generation.
+            if let Some(scope) = &serving_scope
+                && let Ok(mut published) = scope.write()
+            {
+                *published = Some(request::ServingScope {
+                    profile_id: binding.profile_id.clone(),
+                    project_id: binding.project_id.clone(),
+                });
+            }
             Ok::<_, &'static str>(transport::message(blocks, &model, &turn))
         };
         if !body.stream {
@@ -284,6 +349,22 @@ impl Provider for AntigravityProvider {
             Ok(auth) => auth,
             Err(_) => return invalid("Antigravity configuration is invalid"),
         };
+        if auth.config.request_metadata == config::RequestMetadata::Agy {
+            let scope = self.count_scope_snapshot();
+            return match request::estimate(
+                &body,
+                request::CountInputs {
+                    serving_scope: scope.as_ref(),
+                    configured_project: auth.config.project.as_deref(),
+                },
+            ) {
+                Ok(estimate) => Json(json!({"input_tokens":estimate})).into_response(),
+                Err(error) => invalid(error),
+            };
+        }
+        // Frozen default/legacy count behavior intentionally remains separate.
+        #[cfg(test)]
+        request::effects::note(request::effects::Kind::CredentialLoad);
         let credential = match auth.store.load() {
             Ok(c) => c,
             Err(_) => return authentication("Antigravity credentials invalid or unreadable"),

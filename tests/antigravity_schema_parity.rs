@@ -144,6 +144,14 @@ cases! {
     schema_parity_numeric_variants_and_budgets => "numeric-budgets",
     schema_parity_original_admission_controls => "admission",
     schema_parity_project_admission_control => "project-admission",
+    schema_parity_observed_first_agent_metadata => "first-agent",
+    schema_parity_observed_two_user_text_metadata => "two-user-text",
+    schema_parity_observed_three_user_text_recurrence => "three-user-text",
+    schema_parity_observed_last_recorded_execution => "last-recorded-execution",
+    schema_parity_observed_read_tool_metadata => "read-tool-metadata",
+    schema_parity_observed_invalid_turn_never_checkpoints => "invalid-native-checkpoint",
+    schema_parity_observed_count_purity => "observed-count-purity",
+    schema_parity_source_all_tier_metadata => "source-all-tier-metadata",
 }
 
 #[test]
@@ -755,8 +763,711 @@ async fn exercise(case: &str, f: &mut Fixture) -> Result<()> {
         "numeric-budgets" => numeric_budgets(f).await,
         "admission" => admission(f).await,
         "project-admission" => project_admission(f).await,
+        "first-agent" => first_agent_metadata(f).await,
+        "two-user-text" => two_user_text_metadata(f).await,
+        "three-user-text" => user_text_sequence(f, false).await,
+        "last-recorded-execution" => user_text_sequence(f, true).await,
+        "read-tool-metadata" => read_tool_metadata(f).await,
+        "invalid-native-checkpoint" => invalid_native_checkpoint(f).await,
+        "observed-count-purity" => observed_count_purity(f).await,
+        "source-all-tier-metadata" => source_all_tier_metadata(f).await,
         _ => bail!("unknown fixed fixture case"),
     }
+}
+
+async fn first_agent_metadata(f: &mut Fixture) -> Result<()> {
+    let config_path = f
+        .auth_path
+        .parent()
+        .and_then(|p| p.parent())
+        .context("synthetic config parent")?
+        .join("config.json");
+    let original = std::fs::read(&config_path)?;
+    let mut config: Value = serde_json::from_slice(&original)?;
+    config["antigravity"]["requestMetadata"] = json!("agy");
+    std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
+    f.provider = AntigravityProvider::new();
+    let result = async {
+        let mut previous_conversation = None;
+        for stream in [false, true] {
+            let mut body = request(stream);
+            body["model"] = json!("antigravity/gemini-4-argon-low");
+            body["max_tokens"] = json!(65536);
+            body["system"] = json!("Synthetic metadata system instruction.");
+            let exchange = f.exchange(body, json!([{"text":"Synthetic metadata completion."}])).await?;
+            exchange.success(stream)?;
+            let wire = exchange.wire()?;
+            ensure!(wire["model"] == "gemini-4-argon-low" && wire["requestType"] == "agent" && wire["userAgent"] == "antigravity", "observed agent envelope");
+            let request = &wire["request"];
+            exact(&request["generationConfig"], &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}), "observed generation controls")?;
+            ensure!(request["sessionId"] == "-3750763034362895579", "observed signed empty-input FNV session");
+            let labels = request["labels"].as_object().context("observed lineage labels")?;
+            ensure!(labels.len() == 9, "exact observed label set");
+            for (key, expected) in [
+                ("model_enum", "MODEL_PLACEHOLDER_M419"),
+                ("used_claude", "false"),
+                ("used_claude_conservative", "false"),
+                ("used_non_gemini_model", "false"),
+                ("last_step_index", "0"),
+            ] {
+                ensure!(labels.get(key).and_then(Value::as_str) == Some(expected), "observed string-valued label");
+            }
+            let conversation = labels["cascade_id"].as_str().context("cascade ID")?;
+            let trajectory = labels["trajectory_id"].as_str().context("trajectory ID")?;
+            for value in [conversation, trajectory] {
+                let id = uuid::Uuid::parse_str(value)?;
+                ensure!(id.get_version_num() == 4 && id.to_string() == value, "canonical UUIDv4 metadata");
+            }
+            ensure!(labels["root_cascade_id"] == conversation && conversation != trajectory, "root and trajectory relationships");
+            ensure!(labels["request_id"] == format!("{trajectory}-0"), "first request uses zero-based generation counter");
+            let outer = wire["requestId"].as_str().context("outer request ID")?;
+            let components: Vec<_> = outer.split('/').collect();
+            ensure!(components.len() == 5 && components[0] == "agent" && components[1] == conversation && components[3] == trajectory && components[4] == "1", "outer request component relationships");
+            let timestamp = components[2].parse::<i64>()?;
+            ensure!((946_684_800_000..4_102_444_800_000).contains(&timestamp) && timestamp.to_string() == components[2], "canonical plausible Unix milliseconds");
+            ensure!(previous_conversation.as_deref() != Some(conversation), "independent fresh conversations");
+            previous_conversation = Some(conversation.to_owned());
+            let blocks = exchange.blocks()?;
+            let signature = blocks[0]["signature"].as_str().context("versioned native carrier")?;
+            let encoded = signature.strip_prefix("ccp:antigravity:v2:").context("explicit V2 carrier, not V1 reinterpretation")?;
+            let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+            ensure!(raw.len() <= BODY_LIMIT, "synthetic V2 carrier bound");
+            let saved: Value = serde_json::from_slice(&raw)?;
+            ensure!(saved["version"] == 2 && saved["profile_id"] == PROFILE && saved["project_id"] == PROJECT, "V2 scope and version");
+            ensure!(saved["native_model"] == "gemini-4-argon-low" && saved["backend_session_id"] == "-3750763034362895579", "V2 model and separate backend session");
+            exact(&saved["lineage"], &json!({"conversation_id":conversation,"trajectory_id":trajectory}), "V2 logical UUIDs")?;
+            ensure!(saved.get("session_id").is_none(), "V2 must not reinterpret the V1 session field");
+            ensure!(wire.get("enabledCreditTypes").is_none() && request.get("enabledCreditTypes").is_none(), "no invented billing consent");
+            exact(&saved["contents"], &json!([{"role":"model","parts":[{"text":"Synthetic metadata completion."}]}]), "unchanged native response contents")?;
+            let mut continuation = self::request(stream);
+            continuation["model"] = json!("antigravity/gemini-4-argon-low");
+            continuation["messages"].as_array_mut().context("messages")?.extend([
+                json!({"role":"assistant","content":blocks}),
+                json!({"role":"user","content":"Unsupported next transition."}),
+            ]);
+            config["antigravity"]["requestMetadata"] = json!("legacy");
+            std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+            tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
+            f.provider = AntigravityProvider::new();
+            let rejected = f.exchange(continuation, json!([{"text":"must not dispatch"}])).await?;
+            ensure!(rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(), "V2 continuation must never downgrade under legacy policy");
+            let error: Value = serde_json::from_slice(&rejected.bytes)?;
+            ensure!(error["error"]["message"].as_str().is_some_and(|s| s.contains("V2 history requires the agy request metadata policy")), "explicit V2 policy boundary");
+            config["antigravity"]["requestMetadata"] = json!("agy");
+            std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+            tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
+            f.provider = AntigravityProvider::new();
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    std::fs::write(config_path, original)?;
+    result
+}
+
+// Official CLI one-process/two-user trace, served LOCAL_SYNTHETIC_SSE (no
+// Google-origin generation). This checks its exact known ID/counter/content
+// relations, not hidden Go state. The later three-user/source fixture below
+// separately checks the full last_execution_id predecessor relationship.
+async fn two_user_text_metadata(f: &mut Fixture) -> Result<()> {
+    let config_path = f
+        .auth_path
+        .parent()
+        .and_then(|p| p.parent())
+        .context("synthetic config parent")?
+        .join("config.json");
+    let original = std::fs::read(&config_path)?;
+    let mut config: Value = serde_json::from_slice(&original)?;
+    config["antigravity"]["requestMetadata"] = json!("agy");
+    std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
+    f.provider = AntigravityProvider::new();
+    let result = async {
+        for stream in [false, true] {
+            let mut body = request(stream);
+            body["model"] = json!("antigravity/gemini-4-argon-low");
+            body["max_tokens"] = json!(65536);
+            body["system"] = json!("Synthetic two-user system instruction.");
+            body["messages"][0]["content"] = json!("Synthetic first user.");
+            let first = f.exchange(body.clone(), json!([{"text":"Synthetic first completion."}])).await?;
+            first.success(stream)?;
+            let first_blocks = first.blocks()?;
+            body["messages"].as_array_mut().context("messages")?.extend([
+                json!({"role":"assistant","content":first_blocks}),
+                json!({"role":"user","content":"Synthetic second user."}),
+            ]);
+            let second = f.exchange(body.clone(), json!([{"text":"Synthetic second completion."}])).await?;
+            if second.status != StatusCode::OK {
+                let error: Value = serde_json::from_slice(&second.bytes)?;
+                bail!("observed second-user text continuation must succeed; status={} error={}", second.status, error["error"]["message"]);
+            }
+            second.success(stream)?;
+            let first_wire = first.wire()?;
+            let second_wire = second.wire()?;
+            let conversation = first_wire["request"]["labels"]["cascade_id"].as_str().context("conversation")?;
+            let trajectory = first_wire["request"]["labels"]["trajectory_id"].as_str().context("trajectory")?;
+            ensure!(conversation != trajectory, "distinct conversation/trajectory");
+            for id in [conversation, trajectory] {
+                let uuid = uuid::Uuid::parse_str(id)?;
+                ensure!(uuid.get_version_num() == 4 && uuid.get_variant() == uuid::Variant::RFC4122 && uuid.to_string() == id, "canonical independent UUIDv4");
+            }
+            for (wire, generation, last_step, outer_step) in [(first_wire, "0", "0", "1"), (second_wire, "1", "2", "3")] {
+                ensure!(wire["model"] == "gemini-4-argon-low" && wire["project"] == PROJECT && wire["requestType"] == "agent" && wire["userAgent"] == "antigravity", "same actual bound model/project/type");
+                ensure!(wire["request"]["sessionId"] == "-3750763034362895579", "same signed empty FNV backend session");
+                let labels = &wire["request"]["labels"];
+                for (key, value) in [("model_enum", "MODEL_PLACEHOLDER_M419"), ("used_claude", "false"), ("used_claude_conservative", "false"), ("used_non_gemini_model", "false"), ("cascade_id", conversation), ("root_cascade_id", conversation), ("trajectory_id", trajectory), ("last_step_index", last_step)] {
+                    ensure!(labels[key].as_str() == Some(value), "observed stable string-valued label {key}");
+                }
+                ensure!(labels["request_id"] == format!("{trajectory}-{generation}"), "generation suffix must not reset at second user");
+                let outer = wire["requestId"].as_str().context("outer ID")?;
+                let components: Vec<_> = outer.split('/').collect();
+                ensure!(components.len() == 5 && components[0] == "agent" && components[1] == conversation && components[3] == trajectory && components[4] == outer_step, "observed outer step and stable identities");
+                let millis = components[2].parse::<i64>()?;
+                ensure!((946_684_800_000..4_102_444_800_000).contains(&millis) && millis.to_string() == components[2], "canonical Unix milliseconds");
+                exact(&wire["request"]["generationConfig"], &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}), "unchanged generation config")?;
+                exact(&wire["request"]["systemInstruction"], &json!({"role":"user","parts":[{"text":"Synthetic two-user system instruction."}]}), "unchanged system role")?;
+            }
+            exact(&first_wire["request"]["contents"], &json!([{"role":"user","parts":[{"text":"Synthetic first user."}]}]), "first native user contents")?;
+            exact(&second_wire["request"]["contents"], &json!([
+                {"role":"user","parts":[{"text":"Synthetic first user."}]},
+                {"role":"model","parts":[{"text":"Synthetic first completion."}]},
+                {"role":"user","parts":[{"text":"Synthetic second user."}]}
+            ]), "exact observed user/model/user history; no synthetic role rewriting")?;
+            let second_blocks = second.blocks()?;
+            for (blocks, index, text) in [(&first_blocks, 0, "Synthetic first completion."), (&second_blocks, 1, "Synthetic second completion.")] {
+                let encoded = blocks[0]["signature"].as_str().context("V2 signature")?.strip_prefix("ccp:antigravity:v2:").context("V2 prefix")?;
+                let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+                let saved: Value = serde_json::from_slice(&raw)?;
+                ensure!(saved["version"] == 2 && saved["profile_id"] == PROFILE && saved["project_id"] == PROJECT && saved["native_model"] == "gemini-4-argon-low", "V2 actual scope");
+                exact(&saved["lineage"], &json!({"conversation_id":conversation,"trajectory_id":trajectory}), "same carried logical IDs")?;
+                ensure!(saved["native_checkpoint_index"] == index, "proxy-owned completed checkpoint ordinal, not hidden Go state");
+                ensure!(saved["backend_session_id"] == "-3750763034362895579", "separate fixed backend session");
+                exact(&saved["contents"], &json!([{"role":"model","parts":[{"text":text}]}]), "original native checkpoint contents")?;
+            }
+            // Normal text recurrence is separately observed. Unsupported media
+            // must still reject before identity allocation or native dispatch.
+            body["messages"].as_array_mut().context("messages")?.extend([
+                json!({"role":"assistant","content":second_blocks}),
+                json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"synthetic"}}]}),
+            ]);
+            let rejected = f.exchange(body, json!([{"text":"must not dispatch"}])).await?;
+            ensure!(rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(), "unsupported media must reject without reminting or dispatch");
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    std::fs::write(config_path, original)?;
+    result
+}
+
+fn uuid_v4(value: &str) -> Result<()> {
+    let id = uuid::Uuid::parse_str(value)?;
+    ensure!(
+        id.get_version_num() == 4
+            && id.get_variant() == uuid::Variant::RFC4122
+            && id.to_string() == value,
+        "canonical lowercase RFC4122 UUIDv4"
+    );
+    Ok(())
+}
+
+async fn observed_policy(f: &mut Fixture) -> Result<(PathBuf, Vec<u8>)> {
+    let path = f
+        .auth_path
+        .parent()
+        .and_then(|p| p.parent())
+        .context("synthetic config parent")?
+        .join("config.json");
+    let original = std::fs::read(&path)?;
+    let mut config: Value = serde_json::from_slice(&original)?;
+    config["antigravity"]["requestMetadata"] = json!("agy");
+    std::fs::write(&path, serde_json::to_vec(&config)?)?;
+    tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
+    f.provider = AntigravityProvider::new();
+    Ok((path, original))
+}
+
+fn v2_saved(blocks: &Value) -> Result<Value> {
+    let encoded = blocks[0]["signature"]
+        .as_str()
+        .context("native carrier")?
+        .strip_prefix("ccp:antigravity:v2:")
+        .context("V2 carrier prefix")?;
+    let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+    ensure!(raw.len() <= BODY_LIMIT, "bounded synthetic carrier");
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+fn observed_metadata(
+    wire: &Value,
+    conversation: &str,
+    trajectory: &str,
+    generation: u64,
+) -> Result<()> {
+    let (suffix, last_step, outer_step) = match generation {
+        0 => ("0", "0", "1"),
+        1 => ("1", "2", "3"),
+        2 => ("2", "4", "5"),
+        _ => bail!("fixture only asserts independently observed progression"),
+    };
+    ensure!(
+        wire["model"] == "gemini-4-argon-low"
+            && wire["project"] == PROJECT
+            && wire["requestType"] == "agent"
+            && wire["userAgent"] == "antigravity",
+        "bound native agent envelope"
+    );
+    ensure!(
+        wire["request"]["sessionId"] == "-3750763034362895579",
+        "signed empty FNV session"
+    );
+    let labels = &wire["request"]["labels"];
+    for (key, value) in [
+        ("model_enum", "MODEL_PLACEHOLDER_M419"),
+        ("used_claude", "false"),
+        ("used_claude_conservative", "false"),
+        ("used_non_gemini_model", "false"),
+        ("cascade_id", conversation),
+        ("root_cascade_id", conversation),
+        ("trajectory_id", trajectory),
+        ("last_step_index", last_step),
+    ] {
+        ensure!(
+            labels[key].as_str() == Some(value),
+            "observed string-valued label {key}"
+        );
+    }
+    ensure!(
+        labels["request_id"] == format!("{trajectory}-{suffix}"),
+        "observed generation suffix"
+    );
+    let components: Vec<_> = wire["requestId"]
+        .as_str()
+        .context("outer request ID")?
+        .split('/')
+        .collect();
+    ensure!(
+        components.len() == 5
+            && components[0] == "agent"
+            && components[1] == conversation
+            && components[3] == trajectory
+            && components[4] == outer_step,
+        "observed outer request relationships"
+    );
+    let millis = components[2].parse::<i64>()?;
+    ensure!(
+        (946_684_800_000..4_102_444_800_000).contains(&millis)
+            && millis.to_string() == components[2],
+        "canonical Unix milliseconds"
+    );
+    exact(
+        &wire["request"]["generationConfig"],
+        &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}),
+        "observed LOW generation config",
+    )?;
+    Ok(())
+}
+
+// Three successful ordinary-user executions and the public latest-recorded
+// executor-metadata accessor establish these relations. IDs here are our
+// bounded proxy-owned execution representation, not copied private native IDs
+// or a claim about native allocation/error/cancellation timing.
+async fn user_text_sequence(f: &mut Fixture, check_execution: bool) -> Result<()> {
+    let (path, original) = observed_policy(f).await?;
+    let result = async {
+        for stream in [false, true] {
+            let mut body = request(stream);
+            body["model"] = json!("antigravity/gemini-4-argon-low");
+            body["max_tokens"] = json!(65536);
+            body["messages"][0]["content"] = json!("Synthetic user 0.");
+            let mut expected_contents =
+                vec![json!({"role":"user","parts":[{"text":"Synthetic user 0."}]})];
+            let mut conversation = None;
+            let mut trajectory = None;
+            let mut saved_turns: Vec<Value> = Vec::new();
+            for generation in 0..3_u64 {
+                let text = format!("Synthetic completion {generation}.");
+                let exchange = f.exchange(body.clone(), json!([{"text":text}])).await?;
+                if exchange.status != StatusCode::OK {
+                    let error: Value = serde_json::from_slice(&exchange.bytes)?;
+                    bail!(
+                        "observed user generation {generation} must succeed; status={} error={}",
+                        exchange.status,
+                        error["error"]["message"]
+                    );
+                }
+                exchange.success(stream)?;
+                let wire = exchange.wire()?;
+                if generation == 0 {
+                    conversation = Some(
+                        wire["request"]["labels"]["cascade_id"]
+                            .as_str()
+                            .context("conversation")?
+                            .to_owned(),
+                    );
+                    trajectory = Some(
+                        wire["request"]["labels"]["trajectory_id"]
+                            .as_str()
+                            .context("trajectory")?
+                            .to_owned(),
+                    );
+                    uuid_v4(conversation.as_deref().unwrap())?;
+                    uuid_v4(trajectory.as_deref().unwrap())?;
+                    ensure!(conversation != trajectory, "independent lineage UUIDs");
+                }
+                observed_metadata(
+                    wire,
+                    conversation.as_deref().unwrap(),
+                    trajectory.as_deref().unwrap(),
+                    generation,
+                )?;
+                exact(
+                    &wire["request"]["contents"],
+                    &json!(expected_contents),
+                    "exact alternating user/model history",
+                )?;
+                let blocks = exchange.blocks()?;
+                let saved = v2_saved(&blocks)?;
+                ensure!(
+                    saved["native_checkpoint_index"] == generation,
+                    "proxy native checkpoint ordinal"
+                );
+                exact(
+                    &saved["contents"],
+                    &json!([{"role":"model","parts":[{"text":text}]}]),
+                    "original native contents",
+                )?;
+                if check_execution {
+                    let labels = wire["request"]["labels"].as_object().context("labels")?;
+                    if generation == 0 {
+                        ensure!(
+                            labels.len() == 9 && !labels.contains_key("last_execution_id"),
+                            "first request has no recorded execution"
+                        );
+                    } else {
+                        // Reach the actual wire failure before inspecting new
+                        // checkpoint fields, so pre-implementation RED is causal.
+                        let last = labels
+                            .get("last_execution_id")
+                            .and_then(Value::as_str)
+                            .context("observed last recorded user execution label")?;
+                        uuid_v4(last)?;
+                        ensure!(labels.len() == 10, "exact observed later-user label set");
+                        let previous =
+                            saved_turns.last().context("previous completed execution")?;
+                        ensure!(
+                            previous["user_execution"]["active_id"] == last
+                                && previous["checkpoint_stop_reason"] == "end_turn",
+                            "label reuses previous recorded completion, never a renderer-time UUID"
+                        );
+                        ensure!(
+                            saved["user_execution"]["active_id"] != last,
+                            "new ordinary user execution is distinct"
+                        );
+                    }
+                }
+                saved_turns.push(saved);
+                if generation < 2 {
+                    let next = format!("Synthetic user {}.", generation + 1);
+                    body["messages"]
+                        .as_array_mut()
+                        .context("messages")?
+                        .extend([
+                            json!({"role":"assistant","content":blocks}),
+                            json!({"role":"user","content":next}),
+                        ]);
+                    expected_contents.push(json!({"role":"model","parts":[{"text":text}]}));
+                    expected_contents.push(json!({"role":"user","parts":[{"text":next}]}));
+                }
+            }
+            if check_execution {
+                let mut seen = std::collections::HashSet::new();
+                let mut recorded: Option<String> = None;
+                for saved in saved_turns {
+                    let active = saved["user_execution"]["active_id"]
+                        .as_str()
+                        .context("proxy-owned user execution ID")?;
+                    uuid_v4(active)?;
+                    ensure!(
+                        Some(active) != conversation.as_deref()
+                            && Some(active) != trajectory.as_deref()
+                            && seen.insert(active.to_owned()),
+                        "distinct execution identities"
+                    );
+                    ensure!(
+                        saved["checkpoint_stop_reason"] == "end_turn"
+                            && saved["user_execution"]["prior_recorded_id"].as_str() == recorded.as_deref(),
+                        "checkpoint binds the predecessor; validated completion records active for the NEXT user"
+                    );
+                    recorded = Some(active.to_owned());
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    std::fs::write(path, original)?;
+    result
+}
+
+// Genuine one-user READ loop: local scripted SSE, zero origin generations.
+// Both requests omit last_execution_id, despite model generation 0 -> 1.
+async fn read_tool_metadata(f: &mut Fixture) -> Result<()> {
+    const SIGNATURE: &str = "c3ludGhldGljLXNpZ25hdHVyZQ==";
+    const NATIVE_ID: &str = "synthetic-read-call-1";
+    let (path, original) = observed_policy(f).await?;
+    let result = async {
+        for stream in [false, true] {
+            let mut body = request(stream);
+            body["model"] = json!("antigravity/gemini-4-argon-low");
+            body["max_tokens"] = json!(65536);
+            body["tools"] = json!([tool("read_file", json!({"type":"object","properties":{"Path":{"type":"string"}},"required":["Path"],"additionalProperties":false}))]);
+            let native_part = json!({"functionCall":{"name":"read_file","args":{"Path":"/synthetic/owned-fixture.txt"},"id":NATIVE_ID},"thoughtSignature":SIGNATURE});
+            let first = f.exchange(body.clone(), json!([native_part])).await?;
+            first.success(stream)?;
+            let blocks = first.blocks()?;
+            let local = blocks[1]["id"].as_str().context("local tool ID")?;
+            ensure!(blocks[1]["type"] == "tool_use" && local != NATIVE_ID, "preserve original native/local tool mapping");
+            exact(&blocks[1]["input"], &json!({"Path":"/synthetic/owned-fixture.txt"}), "original caller arguments")?;
+            body["messages"].as_array_mut().context("messages")?.extend([
+                json!({"role":"assistant","content":blocks}),
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":local,"content":"Synthetic read fixture marker."}]})
+            ]);
+            let second = f.exchange(body, json!([{"text":"Synthetic read complete."}])).await?;
+            if second.status != StatusCode::OK {
+                let error: Value = serde_json::from_slice(&second.bytes)?;
+                bail!("observed read-tool continuation must succeed; status={} error={}", second.status, error["error"]["message"]);
+            }
+            second.success(stream)?;
+            let first_wire = first.wire()?;
+            let second_wire = second.wire()?;
+            let conversation = first_wire["request"]["labels"]["cascade_id"].as_str().context("conversation")?;
+            let trajectory = first_wire["request"]["labels"]["trajectory_id"].as_str().context("trajectory")?;
+            for (wire, generation) in [(first_wire, 0), (second_wire, 1)] {
+                observed_metadata(wire, conversation, trajectory, generation)?;
+                let labels = wire["request"]["labels"].as_object().context("labels")?;
+                ensure!(labels.len() == 9 && !labels.contains_key("last_execution_id"), "no recorded execution within first user's tool loop");
+            }
+            let mut expected = first_wire.clone();
+            let components: Vec<_> = second_wire["requestId"].as_str().context("second request ID")?.split('/').collect();
+            expected["requestId"] = json!(format!("agent/{conversation}/{}/{trajectory}/3", components[2]));
+            expected["request"]["labels"]["request_id"] = json!(format!("{trajectory}-1"));
+            expected["request"]["labels"]["last_step_index"] = json!("2");
+            expected["request"]["contents"] = json!([
+                {"role":"user","parts":[{"text":"Synthetic schema request."}]},
+                {"role":"model","parts":[native_part]},
+                {"role":"model","parts":[{"functionResponse":{"name":"read_file","response":{"output":"Synthetic read fixture marker."},"id":NATIVE_ID}}]}
+            ]);
+            exact(second_wire, &expected, "complete observed read-loop wire, including separate MODEL functionResponse and untouched signature/native ID")?;
+            let first_saved = v2_saved(&blocks)?;
+            exact(&first_saved["contents"], &json!([{"role":"model","parts":[native_part]}]), "raw call/signature checkpoint")?;
+            let second_saved = v2_saved(&second.blocks()?)?;
+            ensure!(first_saved["checkpoint_stop_reason"] == "tool_use" && first_saved["user_execution"]["prior_recorded_id"].is_null(), "tool call is not a completed user execution");
+            let active = first_saved["user_execution"]["active_id"].as_str().context("active execution")?;
+            uuid_v4(active)?;
+            ensure!(second_saved["user_execution"]["active_id"] == active && second_saved["user_execution"]["prior_recorded_id"].is_null() && second_saved["checkpoint_stop_reason"] == "end_turn", "same execution survives tool loop and records only after validated final completion");
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    std::fs::write(path, original)?;
+    result
+}
+
+async fn invalid_native_checkpoint(f: &mut Fixture) -> Result<()> {
+    let (path, original) = observed_policy(f).await?;
+    let result = async {
+        for stream in [false, true] {
+            let mut body = request(stream);
+            body["model"] = json!("antigravity/gemini-4-argon-low");
+            let exchange = f
+                .exchange(body, json!({"synthetic":"invalid native parts type"}))
+                .await?;
+            ensure!(
+                exchange.wire.is_some(),
+                "actual native request occurred exactly once"
+            );
+            let output = std::str::from_utf8(&exchange.bytes)?;
+            ensure!(
+                !output.contains("ccp:antigravity:v2:"),
+                "invalid upstream turn must never fabricate a successful checkpoint"
+            );
+            if stream {
+                ensure!(
+                    exchange.status == StatusCode::OK
+                        && output.contains("event: error\n")
+                        && !output.contains("event: message_stop\n"),
+                    "streaming invalid turn is terminal error only"
+                );
+            } else {
+                ensure!(
+                    exchange.status == StatusCode::BAD_GATEWAY,
+                    "invalid turn must fail"
+                );
+                let error: Value = serde_json::from_slice(&exchange.bytes)?;
+                ensure!(
+                    error["error"]["message"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("invalid native parts")),
+                    "bounded native validation error"
+                );
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    std::fs::write(path, original)?;
+    result
+}
+
+async fn observed_count_purity(f: &mut Fixture) -> Result<()> {
+    let (path, original) = observed_policy(f).await?;
+    let result = async {
+        let mut body = request(false);
+        body["model"] = json!("antigravity/gemini-4-argon-low");
+        let mut estimates = Vec::new();
+        for kind in ["invalid", "unreadable", "missing"] {
+            if f.auth_path.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&f.auth_path, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            match kind {
+                "invalid" => std::fs::write(&f.auth_path, b"public synthetic invalid auth JSON")?,
+                "unreadable" => {
+                    std::fs::write(&f.auth_path, &f.auth_bytes)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &f.auth_path,
+                            std::fs::Permissions::from_mode(0o000),
+                        )?;
+                    }
+                }
+                "missing" => std::fs::remove_file(&f.auth_path)?,
+                _ => unreachable!(),
+            }
+            let response = tokio::time::timeout(
+                STEP_LIMIT,
+                f.provider
+                    .handle_count_tokens(serde_json::from_value(body.clone())?, context()),
+            )
+            .await?;
+            let status = response.status();
+            let raw = to_bytes(response.into_body(), BODY_LIMIT).await?;
+            let counted: Value = serde_json::from_slice(&raw)?;
+            ensure!(
+                status == StatusCode::OK,
+                "selected agy count must ignore {kind} synthetic auth; status={status} error={}",
+                counted["error"]["message"]
+            );
+            ensure!(
+                counted["input_tokens"].as_u64().is_some_and(|n| n > 0),
+                "positive local estimate"
+            );
+            estimates.push(counted["input_tokens"].clone());
+            ensure!(
+                f.state.lock().unwrap().seen.is_empty(),
+                "count must not dispatch, discover or refresh"
+            );
+            if kind == "missing" {
+                ensure!(!f.auth_path.exists(), "count must not create an auth store");
+            }
+        }
+        ensure!(
+            estimates.iter().all(|n| *n == estimates[0]),
+            "estimate does not depend on credential contents/permissions/presence"
+        );
+        // New policy must not silently change the default/legacy count behavior.
+        std::fs::write(&f.auth_path, b"public synthetic invalid auth JSON")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f.auth_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        config["antigravity"]["requestMetadata"] = json!("legacy");
+        std::fs::write(&path, serde_json::to_vec(&config)?)?;
+        tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
+        f.provider = AntigravityProvider::new();
+        let legacy = tokio::time::timeout(
+            STEP_LIMIT,
+            f.provider
+                .handle_count_tokens(serde_json::from_value(body)?, context()),
+        )
+        .await?;
+        ensure!(
+            legacy.status() == StatusCode::UNAUTHORIZED,
+            "legacy profile validation remains unchanged"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if f.auth_path.exists() {
+            std::fs::set_permissions(&f.auth_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    std::fs::write(&f.auth_path, &f.auth_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f.auth_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::write(path, original)?;
+    result
+}
+
+// Synthetic coverage of existing selectors and compiled public enum facts.
+// This is NOT genuine HIGH/MEDIUM runtime/entitlement evidence; the official
+// runtime reference remains LOW-only. Each tier starts an independent history.
+async fn source_all_tier_metadata(f: &mut Fixture) -> Result<()> {
+    let (path, original) = observed_policy(f).await?;
+    let result = async {
+        for stream in [false, true] {
+            for (model, enumeration, level) in [
+                ("gemini-4-argon-low", "MODEL_PLACEHOLDER_M419", "LOW"),
+                ("gemini-4-argon-medium", "MODEL_PLACEHOLDER_M418", "MEDIUM"),
+                ("gemini-4-argon-high", "MODEL_PLACEHOLDER_M417", "HIGH"),
+            ] {
+                let mut body = request(stream);
+                body["model"] = json!(format!("antigravity/{model}"));
+                let first = f.exchange(body.clone(), json!([{"text":"Synthetic source-tier completion."}])).await?;
+                first.success(stream)?;
+                let blocks = first.blocks()?;
+                let saved = v2_saved(&blocks)?;
+                body["messages"].as_array_mut().context("messages")?.extend([json!({"role":"assistant","content":blocks}), json!({"role":"user","content":"Synthetic source-tier next user."})]);
+                let second = f.exchange(body, json!([{"text":"Synthetic source-tier second completion."}])).await?;
+                if second.status != StatusCode::OK {
+                    let error: Value = serde_json::from_slice(&second.bytes)?;
+                    bail!("supported selector {model} must share continuation logic; status={} error={}", second.status, error["error"]["message"]);
+                }
+                second.success(stream)?;
+                for (exchange, generation) in [(&first, "0"), (&second, "1")] {
+                    let wire = exchange.wire()?;
+                    let labels = &wire["request"]["labels"];
+                    ensure!(wire["model"] == model && saved["native_model"] == model && labels["model_enum"] == enumeration, "exact fixed-tier model and source enum mapping");
+                    ensure!(labels["cascade_id"] == first.wire()?["request"]["labels"]["cascade_id"] && labels["trajectory_id"] == first.wire()?["request"]["labels"]["trajectory_id"], "fixed tier history retains lineage");
+                    let trajectory = labels["trajectory_id"].as_str().context("trajectory")?;
+                    ensure!(labels["request_id"] == format!("{trajectory}-{generation}"), "shared generation progression");
+                    ensure!(wire["request"]["sessionId"] == "-3750763034362895579", "fixed signed backend session");
+                    exact(&wire["request"]["generationConfig"], &json!({"maxOutputTokens":137,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":level}}), "existing cap and thinking tiers unchanged")?;
+                }
+                ensure!(second.wire()?["request"]["labels"]["last_execution_id"] == saved["user_execution"]["active_id"], "same predecessor relationship independent of tier");
+                let mut switched = request(stream);
+                switched["model"] = json!(if model == "gemini-4-argon-low" { "antigravity/gemini-4-argon-high" } else { "antigravity/gemini-4-argon-low" });
+                switched["messages"].as_array_mut().context("messages")?.extend([json!({"role":"assistant","content":blocks}), json!({"role":"user","content":"Must not switch tier on a carried history."})]);
+                let rejected = f.exchange(switched, json!([{"text":"must not dispatch"}])).await?;
+                ensure!(rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(), "fixed-model tier binding is still closed");
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    std::fs::write(path, original)?;
+    result
 }
 
 async fn tls_control(f: &mut Fixture) -> Result<()> {

@@ -132,6 +132,1340 @@ fn request_value() -> Value {
         "messages":[{"role":"user", "content":"hello"}]})
 }
 
+fn execution_id(index: u64) -> String {
+    format!("aaaaaaaa-aaaa-4aaa-8aaa-{index:012x}")
+}
+
+fn v2_state(lineage: &replay::v2::Lineage, index: u64) -> replay::v2::State {
+    replay::v2::State {
+        lineage: lineage.clone(),
+        native_checkpoint_index: index,
+        user_execution: replay::v2::UserExecution {
+            active_id: execution_id(index),
+            prior_recorded_id: index.checked_sub(1).map(execution_id),
+        },
+    }
+}
+
+fn v2_encode(
+    contents: &Value,
+    binding: &replay::Binding,
+    lineage: &replay::v2::Lineage,
+    index: u64,
+    display: &str,
+    mapping: &Value,
+) -> replay::Result<Value> {
+    let stop = if mapping.as_array().is_some_and(|m| !m.is_empty()) {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+    replay::v2::encode(
+        contents,
+        binding,
+        &v2_state(lineage, index),
+        stop,
+        display,
+        mapping,
+    )
+}
+
+#[test]
+fn antigravity_v2_first_checkpoint_is_separate_bounded_and_scope_bound() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let contents = json!([{"role":"model","parts":[
+        {"text":"private thought","thought":true,"thoughtSignature":"opaque-original"},
+        {"functionCall":{"name":"native_name","args":{"payload":"{\"x\":17}"}},"thoughtSignature":"opaque-call"},
+        {"text":"complete"}
+    ]}]);
+    let recipes =
+        json!([{"local_id":"toolu_fixed","caller_name":"caller_name","codec_paths":["/payload"]}]);
+    let mapping = replay::mapping(&contents, Some(&recipes)).unwrap();
+    for display in ["full", "omitted"] {
+        let v1 = replay::encode(&contents, &binding(), "19", display, &mapping).unwrap();
+        let v2 = v2_encode(&contents, &binding(), &lineage, 0, display, &mapping).unwrap();
+        assert_eq!(
+            replay::projection_values(&v1).unwrap(),
+            replay::projection_values(&v2).unwrap()
+        );
+        assert!(
+            v2[0]["signature"]
+                .as_str()
+                .unwrap()
+                .starts_with(replay::v2::PREFIX)
+        );
+        assert!(replay::decode(&v2, &binding()).is_err());
+        assert!(replay::v2::decode(&v1, &binding()).is_err());
+        let envelope = replay::v2::decode(&v2, &binding()).unwrap();
+        assert_eq!(envelope["contents"], contents);
+        assert_eq!(envelope["tool_mapping"], mapping);
+        assert_eq!(envelope["version"], 2);
+        assert_eq!(envelope["backend_session_id"], "-3750763034362895579");
+        assert_eq!(
+            envelope["lineage"]["conversation_id"],
+            lineage.conversation_id
+        );
+        assert_eq!(envelope["lineage"]["trajectory_id"], lineage.trajectory_id);
+        assert_ne!(
+            envelope["projection_digest"],
+            replay::decode(&v1, &binding()).unwrap()["projection_digest"]
+        );
+        for key in ["profile_id", "project_id", "native_model"] {
+            let mut scope = serde_json::to_value(binding()).unwrap();
+            scope[key] = json!("different");
+            let scope = serde_json::from_value(scope).unwrap();
+            assert!(replay::v2::decode(&v2, &scope).is_err());
+        }
+        for (key, value) in [
+            ("version", json!(1)),
+            ("version", json!(3)),
+            ("backend_session_id", json!("19")),
+            ("native_checkpoint_index", json!(1)),
+            ("native_checkpoint_index", json!(2)),
+            (
+                "lineage",
+                json!({"conversation_id":lineage.conversation_id,"trajectory_id":lineage.conversation_id}),
+            ),
+            (
+                "lineage",
+                json!({"conversation_id":"33333333-3333-4333-8333-333333333333","trajectory_id":lineage.trajectory_id}),
+            ),
+            (
+                "projection_digest",
+                replay::decode(&v1, &binding()).unwrap()["projection_digest"].clone(),
+            ),
+            ("extra", json!(true)),
+        ] {
+            let mut tampered = envelope.clone();
+            tampered[key] = value;
+            let mut blocks = v2.clone();
+            blocks[0]["signature"] = json!(format!(
+                "{}{}",
+                replay::v2::PREFIX,
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&tampered).unwrap())
+            ));
+            assert!(
+                replay::v2::decode(&blocks, &binding()).is_err(),
+                "accepted {key}"
+            );
+        }
+        let mut modified = v2.clone();
+        modified[1]["input"]["payload"]["x"] = json!(18);
+        assert!(replay::v2::decode(&modified, &binding()).is_err());
+        let mut foreign = v2.clone();
+        foreign[0]["signature"] = json!("ccp:antigravity:v3:unknown");
+        assert!(replay::v2::decode(&foreign, &binding()).is_err());
+        foreign[0]["signature"] = json!(format!("{}!", replay::v2::PREFIX));
+        assert!(replay::v2::decode(&foreign, &binding()).is_err());
+    }
+    for id in [
+        "not-a-uuid",
+        "11111111111141118111111111111111",
+        "11111111-1111-1111-8111-111111111111",
+        "11111111-1111-4111-0111-111111111111",
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    ] {
+        assert!(replay::v2::Lineage::new(id.into(), lineage.trajectory_id.clone()).is_err());
+    }
+    let oversized = json!([{"role":"model","parts":[{"text":"x".repeat(replay::MAX_DECODED)}]}]);
+    assert_eq!(
+        v2_encode(&oversized, &binding(), &lineage, 0, "full", &json!([])).err(),
+        Some("JSON byte limit")
+    );
+    let too_many = json!(vec![json!({"role":"model","parts":[]}); 513]);
+    assert!(v2_encode(&too_many, &binding(), &lineage, 0, "full", &json!([])).is_err());
+    assert!(
+        replay::v2::Lineage::new(lineage.conversation_id.clone(), lineage.conversation_id).is_err()
+    );
+}
+
+#[test]
+fn antigravity_metadata_first_request_and_legacy_history_boundary() {
+    use super::antigravity::{
+        config::RequestMetadata,
+        request::{Metadata, prepare_with_policy},
+    };
+    let body = serde_json::from_value(request_value()).unwrap();
+    let mut fresh = prepare_with_policy(&body, &binding(), RequestMetadata::Agy).unwrap();
+    assert!(
+        matches!(fresh.metadata, Metadata::Fresh),
+        "preparation must not allocate Go identifiers"
+    );
+    assert_eq!(fresh.wire["requestId"], "");
+    assert_eq!(fresh.wire["request"]["sessionId"], "");
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    assert!(
+        fresh
+            .finalize_metadata(-1, || panic!("invalid clock must not allocate"))
+            .is_err()
+    );
+    let mut allocated = 0;
+    let mut ids = [
+        lineage.conversation_id.clone(),
+        lineage.trajectory_id.clone(),
+        execution_id(0),
+    ]
+    .into_iter();
+    fresh
+        .finalize_metadata(1_799_999_999_123, || {
+            allocated += 1;
+            ids.next().unwrap()
+        })
+        .unwrap();
+    assert_eq!(
+        allocated, 3,
+        "two logical IDs and one proxy user execution at admission"
+    );
+    assert_eq!(
+        fresh.wire["requestId"],
+        "agent/11111111-1111-4111-8111-111111111111/1799999999123/22222222-2222-4222-8222-222222222222/1"
+    );
+    assert_eq!(fresh.wire["request"]["sessionId"], "-3750763034362895579");
+    assert_eq!(
+        fresh.wire["request"]["labels"],
+        json!({
+            "model_enum":"MODEL_PLACEHOLDER_M419","used_claude":"false","used_claude_conservative":"false",
+            "used_non_gemini_model":"false","last_step_index":"0","cascade_id":lineage.conversation_id,
+            "root_cascade_id":lineage.conversation_id,"trajectory_id":lineage.trajectory_id,
+            "request_id":format!("{}-0", lineage.trajectory_id)
+        })
+    );
+    assert!(
+        fresh
+            .finalize_metadata(1_799_999_999_123, || panic!(
+                "double finalization must not allocate"
+            ))
+            .is_err()
+    );
+    let contents = json!([{"role":"model","parts":[{"text":"previous"}]}]);
+    let v1 = replay::encode(&contents, &binding(), "19", "full", &json!([])).unwrap();
+    let v2 = v2_encode(&contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let mut history = request_value();
+    history["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":v1}),
+        json!({"role":"user","content":"next"}),
+    ]);
+    let mut legacy = prepare_with_policy(
+        &serde_json::from_value(history.clone()).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    assert_eq!(legacy.session, "19");
+    assert!(legacy.wire["request"].get("labels").is_none());
+    assert!(
+        legacy.wire["requestId"]
+            .as_str()
+            .unwrap()
+            .starts_with("ccp-")
+    );
+    assert!(matches!(legacy.metadata, Metadata::Legacy));
+    assert!(
+        legacy
+            .finalize_metadata(1_799_999_999_123, || panic!(
+                "legacy must not allocate Go IDs"
+            ))
+            .is_err()
+    );
+    // Ignored noncarrier signatures have always been projection metadata in V1.
+    // A V2-looking string there must not reclassify a valid V1 turn as mixed.
+    history["messages"][1]["content"][1]["signature"] =
+        json!("ccp:antigravity:v2:ignored-text-signature");
+    assert!(
+        prepare_with_policy(
+            &serde_json::from_value(history.clone()).unwrap(),
+            &binding(),
+            RequestMetadata::Agy
+        )
+        .is_ok()
+    );
+    history["messages"][1]["content"] = v2;
+    let error = prepare_with_policy(
+        &serde_json::from_value(history.clone()).unwrap(),
+        &binding(),
+        RequestMetadata::Legacy,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error, "V2 history requires the agy request metadata policy");
+    let resumed = prepare_with_policy(
+        &serde_json::from_value(history).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    assert!(matches!(
+        resumed.metadata,
+        Metadata::Continuation {
+            new_user_execution: true,
+            ..
+        }
+    ));
+    let default = prepare(&body, &binding()).unwrap();
+    assert!(matches!(default.metadata, Metadata::Legacy));
+    assert!(default.wire["request"].get("labels").is_none());
+    assert!(default.session.parse::<i64>().unwrap() > 0);
+}
+
+#[test]
+fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
+    use super::antigravity::{
+        config::RequestMetadata,
+        request::{Metadata, prepare_with_policy},
+    };
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let first_contents =
+        json!([{"role":"model","parts":[{"text":"first","thoughtSignature":"original-opaque"}]}]);
+    let second_contents = json!([{"role":"model","parts":[{"text":"second"}]}]);
+    let first = v2_encode(&first_contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let second = v2_encode(
+        &second_contents,
+        &binding(),
+        &lineage,
+        1,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let decoded = replay::v2::decode_history(&json!([first, second]), &binding()).unwrap();
+    assert_eq!(decoded[0]["native_checkpoint_index"], 0);
+    assert_eq!(decoded[1]["native_checkpoint_index"], 1);
+    assert_eq!(decoded[0]["contents"], first_contents);
+    assert!(
+        v2_encode(
+            &second_contents,
+            &binding(),
+            &lineage,
+            512,
+            "full",
+            &json!([])
+        )
+        .is_err()
+    );
+    for history in [
+        json!([second]),
+        json!([second, first]),
+        json!([first, first]),
+    ] {
+        assert!(
+            replay::v2::decode_history(&history, &binding()).is_err(),
+            "checkpoint omission/reorder/duplicate"
+        );
+    }
+    let foreign = replay::v2::Lineage::new(
+        "33333333-3333-4333-8333-333333333333".into(),
+        "44444444-4444-4444-8444-444444444444".into(),
+    )
+    .unwrap();
+    let other_second = v2_encode(
+        &second_contents,
+        &binding(),
+        &foreign,
+        1,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    assert!(replay::v2::decode_history(&json!([first, other_second]), &binding()).is_err());
+    let v1 = replay::encode(&first_contents, &binding(), "19", "full", &json!([])).unwrap();
+    for mixed in [json!([first, v1]), json!([v1, first])] {
+        let mut body = request_value();
+        for blocks in mixed.as_array().unwrap() {
+            body["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":blocks}),
+                json!({"role":"user","content":"next"}),
+            ]);
+        }
+        for policy in [RequestMetadata::Legacy, RequestMetadata::Agy] {
+            assert!(
+                prepare_with_policy(
+                    &serde_json::from_value(body.clone()).unwrap(),
+                    &binding(),
+                    policy
+                )
+                .is_err()
+            );
+        }
+    }
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first}),
+        json!({"role":"user","content":"next"}),
+    ]);
+    let mut prepared = prepare_with_policy(
+        &serde_json::from_value(body.clone()).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    let Metadata::Continuation {
+        state,
+        new_user_execution: true,
+        ..
+    } = &prepared.metadata
+    else {
+        panic!("expected carried lineage, no fresh allocation yet")
+    };
+    assert_eq!(state.lineage.conversation_id, lineage.conversation_id);
+    assert_eq!(state.lineage.trajectory_id, lineage.trajectory_id);
+    assert_eq!(prepared.wire["requestId"], "");
+    assert_eq!(prepared.wire["request"]["sessionId"], "");
+    assert!(
+        prepared
+            .finalize_metadata(1_799_999_999_456, || lineage.conversation_id.clone())
+            .is_err(),
+        "reject detected user-execution/lineage collision without reminting"
+    );
+    let mut allocations = 0;
+    prepared
+        .finalize_metadata(1_799_999_999_456, || {
+            allocations += 1;
+            execution_id(1)
+        })
+        .unwrap();
+    assert_eq!(
+        allocations, 1,
+        "ordinary new user allocates only its active execution"
+    );
+    assert!(
+        matches!(prepared.metadata, Metadata::Ready(ref state) if state.native_checkpoint_index == 1)
+    );
+    assert_eq!(
+        prepared.wire["request"]["labels"]["last_execution_id"],
+        execution_id(0)
+    );
+    assert_eq!(
+        prepared.wire["request"]["labels"]["request_id"],
+        format!("{}-1", lineage.trajectory_id)
+    );
+    assert_eq!(prepared.wire["request"]["labels"]["last_step_index"], "2");
+    assert_eq!(
+        prepared.wire["requestId"],
+        format!(
+            "agent/{}/1799999999456/{}/3",
+            lineage.conversation_id, lineage.trajectory_id
+        )
+    );
+    assert_eq!(
+        prepared.wire["request"]["contents"],
+        json!([
+            {"role":"user","parts":[{"text":"hello"}]}, first_contents[0], {"role":"user","parts":[{"text":"next"}]}
+        ])
+    );
+    // A carried native assistant checkpoint counts once; no hidden Go operation
+    // counters are inferred from the number of native SSE fragments/parts.
+    let fragmented = json!([
+        {"role":"model","parts":[{"text":"part one","thoughtSignature":"opaque-one"}]},
+        {"role":"model","parts":[{"text":"part two","thoughtSignature":"opaque-two"}]}
+    ]);
+    let fragmented_blocks =
+        v2_encode(&fragmented, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let mut split_body = body.clone();
+    split_body["messages"][1]["content"] = fragmented_blocks;
+    let mut split = prepare_with_policy(
+        &serde_json::from_value(split_body).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    split
+        .finalize_metadata(1_799_999_999_456, || execution_id(1))
+        .unwrap();
+    assert_eq!(split.wire["request"]["labels"]["last_step_index"], "2");
+    assert_eq!(split.wire["request"]["contents"][1], fragmented[0]);
+    assert_eq!(split.wire["request"]["contents"][2], fragmented[1]);
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":second}),
+        json!({"role":"user","content":"unobserved third user"}),
+    ]);
+    let mut third = prepare_with_policy(
+        &serde_json::from_value(body).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    assert!(
+        third
+            .finalize_metadata(1_799_999_999_789, || execution_id(0))
+            .is_err(),
+        "new USER execution must not reuse an older carried identity"
+    );
+    third
+        .finalize_metadata(1_799_999_999_789, || execution_id(2))
+        .unwrap();
+    assert_eq!(
+        third.wire["request"]["labels"]["request_id"],
+        format!("{}-2", lineage.trajectory_id)
+    );
+    assert_eq!(third.wire["request"]["labels"]["last_step_index"], "4");
+    assert_eq!(
+        third.wire["request"]["labels"]["last_execution_id"],
+        execution_id(1)
+    );
+    assert!(third.wire["requestId"].as_str().unwrap().ends_with("/5"));
+}
+
+#[test]
+fn antigravity_v2_unqualified_tool_and_noncanonical_text_transitions_reject() {
+    use super::antigravity::{config::RequestMetadata, request::prepare_with_policy};
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"tool","args":{}}}]}]);
+    let mapping = replay::mapping(&contents, None).unwrap();
+    let tool_turn = v2_encode(&contents, &binding(), &lineage, 0, "full", &mapping).unwrap();
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":tool_turn}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":tool_turn[1]["id"],"content":"done"}]})
+    ]);
+    assert!(
+        prepare_with_policy(
+            &serde_json::from_value(body).unwrap(),
+            &binding(),
+            RequestMetadata::Agy
+        )
+        .is_err()
+    );
+    let text = v2_encode(
+        &json!([{"role":"model","parts":[{"text":"first"}]}]),
+        &binding(),
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":text}),
+        json!({"role":"user","content":"next"}),
+    ]);
+    for signature in [
+        "ccp:antigravity:v2:!",
+        "ccp:antigravity:v3:unknown",
+        "foreign",
+    ] {
+        let mut invalid = body.clone();
+        invalid["messages"][1]["content"][0]["signature"] = json!(signature);
+        assert!(
+            prepare_with_policy(
+                &serde_json::from_value(invalid).unwrap(),
+                &binding(),
+                RequestMetadata::Agy
+            )
+            .is_err()
+        );
+    }
+    let mut changed_scope = binding();
+    changed_scope.profile_id = "other".into();
+    assert!(
+        prepare_with_policy(
+            &serde_json::from_value(body.clone()).unwrap(),
+            &changed_scope,
+            RequestMetadata::Agy
+        )
+        .is_err()
+    );
+    body["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"additional unobserved role"}));
+    assert!(
+        prepare_with_policy(
+            &serde_json::from_value(body).unwrap(),
+            &binding(),
+            RequestMetadata::Agy
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user() {
+    use super::antigravity::{
+        config::RequestMetadata,
+        request::{Metadata, prepare_with_policy},
+    };
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let initial = v2_state(&lineage, 0);
+    let call = json!([{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"Path":"/synthetic/owned"},"id":"synthetic-read-call-1"},"thoughtSignature":"c3ludGhldGljLXNpZ25hdHVyZQ=="}]}]);
+    let mapping = replay::mapping(&call, None).unwrap();
+    let first =
+        replay::v2::encode(&call, &binding(), &initial, "tool_use", "full", &mapping).unwrap();
+    let saved = replay::v2::decode(&first, &binding()).unwrap();
+    assert_eq!(saved["checkpoint_stop_reason"], "tool_use");
+    assert!(saved["user_execution"]["prior_recorded_id"].is_null());
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":first[1]["id"],"content":"read marker"}]})
+    ]);
+    let mut tool = prepare_with_policy(
+        &serde_json::from_value(body.clone()).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    assert!(matches!(
+        tool.metadata,
+        Metadata::Continuation {
+            new_user_execution: false,
+            ..
+        }
+    ));
+    tool.finalize_metadata(1_799_999_999_456, || {
+        panic!("tool loop must not mint any IDs")
+    })
+    .unwrap();
+    let Metadata::Ready(ref running) = tool.metadata else {
+        panic!("metadata ready")
+    };
+    assert_eq!(running.native_checkpoint_index, 1);
+    assert_eq!(running.user_execution.active_id, execution_id(0));
+    assert_eq!(running.user_execution.prior_recorded_id, None);
+    assert!(
+        tool.wire["request"]["labels"]
+            .get("last_execution_id")
+            .is_none()
+    );
+    assert_eq!(tool.wire["request"]["labels"]["last_step_index"], "2");
+    assert_eq!(tool.wire["request"]["contents"][1], call[0]);
+    assert_eq!(
+        tool.wire["request"]["contents"][2],
+        json!({"role":"model","parts":[{"functionResponse":{"name":"read_file","response":{"output":"read marker"},"id":"synthetic-read-call-1"}}]})
+    );
+    let completion = json!([{"role":"model","parts":[{"text":"done"}]}]);
+    let second = replay::v2::encode(
+        &completion,
+        &binding(),
+        running,
+        "end_turn",
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let decoded = replay::v2::decode(&second, &binding()).unwrap();
+    let complete = replay::v2::State::from_envelope(&decoded).unwrap();
+    assert_eq!(
+        complete.recorded_after("end_turn").unwrap(),
+        Some(execution_id(0).as_str())
+    );
+    assert_eq!(
+        complete.user_execution.active_id,
+        initial.user_execution.active_id
+    );
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":second}),
+        json!({"role":"user","content":"next ordinary user"}),
+    ]);
+    let mut next = prepare_with_policy(
+        &serde_json::from_value(body).unwrap(),
+        &binding(),
+        RequestMetadata::Agy,
+    )
+    .unwrap();
+    let mut calls = 0;
+    next.finalize_metadata(1_799_999_999_789, || {
+        calls += 1;
+        execution_id(1)
+    })
+    .unwrap();
+    assert_eq!(calls, 1);
+    let Metadata::Ready(ref next_state) = next.metadata else {
+        panic!("ready")
+    };
+    assert_eq!(
+        next_state.native_checkpoint_index, 2,
+        "generation ordinal is separate from USER execution identity"
+    );
+    assert_eq!(next_state.user_execution.active_id, execution_id(1));
+    assert_eq!(
+        next_state.user_execution.prior_recorded_id,
+        Some(execution_id(0))
+    );
+    assert_eq!(
+        next.wire["request"]["labels"]["last_execution_id"],
+        execution_id(0)
+    );
+    assert_eq!(
+        next.wire["request"]["labels"]["request_id"],
+        format!("{}-2", lineage.trajectory_id)
+    );
+    let third = replay::v2::encode(
+        &completion,
+        &binding(),
+        next_state,
+        "end_turn",
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    assert!(replay::v2::decode_history(&json!([first, second, third]), &binding()).is_ok());
+}
+
+#[test]
+fn antigravity_v2_incomplete_or_invalid_terminal_state_never_records_success() {
+    use super::antigravity::{config::RequestMetadata, request::prepare_with_policy};
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let state = v2_state(&lineage, 0);
+    let text = json!([{"role":"model","parts":[{"text":"limited"}]}]);
+    let limited =
+        replay::v2::encode(&text, &binding(), &state, "max_tokens", "full", &json!([])).unwrap();
+    let saved = replay::v2::decode(&limited, &binding()).unwrap();
+    let incomplete = replay::v2::State::from_envelope(&saved).unwrap();
+    assert_eq!(incomplete.recorded_after("max_tokens").unwrap(), None);
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":limited}),
+        json!({"role":"user","content":"not a proven continuation"}),
+    ]);
+    assert!(
+        prepare_with_policy(
+            &serde_json::from_value(body).unwrap(),
+            &binding(),
+            RequestMetadata::Agy
+        )
+        .is_err()
+    );
+    assert!(replay::v2::encode(&text, &binding(), &state, "tool_use", "full", &json!([])).is_err());
+    for stop in ["STOP", "", "error", "cancelled"] {
+        assert!(replay::v2::encode(&text, &binding(), &state, stop, "full", &json!([])).is_err());
+    }
+    let call = json!([{"role":"model","parts":[{"functionCall":{"name":"tool","id":"native","args":{}}}]}]);
+    let map = replay::mapping(&call, None).unwrap();
+    assert!(replay::v2::encode(&call, &binding(), &state, "end_turn", "full", &map).is_err());
+    for id in [
+        lineage.conversation_id.clone(),
+        lineage.trajectory_id.clone(),
+        "bad".into(),
+    ] {
+        let mut invalid = state.clone();
+        invalid.user_execution.active_id = id;
+        assert!(
+            replay::v2::encode(&text, &binding(), &invalid, "end_turn", "full", &json!([]))
+                .is_err()
+        );
+    }
+    let mut invalid = state;
+    invalid.user_execution.prior_recorded_id = Some(execution_id(7));
+    assert!(
+        replay::v2::encode(&text, &binding(), &invalid, "end_turn", "full", &json!([])).is_err(),
+        "first checkpoint has no previous execution"
+    );
+}
+
+#[test]
+fn antigravity_v2_execution_predecessors_and_termination_are_digest_bound() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let text = json!([{"role":"model","parts":[{"text":"complete"}]}]);
+    let first = v2_encode(&text, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let second = v2_encode(&text, &binding(), &lineage, 1, "full", &json!([])).unwrap();
+    let envelope = replay::v2::decode(&first, &binding()).unwrap();
+    for (key, value) in [
+        (
+            "user_execution",
+            json!({"active_id":execution_id(7),"prior_recorded_id":null}),
+        ),
+        (
+            "user_execution",
+            json!({"active_id":execution_id(0),"prior_recorded_id":execution_id(9)}),
+        ),
+        ("user_execution", json!({"active_id":execution_id(0)})),
+        (
+            "user_execution",
+            json!({"active_id":execution_id(0),"prior_recorded_id":null,"extra":true}),
+        ),
+        ("checkpoint_stop_reason", json!("max_tokens")),
+    ] {
+        let mut modified = envelope.clone();
+        modified[key] = value;
+        let mut blocks = first.clone();
+        blocks[0]["signature"] = json!(format!(
+            "{}{}",
+            replay::v2::PREFIX,
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&modified).unwrap())
+        ));
+        assert!(replay::v2::decode(&blocks, &binding()).is_err());
+    }
+    let mut wrong_predecessor = v2_state(&lineage, 1);
+    wrong_predecessor.user_execution.prior_recorded_id = Some(execution_id(7));
+    let wrong = replay::v2::encode(
+        &text,
+        &binding(),
+        &wrong_predecessor,
+        "end_turn",
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    assert!(replay::v2::decode_history(&json!([first, wrong]), &binding()).is_err());
+    let mut reused = v2_state(&lineage, 2);
+    reused.user_execution.active_id = execution_id(0);
+    let wrong =
+        replay::v2::encode(&text, &binding(), &reused, "end_turn", "full", &json!([])).unwrap();
+    assert!(replay::v2::decode_history(&json!([first, second, wrong]), &binding()).is_err());
+    let call = json!([{"role":"model","parts":[{"functionCall":{"name":"read_file","id":"native","args":{}},"thoughtSignature":"opaque"}]}]);
+    let mapping = replay::mapping(&call, None).unwrap();
+    let tool_first = replay::v2::encode(
+        &call,
+        &binding(),
+        &v2_state(&lineage, 0),
+        "tool_use",
+        "full",
+        &mapping,
+    )
+    .unwrap();
+    let mut reset = v2_state(&lineage, 1);
+    reset.user_execution.prior_recorded_id = None;
+    let changed_active =
+        replay::v2::encode(&text, &binding(), &reset, "end_turn", "full", &json!([])).unwrap();
+    assert!(
+        replay::v2::decode_history(&json!([tool_first, changed_active]), &binding()).is_err(),
+        "tool continuation cannot reset active execution"
+    );
+}
+
+fn metadata_count_context() -> crate::provider::RequestContext {
+    crate::provider::RequestContext {
+        req_id: "synthetic-pure-count".into(),
+        session_id: None,
+        session_seq: None,
+        provider: "antigravity".into(),
+        traffic: None,
+        monitor: None,
+    }
+}
+
+async fn counting_provider(
+    directory: &std::path::Path,
+    url: &url::Url,
+    mode: super::antigravity::config::RequestMetadata,
+    project: Option<&str>,
+    expires: u64,
+) -> (super::antigravity::AntigravityProvider, Store) {
+    let store = Store::new(directory.join("antigravity/auth.json"));
+    let lock = store.lock(std::time::Duration::from_secs(1)).await.unwrap();
+    store
+        .save(
+            &lock,
+            &Credential {
+                profile_id: "profile".into(),
+                project_id: project.map(str::to_owned),
+                access_token: "public-synthetic-access".into(),
+                refresh_token: Some("public-synthetic-refresh".into()),
+                expires_at: expires,
+            },
+        )
+        .unwrap();
+    drop(lock);
+    let config = Config {
+        request_metadata: mode,
+        base_url: url.clone(),
+        token_url: url.join("/token").unwrap(),
+        client_id: Some("public-synthetic-client".into()),
+        project: project.map(str::to_owned),
+        ..Config::default()
+    };
+    (
+        super::antigravity::AntigravityProvider::with_auth(
+            super::antigravity::auth::Auth::new(config, store.clone()).unwrap(),
+        ),
+        store,
+    )
+}
+
+async fn pure_count_response(
+    provider: &super::antigravity::AntigravityProvider,
+    body: &crate::anthropic::schema::MessagesRequest,
+) -> (http::StatusCode, Value) {
+    use super::antigravity::request::effects;
+    use crate::provider::Provider;
+    let before = provider.count_scope_snapshot();
+    effects::reset();
+    let response = provider
+        .handle_count_tokens(body.clone(), metadata_count_context())
+        .await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        effects::snapshot(),
+        [0; 6],
+        "no credential/profile load, access, factory, clock or native/legacy identity source"
+    );
+    assert_eq!(
+        provider.count_scope_snapshot(),
+        before,
+        "count cannot publish or mutate scope"
+    );
+    (status, value)
+}
+
+#[test]
+fn antigravity_agy_count_value_inputs_preserve_v1_v2_semantics_without_effects() {
+    use super::antigravity::request::{self, CountInputs, ServingScope, effects};
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let contents =
+        json!([{"role":"model","parts":[{"text":"prior","thoughtSignature":"untouched"}]}]);
+    let v1 = replay::encode(&contents, &binding(), "19", "full", &json!([])).unwrap();
+    let v2 = v2_encode(&contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let known = ServingScope {
+        profile_id: "profile".into(),
+        project_id: "project".into(),
+    };
+    let wrong = ServingScope {
+        profile_id: "not-the-serving-profile".into(),
+        project_id: "project".into(),
+    };
+    let mut expected = None;
+    for blocks in [v1, v2] {
+        let mut value = request_value();
+        value["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":blocks}),
+            json!({"role":"user","content":"next"}),
+        ]);
+        let body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(value).unwrap();
+        let before = serde_json::to_vec(&body).unwrap();
+        for scope in [None, Some(&known)] {
+            effects::reset();
+            let inputs = CountInputs {
+                serving_scope: scope,
+                configured_project: Some("project"),
+            };
+            let count = request::estimate(&body, inputs).unwrap();
+            assert_eq!(request::estimate(&body, inputs).unwrap(), count);
+            assert!(count > 0);
+            if let Some(expected) = expected {
+                assert_eq!(
+                    count, expected,
+                    "opaque/version/state bytes are not semantic token input"
+                );
+            }
+            expected = Some(count);
+            assert_eq!(
+                serde_json::to_vec(&body).unwrap(),
+                before,
+                "count never mutates caller history/lineage"
+            );
+            assert_eq!(effects::snapshot(), [0; 6]);
+        }
+        effects::reset();
+        assert!(
+            request::estimate(
+                &body,
+                CountInputs {
+                    serving_scope: Some(&wrong),
+                    configured_project: Some("project")
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            request::estimate(
+                &body,
+                CountInputs {
+                    serving_scope: None,
+                    configured_project: Some("other-project")
+                }
+            )
+            .is_err()
+        );
+        let mut changed_model = body.clone();
+        changed_model.model = Some("antigravity/gemini-4-argon-high".into());
+        assert!(
+            request::estimate(
+                &changed_model,
+                CountInputs {
+                    serving_scope: None,
+                    configured_project: Some("project")
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(effects::snapshot(), [0; 6]);
+    }
+    effects::reset();
+    let fresh = serde_json::from_value(request_value()).unwrap();
+    assert!(
+        request::estimate(
+            &fresh,
+            CountInputs {
+                serving_scope: None,
+                configured_project: None
+            }
+        )
+        .unwrap()
+            > 0,
+        "unknown scope is estimate-only, not admission"
+    );
+    assert_eq!(effects::snapshot(), [0; 6]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_agy_count_never_loads_credentials_accesses_or_constructs_factories() {
+    use super::antigravity::{
+        config::RequestMetadata,
+        request::effects::{self, Kind},
+    };
+    use crate::provider::Provider;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let server =
+        super::antigravity_http_tests::Server::start(axum::Router::new().fallback(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }))
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let (provider, _) = counting_provider(
+        directory.path(),
+        &server.url,
+        RequestMetadata::Agy,
+        Some("project"),
+        u64::MAX,
+    )
+    .await;
+    let path = directory.path().join("antigravity/auth.json");
+    let body = serde_json::from_value(request_value()).unwrap();
+    for kind in ["invalid", "unreadable", "missing"] {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if path.exists() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        match kind {
+            "invalid" => std::fs::write(&path, b"public invalid synthetic auth").unwrap(),
+            "unreadable" => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                }
+            }
+            "missing" => std::fs::remove_file(&path).unwrap(),
+            _ => unreachable!(),
+        }
+        let (status, counted) = pure_count_response(&provider, &body).await;
+        assert_eq!(status, 200, "{kind}");
+        assert!(counted["input_tokens"].as_u64().unwrap() > 0);
+        if kind == "missing" {
+            assert!(!path.exists());
+        }
+        assert!(provider.count_scope_snapshot().is_none());
+    }
+    let (expired, _) = counting_provider(
+        directory.path(),
+        &server.url,
+        RequestMetadata::Agy,
+        Some("project"),
+        1,
+    )
+    .await;
+    assert_eq!(pure_count_response(&expired, &body).await.0, 200);
+    let (undiscovered, _) = counting_provider(
+        directory.path(),
+        &server.url,
+        RequestMetadata::Agy,
+        None,
+        u64::MAX,
+    )
+    .await;
+    assert_eq!(pure_count_response(&undiscovered, &body).await.0, 200);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no refresh/discovery/generation transport calls"
+    );
+    let (legacy, _) = counting_provider(
+        directory.path(),
+        &server.url,
+        RequestMetadata::Legacy,
+        Some("project"),
+        u64::MAX,
+    )
+    .await;
+    effects::reset();
+    let response = legacy
+        .handle_count_tokens(body, metadata_count_context())
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        effects::count(Kind::CredentialLoad),
+        1,
+        "legacy file semantics retained and spy is live"
+    );
+    assert_eq!(
+        effects::count(Kind::LegacyId),
+        2,
+        "legacy nonce/outer identity semantics retained and spy is live"
+    );
+    assert_eq!(effects::count(Kind::Access), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_agy_count_claims_are_estimates_never_authoritative_scope() {
+    use super::antigravity::config::RequestMetadata;
+    use crate::provider::Provider;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let server =
+        super::antigravity_http_tests::Server::start(axum::Router::new().fallback(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }))
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let (provider, _) = counting_provider(
+        directory.path(),
+        &server.url,
+        RequestMetadata::Agy,
+        Some("project"),
+        u64::MAX,
+    )
+    .await;
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let mut claim = binding();
+    claim.profile_id = "untrusted-carrier-claim".into();
+    let blocks = v2_encode(
+        &json!([{"role":"model","parts":[{"text":"prior"}]}]),
+        &claim,
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":blocks}),
+        json!({"role":"user","content":"next"}),
+    ]);
+    let body = serde_json::from_value(body).unwrap();
+    let (status, counted) = pure_count_response(&provider, &body).await;
+    assert_eq!(status, 200);
+    assert!(counted["input_tokens"].as_u64().unwrap() > 0);
+    assert!(
+        provider.count_scope_snapshot().is_none(),
+        "untrusted carrier cannot bootstrap authoritative scope"
+    );
+    let rejected = provider
+        .handle_messages(body, metadata_count_context())
+        .await;
+    assert_eq!(
+        rejected.status(),
+        400,
+        "generation still validates actual native owner/profile binding"
+    );
+    assert!(provider.count_scope_snapshot().is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_agy_count_scope_is_published_only_by_validated_serving() {
+    use super::antigravity::{config::RequestMetadata, request::ServingScope};
+    use crate::provider::Provider;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let frame = format!(
+        "data: {}\n\n",
+        json!({"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"completed"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}})
+    );
+    let server =
+        super::antigravity_http_tests::Server::start(axum::Router::new().fallback(move || {
+            let observed = observed.clone();
+            let frame = frame.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                ([("content-type", "text/event-stream")], frame)
+            }
+        }))
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let (provider, _) = counting_provider(
+        directory.path(),
+        &server.url,
+        RequestMetadata::Agy,
+        Some("project"),
+        u64::MAX,
+    )
+    .await;
+    assert!(provider.count_scope_snapshot().is_none());
+    let generated = provider
+        .handle_messages(
+            serde_json::from_value(request_value()).unwrap(),
+            metadata_count_context(),
+        )
+        .await;
+    assert_eq!(generated.status(), 200);
+    let generated: Value = serde_json::from_slice(
+        &axum::body::to_bytes(generated.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        provider.count_scope_snapshot(),
+        Some(ServingScope {
+            profile_id: "profile".into(),
+            project_id: "project".into()
+        })
+    );
+    std::fs::write(
+        directory.path().join("antigravity/auth.json"),
+        b"public invalid synthetic auth after successful serving",
+    )
+    .unwrap();
+    let mut body = request_value();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":generated["content"]}),
+        json!({"role":"user","content":"next"}),
+    ]);
+    let body = serde_json::from_value(body).unwrap();
+    assert_eq!(pure_count_response(&provider, &body).await.0, 200);
+    let mut foreign_scope = binding();
+    foreign_scope.profile_id = "untrusted-carrier-claim".into();
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let foreign = v2_encode(
+        &json!([{"role":"model","parts":[{"text":"foreign"}]}]),
+        &foreign_scope,
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let mut foreign_body = request_value();
+    foreign_body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":foreign}),
+        json!({"role":"user","content":"next"}),
+    ]);
+    assert_eq!(
+        pure_count_response(&provider, &serde_json::from_value(foreign_body).unwrap())
+            .await
+            .0,
+        400,
+        "a carrier cannot replace known serving scope"
+    );
+    let rejected = provider
+        .handle_messages(body, metadata_count_context())
+        .await;
+    assert_eq!(
+        rejected.status(),
+        401,
+        "count snapshot never authorizes generation"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "count and failed auth do not call upstream"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn antigravity_agy_failed_and_cancelled_turns_do_not_publish_count_scope() {
+    use super::antigravity::config::RequestMetadata;
+    use crate::provider::Provider;
+    use futures_util::StreamExt;
+    for cancel in [false, true] {
+        let server=super::antigravity_http_tests::Server::start(axum::Router::new().fallback(move || async move {
+            let body=if cancel {
+                let stream=futures_util::stream::once(async { Ok::<_,std::convert::Infallible>(bytes::Bytes::from_static(b"data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"incomplete\"}]}}]}}\n\n")) }).chain(futures_util::stream::pending());
+                axum::body::Body::from_stream(stream)
+            } else { axum::body::Body::from("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":false}}]}}\n\n") };
+            axum::response::Response::builder().header("content-type","text/event-stream").body(body).unwrap()
+        })).await;
+        let directory = tempfile::tempdir().unwrap();
+        let (provider, _) = counting_provider(
+            directory.path(),
+            &server.url,
+            RequestMetadata::Agy,
+            Some("project"),
+            u64::MAX,
+        )
+        .await;
+        let mut body = request_value();
+        body["stream"] = json!(cancel);
+        let response = provider
+            .handle_messages(
+                serde_json::from_value(body).unwrap(),
+                metadata_count_context(),
+            )
+            .await;
+        assert_eq!(response.status(), if cancel { 200 } else { 502 });
+        drop(response);
+        tokio::task::yield_now().await;
+        assert!(
+            provider.count_scope_snapshot().is_none(),
+            "no successful native checkpoint, no authoritative count scope"
+        );
+    }
+}
+
 #[test]
 fn antigravity_absent_native_args_project_empty_without_changing_replay() {
     let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"empty"},"thoughtSignature":"untouched"}]}]);

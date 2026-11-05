@@ -118,6 +118,49 @@ gates; offline tests are not evidence of account access. See the
 and [configuration](docs/src/content/docs/reference/configuration.md#experimental-antigravity)
 before explicitly enabling it. Existing provider defaults and aliases are unchanged.
 
+### Native request metadata policy
+
+The closed file setting `antigravity.requestMetadata` in `config.json` accepts
+`"legacy"` (the default) or `"agy"`:
+
+```json
+{"antigravity":{"requestMetadata":"agy"}}
+```
+
+This does **not** enable the default-off provider, change GPT routing, import
+credentials, grant billing consent, or change OAuth or the existing explicit
+HTTP User-Agent policy. Existing User-Agent overrides are never silently rewritten.
+There is no environment or per-request HTTP escape for this selector.
+
+- Existing V1 histories stay legacy even with `"agy"`; start a fresh session for
+  V2. V2 requires `"agy"` and rejects mixed versions or changed model/tier,
+  profile or project scope. Its signed empty-input FNV **backend session** is
+  separate from logical conversation/trajectory UUIDs and proxy-owned USER
+  execution identities. `last_execution_id` names the previously recorded USER
+  execution, not a fresh model-generation ID; tool loops retain their active
+  execution and predecessor. The bounded digest checks consistency, **not
+  authentication, stale-parent rejection or at-most-once execution**.
+- The new-policy native count estimator is local and pure: no profile/credential reads,
+  refresh/discovery, network dispatch, clock/ID allocation or lineage mutation.
+  It may use an immutable nonsecret scope published by validated native serving;
+  unknown scope uses only bounded carrier/model/configured-project consistency.
+  Neither an estimate nor a caller scope claim authorizes generation or publishes
+  trusted scope. Legacy counting is unchanged.
+- Qualified success cases are main-USER text progression and one complete,
+  ID-bearing signed tool call followed by one successful STRING tool result
+  (read-tool reference), preserving native call IDs/signatures and the separate
+  MODEL-role `functionResponse`/`output` wrapper. LOW/MEDIUM/HIGH use public source
+  enum mappings M419/M418/M417 and shared synthetic tests; genuine official-client
+  runtime reference evidence is **LOW-only**, not all-tier entitlement or Google
+  acceptance. Local scripted responses and stock-client interoperability do not
+  establish account access.
+- Parallel/error/ID-less/compound tool continuations and subagent ancestry are not
+  qualified. Failed or cancelled turns do not fabricate successful checkpoints;
+  MAX_TOKENS continuations are rejected rather than treated as completed USER
+  executions. Native error/cancellation append behavior and hidden attempt
+  counters are not claimed equivalent; no automatic retry or execution guarantee
+  is added. Model selectors and context-window claims remain unchanged.
+
 Auto-review classifiers route by their own requested model, not the main conversation's
 model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`;
 Grok does not establish alias affinity. Explicit Antigravity requests ignore
