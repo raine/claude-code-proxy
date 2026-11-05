@@ -566,8 +566,72 @@ fn antigravity_integer_exclusive_projection_keeps_fractional_inclusive_constrain
     )
     .unwrap();
     let properties = &set.declarations[0]["parameters"]["properties"];
-    assert_eq!(properties["lower"]["minimum"], 2);
-    assert_eq!(properties["upper"]["maximum"], -2);
+    assert_eq!(
+        properties,
+        &json!({
+            "lower":{"type":"INTEGER","minimum":1.5},
+            "upper":{"type":"INTEGER","maximum":-1.5}
+        })
+    );
+    let call = |args: Value| json!([{"role":"model","parts":[{"functionCall":{"name":"range","args":args}}]}]);
+    assert!(set.mapping(&call(json!({"lower":2,"upper":-2}))).is_ok());
+    for args in [
+        json!({"lower":1,"upper":-2}),
+        json!({"lower":1.5,"upper":-2}),
+        json!({"lower":2,"upper":-1}),
+        json!({"lower":2,"upper":-1.5}),
+    ] {
+        assert!(set.mapping(&call(args)).is_err());
+    }
+}
+
+#[test]
+fn antigravity_selected_scalar_constraints_keep_proto_types_and_original_validation() {
+    let set = ToolSet::compile(&json!([{"name":"bounded","input_schema":{
+        "type":"object","properties":{
+            "text":{"type":"string","minLength":1,"maxLength":3},
+            "list":{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":2},
+            "number":{"type":"number","minimum":1,"maximum":4.0}
+        },"required":["text","list","number"],"additionalProperties":false
+    }}]))
+    .unwrap();
+    let parameters = &set.declarations[0]["parameters"];
+    assert_eq!(parameters.as_object().unwrap().len(), 3);
+    assert_eq!(parameters["type"], "OBJECT");
+    assert_eq!(parameters["required"], json!(["text", "list", "number"]));
+    let properties = &parameters["properties"];
+    assert_eq!(properties.as_object().unwrap().len(), 3);
+    assert_eq!(
+        properties["text"],
+        json!({"type":"STRING","minLength":"1","maxLength":"3"})
+    );
+    assert_eq!(
+        properties["list"],
+        json!({"type":"ARRAY","items":{"type":"INTEGER"},"minItems":"1","maxItems":"2"})
+    );
+    let number = properties["number"].as_object().unwrap();
+    assert_eq!(number.len(), 3);
+    assert_eq!(number["type"], "NUMBER");
+    assert_eq!(number["minimum"].as_f64(), Some(1.0));
+    assert_eq!(number["maximum"].as_f64(), Some(4.0));
+    let call = |args: Value| json!([{"role":"model","parts":[{"functionCall":{"name":"bounded","args":args}}]}]);
+    assert!(
+        set.mapping(&call(json!({"text":"ok","list":[1,2],"number":2.5})))
+            .is_ok()
+    );
+    for args in [
+        json!({"text":"","list":[1],"number":2}),
+        json!({"text":"long","list":[1],"number":2}),
+        json!({"text":"ok","list":[],"number":2}),
+        json!({"text":"ok","list":[1,2,3],"number":2}),
+        json!({"text":"ok","list":[1.5],"number":2}),
+        json!({"text":"ok","list":[1],"number":0.5}),
+        json!({"text":"ok","list":[1],"number":4.5}),
+        json!({"text":"ok","list":[1],"number":2,"extra":true}),
+        json!({"text":"ok","list":[1]}),
+    ] {
+        assert!(set.mapping(&call(args)).is_err());
+    }
 }
 
 fn property_names_tool(schema: Value) -> ToolSet {
@@ -874,10 +938,15 @@ fn antigravity_schema_preserves_original_dialects_and_constraints() {
             "required":["limit"], "additionalProperties":false
         }}])).unwrap();
         assert_eq!(
-            set.declarations[0]["parameters"]["properties"]["limit"]["minimum"],
-            1
+            set.declarations[0]["parameters"],
+            json!({"type":"OBJECT","properties":{"limit":{"type":"INTEGER"}},"required":["limit"]})
         );
-        for args in [json!({"limit":0}), json!({"limit":1,"extra":true})] {
+        for args in [
+            json!({"limit":0}),
+            json!({"limit":-1}),
+            json!({"limit":1.5}),
+            json!({"limit":1,"extra":true}),
+        ] {
             assert!(set.mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"Read","args":args}}]}])).is_err());
         }
         assert!(set.mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"Read","args":{"limit":1}}}]}])).is_ok());
@@ -1120,9 +1189,12 @@ fn antigravity_request_multiple_tools_have_one_declaration_per_object() {
         .map(|declaration| json!({"functionDeclarations":[declaration]}))
         .collect();
     assert_eq!(prepared.wire["request"]["tools"], json!(expected));
-    assert_eq!(prepared.wire["request"].as_object().unwrap().len(), 4);
+    assert_eq!(prepared.wire["request"].as_object().unwrap().len(), 5);
     assert_eq!(prepared.wire.as_object().unwrap().len(), 6);
-    assert!(prepared.wire["request"].get("toolConfig").is_none());
+    assert_eq!(
+        prepared.wire["request"]["toolConfig"],
+        json!({"functionCallingConfig":{"mode":"VALIDATED"}})
+    );
     assert!(prepared.wire.get("labels").is_none());
     let contents = json!([{"role":"model","parts":[
         {"functionCall":{"name":compiled.declarations[0]["name"],"args":{"json":"{\"payload\":[1,true]}"}}},
@@ -1140,6 +1212,18 @@ fn antigravity_request_multiple_tools_have_one_declaration_per_object() {
         replay::decode(&blocks, &binding()).unwrap()["contents"],
         contents
     );
+    for args in [
+        json!({"limit":0}),
+        json!({"limit":1.5}),
+        json!({"limit":1,"extra":true}),
+    ] {
+        assert!(
+            prepared
+                .tools
+                .mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"limited","args":args}}]}]))
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -1148,10 +1232,13 @@ fn antigravity_request_zero_one_tools_and_choice_none_preserve_omission() {
         json!({"name":"empty","input_schema":{"type":"object","additionalProperties":false}});
     for (source, choice, expected) in [
         (json!([]), None, None),
+        (json!([]), Some(json!({"type":"auto"})), None),
         (
             json!([tool]),
             None,
-            Some(json!([{"functionDeclarations":[{"name":"empty"}]}])),
+            Some(
+                json!([{"functionDeclarations":[{"name":"empty","parameters":{"type":"OBJECT"}}]}]),
+            ),
         ),
         (json!([tool]), Some(json!({"type":"none"})), None),
     ] {
@@ -1354,7 +1441,7 @@ fn antigravity_schema_root_freeform_and_closed_no_argument_tools_are_explicit() 
         set.declarations[0]["parameters"]["properties"]["json"]["type"],
         "STRING"
     );
-    assert!(set.declarations[1].get("parameters").is_none());
+    assert_eq!(set.declarations[1]["parameters"], json!({"type":"OBJECT"}));
     let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"json":"{\"x\":[1,true]}"}}},{"functionCall":{"name":"empty","args":{}}}]}]);
     let map = set.mapping(&contents).unwrap();
     let blocks = replay::encode(&contents, &binding(), "1", "full", &map).unwrap();
@@ -1362,6 +1449,9 @@ fn antigravity_schema_root_freeform_and_closed_no_argument_tools_are_explicit() 
     assert_eq!(blocks[2]["input"], json!({}));
     let invalid = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"json":"{}","extra":true}}}]}]);
     assert!(set.mapping(&invalid).is_err());
+    let invalid_empty =
+        json!([{"role":"model","parts":[{"functionCall":{"name":"empty","args":{"extra":true}}}]}]);
+    assert!(set.mapping(&invalid_empty).is_err());
 }
 
 #[test]

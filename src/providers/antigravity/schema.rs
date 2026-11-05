@@ -108,7 +108,14 @@ impl ToolSet {
                     .ok_or("invalid tool description")?;
                 declaration["description"] = json!(text);
             }
-            if !empty {
+            let compatible = if caller == native && identity(&codec) {
+                compatible_projection(schema)
+            } else {
+                None
+            };
+            if let Some(parameters) = compatible {
+                declaration["parameters"] = parameters;
+            } else if !empty {
                 declaration["parameters"] = if root {
                     json!({"type":"OBJECT","properties":{"json":projected},"required":["json"],"description":"Encode the entire original caller argument object as JSON in the single json string field; no extra wrapper keys."})
                 } else {
@@ -482,6 +489,171 @@ fn project(schema: &Value) -> Result<(Value, Codec)> {
         out.insert("description".into(), json!(description));
     }
     Ok((Value::Object(out), codec))
+}
+
+fn compatible_projection(schema: &Value) -> Option<Value> {
+    // Check the whole tool before copying defaults or selecting any child.
+    (ProjectionBudget::default().visit(schema, 0) && compatible_schema(schema))
+        .then(|| typed_projection(schema))
+}
+
+#[derive(Default)]
+struct ProjectionBudget {
+    nodes: usize,
+    strings: usize,
+}
+
+impl ProjectionBudget {
+    fn string(&mut self, value: &str) -> bool {
+        let Some(total) = self.strings.checked_add(value.len()) else {
+            return false;
+        };
+        if total > MAX_SCHEMA_BYTES {
+            return false;
+        }
+        self.strings = total;
+        true
+    }
+
+    fn visit(&mut self, value: &Value, depth: usize) -> bool {
+        self.nodes += 1;
+        if depth > 32 || self.nodes > 4096 {
+            return false;
+        }
+        match value {
+            Value::Null | Value::Bool(_) => true,
+            Value::Number(_) => number_value(value).is_some(),
+            Value::String(text) => self.string(text),
+            Value::Array(values) => values.iter().all(|v| self.visit(v, depth + 1)),
+            Value::Object(values) => values
+                .iter()
+                .all(|(key, value)| self.string(key) && self.visit(value, depth + 1)),
+        }
+    }
+}
+
+fn number_value(value: &Value) -> Option<f64> {
+    const SAFE: i64 = 9_007_199_254_740_991;
+    let number = value.as_number()?;
+    if let Some(value) = number.as_i64() {
+        if !(-SAFE..=SAFE).contains(&value) {
+            return None;
+        }
+        return Some(value as f64);
+    }
+    if let Some(value) = number.as_u64() {
+        if value > SAFE as u64 {
+            return None;
+        }
+        return Some(value as f64);
+    }
+    number.as_f64().filter(|value| value.is_finite())
+}
+
+fn length_value(value: &Value) -> Option<u64> {
+    number_value(value)
+        .filter(|value| *value >= 0.0 && *value <= 9_007_199_254_740_991.0 && value.fract() == 0.0)
+        .map(|value| value as u64)
+}
+
+fn compatible_schema(schema: &Value) -> bool {
+    let Some(fields) = schema.as_object() else {
+        return false;
+    };
+    let Some(kind) = schema.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    fields
+        .iter()
+        .all(|(key, value)| match (kind, key.as_str()) {
+            (_, "type") => matches!(
+                kind,
+                "object" | "array" | "string" | "integer" | "number" | "boolean"
+            ),
+            (_, "description" | "title" | "$schema") => value.is_string(),
+            (_, "default") => true,
+            ("object", "properties") => value
+                .as_object()
+                .is_some_and(|properties| properties.values().all(compatible_schema)),
+            ("object", "required") => value.as_array().is_some_and(|required| {
+                required.iter().all(|name| {
+                    name.as_str().is_some_and(|name| {
+                        schema
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| properties.contains_key(name))
+                    })
+                })
+            }),
+            ("object", "additionalProperties") => value.is_boolean(),
+            ("array", "items") => value.is_object() && compatible_schema(value),
+            ("array", "minItems" | "maxItems") | ("string", "minLength" | "maxLength") => {
+                length_value(value).is_some()
+            }
+            ("string", "enum") => value
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_string)),
+            ("string", "pattern" | "format") => value.is_string(),
+            ("integer" | "number", "minimum" | "maximum")
+            | ("integer", "exclusiveMinimum" | "exclusiveMaximum") => number_value(value).is_some(),
+            _ => false,
+        })
+}
+
+fn typed_projection(schema: &Value) -> Value {
+    let mut out = Map::new();
+    out.insert(
+        "type".into(),
+        json!(schema["type"].as_str().unwrap().to_ascii_uppercase()),
+    );
+    for key in ["description", "format", "pattern"] {
+        if let Some(text) = schema
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            out.insert(key.into(), json!(text));
+        }
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object)
+        && !properties.is_empty()
+    {
+        out.insert(
+            "properties".into(),
+            Value::Object(
+                properties
+                    .iter()
+                    .map(|(name, child)| (name.clone(), typed_projection(child)))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(items) = schema.get("items") {
+        out.insert("items".into(), typed_projection(items));
+    }
+    for key in ["required", "enum"] {
+        if let Some(values) = schema
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|v| !v.is_empty())
+        {
+            out.insert(key.into(), json!(values));
+        }
+    }
+    for key in ["minimum", "maximum"] {
+        if let Some(value) = schema.get(key).and_then(number_value).filter(|v| *v != 0.0) {
+            out.insert(key.into(), json!(value));
+        }
+    }
+    for key in ["minLength", "maxLength", "minItems", "maxItems"] {
+        if let Some(value) = schema.get(key).and_then(length_value).filter(|v| *v != 0) {
+            out.insert(key.into(), json!(value.to_string()));
+        }
+    }
+    if let Some(value) = schema.get("default") {
+        out.insert("default".into(), value.clone());
+    }
+    Value::Object(out)
 }
 
 fn identity(codec: &Codec) -> bool {

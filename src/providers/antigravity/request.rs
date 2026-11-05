@@ -434,6 +434,13 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                 .map(|declaration| json!({"functionDeclarations":[declaration]}))
                 .collect::<Vec<_>>()
         );
+        if body
+            .extra
+            .get("tool_choice")
+            .is_some_and(|choice| choice["type"] == "auto")
+        {
+            request["toolConfig"] = json!({"functionCallingConfig":{"mode":"VALIDATED"}});
+        }
     }
     let wire = json!({"project":binding.project_id,"model":binding.native_model,"request":request,
         "requestId":format!("ccp-{}",uuid::Uuid::new_v4()),"userAgent":"antigravity","requestType":"agent"});
