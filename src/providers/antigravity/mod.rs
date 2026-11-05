@@ -1,6 +1,7 @@
 //! Experimental, opt-in native Argon subscription transport.
 pub(crate) mod auth;
 pub(crate) mod config;
+pub(crate) mod generation;
 #[cfg(any(unix, test))]
 mod manual;
 mod refresh;
@@ -23,12 +24,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use config::Config;
+use generation::GenerationClient;
 use replay::{Binding, Result};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
 pub struct AntigravityProvider {
     auth: Result<Arc<Auth>>,
+    generation: Result<GenerationClient>,
 }
 impl Default for AntigravityProvider {
     fn default() -> Self {
@@ -37,16 +40,22 @@ impl Default for AntigravityProvider {
 }
 impl AntigravityProvider {
     pub fn new() -> Self {
-        Self {
-            auth: Config::load()
-                .and_then(|c| Auth::new(c, Store::configured()))
-                .map(Arc::new),
-        }
+        let config = Config::load();
+        let generation = config
+            .as_ref()
+            .map_err(|error| *error)
+            .and_then(GenerationClient::new);
+        let auth = config
+            .and_then(|config| Auth::new(config, Store::configured()))
+            .map(Arc::new);
+        Self { auth, generation }
     }
     #[cfg(test)]
     pub(crate) fn with_auth(auth: Auth) -> Self {
+        let generation = GenerationClient::new(&auth.config);
         Self {
             auth: Ok(Arc::new(auth)),
+            generation,
         }
     }
 
@@ -63,6 +72,12 @@ impl AntigravityProvider {
         let prepared = match request::prepare(&body, &binding) {
             Ok(p) => p,
             Err(e) => return invalid(e),
+        };
+        let generation = match &self.generation {
+            Ok(client) => client,
+            Err(_) => {
+                return upstream_error("Antigravity generation transport initialization failed");
+            }
         };
         let credential = match auth.access().await {
             Ok(c) => c,
@@ -104,16 +119,18 @@ impl AntigravityProvider {
             Ok(v) => v,
             Err(_) => return invalid("invalid native endpoint"),
         };
-        let header_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let request_started = tokio::time::Instant::now();
+        let header_deadline = request_started + Duration::from_secs(30);
+        let request_deadline = request_started + Duration::from_secs(180);
         let sent = tokio::time::timeout_at(
             header_deadline,
-            auth.client
-                .post(endpoint)
-                .bearer_auth(&credential.access_token)
-                .header("accept", "text/event-stream")
-                .headers(auth.config.native_headers())
-                .json(&prepared.wire)
-                .send(),
+            generation.send(
+                endpoint,
+                &credential.access_token,
+                &prepared.wire,
+                header_deadline,
+                request_deadline,
+            ),
         )
         .await;
         let upstream = match sent {
@@ -137,7 +154,7 @@ impl AntigravityProvider {
         }
         let model = body.model.unwrap_or_default();
         let work = async move {
-            let turn = tokio::time::timeout(Duration::from_secs(180), transport::collect(upstream))
+            let turn = tokio::time::timeout_at(request_deadline, transport::collect(upstream))
                 .await
                 .map_err(|_| "native turn deadline exceeded")??;
             if let Some(monitor) = ctx.monitor.as_ref() {
@@ -163,8 +180,8 @@ impl AntigravityProvider {
                 Err(e) => upstream_error(e),
             };
         }
-        // The returned Body owns this future, including reqwest's response. No
-        // worker survives a downstream drop. Initial HTTP errors occurred above.
+        // The returned Body owns this future, including the native response and
+        // decoder. No worker survives a downstream drop. Initial errors occurred above.
         let outcome = NativeResponseOutcome::default();
         let shared = outcome.clone();
         let stream = futures_util::stream::once(async move {

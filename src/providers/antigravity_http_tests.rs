@@ -241,7 +241,10 @@ async fn assert_generation_cap_ingress(stream: bool) {
     let captured = captured.lock().unwrap();
     assert_eq!(captured.len(), cases.len());
     for ((headers, wire), (_, cap)) in captured.iter().zip(&cases) {
-        assert_eq!(headers["accept"], "text/event-stream");
+        assert!(!headers.contains_key("accept"));
+        assert_eq!(headers["accept-encoding"], "gzip");
+        assert!(!headers.contains_key("content-length"));
+        assert_eq!(headers["transfer-encoding"], "chunked");
         assert_eq!(headers["content-type"], "application/json");
         assert_eq!(headers["authorization"], "Bearer proxy-owned-access");
         assert_eq!(headers["user-agent"], expected_native_user_agent());
@@ -411,6 +414,89 @@ async fn antigravity_property_names_http_preflight_never_refreshes_or_generates(
             );
         }
     }
+}
+
+#[tokio::test]
+async fn antigravity_generation_init_error_is_separate_from_auth_and_counting() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let token = Server::start(Router::new().fallback(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path().join("antigravity/auth.json"));
+    let lock = store.lock(Duration::from_secs(1)).await.unwrap();
+    store
+        .save(
+            &lock,
+            &Credential {
+                profile_id: "profile".into(),
+                project_id: Some("project".into()),
+                access_token: "expired-synthetic".into(),
+                refresh_token: Some("synthetic-refresh".into()),
+                expires_at: 1,
+            },
+        )
+        .unwrap();
+    drop(lock);
+    // A private constructor injection isolates generation init failure without
+    // weakening the release Config loader or changing the auth client's policy.
+    let config = Config {
+        base_url: url::Url::parse("http://outside.invalid").unwrap(),
+        token_url: token.url.join("token").unwrap(),
+        client_id: Some("synthetic-client".into()),
+        ..Config::default()
+    };
+    let provider = AntigravityProvider::with_auth(Auth::new(config, store).unwrap());
+    assert_eq!(
+        provider.local_capability().unwrap()["status"]["configuration"],
+        "valid"
+    );
+    let proxy = proxy(provider, None).await;
+    let counted = client()
+        .post(proxy.url.join("/v1/messages/count_tokens").unwrap())
+        .json(&request(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(counted.status(), 200);
+    for stream in [false, true] {
+        let response = client()
+            .post(proxy.url.join("/v1/messages").unwrap())
+            .json(&request(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["error"]["type"], "api_error");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("generation transport initialization failed")
+        );
+    }
+    let mut invalid = request(false);
+    invalid["temperature"] = json!(0.5);
+    let response = client()
+        .post(proxy.url.join("/v1/messages").unwrap())
+        .json(&invalid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "transport init failure/counting/preflight must never refresh"
+    );
 }
 
 #[tokio::test]
@@ -788,6 +874,411 @@ async fn antigravity_http2_refused_stream_is_not_automatically_retried() {
 }
 
 #[tokio::test]
+async fn antigravity_legacy_reqwest_socks5_ipv6_literal_is_a_known_wire_gap() {
+    // Exercise the UNCHANGED OAuth/native-baseline reqwest builder, not the new
+    // generation connector. No origin exists or is contacted: the synthetic
+    // SOCKS proxy rejects the observed bracketed domain before any TLS/HTTP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let observed = tokio::spawn(async move {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut greeting = [0; 2];
+        socket.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0; greeting[1] as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        socket.write_all(&[5, 0]).await.unwrap();
+        let mut request = [0; 4];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request[..3], &[5, 1, 0]);
+        let mut host = Vec::new();
+        match request[3] {
+            1 => {
+                host.resize(4, 0);
+            }
+            4 => {
+                host.resize(16, 0);
+            }
+            3 => {
+                let mut length = [0];
+                socket.read_exact(&mut length).await.unwrap();
+                host.resize(length[0] as usize, 0);
+            }
+            _ => panic!("unexpected synthetic SOCKS address type"),
+        }
+        socket.read_exact(&mut host).await.unwrap();
+        let mut port = [0; 2];
+        socket.read_exact(&mut port).await.unwrap();
+        socket
+            .write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        (request[3], host)
+    });
+    let config = Config::default();
+    let legacy = config
+        .client_builder()
+        .proxy(reqwest::Proxy::all(format!("socks5h://{address}")).unwrap())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    assert!(
+        legacy
+            .post("https://[::1]:443/v1internal:streamGenerateContent?alt=sse")
+            .headers(config.native_headers())
+            .json(&json!({"synthetic":"baseline-proxy-probe"}))
+            .send()
+            .await
+            .is_err()
+    );
+    let (kind, host) = observed.await.unwrap();
+    assert_eq!(
+        kind, 3,
+        "baseline hypothesis: cached helper cannot emit literal IPv6 ATYP4 through Uri"
+    );
+    assert_eq!(
+        host, b"[::1]",
+        "baseline hypothesis must be measured, never assumed as candidate parity"
+    );
+}
+
+#[tokio::test]
+async fn antigravity_legacy_reqwest_local_socks5_ipv6_and_aaaa_only_are_measured_separately() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    for (case, endpoint, override_name, override_ip) in [
+        (
+            "ipv4-control",
+            "https://aaaa-only.fixture.invalid:443/",
+            Some("aaaa-only.fixture.invalid"),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ),
+        ("literal-default", "https://[::1]:443/", None, None),
+        (
+            "literal-controlled",
+            "https://[::1]:443/",
+            Some("[::1]"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ),
+        (
+            "aaaa-only",
+            "https://aaaa-only.fixture.invalid:443/",
+            Some("aaaa-only.fixture.invalid"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let accepted = tokio::select! { biased;
+                accepted = listener.accept() => Some(accepted.unwrap().0),
+                _ = stop_rx => None,
+            };
+            let mut socket = accepted?;
+            let mut greeting = [0; 2];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; greeting[1] as usize];
+            socket.read_exact(&mut methods).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0; 4];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..3], &[5, 1, 0]);
+            let mut host = Vec::new();
+            match request[3] {
+                1 => host.resize(4, 0),
+                4 => host.resize(16, 0),
+                3 => {
+                    let mut length = [0];
+                    socket.read_exact(&mut length).await.unwrap();
+                    host.resize(length[0] as usize, 0);
+                }
+                _ => panic!("unexpected synthetic SOCKS address type"),
+            }
+            socket.read_exact(&mut host).await.unwrap();
+            let mut port = [0; 2];
+            socket.read_exact(&mut port).await.unwrap();
+            socket
+                .write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            Some((request[3], host))
+        });
+        // Public locked reqwest DNS override isolates AAAA-only resolution;
+        // no real DNS origin/profile/network or candidate connector is involved.
+        let config = Config::default();
+        let mut builder = config
+            .client_builder()
+            .proxy(reqwest::Proxy::all(format!("socks5://{address}")).unwrap())
+            .timeout(Duration::from_secs(3));
+        if let (Some(name), Some(ip)) = (override_name, override_ip) {
+            builder = builder.resolve(name, SocketAddr::new(ip, 443));
+        }
+        let legacy = builder.build().unwrap();
+        assert!(
+            legacy
+                .post(endpoint)
+                .json(&json!({"synthetic":"legacy-local-dns"}))
+                .send()
+                .await
+                .is_err()
+        );
+        let _ = stop_tx.send(());
+        let result = peer.await.unwrap();
+        match case {
+            "ipv4-control" => assert_eq!(
+                result,
+                Some((1, vec![127, 0, 0, 1])),
+                "public override/proxy fixture must actually work"
+            ),
+            "literal-default" => match result {
+                None => eprintln!("BASELINE_LOCAL_SOCKS5_LITERAL_IPV6_PREHANDSHAKE_FAILURE"),
+                Some((3, host)) if host == b"[::1]" => {
+                    eprintln!("BASELINE_LOCAL_SOCKS5_LITERAL_IPV6_BRACKETED_DOMAIN")
+                }
+                _ => panic!(
+                    "baseline local literal IPv6 may work; candidate compatibility requires adjudication"
+                ),
+            },
+            _ => {
+                assert_eq!(
+                    result,
+                    Some((3, b"[::1]".to_vec())),
+                    "baseline AAAA-only hypothesis must be actual wire evidence"
+                );
+                eprintln!("BASELINE_LOCAL_SOCKS5_AAAA_RESOLVED_TO_BRACKETED_DOMAIN");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn antigravity_legacy_reqwest_connect_ua_is_the_client_default() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let observed = tokio::spawn(async move {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut buffer = [0; 512];
+        while !raw.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0 && raw.len() + count <= 8192);
+            raw.extend_from_slice(&buffer[..count]);
+        }
+        let headers = std::str::from_utf8(&raw).unwrap();
+        assert!(headers.starts_with("CONNECT "));
+        assert!(!headers.lines().any(|line| {
+            line.split_once(':')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        }));
+        let user_agent = headers.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value.trim().to_owned())
+        });
+        socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        user_agent
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::read(&directory.path().join("config.json"), |key| {
+        (key == "CCP_ANTIGRAVITY_USER_AGENT").then(|| "public-native-override".into())
+    })
+    .unwrap();
+    let legacy = config
+        .client_builder()
+        .proxy(reqwest::Proxy::all(format!("http://user:pass@{address}")).unwrap())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    assert!(
+        legacy
+            .post("https://127.0.0.1:443/v1internal:streamGenerateContent?alt=sse")
+            .bearer_auth("public-test-access")
+            .headers(config.native_headers())
+            .json(&json!({"synthetic":"baseline-connect-ua"}))
+            .send()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        observed.await.unwrap().as_deref(),
+        Some(expected_native_user_agent().as_str()),
+        "baseline CONNECT uses client builder UA, not per-request native override"
+    );
+}
+
+#[tokio::test]
+async fn antigravity_legacy_https_proxy_connect_omits_alpn_and_speaks_http1() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let certificate = include_bytes!("../../tests/fixtures/antigravity-transport/server.pem");
+    let key = include_bytes!("../../tests/fixtures/antigravity-transport/server-key.pem");
+    let ca = include_bytes!("../../tests/fixtures/antigravity-transport/ca.pem");
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            CertificateDer::pem_slice_iter(certificate)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            PrivateKeyDer::from_pem_slice(key).unwrap(),
+        )
+        .unwrap();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut socket = tokio::time::timeout(Duration::from_secs(3), acceptor.accept(socket))
+            .await
+            .unwrap()
+            .unwrap();
+        let alpn = socket
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|value| value.to_vec());
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            assert!(headers.len() < 8192);
+            headers.push(socket.read_u8().await.unwrap());
+        }
+        let http1_connect = headers.starts_with(b"CONNECT ")
+            && headers.windows(10).any(|value| value == b" HTTP/1.1\r");
+        socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        (alpn, http1_connect)
+    });
+    let config = Config::default();
+    let legacy = config
+        .client_builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca).unwrap())
+        .proxy(reqwest::Proxy::all(format!("https://{address}")).unwrap())
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    assert!(
+        legacy
+            .post("https://127.0.0.1:443/")
+            .json(&json!({"synthetic":"legacy-proxy-alpn"}))
+            .send()
+            .await
+            .is_err()
+    );
+    let (alpn, http1) = peer.await.unwrap();
+    assert!(
+        alpn.is_none(),
+        "measure legacy proxy ALPN rather than assume h1 advertisement"
+    );
+    assert!(
+        http1,
+        "absence of ALPN must still carry explicit HTTP/1.1 CONNECT"
+    );
+    eprintln!("BASELINE_HTTPS_PROXY_ALPN_ABSENT_HTTP1_CONNECT_OBSERVED");
+}
+
+#[tokio::test]
+async fn antigravity_legacy_reqwest_socks4_empty_userid_has_a_strict_rfc_wire_gap() {
+    async fn terminated(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut value = Vec::new();
+        for _ in 0..256 {
+            let byte = socket.read_u8().await.unwrap();
+            if byte == 0 {
+                return value;
+            }
+            value.push(byte);
+        }
+        panic!("bounded synthetic SOCKS string exceeded");
+    }
+    for (scheme, endpoint) in [
+        ("socks4", "https://127.0.0.1:443/"),
+        ("socks4a", "https://fixture.invalid:443/"),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut header = [0; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..2], &[4, 1]);
+            let userid = terminated(&mut socket).await;
+            // Strict RFC: this is already the socket request end, or the first
+            // byte of the SOCKS4a hostname. Do not consume/forgive a second NUL.
+            let next = tokio::time::timeout(Duration::from_millis(200), socket.read_u8()).await;
+            let extra = next.ok().and_then(Result::ok);
+            let remaining_domain = if scheme == "socks4a" && extra == Some(0) {
+                Some(terminated(&mut socket).await)
+            } else {
+                None
+            };
+            socket.write_all(&[0, 91, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            (userid, extra, remaining_domain)
+        });
+        let config = Config::default();
+        let legacy = config
+            .client_builder()
+            .proxy(reqwest::Proxy::all(format!("{scheme}://{address}")).unwrap())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        assert!(
+            legacy
+                .post(endpoint)
+                .json(&json!({"synthetic":"strict-legacy-socks4"}))
+                .send()
+                .await
+                .is_err()
+        );
+        let (userid, extra, domain) = peer.await.unwrap();
+        assert!(userid.is_empty());
+        assert_eq!(
+            extra,
+            Some(0),
+            "legacy extra-NUL hypothesis must be measured, not worked around in the proxy"
+        );
+        if scheme == "socks4a" {
+            assert_eq!(domain.as_deref(), Some(b"fixture.invalid".as_slice()));
+        }
+        eprintln!("BASELINE_STRICT_SOCKS4_EMPTY_USERID_EXTRA_NUL_OBSERVED");
+    }
+}
+
+#[test]
+fn antigravity_legacy_matcher_wildcard_domain_and_literal_ip_are_distinct() {
+    use hyper_util::client::proxy::matcher::Matcher;
+    let proxy = "http://127.0.0.1:9";
+    let ip = "https://127.0.0.1:443/".parse().unwrap();
+    let domain = "https://localhost:443/".parse().unwrap();
+    let wildcard = Matcher::builder().https(proxy).no("*").build();
+    assert!(wildcard.intercept(&domain).is_none());
+    assert!(
+        wildcard.intercept(&ip).is_some(),
+        "measure cached baseline wildcard/IP behavior without changing privacy policy"
+    );
+    for bypass in ["127.0.0.1", "127.0.0.0/8"] {
+        assert!(
+            Matcher::builder()
+                .https(proxy)
+                .no(bypass)
+                .build()
+                .intercept(&ip)
+                .is_none()
+        );
+    }
+    eprintln!("BASELINE_NO_PROXY_WILDCARD_DOMAIN_ONLY_LITERAL_IP_REMAINS_PROXIED");
+}
+
+#[tokio::test]
 async fn antigravity_serving_capability_uses_its_own_auth_and_configuration() {
     let (upstream, captured) = native(vec![(200, successful(json!([{"text":"unused"}])))]).await;
     let directory = tempfile::tempdir().unwrap();
@@ -1064,26 +1555,102 @@ async fn antigravity_effective_tier_is_observable_and_openai_stays_unsupported()
 }
 
 async fn read_request(stream: &mut tokio::net::TcpStream) {
+    const MAX_REQUEST: usize = 64 * 1024 * 1024;
+    const MAX_HEADERS: usize = 64 * 1024;
+    fn complete(raw: &[u8]) -> bool {
+        let Some(end) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            assert!(raw.len() <= MAX_HEADERS);
+            return false;
+        };
+        assert!(end <= MAX_HEADERS);
+        let headers = std::str::from_utf8(&raw[..end]).unwrap();
+        let length = headers.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+        });
+        if let Some(length) = length {
+            assert!(length <= MAX_REQUEST - end - 4);
+            return raw.len() >= end + 4 + length;
+        }
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("transfer-encoding")
+                        && value.trim().eq_ignore_ascii_case("chunked")
+                })),
+            "fixture request must have explicit HTTP/1.1 framing"
+        );
+        let mut offset = end + 4;
+        loop {
+            let Some(line) = raw[offset..].windows(2).position(|bytes| bytes == b"\r\n") else {
+                return false;
+            };
+            assert!(line <= MAX_HEADERS);
+            let value = std::str::from_utf8(&raw[offset..offset + line])
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .trim();
+            let length = usize::from_str_radix(value, 16).unwrap();
+            offset += line + 2;
+            if length == 0 {
+                let trailers = &raw[offset..];
+                if trailers.starts_with(b"\r\n") {
+                    return true;
+                }
+                assert!(trailers.len() <= MAX_HEADERS);
+                return trailers.windows(4).any(|bytes| bytes == b"\r\n\r\n");
+            }
+            let needed = offset
+                .checked_add(length)
+                .and_then(|end| end.checked_add(2))
+                .unwrap();
+            assert!(needed <= MAX_REQUEST);
+            if raw.len() < needed {
+                return false;
+            }
+            assert_eq!(&raw[needed - 2..needed], b"\r\n");
+            offset = needed;
+        }
+    }
     let mut raw = Vec::new();
     let mut buffer = [0u8; 1024];
     loop {
-        let n = stream.read(&mut buffer).await.unwrap();
-        assert_ne!(n, 0);
-        raw.extend_from_slice(&buffer[..n]);
-        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header = String::from_utf8_lossy(&raw[..end]);
-            let length = header
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|v| v.trim().parse::<usize>().unwrap())
-                })
-                .unwrap();
-            if raw.len() >= end + 4 + length {
-                return;
-            }
+        let count = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(count, 0);
+        assert!(raw.len() + count <= MAX_REQUEST);
+        raw.extend_from_slice(&buffer[..count]);
+        if complete(&raw) {
+            return;
         }
+    }
+}
+
+#[tokio::test]
+async fn antigravity_raw_fixture_reads_known_and_chunked_request_bodies() {
+    for body in [
+        "Content-Length: 3\r\n\r\nabc",
+        "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n1;x=y\r\na\r\n2\r\nbc\r\n0\r\nx-fixture: okay\r\n\r\n",
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\n{body}");
+        let sender = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            for chunk in request.as_bytes().chunks(2) {
+                socket.write_all(chunk).await.unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), read_request(&mut socket))
+            .await
+            .unwrap();
+        sender.await.unwrap();
     }
 }
 

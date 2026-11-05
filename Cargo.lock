@@ -375,6 +375,8 @@ dependencies = [
  "hostname",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-rustls",
  "hyper-util",
  "jiff",
  "jsonschema",

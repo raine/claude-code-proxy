@@ -1,5 +1,8 @@
 //! Bounded native HTTP error diagnostics and SSE collection. No generation retry.
-use super::replay::{self, Result};
+use super::{
+    generation::NativeResponse,
+    replay::{self, Result},
+};
 use crate::anthropic::json_error;
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -263,9 +266,9 @@ fn combine_retry(header: &RetryHeader, body: RetryHint) -> RetryHint {
     }
 }
 
-async fn error_body(mut upstream: reqwest::Response, deadline: Instant) -> Option<Vec<u8>> {
+async fn error_body(mut upstream: NativeResponse, deadline: Instant) -> Option<Vec<u8>> {
     if upstream
-        .content_length()
+        .encoded_length_hint()
         .is_some_and(|n| n > MAX_ERROR_BODY as u64)
         || Instant::now() >= deadline
     {
@@ -289,7 +292,11 @@ async fn error_body(mut upstream: reqwest::Response, deadline: Instant) -> Optio
 /// Initial native failures remain HTTP JSON errors even when the caller requested SSE.
 /// Only static labels and bounded integers escape; never log the response/body/parse errors.
 /// This future owns the upstream body, so dropping the request cancels inspection.
-pub(crate) async fn http_error(upstream: reqwest::Response, header_deadline: Instant) -> Response {
+pub(crate) async fn http_error(
+    upstream: impl Into<NativeResponse>,
+    header_deadline: Instant,
+) -> Response {
+    let upstream = upstream.into();
     let deadline = header_deadline.min(Instant::now() + Duration::from_secs(1));
     let status = upstream.status();
     let retry = RetryHeader::parse(upstream.headers(), time::OffsetDateTime::now_utc());
@@ -568,14 +575,9 @@ impl Reducer {
     }
 }
 
-pub(crate) async fn collect(mut response: reqwest::Response) -> Result<Turn> {
+pub(crate) async fn collect(mut response: NativeResponse) -> Result<Turn> {
     let mut reducer = Reducer::default();
-    while let Some(chunk) =
-        tokio::time::timeout(std::time::Duration::from_secs(30), response.chunk())
-            .await
-            .map_err(|_| "native stream idle timeout")?
-            .map_err(|_| "native stream transport failed")?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.message())? {
         reducer.push(&chunk)?;
     }
     reducer.finish()
