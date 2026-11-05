@@ -222,10 +222,15 @@ async fn generation(State(state): State<Shared>, request: Request) -> Response {
             .headers()
             .get("authorization")
             .is_some_and(|v| v.as_bytes() == format!("Bearer {TOKEN}").as_bytes())
+        && !request.headers().contains_key("accept")
         && request
             .headers()
-            .get("accept")
-            .is_some_and(|v| v == "text/event-stream");
+            .get("content-type")
+            .is_some_and(|v| v == "application/json")
+        && request
+            .headers()
+            .get("accept-encoding")
+            .is_some_and(|v| v == "gzip");
     if !valid_headers {
         state
             .lock()
