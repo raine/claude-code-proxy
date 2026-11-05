@@ -978,28 +978,196 @@ impl Drop for ChildGuard {
 }
 
 #[cfg(unix)]
+struct ServiceStderr {
+    file: tempfile::NamedTempFile,
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl ServiceStderr {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            file: tempfile::NamedTempFile::new()?,
+            bytes: Vec::new(),
+        })
+    }
+
+    fn stdio(&self) -> std::io::Result<Stdio> {
+        // Reopen rather than clone: reading must not move the child's write cursor.
+        Ok(Stdio::from(self.file.reopen()?))
+    }
+
+    fn read(&mut self) -> std::io::Result<()> {
+        const LIMIT: usize = 64 * 1024;
+        self.file
+            .as_file_mut()
+            .take((LIMIT.saturating_sub(self.bytes.len()) + 1) as u64)
+            .read_to_end(&mut self.bytes)?;
+        if self.bytes.len() > LIMIT {
+            return Err(std::io::Error::other(
+                "synthetic service stderr exceeded limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
+}
+
+#[cfg(unix)]
 fn wait_for_service(
     child: &mut ChildGuard,
-    port: u16,
+    stderr: &mut ServiceStderr,
 ) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut address = None;
     loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => return Ok(stream),
-            Err(error) if Instant::now() < deadline => {
-                if let Some(status) = child.0.try_wait()? {
-                    let mut stderr = String::new();
-                    if let Some(mut pipe) = child.0.stderr.take() {
-                        pipe.read_to_string(&mut stderr)?;
-                    }
-                    return Err(format!("service exited with {status}: {stderr}").into());
-                }
-                let _ = error;
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error.into()),
+        stderr.read()?;
+        if let Some(status) = child.0.try_wait()? {
+            return Err(format!("service exited with {status}: {}", stderr.text()).into());
         }
+        if address.is_none() {
+            // Only this child's post-bind log is evidence of its listener. A TCP
+            // probe on a released ephemeral port can reach an unrelated fixture.
+            for line in stderr.bytes.split(|byte| *byte == b'\n') {
+                let Ok(entry) = serde_json::from_slice::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if entry["service"] != "server" || entry["msg"] != "server listening" {
+                    continue;
+                }
+                let ip = entry["fields"]["bindAddress"]
+                    .as_str()
+                    .ok_or("service startup omitted bound address")?
+                    .parse::<std::net::IpAddr>()?;
+                if ip != std::net::Ipv4Addr::LOCALHOST {
+                    return Err("synthetic service must bind explicit IPv4 loopback".into());
+                }
+                let port = entry["fields"]["port"]
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port != 0)
+                    .ok_or("service startup omitted actual bound port")?;
+                address = Some(std::net::SocketAddr::new(ip, port));
+                break;
+            }
+        }
+        if let Some(address) = address {
+            match TcpStream::connect(address) {
+                Ok(stream) => {
+                    if let Some(status) = child.0.try_wait()? {
+                        stderr.read()?;
+                        return Err(
+                            format!("service exited with {status}: {}", stderr.text()).into()
+                        );
+                    }
+                    return Ok(stream);
+                }
+                Err(error) if Instant::now() >= deadline => return Err(error.into()),
+                Err(_) => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for owned service startup: {}",
+                stderr.text()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn service_readiness_rejects_exited_child_on_foreign_listener()
+-> Result<(), Box<dyn std::error::Error>> {
+    let foreign = TcpListener::bind("127.0.0.1:0")?;
+    let mut stderr = ServiceStderr::new()?;
+    let child = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf synthetic-service-startup-failure >&2; exit 23",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr.stdio()?)
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    assert_eq!(child.0.wait()?.code(), Some(23));
+
+    let result = wait_for_service(&mut child, &mut stderr);
+    assert!(
+        result.is_err(),
+        "an unrelated listener must not make an exited service ready"
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("23"), "{error}");
+    assert!(
+        error.contains("synthetic-service-startup-failure"),
+        "{error}"
+    );
+    foreign.set_nonblocking(true)?;
+    assert!(
+        matches!(foreign.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn service_readiness_discovers_delayed_owned_ephemeral_listener()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let foreign = TcpListener::bind("127.0.0.1:0")?;
+    let mut stderr = ServiceStderr::new()?;
+    // Delay only this synthetic child's startup, not the readiness deadline.
+    let child = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "/bin/sleep 0.1; exec \"$@\"",
+            "synthetic-delayed-service",
+            env!("CARGO_BIN_EXE_claude-code-proxy"),
+            "serve",
+            "--no-monitor",
+            "--port",
+            "0",
+        ])
+        .env_clear()
+        .env("HOME", directory.path())
+        .env("CCP_CONFIG_DIR", directory.path())
+        .env("XDG_STATE_HOME", directory.path().join("state"))
+        .env("CCP_BIND_ADDRESS", "127.0.0.1")
+        .env("CCP_LOG_STDERR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr.stdio()?)
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    let connection = wait_for_service(&mut child, &mut stderr)
+        .expect("readiness must discover the delayed child's actual bound port");
+    let address = connection.peer_addr()?;
+    assert!(address.ip().is_loopback());
+    assert_ne!(address.port(), 0);
+    assert_ne!(address.port(), foreign.local_addr()?.port());
+    drop(connection);
+    send_signal(&child, "-TERM")?;
+    assert!(wait_for_exit(&mut child, Duration::from_secs(5))?.success());
+    stderr.read()?;
+    assert!(
+        stderr
+            .text()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|entry| {
+                entry["service"] == "server"
+                    && entry["msg"] == "server listening"
+                    && entry["fields"]["port"] == address.port()
+            })
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1057,9 +1225,10 @@ async fn antigravity_user_agent_invalid_environment_is_scoped_to_native_provider
                 "access_token":"synthetic-access", "refresh_token":null, "expires_at":4102444800u64
             }).to_string())?;
             std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))?;
-            let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+            let mut stderr = ServiceStderr::new()?;
             let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
-                .args(["serve", "--no-monitor", "--port", &port.to_string()])
+                .args(["serve", "--no-monitor", "--port", "0"])
+                .env("CCP_BIND_ADDRESS", "127.0.0.1")
                 .env("CCP_CONFIG_DIR", directory.path())
                 .env("XDG_STATE_HOME", directory.path().join("state"))
                 .env("CCP_ANTIGRAVITY_ENABLED", enabled)
@@ -1073,10 +1242,12 @@ async fn antigravity_user_agent_invalid_environment_is_scoped_to_native_provider
                 .env("CCP_TRAFFIC_LOG", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(stderr.stdio()?)
                 .spawn()?;
             let mut child = ChildGuard(child);
-            drop(wait_for_service(&mut child, port)?);
+            let port = wait_for_service(&mut child, &mut stderr)?
+                .peer_addr()?
+                .port();
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
@@ -1086,7 +1257,15 @@ async fn antigravity_user_agent_invalid_environment_is_scoped_to_native_provider
                     "http://127.0.0.1:{port}/v1/models?include_capabilities=true"
                 ))
                 .send()
-                .await?;
+                .await
+                .map_err(|error| {
+                    let capture = stderr.read();
+                    format!(
+                        "models request failed: {error}; child: {:?}; stderr capture: {capture:?}; stderr: {}",
+                        child.0.try_wait(),
+                        stderr.text()
+                    )
+                })?;
             assert_eq!(response.status(), 200);
             let models: serde_json::Value = response.json().await?;
             assert!(!models["data"].as_array().unwrap().iter().any(|entry| {
@@ -1131,9 +1310,8 @@ async fn antigravity_user_agent_invalid_environment_is_scoped_to_native_provider
             );
             send_signal(&child, "-TERM")?;
             assert!(wait_for_exit(&mut child, Duration::from_secs(5))?.success());
-            let mut stderr = String::new();
-            child.0.stderr.take().unwrap().read_to_string(&mut stderr)?;
-            assert!(!stderr.contains("sentinel"));
+            stderr.read()?;
+            assert!(!stderr.text().contains("sentinel"));
         }
     }
     Ok(())
@@ -1159,19 +1337,21 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
         auth_dir.join("auth.json"),
         r#"{"access":"test","refresh":"test","expires":4102444800000,"scope":"openid","userId":"test"}"#,
     )?;
-    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut stderr = ServiceStderr::new()?;
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
-        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .args(["serve", "--no-monitor", "--port", "0"])
+        .env("CCP_BIND_ADDRESS", "127.0.0.1")
+        .env("CCP_LOG_STDERR", "1")
         .env("CCP_CONFIG_DIR", config.path())
         .env("CCP_KIMI_BASE_URL", upstream_url)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(stderr.stdio()?)
         .spawn()?;
     let mut child = ChildGuard(child);
-    let mut downstream = wait_for_service(&mut child, port)?;
+    let mut downstream = wait_for_service(&mut child, &mut stderr)?;
     let body = br#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
     write!(
         downstream,
