@@ -11,4 +11,6 @@ mod antigravity_auth_tests;
 #[cfg(test)]
 mod antigravity_http_tests;
 #[cfg(test)]
+mod antigravity_observed_schema_tests;
+#[cfg(test)]
 mod antigravity_tests;

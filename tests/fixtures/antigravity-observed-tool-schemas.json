@@ -1,0 +1,479 @@
+[
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0001",
+        "name": "synthetic_tool_0001",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0002",
+              "type": "INTEGER"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0003",
+              "type": "INTEGER"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0004",
+              "type": "STRING"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0005",
+              "type": "INTEGER"
+            }
+          },
+          "required": [
+            "field_0003"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0006",
+        "name": "synthetic_tool_0002",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0007",
+              "type": "BOOLEAN"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0008",
+              "type": "STRING"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0009",
+              "type": "BOOLEAN"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0010",
+              "type": "INTEGER"
+            },
+            "field_0005": {
+              "description": "synthetic_text_0011",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0002",
+            "field_0005",
+            "field_0004"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0012",
+        "name": "synthetic_tool_0003",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0013",
+              "enum": [
+                "synthetic_text_0014",
+                "synthetic_text_0015",
+                "synthetic_text_0016",
+                "synthetic_text_0017"
+              ],
+              "type": "STRING"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0018",
+              "type": "STRING"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0019",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0001"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0020",
+        "name": "synthetic_tool_0004",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0021",
+              "minLength": "1",
+              "type": "STRING"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0022",
+              "minLength": "1",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0002",
+            "field_0001"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0023",
+        "name": "synthetic_tool_0005",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0024",
+              "type": "STRING"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0025",
+              "type": "INTEGER"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0026",
+              "type": "BOOLEAN"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0027",
+              "type": "BOOLEAN"
+            },
+            "field_0005": {
+              "description": "synthetic_text_0028",
+              "type": "INTEGER"
+            },
+            "field_0006": {
+              "description": "synthetic_text_0029",
+              "type": "STRING"
+            },
+            "field_0007": {
+              "description": "synthetic_text_0030",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0006"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0031",
+        "name": "synthetic_tool_0006",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0032",
+              "enum": [
+                "synthetic_text_0033",
+                "synthetic_text_0034",
+                "synthetic_text_0035",
+                "synthetic_text_0036"
+              ],
+              "type": "STRING"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0037",
+              "type": "STRING"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0038",
+              "type": "STRING"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0039",
+              "type": "STRING"
+            },
+            "field_0005": {
+              "description": "synthetic_text_0040",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0004",
+            "field_0003",
+            "field_0002"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0041",
+        "name": "synthetic_tool_0007",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0042",
+              "minLength": "1",
+              "type": "STRING"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0043",
+              "type": "BOOLEAN"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0044",
+              "type": "BOOLEAN"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0045",
+              "type": "BOOLEAN"
+            },
+            "field_0005": {
+              "description": "synthetic_text_0046",
+              "minLength": "1",
+              "type": "STRING"
+            },
+            "field_0006": {
+              "description": "synthetic_text_0047",
+              "minLength": "1",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0005",
+            "field_0001",
+            "field_0006"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0048",
+        "name": "synthetic_tool_0008",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0049",
+              "enum": [
+                "synthetic_text_0014",
+                "synthetic_text_0015",
+                "synthetic_text_0050"
+              ],
+              "type": "STRING"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0051",
+              "items": {
+                "type": "STRING"
+              },
+              "type": "ARRAY"
+            }
+          },
+          "required": [
+            "field_0001"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0052",
+        "name": "synthetic_tool_0009",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0053",
+              "type": "BOOLEAN"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0054",
+              "properties": {
+                "field_0001": {
+                  "description": "synthetic_text_0055",
+                  "type": "BOOLEAN"
+                },
+                "field_0002": {
+                  "description": "synthetic_text_0056",
+                  "type": "STRING"
+                },
+                "field_0003": {
+                  "description": "synthetic_text_0057",
+                  "type": "BOOLEAN"
+                }
+              },
+              "required": [
+                "field_0002",
+                "field_0003",
+                "field_0001"
+              ],
+              "type": "OBJECT"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0058",
+              "type": "STRING"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0059",
+              "type": "BOOLEAN"
+            },
+            "field_0005": {
+              "description": "synthetic_text_0060",
+              "minLength": "1",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0005",
+            "field_0003"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0061",
+        "name": "synthetic_tool_0010",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0062",
+              "properties": {
+                "field_0001": {
+                  "description": "synthetic_text_0055",
+                  "type": "BOOLEAN"
+                },
+                "field_0002": {
+                  "description": "synthetic_text_0056",
+                  "type": "STRING"
+                },
+                "field_0003": {
+                  "description": "synthetic_text_0057",
+                  "type": "BOOLEAN"
+                }
+              },
+              "required": [
+                "field_0002",
+                "field_0003",
+                "field_0001"
+              ],
+              "type": "OBJECT"
+            },
+            "field_0002": {
+              "description": "synthetic_text_0063",
+              "minLength": "1",
+              "type": "STRING"
+            },
+            "field_0003": {
+              "description": "synthetic_text_0064",
+              "type": "STRING"
+            },
+            "field_0004": {
+              "description": "synthetic_text_0065",
+              "minLength": "1",
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0002",
+            "field_0004",
+            "field_0003"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0066",
+        "name": "synthetic_tool_0011",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "description": "synthetic_text_0067",
+              "type": "STRING"
+            },
+            "field_0002": {
+              "type": "STRING"
+            }
+          },
+          "required": [
+            "field_0002"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  },
+  {
+    "functionDeclarations": [
+      {
+        "description": "synthetic_text_0068",
+        "name": "synthetic_tool_0012",
+        "parameters": {
+          "properties": {
+            "field_0001": {
+              "items": {
+                "properties": {
+                  "field_0001": {
+                    "description": "synthetic_text_0069",
+                    "type": "BOOLEAN"
+                  },
+                  "field_0002": {
+                    "description": "synthetic_text_0070",
+                    "items": {
+                      "type": "STRING"
+                    },
+                    "minItems": "2",
+                    "type": "ARRAY"
+                  },
+                  "field_0003": {
+                    "description": "synthetic_text_0071",
+                    "minLength": "1",
+                    "type": "STRING"
+                  }
+                },
+                "required": [
+                  "field_0003",
+                  "field_0002"
+                ],
+                "type": "OBJECT"
+              },
+              "minItems": "1",
+              "type": "ARRAY"
+            }
+          },
+          "required": [
+            "field_0001"
+          ],
+          "type": "OBJECT"
+        }
+      }
+    ]
+  }
+]
