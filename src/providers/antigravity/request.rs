@@ -221,6 +221,72 @@ pub(crate) fn validate_raw(raw: &[u8]) -> Result<()> {
     Ok(())
 }
 
+const CLAUDE_CODE_SYSTEM_HEADERS: [&str; 3] = [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+];
+
+fn strip_claude_code_system_header(mut text: &str) -> Option<&str> {
+    let mut stripped_any = false;
+    loop {
+        let trimmed = text.trim_start_matches([' ', '\t', '\r', '\n']);
+        if let Some(rest) = trimmed.strip_prefix("x-anthropic-billing-header:") {
+            stripped_any = true;
+            let after_line = rest.split_once('\n').map_or("", |(_, tail)| tail);
+            text = after_line
+                .strip_prefix("\r\n")
+                .or_else(|| after_line.strip_prefix('\n'))
+                .unwrap_or(after_line);
+            continue;
+        }
+        if let Some(after_header) = CLAUDE_CODE_SYSTEM_HEADERS
+            .iter()
+            .find_map(|header| trimmed.strip_prefix(header))
+        {
+            let after_ws = after_header.trim_start_matches([' ', '\t']);
+            if after_ws.is_empty() || after_ws.starts_with('\n') || after_ws.starts_with("\r\n") {
+                stripped_any = true;
+                let after_line = after_ws
+                    .strip_prefix("\r\n")
+                    .or_else(|| after_ws.strip_prefix('\n'))
+                    .unwrap_or(after_ws);
+                text = after_line
+                    .strip_prefix("\r\n")
+                    .or_else(|| after_line.strip_prefix('\n'))
+                    .unwrap_or(after_line);
+                continue;
+            }
+        }
+        break;
+    }
+    if stripped_any && text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn sanitize_system_parts(parts: Vec<Value>, policy: RequestMetadata) -> Vec<Value> {
+    let filtered: Vec<Value> = parts
+        .into_iter()
+        .filter_map(|part| {
+            let text = part["text"].as_str()?;
+            strip_claude_code_system_header(text).map(|cleaned| json!({"text": cleaned}))
+        })
+        .collect();
+    if policy == RequestMetadata::Agy && filtered.len() > 1 {
+        let joined = filtered
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        vec![json!({"text": joined})]
+    } else {
+        filtered
+    }
+}
+
 fn text_parts(value: &Value) -> Result<Vec<Value>> {
     if let Some(text) = value.as_str() {
         return Ok(vec![json!({"text":text})]);
@@ -605,6 +671,7 @@ fn prepare_inner(
             system.extend(text_parts(&message.content)?);
         }
     }
+    let system = sanitize_system_parts(system, policy);
     let turns = messages
         .iter()
         .filter(|m| m.role == "assistant")

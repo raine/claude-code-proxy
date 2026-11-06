@@ -2918,3 +2918,90 @@ fn antigravity_local_tool_ids_are_unique_despite_reused_native_ids() {
         assert_ne!(entry["local_id"], entry["native_id"]);
     }
 }
+
+#[test]
+fn antigravity_strips_claude_code_billing_and_sdk_headers_and_consolidates_agy_system_parts() {
+    use super::antigravity::config::RequestMetadata;
+    use super::antigravity::request::prepare_with_policy;
+
+    for sdk_header in [
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+        "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    ] {
+        let mut request = request_value();
+        request["system"] = json!([
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.270.dd6; cc_entrypoint=sdk-cli;"},
+            {"type":"text","text":sdk_header,"cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"\nYou are an interactive agent.","cache_control":{"type":"ephemeral"}}
+        ]);
+        request["messages"] = json!([
+            {"role":"system","content":"# Environment\n - Primary working directory: /workspace"},
+            {"role":"user","content":"Reply with OK."}
+        ]);
+
+        let agy_prepared = prepare_with_policy(
+            &serde_json::from_value(request.clone()).unwrap(),
+            &binding(),
+            RequestMetadata::Agy,
+        )
+        .unwrap();
+        assert_eq!(
+            agy_prepared.wire["request"]["systemInstruction"],
+            json!({
+                "role":"user",
+                "parts":[{"text":"\nYou are an interactive agent.\n\n# Environment\n - Primary working directory: /workspace"}]
+            })
+        );
+
+        let legacy_prepared = prepare_with_policy(
+            &serde_json::from_value(request).unwrap(),
+            &binding(),
+            RequestMetadata::Legacy,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_prepared.wire["request"]["systemInstruction"],
+            json!({
+                "role":"user",
+                "parts":[
+                    {"text":"\nYou are an interactive agent."},
+                    {"text":"# Environment\n - Primary working directory: /workspace"}
+                ]
+            })
+        );
+
+        // Pre-flattened single-string system with leading billing + SDK headers.
+        let mut flattened = request_value();
+        flattened["system"] = json!(format!(
+            "x-anthropic-billing-header: cc_version=2.1.270.dd6\n\n{sdk_header}\n\n\nYou are an interactive agent."
+        ));
+        let flattened_prepared = prepare_with_policy(
+            &serde_json::from_value(flattened).unwrap(),
+            &binding(),
+            RequestMetadata::Agy,
+        )
+        .unwrap();
+        assert_eq!(
+            flattened_prepared.wire["request"]["systemInstruction"],
+            json!({
+                "role":"user",
+                "parts":[{"text":"\nYou are an interactive agent."}]
+            })
+        );
+
+        // System consisting solely of billing + SDK headers omits systemInstruction entirely.
+        let mut headers_only = request_value();
+        headers_only["system"] = json!([
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.270.dd6"},
+            {"type":"text","text":sdk_header}
+        ]);
+        let omitted = prepare_with_policy(
+            &serde_json::from_value(headers_only).unwrap(),
+            &binding(),
+            RequestMetadata::Agy,
+        )
+        .unwrap();
+        assert!(omitted.wire["request"].get("systemInstruction").is_none());
+    }
+}

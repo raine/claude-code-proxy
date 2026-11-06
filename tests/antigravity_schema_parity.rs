@@ -794,12 +794,25 @@ async fn first_agent_metadata(f: &mut Fixture) -> Result<()> {
             let mut body = request(stream);
             body["model"] = json!("antigravity/gemini-4-argon-low");
             body["max_tokens"] = json!(65536);
-            body["system"] = json!("Synthetic metadata system instruction.");
+            body["system"] = json!([
+                {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.270.dd6; cc_entrypoint=sdk-cli;"},
+                {"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral"}},
+                {"type":"text","text":"Synthetic metadata system instruction.","cache_control":{"type":"ephemeral"}}
+            ]);
+            body["messages"].as_array_mut().context("messages")?.insert(
+                0,
+                json!({"role":"system","content":"Synthetic environment instruction."}),
+            );
             let exchange = f.exchange(body, json!([{"text":"Synthetic metadata completion."}])).await?;
             exchange.success(stream)?;
             let wire = exchange.wire()?;
             ensure!(wire["model"] == "gemini-4-argon-low" && wire["requestType"] == "agent" && wire["userAgent"] == "antigravity", "observed agent envelope");
             let request = &wire["request"];
+            exact(
+                &request["systemInstruction"],
+                &json!({"role":"user","parts":[{"text":"Synthetic metadata system instruction.\n\nSynthetic environment instruction."}]}),
+                "agy single-part systemInstruction with Claude Code headers stripped",
+            )?;
             exact(&request["generationConfig"], &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}), "observed generation controls")?;
             ensure!(request["sessionId"] == "-3750763034362895579", "observed signed empty-input FNV session");
             let labels = request["labels"].as_object().context("observed lineage labels")?;
