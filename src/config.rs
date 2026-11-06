@@ -57,6 +57,8 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "requestCompression")]
+    pub request_compression: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
@@ -314,6 +316,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_REQUEST_COMPRESSION") {
+        out.push("CCP_CODEX_REQUEST_COMPRESSION (env)".to_string());
+    }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
@@ -361,6 +366,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if let Some(enabled) = codex.request_compression {
+                out.push(format!("codex.requestCompression: {enabled}"));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -706,6 +714,25 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+pub fn codex_request_compression() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_REQUEST_COMPRESSION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.request_compression
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_server_compaction() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
@@ -917,6 +944,9 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
+    if codex_request_compression() {
+        return CodexTransport::Http;
+    }
     CodexTransport::Auto
 }
 
@@ -1045,6 +1075,7 @@ mod tests {
             EnvGuard::unset("CCP_LOG_VERBOSE"),
             EnvGuard::unset("CCP_LOG_STDERR"),
             EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
+            EnvGuard::unset("CCP_CODEX_REQUEST_COMPRESSION"),
             EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
             EnvGuard::unset("CCP_CODEX_FULL_LANE"),
@@ -1538,5 +1569,32 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn codex_request_compression_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert!(!codex_request_compression());
+        {
+            let _enabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "on");
+            assert!(codex_request_compression());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"requestCompression":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_request_compression());
+        assert_eq!(codex_transport(), CodexTransport::Http);
+        {
+            let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
+        let _disabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "false");
+        assert!(!codex_request_compression());
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 }
