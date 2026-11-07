@@ -149,6 +149,7 @@ async fn provider_with_user_agent(
         .unwrap();
     drop(lock);
     let config = Config {
+        request_metadata: super::antigravity::config::RequestMetadata::Legacy,
         base_url: url.clone(),
         client_id: Some("synthetic-client".into()),
         ..Config::read(&directory.join("config.json"), |key| {

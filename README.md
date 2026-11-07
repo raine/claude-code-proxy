@@ -105,9 +105,10 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
 
-An additional **experimental, default-off native Antigravity Argon adapter** supports
-only `antigravity/gemini-4-argon-low`, `antigravity/gemini-4-argon-medium`, and
-`antigravity/gemini-4-argon-high`. It does not run or import credentials from `agy`.
+An additional **experimental, default-off native Antigravity adapter** supports
+`antigravity/gemini-4-argon-low`, `antigravity/gemini-4-argon-medium`,
+`antigravity/gemini-4-argon-high`, `antigravity/claude-opus-5-5-low`,
+`antigravity/claude-opus-5-5-medium`, and `antigravity/claude-opus-5-5-high`. It does not run or import credentials from `agy`.
 Its default HTTP User-Agent is `claude-code-proxy/<package version>`. An explicit
 provider-specific override affects only native generation/project discovery,
 not OAuth; it is compatibility metadata, not verified official-client identity.
@@ -121,7 +122,7 @@ before explicitly enabling it. Existing provider defaults and aliases are unchan
 ### Native request metadata policy
 
 The closed file setting `antigravity.requestMetadata` in `config.json` accepts
-`"legacy"` (the default) or `"agy"`:
+`"agy"` (the default) or `"legacy"`:
 
 ```json
 {"antigravity":{"requestMetadata":"agy"}}

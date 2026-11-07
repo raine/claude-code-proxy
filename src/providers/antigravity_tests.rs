@@ -3005,3 +3005,103 @@ fn antigravity_strips_claude_code_billing_and_sdk_headers_and_consolidates_agy_s
         assert!(omitted.wire["request"].get("systemInstruction").is_none());
     }
 }
+
+#[test]
+fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks() {
+    use super::antigravity::config::RequestMetadata;
+    use super::antigravity::request::{CountInputs, estimate, prepare_with_policy};
+    use crate::MessagesRequest;
+
+    let opus_binding = replay::Binding {
+        profile_id: "profile".into(),
+        project_id: "project".into(),
+        native_model: "claude-opus-5-5-low".into(),
+    };
+    let lineage = replay::v2::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let v2_turn = v2_encode(
+        &json!([{"role":"model","parts":[{"thought":true,"text":"thinking","thoughtSignature":"sig-1"},{"text":"Turn 2 reply."}]}]),
+        &opus_binding,
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+
+    // Carrier-less prefix (from mid-session /model switch) + active signed V2 turn
+    let mut switched = request_value();
+    switched["model"] = json!("antigravity/claude-opus-5-5-low");
+    switched["messages"] = json!([
+        {"role":"user","content":"Remember token ALPHA."},
+        {"role":"assistant","content":[
+            {"type":"text","text":"Checking tool."},
+            {"type":"tool_use","id":"toolu_prefix_1","name":"Read","input":{"file_path":"/tmp/a.txt"}}
+        ]},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_prefix_1","content":"ALPHA"}
+        ]},
+        {"role":"assistant","content":[
+            {"type":"text","text":"Token ALPHA recorded."}
+        ]},
+        {"role":"user","content":"Now switch model."},
+        {"role":"assistant","content":v2_turn},
+        {"role":"user","content":"What was the token?"}
+    ]);
+
+    let body: MessagesRequest = serde_json::from_value(switched).unwrap();
+    let mut prepared = prepare_with_policy(&body, &opus_binding, RequestMetadata::Agy).unwrap();
+    let mut ids = [execution_id(1)].into_iter();
+    prepared
+        .finalize_metadata(1_799_999_999_456, || ids.next().unwrap())
+        .unwrap();
+    assert_eq!(
+        prepared.wire["request"]["labels"]["model_enum"],
+        json!("MODEL_PLACEHOLDER_M400")
+    );
+    let contents = prepared.wire["request"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 7);
+    assert_eq!(
+        contents[0],
+        json!({"role":"user","parts":[{"text":"Remember token ALPHA."}]})
+    );
+    assert_eq!(
+        contents[1],
+        json!({"role":"model","parts":[
+            {"text":"Checking tool."},
+            {"text":"[tool_use Read(id=toolu_prefix_1): {\"file_path\":\"/tmp/a.txt\"}]"}
+        ]})
+    );
+    assert_eq!(
+        contents[2],
+        json!({"role":"user","parts":[
+            {"text":"[tool_result (toolu_prefix_1): ALPHA]"}
+        ]})
+    );
+    assert_eq!(
+        contents[3],
+        json!({"role":"model","parts":[{"text":"Token ALPHA recorded."}]})
+    );
+    assert_eq!(
+        contents[4],
+        json!({"role":"user","parts":[{"text":"Now switch model."}]})
+    );
+    assert_eq!(contents[5]["role"], json!("model"));
+    assert_eq!(
+        contents[6],
+        json!({"role":"user","parts":[{"text":"What was the token?"}]})
+    );
+
+    let counted = estimate(
+        &body,
+        CountInputs {
+            serving_scope: None,
+            configured_project: Some("project"),
+        },
+    )
+    .unwrap();
+    assert!(counted > 0);
+}

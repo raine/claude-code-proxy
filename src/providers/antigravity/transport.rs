@@ -584,8 +584,29 @@ pub(crate) async fn collect(mut response: NativeResponse) -> Result<Turn> {
 }
 
 pub(crate) fn message(blocks: Value, model: &str, turn: &Turn) -> Value {
+    let content = match blocks {
+        Value::Array(items) => {
+            let mut coalesced: Vec<Value> = Vec::with_capacity(items.len());
+            for item in items {
+                if item["type"] == "text"
+                    && let Some(text) = item["text"].as_str()
+                    && coalesced.last().is_some_and(|b| b["type"] == "text")
+                {
+                    if let Some(Value::String(prev)) =
+                        coalesced.last_mut().and_then(|b| b.get_mut("text"))
+                    {
+                        prev.push_str(text);
+                    }
+                } else {
+                    coalesced.push(item);
+                }
+            }
+            Value::Array(coalesced)
+        }
+        other => other,
+    };
     json!({"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"type":"message","role":"assistant","model":model,
-        "content":blocks,"stop_reason":turn.stop_reason,"stop_sequence":null,"usage":turn.usage})
+        "content":content,"stop_reason":turn.stop_reason,"stop_sequence":null,"usage":turn.usage})
 }
 
 pub(crate) fn sse(message: &Value) -> Result<Vec<u8>> {

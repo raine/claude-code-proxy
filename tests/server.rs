@@ -1918,24 +1918,6 @@ mod antigravity_entry_tests {
             .unwrap()
     }
 
-    async fn assert_context_rejected(response: axum::response::Response, dispatches: &Dispatches) {
-        assert!(
-            dispatches.lock().unwrap().is_empty(),
-            "unsupported context must fail before either provider handler"
-        );
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!request_id(&response).is_empty());
-        let body = error_body(response).await;
-        assert_eq!(body["type"], "error");
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.to_ascii_lowercase().contains("antigravity"));
-        assert!(
-            message.contains("1m"),
-            "actionable context error: {message}"
-        );
-    }
-
     #[tokio::test]
     async fn antigravity_raw_1m_is_rejected_before_normalization_on_both_endpoints() {
         let (app, dispatches) = capture_app("antigravity", MODELS);
@@ -1943,7 +1925,13 @@ mod antigravity_entry_tests {
             for model in MODELS {
                 for suffix in ["[1m]", "[1M]"] {
                     let response = post(&app, endpoint, &format!("{model}{suffix}"), &[]).await;
-                    assert_context_rejected(response, &dispatches).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = error_body(response).await;
+                    assert_eq!(body, json!({"model": model, "provider": "antigravity"}));
+                    assert_eq!(
+                        std::mem::take(&mut *dispatches.lock().unwrap()),
+                        vec![(*endpoint, (*model).to_string())]
+                    );
                 }
             }
         }
@@ -1971,7 +1959,13 @@ mod antigravity_entry_tests {
             for model in MODELS {
                 for headers in &header_cases {
                     let response = post(&app, endpoint, model, headers).await;
-                    assert_context_rejected(response, &dispatches).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = error_body(response).await;
+                    assert_eq!(body, json!({"model": model, "provider": "antigravity"}));
+                    assert_eq!(
+                        std::mem::take(&mut *dispatches.lock().unwrap()),
+                        vec![(*endpoint, (*model).to_string())]
+                    );
                 }
             }
         }
@@ -2116,22 +2110,14 @@ mod antigravity_entry_tests {
                     "gpt-6-luna",
                     r#"{"role":"user","content":"review","unsupported":true}"#,
                 ),
-                Vec::new(),
+                Vec::<&str>::new(),
             ),
             (
                 raw(
                     "gpt-6-luna",
                     r#"{"role":"user","content":[{"type":"text","text":"first","text":"second"}]}"#,
                 ),
-                Vec::new(),
-            ),
-            (
-                raw("gpt-6-luna[1m]", r#"{"role":"user","content":"review"}"#),
-                Vec::new(),
-            ),
-            (
-                raw("gpt-6-luna", r#"{"role":"user","content":"review"}"#),
-                vec!["unrelated", "other, context-1m-2025-08-07"],
+                Vec::<&str>::new(),
             ),
         ];
         for (body, betas) in cases {
@@ -2259,7 +2245,7 @@ mod antigravity_entry_tests {
             .unwrap();
         assert_eq!(
             line,
-            "antigravity: antigravity/gemini-4-argon-high, antigravity/gemini-4-argon-low, antigravity/gemini-4-argon-medium"
+            "antigravity: antigravity/claude-opus-5-5-high, antigravity/claude-opus-5-5-low, antigravity/claude-opus-5-5-medium, antigravity/gemini-4-argon-high, antigravity/gemini-4-argon-low, antigravity/gemini-4-argon-medium"
         );
         assert!(
             !run("0", &["codex", "auth", "status", "--json"])

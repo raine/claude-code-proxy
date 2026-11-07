@@ -320,7 +320,7 @@ impl Fixture {
         std::fs::write(
             config_dir.join("config.json"),
             serde_json::to_vec(&json!({"antigravity":{
-                "enabled":true,"baseUrl":origin,"projectId":PROJECT
+                "enabled":true,"baseUrl":origin,"projectId":PROJECT,"requestMetadata":"legacy"
             }}))?,
         )?;
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(

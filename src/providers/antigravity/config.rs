@@ -48,7 +48,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            request_metadata: RequestMetadata::Legacy,
+            request_metadata: RequestMetadata::Agy,
             base_url: Url::parse("https://daily-cloudcode-pa.googleapis.com").unwrap(),
             token_url: Url::parse("https://oauth2.googleapis.com/token").unwrap(),
             authorization_url: Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap(),
@@ -205,10 +205,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
         let default = Config::read(&path, |key| {
-            (key == "CCP_ANTIGRAVITY_REQUEST_METADATA").then(|| "agy".into())
+            (key == "CCP_ANTIGRAVITY_REQUEST_METADATA").then(|| "legacy".into())
         })
         .unwrap();
-        assert_eq!(default.request_metadata, RequestMetadata::Legacy);
+        assert_eq!(default.request_metadata, RequestMetadata::Agy);
         assert!(!default.enabled);
         for (value, expected) in [
             ("legacy", RequestMetadata::Legacy),

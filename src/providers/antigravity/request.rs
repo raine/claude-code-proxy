@@ -12,13 +12,18 @@ pub const MODELS: &[&str] = &[
     "antigravity/gemini-4-argon-low",
     "antigravity/gemini-4-argon-medium",
     "antigravity/gemini-4-argon-high",
+    "antigravity/claude-opus-5-5-low",
+    "antigravity/claude-opus-5-5-medium",
+    "antigravity/claude-opus-5-5-high",
 ];
 
 pub(crate) fn effective_tier(model: &str) -> Option<&'static str> {
     match model {
-        "antigravity/gemini-4-argon-low" => Some("low"),
-        "antigravity/gemini-4-argon-medium" => Some("medium"),
-        "antigravity/gemini-4-argon-high" => Some("high"),
+        "antigravity/gemini-4-argon-low" | "antigravity/claude-opus-5-5-low" => Some("low"),
+        "antigravity/gemini-4-argon-medium" | "antigravity/claude-opus-5-5-medium" => {
+            Some("medium")
+        }
+        "antigravity/gemini-4-argon-high" | "antigravity/claude-opus-5-5-high" => Some("high"),
         _ => None,
     }
 }
@@ -142,6 +147,9 @@ impl Prepared {
             Some("gemini-4-argon-low") => "MODEL_PLACEHOLDER_M419",
             Some("gemini-4-argon-medium") => "MODEL_PLACEHOLDER_M418",
             Some("gemini-4-argon-high") => "MODEL_PLACEHOLDER_M417",
+            Some("claude-opus-5-5-low") => "MODEL_PLACEHOLDER_M400",
+            Some("claude-opus-5-5-medium") => "MODEL_PLACEHOLDER_M401",
+            Some("claude-opus-5-5-high") => "MODEL_PLACEHOLDER_M402",
             _ => return Err("unsupported metadata model"),
         };
         let state = match &self.metadata {
@@ -443,6 +451,9 @@ fn native_checkpoint_parts(envelope: &Value) -> Result<()> {
     if contents.is_empty() {
         return Err("V2 continuation requires native content");
     }
+    let is_claude = envelope["native_model"]
+        .as_str()
+        .is_some_and(|m| m.starts_with("claude-"));
     // Preserve every raw content/signature and original codec. A completed
     // assistant checkpoint counts once regardless of native SSE fragmentation.
     for content in contents {
@@ -453,12 +464,15 @@ fn native_checkpoint_parts(envelope: &Value) -> Result<()> {
         }
         for part in parts {
             if part.get("functionCall").is_some() {
-                keys(
-                    part,
-                    &["functionCall", "thoughtSignature"],
-                    &["functionCall", "thoughtSignature"],
-                )?;
-                nonempty(&part["thoughtSignature"])?;
+                let required: &[&str] = if is_claude {
+                    &["functionCall"]
+                } else {
+                    &["functionCall", "thoughtSignature"]
+                };
+                keys(part, &["functionCall", "thoughtSignature"], required)?;
+                if let Some(sig) = part.get("thoughtSignature") {
+                    nonempty(sig)?;
+                }
             } else {
                 keys(part, &["text", "thought", "thoughtSignature"], &["text"])?;
                 if !part["text"].is_string() {
@@ -473,6 +487,62 @@ fn native_checkpoint_parts(envelope: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn coalesce_claude_native_turn(native: &[Value]) -> Vec<Value> {
+    let mut merged_parts: Vec<Value> = Vec::new();
+    for content in native {
+        let Some(parts) = content["parts"].as_array() else {
+            continue;
+        };
+        for part in parts {
+            if part["thought"] == true {
+                let chunk = part["text"].as_str().unwrap_or("");
+                let sig = part.get("thoughtSignature").cloned();
+                if let Some(last) = merged_parts.last_mut().filter(|p| p["thought"] == true) {
+                    if let Some(Value::String(prev)) = last.get_mut("text") {
+                        prev.push_str(chunk);
+                    }
+                    if let Some(sig) = sig {
+                        last["thoughtSignature"] = sig;
+                    }
+                } else {
+                    let mut item = json!({"thought": true, "text": chunk});
+                    if let Some(sig) = sig {
+                        item["thoughtSignature"] = sig;
+                    }
+                    merged_parts.push(item);
+                }
+            } else if part.get("functionCall").is_some() {
+                merged_parts.push(part.clone());
+            } else if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if text.is_empty() && part.get("thoughtSignature").is_none() {
+                    continue;
+                }
+                if part.get("thoughtSignature").is_none()
+                    && let Some(last) = merged_parts.last_mut().filter(|p| {
+                        p.get("text").is_some()
+                            && p.get("thought").is_none()
+                            && p.get("thoughtSignature").is_none()
+                    })
+                {
+                    if let Some(Value::String(prev)) = last.get_mut("text") {
+                        prev.push_str(text);
+                    }
+                } else {
+                    merged_parts.push(part.clone());
+                }
+            } else {
+                merged_parts.push(part.clone());
+            }
+        }
+    }
+    merged_parts.retain(|p| p["thought"] != true || p.get("thoughtSignature").is_some());
+    if merged_parts.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"role": "model", "parts": merged_parts})]
+    }
 }
 
 fn continuation_input(envelope: &Value, user: &Message) -> Result<bool> {
@@ -490,25 +560,63 @@ fn continuation_input(envelope: &Value, user: &Message) -> Result<bool> {
             // must not acquire invented Go counter/grouping semantics.
             let mapping = envelope["tool_mapping"].as_array().unwrap();
             let calls = replay::calls(&envelope["contents"])?;
-            if mapping.len() != 1 || calls.len() != 1 || calls[0].2.get("id").is_none() {
-                return Err("unqualified V2 tool continuation shape");
+            let is_claude = envelope["native_model"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("claude-"));
+            if is_claude {
+                if mapping.is_empty()
+                    || mapping.len() != calls.len()
+                    || calls.iter().any(|c| c.2.get("id").is_none())
+                {
+                    return Err("unqualified V2 tool continuation shape");
+                }
+                let blocks = user
+                    .content
+                    .as_array()
+                    .filter(|b| b.len() >= mapping.len())
+                    .ok_or("V2 tool continuation requires one result")?;
+                let expected_ids: HashSet<&str> = mapping
+                    .iter()
+                    .filter_map(|m| m["local_id"].as_str())
+                    .collect();
+                let mut seen_ids = HashSet::new();
+                for block in blocks.iter().take(mapping.len()) {
+                    let Some(id) = block["tool_use_id"].as_str() else {
+                        return Err("unqualified V2 tool result");
+                    };
+                    if block["type"] != "tool_result"
+                        || !expected_ids.contains(id)
+                        || !seen_ids.insert(id)
+                        || !block["content"].is_string()
+                        || block
+                            .get("is_error")
+                            .is_some_and(|v| v.as_bool() != Some(false))
+                    {
+                        return Err("unqualified V2 tool result");
+                    }
+                }
+                Ok(false)
+            } else {
+                if mapping.len() != 1 || calls.len() != 1 || calls[0].2.get("id").is_none() {
+                    return Err("unqualified V2 tool continuation shape");
+                }
+                let blocks = user
+                    .content
+                    .as_array()
+                    .filter(|b| b.len() == 1)
+                    .ok_or("V2 tool continuation requires one result")?;
+                let block = &blocks[0];
+                if block["type"] != "tool_result"
+                    || block["tool_use_id"] != mapping[0]["local_id"]
+                    || !block["content"].is_string()
+                    || block
+                        .get("is_error")
+                        .is_some_and(|v| v.as_bool() != Some(false))
+                {
+                    return Err("unqualified V2 tool result");
+                }
+                Ok(false)
             }
-            let blocks = user
-                .content
-                .as_array()
-                .filter(|b| b.len() == 1)
-                .ok_or("V2 tool continuation requires one result")?;
-            let block = &blocks[0];
-            if block["type"] != "tool_result"
-                || block["tool_use_id"] != mapping[0]["local_id"]
-                || !block["content"].is_string()
-                || block
-                    .get("is_error")
-                    .is_some_and(|v| v.as_bool() != Some(false))
-            {
-                return Err("unqualified V2 tool result");
-            }
-            Ok(false)
         }
         _ => Err("unqualified continuation after incomplete V2 checkpoint"),
     }
@@ -598,7 +706,12 @@ pub(crate) fn estimate(body: &MessagesRequest, inputs: CountInputs<'_>) -> Resul
         }
     } else {
         let messages = logical_messages(&body.messages)?;
-        if let Some(turn) = messages.iter().find(|m| m.role == "assistant") {
+        if let Some(turn) = messages.iter().rev().find(|m| {
+            m.role == "assistant"
+                && m.content
+                    .get(0)
+                    .is_some_and(|block| block["type"] == "thinking")
+        }) {
             replay::claimed_binding(&turn.content, native_model, inputs.configured_project)?
         } else {
             Binding {
@@ -638,8 +751,8 @@ fn prepare_inner(
         return Err("unsupported Antigravity model or replay scope");
     }
     let tier = match model {
-        "antigravity/gemini-4-argon-low" => "LOW",
-        "antigravity/gemini-4-argon-medium" => "MEDIUM",
+        "antigravity/gemini-4-argon-low" | "antigravity/claude-opus-5-5-low" => "LOW",
+        "antigravity/gemini-4-argon-medium" | "antigravity/claude-opus-5-5-medium" => "MEDIUM",
         _ => "HIGH",
     };
     let cap = body.max_tokens.unwrap_or(65536);
@@ -672,7 +785,22 @@ fn prepare_inner(
         }
     }
     let system = sanitize_system_parts(system, policy);
-    let turns = messages
+    let v2_start_idx = if policy == RequestMetadata::Agy {
+        messages
+            .iter()
+            .rposition(|m| {
+                m.role == "assistant"
+                    && m.content
+                        .get(0)
+                        .is_none_or(|block| block["type"] != "thinking")
+            })
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let (prefix_messages, active_messages) = messages.split_at(v2_start_idx);
+    let turns = active_messages
         .iter()
         .filter(|m| m.role == "assistant")
         .map(|m| m.content.clone())
@@ -698,12 +826,12 @@ fn prepare_inner(
             return Err("V2 history requires the agy request metadata policy");
         }
         let envelopes = replay::v2::decode_history(&json!(turns), binding)?;
-        let metadata = observed_continuation(&messages, &envelopes, model)?;
+        let metadata = observed_continuation(active_messages, &envelopes, model)?;
         (envelopes, metadata)
     } else {
         let envelopes = replay::decode_history(&json!(turns), binding)?;
         let metadata = if policy == RequestMetadata::Agy && turns.is_empty() {
-            let input = messages
+            let input = active_messages
                 .iter()
                 .filter(|m| m.role != "system")
                 .collect::<Vec<_>>();
@@ -737,7 +865,7 @@ fn prepare_inner(
     };
     let mut history = envelopes.into_iter();
     let mut pending: Vec<(Value, Value)> = Vec::new();
-    let mut contents = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
     let mut last_role = "";
     let mut estimate_bytes = serde_json::to_vec(&system)
         .map_err(|_| "invalid system")?
@@ -745,7 +873,141 @@ fn prepare_inner(
     estimate_bytes += serde_json::to_vec(&tools.declarations)
         .map_err(|_| "invalid tools")?
         .len();
-    for message in &messages {
+    for message in prefix_messages {
+        if message.role == "system" {
+            continue;
+        }
+        if message.role == "user" {
+            let blocks = if let Some(text) = message.content.as_str() {
+                vec![json!({"type":"text","text":text})]
+            } else {
+                message
+                    .content
+                    .as_array()
+                    .ok_or("invalid user content")?
+                    .clone()
+            };
+            let mut parts = Vec::new();
+            for block in blocks {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        keys(
+                            &block,
+                            &["type", "text", "cache_control"],
+                            &["type", "text"],
+                        )?;
+                        cache_hint(block.get("cache_control"))?;
+                        let value = block["text"].as_str().ok_or("invalid user text")?;
+                        estimate_bytes += value.len();
+                        parts.push(json!({"text":value}));
+                    }
+                    Some("tool_result") => {
+                        keys(
+                            &block,
+                            &[
+                                "type",
+                                "tool_use_id",
+                                "content",
+                                "is_error",
+                                "cache_control",
+                            ],
+                            &["type", "tool_use_id"],
+                        )?;
+                        cache_hint(block.get("cache_control"))?;
+                        let id = nonempty(&block["tool_use_id"])?;
+                        let rendered = match block.get("content") {
+                            None => String::new(),
+                            Some(Value::String(s)) => s.clone(),
+                            Some(value) => text_parts(value)?
+                                .iter()
+                                .filter_map(|p| p["text"].as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        };
+                        let is_error = block
+                            .get("is_error")
+                            .map(|v| v.as_bool().ok_or("invalid is_error flag"))
+                            .transpose()?
+                            .unwrap_or(false);
+                        let formatted = if is_error {
+                            format!("[tool_result ({id}) error: {rendered}]")
+                        } else {
+                            format!("[tool_result ({id}): {rendered}]")
+                        };
+                        estimate_bytes += formatted.len();
+                        parts.push(json!({"text":formatted}));
+                    }
+                    _ => return Err("unsupported user content/media"),
+                }
+            }
+            if !parts.is_empty() {
+                if contents.last().is_some_and(|c| c["role"] == "user") {
+                    contents
+                        .last_mut()
+                        .unwrap()
+                        .get_mut("parts")
+                        .and_then(Value::as_array_mut)
+                        .unwrap()
+                        .extend(parts);
+                } else {
+                    if contents.len() >= 1024 {
+                        return Err("native history content limit");
+                    }
+                    contents.push(json!({"role":"user","parts":parts}));
+                }
+                last_role = "user";
+            }
+        } else if message.role == "assistant" {
+            let blocks = message
+                .content
+                .as_array()
+                .ok_or("invalid assistant content")?;
+            let mut parts = Vec::new();
+            for block in blocks {
+                match block["type"].as_str() {
+                    Some("thinking") => {}
+                    Some("text") => {
+                        let text = block["text"].as_str().ok_or("invalid display text")?;
+                        if !text.is_empty() {
+                            estimate_bytes += text.len();
+                            parts.push(json!({"text":text}));
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = nonempty(&block["id"])?;
+                        let name = nonempty(&block["name"])?;
+                        let input = serde_json::to_string(&block["input"])
+                            .map_err(|_| "invalid tool input")?;
+                        let formatted = format!("[tool_use {name}(id={id}): {input}]");
+                        estimate_bytes += formatted.len();
+                        parts.push(json!({"text":formatted}));
+                    }
+                    _ => return Err("unsupported projection block"),
+                }
+            }
+            if parts.is_empty() {
+                parts.push(json!({"text":"..."}));
+            }
+            if contents.last().is_some_and(|c| c["role"] == "model") {
+                contents
+                    .last_mut()
+                    .unwrap()
+                    .get_mut("parts")
+                    .and_then(Value::as_array_mut)
+                    .unwrap()
+                    .extend(parts);
+            } else {
+                if contents.len() >= 1024 {
+                    return Err("native history content limit");
+                }
+                contents.push(json!({"role":"model","parts":parts}));
+            }
+            last_role = "assistant";
+        } else {
+            return Err("unsupported message role");
+        }
+    }
+    for message in active_messages {
         if message.role == "system" {
             continue;
         }
@@ -780,10 +1042,18 @@ fn prepare_inner(
                 }
             }
             let native = envelope["contents"].as_array().unwrap();
-            if contents.len().saturating_add(native.len()) > 1024 {
-                return Err("native history content limit");
+            if binding.native_model.starts_with("claude-") {
+                let coalesced = coalesce_claude_native_turn(native);
+                if contents.len().saturating_add(coalesced.len()) > 1024 {
+                    return Err("native history content limit");
+                }
+                contents.extend(coalesced);
+            } else {
+                if contents.len().saturating_add(native.len()) > 1024 {
+                    return Err("native history content limit");
+                }
+                contents.extend(native.iter().cloned());
             }
-            contents.extend(native.iter().cloned());
         } else if message.role == "user" {
             let blocks = if let Some(text) = message.content.as_str() {
                 vec![json!({"type":"text","text":text})]

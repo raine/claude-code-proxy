@@ -1432,25 +1432,11 @@ fn log_native_request_completed(
 }
 
 fn antigravity_context_error(
-    model: &str,
-    original_model: &str,
-    headers: &http::HeaderMap,
+    _model: &str,
+    _original_model: &str,
+    _headers: &http::HeaderMap,
 ) -> Option<&'static str> {
-    if !model.starts_with("antigravity/") {
-        return None;
-    }
-    let raw_hint = model.to_ascii_lowercase().contains("[1m]")
-        || original_model.to_ascii_lowercase().contains("[1m]");
-    let beta_hint = headers.get_all("anthropic-beta").iter().any(|value| {
-        value.to_str().map_or(true, |value| {
-            value
-                .split(',')
-                .any(|token| token.trim() == "context-1m-2025-08-07")
-        })
-    });
-    (raw_hint || beta_hint).then_some(
-        "Antigravity does not support the 1m context hint; use its conservative 200k client window",
-    )
+    None
 }
 
 async fn dispatch_request(

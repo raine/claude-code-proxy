@@ -741,7 +741,7 @@ pub fn codex_responses_api() -> bool {
 }
 
 pub fn codex_full_lane() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
