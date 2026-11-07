@@ -29,6 +29,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Official Sign in with ChatGPT authentication, models, and isolated proxy
+    Siwc {
+        #[command(subcommand)]
+        command: claude_code_proxy::providers::chatgpt_siwc::cli::Command,
+    },
     /// Print version information
     Version,
     /// Start the proxy server and monitor
@@ -95,6 +100,7 @@ fn main() -> Result<()> {
     });
 
     match commands {
+        Commands::Siwc { command } => claude_code_proxy::providers::chatgpt_siwc::cli::run(command),
         Commands::Version => {
             println!("claude-code-proxy {}", VERSION);
             Ok(())
@@ -328,7 +334,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["siwc", "codex", "kimi", "grok", "opencode", "cursor"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };

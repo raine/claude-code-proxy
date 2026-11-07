@@ -259,3 +259,50 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
     cmd.assert().success().stdout(contains("User: u"));
     Ok(())
 }
+
+#[test]
+fn siwc_cli_uses_separate_storage_and_requires_login() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    for args in [
+        vec!["siwc", "--help"],
+        vec!["siwc", "auth", "login", "--help"],
+        vec!["siwc", "auth", "status"],
+    ] {
+        Command::cargo_bin("claude-code-proxy")?
+            .args(args)
+            .env("CCP_CONFIG_DIR", temp.path())
+            .assert()
+            .success();
+    }
+    let state_path = temp.path().join("siwc/state.json");
+    let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["siwc", "auth", "logout"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .assert()
+        .success();
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+    assert_eq!(before["ext_agent_host_id"], after["ext_agent_host_id"]);
+    assert!(!temp.path().join("codex").exists());
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["siwc", "serve", "--port", "0"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .assert()
+        .failure()
+        .stderr(contains("not signed in"));
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["siwc", "auth", "status", "--profile", "../unsafe"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .assert()
+        .failure()
+        .stderr(contains("Profile label"));
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["serve", "--no-monitor", "--port", "0"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_ALIAS_PROVIDER", "siwc")
+        .env("CCP_BIND_ADDRESS", "0.0.0.0")
+        .assert()
+        .failure()
+        .stderr(contains("loopback"));
+    Ok(())
+}

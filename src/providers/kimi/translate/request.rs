@@ -565,15 +565,11 @@ fn push_assistant_message(out: &mut Vec<KimiMessage>, blocks: &[ContentBlock]) {
 
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => {
-                if !text.is_empty() {
-                    text_parts.push(text.clone());
-                }
+            ContentBlock::Text { text } if !text.is_empty() => {
+                text_parts.push(text.clone());
             }
-            ContentBlock::Thinking { thinking, .. } => {
-                if !thinking.is_empty() {
-                    thinking_parts.push(thinking.clone());
-                }
+            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                thinking_parts.push(thinking.clone());
             }
             ContentBlock::ToolUse { id, name, input } => {
                 let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());

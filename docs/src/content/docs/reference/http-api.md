@@ -37,6 +37,13 @@ Streaming responses use Anthropic SSE events such as `message_start`, `content_b
 
 Unknown models return HTTP 400 with the supported catalog. Missing provider auth returns HTTP 401.
 
+In isolated [SIWC mode](/providers/chatgpt-siwc/), model slugs are validated by the
+official account endpoint. Upstream non-success HTTP statuses and safe error
+codes/parameters are retained. An invalid successful response or incomplete SSE
+stream is a protocol failure. Once downstream SSE has begun, a later failure is
+an error event, not a replacement HTTP status. SIWC sets `x-should-retry: false`
+and does not replay inference automatically.
+
 ## `POST /v1/messages/count_tokens`
 
 Accepts the same basic Anthropic request shape and returns:
@@ -67,6 +74,11 @@ Returns Anthropic-shaped model discovery:
 ```
 
 An optional `limit` query truncates `data` and sets `has_more`. The route does not expose a pagination cursor.
+
+In isolated SIWC mode, this route fetches the selected account's official model
+catalog. SIWC exposes Messages, estimated token counts, models, and liveness;
+Codex/OpenAI-compatible extra routes are disabled even if their general flags
+are enabled. SIWC also enforces loopback CLI access and rejects browser origins.
 
 Claude Code gateway discovery filters IDs according to its own model rules. See [Models and routing](/using/models-and-routing/).
 

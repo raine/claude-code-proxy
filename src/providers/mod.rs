@@ -1,3 +1,4 @@
+pub mod chatgpt_siwc;
 pub mod codex;
 pub mod cursor;
 pub mod grok;

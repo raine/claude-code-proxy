@@ -92,7 +92,7 @@ fn apply_auto_review_model(
     configured_model: Option<&str>,
     original_provider: &str,
 ) -> Option<AutoReviewRoute> {
-    if count_tokens || !is_claude_auto_review_request(body) {
+    if count_tokens || original_provider == "siwc" || !is_claude_auto_review_request(body) {
         return None;
     }
 
@@ -137,6 +137,11 @@ pub async fn bind_proxy_listener(bind_address: &str, port: u16) -> anyhow::Resul
         .parse::<std::net::IpAddr>()
         .map_err(|err| anyhow::anyhow!("invalid proxy bind address {bind_address:?}: {err}"))?;
     let addr = std::net::SocketAddr::new(ip, port);
+    if crate::config::alias_provider() == crate::config::AliasProvider::Siwc
+        && !ip.to_canonical().is_loopback()
+    {
+        anyhow::bail!("SIWC proxy must listen on a loopback address");
+    }
     TcpListener::bind(addr)
         .await
         .map_err(|err| anyhow::anyhow!("failed to bind proxy listener on {addr}: {err}"))
@@ -148,6 +153,11 @@ pub async fn serve_listener(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
+    if crate::config::alias_provider() == crate::config::AliasProvider::Siwc
+        && !local_addr.ip().to_canonical().is_loopback()
+    {
+        anyhow::bail!("SIWC proxy must listen on a loopback address");
+    }
     let port = local_addr.port();
     create_logger("server").info(
         "server listening",
@@ -229,6 +239,12 @@ pub fn app_with_features(
     monitor: Option<MonitorHandle>,
     features: AppFeatures,
 ) -> Router {
+    let siwc = registry.is_siwc();
+    let features = if siwc {
+        AppFeatures::default()
+    } else {
+        features
+    };
     let native_responses = features
         .responses_api
         .then(|| Arc::new(CodexNativeBackend::new()));
@@ -292,7 +308,50 @@ pub fn app_with_features(
     } else {
         router
     };
-    router.fallback(fallback_handler).with_state(state)
+    let router = router.fallback(fallback_handler).with_state(state);
+    if siwc {
+        router.layer(axum::middleware::from_fn(siwc_local_requests))
+    } else {
+        router
+    }
+}
+
+async fn siwc_local_requests(req: Request<Body>, next: axum::middleware::Next) -> Response {
+    let peer_ok = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_none_or(|peer| peer.0.ip().to_canonical().is_loopback());
+    let host_ok = req.headers().get(http::header::HOST).is_none_or(|host| {
+        host.to_str()
+            .ok()
+            .and_then(|host| format!("http://{host}").parse::<url::Url>().ok())
+            .is_some_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+    });
+    if !peer_ok || !host_ok || req.headers().contains_key(http::header::ORIGIN) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "SIWC accepts local CLI connections only",
+        );
+    }
+    if req.method() == http::Method::POST
+        && !req
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
+            })
+    {
+        return json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "SIWC requests require application/json",
+        );
+    }
+    next.run(req).await
 }
 
 #[derive(Clone)]
@@ -356,7 +415,13 @@ struct ModelsQuery {
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
-) -> Json<serde_json::Value> {
+) -> Response {
+    if state.registry.is_siwc()
+        && let Some(provider) = state.registry.provider("siwc")
+        && let Some(response) = provider.model_catalog(query.limit).await
+    {
+        return response;
+    }
     let mut data: Vec<Value> = state
         .registry
         .all_supported_models()
@@ -381,6 +446,7 @@ async fn handler_models(
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
     }))
+    .into_response()
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -1828,7 +1894,8 @@ async fn dispatch_request(
         },
     );
     let status = response.status();
-    if status.is_success() {
+    if status.is_success() || provider.name() == "siwc" {
+        // Upstream diagnostics may echo project content; SIWC never writes them to logs.
         return monitor_response_body(response, request_guard);
     }
 
@@ -1893,21 +1960,32 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
         .extensions()
         .get::<NativeResponseOutcome>()
         .cloned();
+    let siwc_outcome = response
+        .extensions()
+        .get::<crate::providers::chatgpt_siwc::StreamOutcome>()
+        .cloned();
     let (mut parts, body) = response.into_parts();
     // Stamped on the parts before the body is streamed, so a streaming SSE
     // response carries the header too.
     stamp_request_id(&mut parts.headers, &guard.req_id);
     let stream = futures_util::stream::unfold(
-        (body, guard, outcome),
-        move |(mut body, mut guard, outcome)| async move {
+        (body, guard, outcome, siwc_outcome),
+        move |(mut body, mut guard, outcome, siwc_outcome)| async move {
             match body.frame().await {
-                Some(Ok(frame)) => Some((Ok(frame), (body, guard, outcome))),
+                Some(Ok(frame)) => Some((Ok(frame), (body, guard, outcome, siwc_outcome))),
                 Some(Err(err)) => {
                     guard.failed(status, err.to_string());
-                    Some((Err(err), (body, guard, outcome)))
+                    Some((Err(err), (body, guard, outcome, siwc_outcome)))
                 }
                 None => {
-                    if let Some(message) = outcome.as_ref().and_then(NativeResponseOutcome::failure)
+                    if let Some(message) = outcome
+                        .as_ref()
+                        .and_then(NativeResponseOutcome::failure)
+                        .or_else(|| {
+                            siwc_outcome
+                                .as_ref()
+                                .and_then(crate::providers::chatgpt_siwc::StreamOutcome::failure)
+                        })
                     {
                         guard.failed(status, message);
                     } else if status.is_success() {

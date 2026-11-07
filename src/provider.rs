@@ -42,6 +42,11 @@ pub trait Provider: Send + Sync {
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
+    /// Account-specific catalog, when the provider supports discovery.
+    async fn model_catalog(&self, _limit: Option<usize>) -> Option<Response> {
+        None
+    }
+
     async fn generate_anthropic_stream(
         &self,
         _body: MessagesRequest,

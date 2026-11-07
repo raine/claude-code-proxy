@@ -92,6 +92,7 @@ pub(crate) fn record_session_request_with_affinity_update(
         && !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
     {
         next.affinity_provider = Some(match provider_name {
+            "siwc" => AliasProvider::Siwc,
             "codex" => AliasProvider::Codex,
             "kimi" => AliasProvider::Kimi,
             _ => next.affinity_provider.unwrap_or(AliasProvider::Codex),
@@ -115,7 +116,7 @@ pub(crate) fn record_session_request_with_affinity_update(
 }
 
 fn is_alias_routable_provider(name: &str) -> bool {
-    matches!(name, "codex" | "kimi")
+    matches!(name, "codex" | "kimi" | "siwc")
 }
 
 #[cfg(test)]
