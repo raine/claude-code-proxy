@@ -1,0 +1,554 @@
+{
+  "vectors": [
+    {
+      "name": "client-name-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiOTIyMzM3MjAzNjg1NDc3NTgwNyIsInRob3VnaHRfZGlzcGxheSI6Im9taXR0ZWQiLCJjb250ZW50cyI6W3sicm9sZSI6Im1vZGVsIiwicGFydHMiOlt7InRob3VnaHQiOnRydWUsInRleHQiOiJHZW51aW5lIHN5bnRoZXRpYyBuYXRpdmUgdGhvdWdodCDpm6oiLCJ0aG91Z2h0U2lnbmF0dXJlIjoicmF3LXRob3VnaHQifSx7ImZ1bmN0aW9uQ2FsbCI6eyJuYW1lIjoibmF0aXZlX3JlYWRfYWxpYXMiLCJpZCI6InJldXNlZC1uYXRpdmUtaWQiLCJhcmdzIjp7ImZpbGVfcGF0aCI6IlwiL2ZpeHR1cmUvcmVhZC50eHRcIiIsIm9mZnNldCI6MS4wfX0sInRob3VnaHRTaWduYXR1cmUiOiJyYXctY2FsbCJ9XX1dLCJ0b29sX21hcHBpbmciOlt7ImxvY2FsX2lkIjoidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwiY2FsbGVyX25hbWUiOiJSZWFkIiwiY29udGVudF9pbmRleCI6MCwicGFydF9pbmRleCI6MSwibmF0aXZlX2lkX3ByZXNlbnQiOnRydWUsImNvZGVjX3BhdGhzIjpbIi9maWxlX3BhdGgiXSwicm9vdF93cmFwcGVyIjpudWxsLCJuYXRpdmVfaWQiOiJyZXVzZWQtbmF0aXZlLWlkIn1dLCJwcm9qZWN0aW9uX2RpZ2VzdCI6ImI0ZDA3MTdhNzhmMzRhMjE5MWVkMWNiOWRiZmUwNjNkMGFkOWU0ZTQxMWRiNTUwYWUwYjdiNzkyNDAzMTZiNzYifQ"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Other",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "client-id-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiOTIyMzM3MjAzNjg1NDc3NTgwNyIsInRob3VnaHRfZGlzcGxheSI6Im9taXR0ZWQiLCJjb250ZW50cyI6W3sicm9sZSI6Im1vZGVsIiwicGFydHMiOlt7InRob3VnaHQiOnRydWUsInRleHQiOiJHZW51aW5lIHN5bnRoZXRpYyBuYXRpdmUgdGhvdWdodCDpm6oiLCJ0aG91Z2h0U2lnbmF0dXJlIjoicmF3LXRob3VnaHQifSx7ImZ1bmN0aW9uQ2FsbCI6eyJuYW1lIjoibmF0aXZlX3JlYWRfYWxpYXMiLCJpZCI6InJldXNlZC1uYXRpdmUtaWQiLCJhcmdzIjp7ImZpbGVfcGF0aCI6IlwiL2ZpeHR1cmUvcmVhZC50eHRcIiIsIm9mZnNldCI6MS4wfX0sInRob3VnaHRTaWduYXR1cmUiOiJyYXctY2FsbCJ9XX1dLCJ0b29sX21hcHBpbmciOlt7ImxvY2FsX2lkIjoidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwiY2FsbGVyX25hbWUiOiJSZWFkIiwiY29udGVudF9pbmRleCI6MCwicGFydF9pbmRleCI6MSwibmF0aXZlX2lkX3ByZXNlbnQiOnRydWUsImNvZGVjX3BhdGhzIjpbIi9maWxlX3BhdGgiXSwicm9vdF93cmFwcGVyIjpudWxsLCJuYXRpdmVfaWQiOiJyZXVzZWQtbmF0aXZlLWlkIn1dLCJwcm9qZWN0aW9uX2RpZ2VzdCI6ImI0ZDA3MTdhNzhmMzRhMjE5MWVkMWNiOWRiZmUwNjNkMGFkOWU0ZTQxMWRiNTUwYWUwYjdiNzkyNDAzMTZiNzYifQ"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_changed",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "client-input-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiOTIyMzM3MjAzNjg1NDc3NTgwNyIsInRob3VnaHRfZGlzcGxheSI6Im9taXR0ZWQiLCJjb250ZW50cyI6W3sicm9sZSI6Im1vZGVsIiwicGFydHMiOlt7InRob3VnaHQiOnRydWUsInRleHQiOiJHZW51aW5lIHN5bnRoZXRpYyBuYXRpdmUgdGhvdWdodCDpm6oiLCJ0aG91Z2h0U2lnbmF0dXJlIjoicmF3LXRob3VnaHQifSx7ImZ1bmN0aW9uQ2FsbCI6eyJuYW1lIjoibmF0aXZlX3JlYWRfYWxpYXMiLCJpZCI6InJldXNlZC1uYXRpdmUtaWQiLCJhcmdzIjp7ImZpbGVfcGF0aCI6IlwiL2ZpeHR1cmUvcmVhZC50eHRcIiIsIm9mZnNldCI6MS4wfX0sInRob3VnaHRTaWduYXR1cmUiOiJyYXctY2FsbCJ9XX1dLCJ0b29sX21hcHBpbmciOlt7ImxvY2FsX2lkIjoidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwiY2FsbGVyX25hbWUiOiJSZWFkIiwiY29udGVudF9pbmRleCI6MCwicGFydF9pbmRleCI6MSwibmF0aXZlX2lkX3ByZXNlbnQiOnRydWUsImNvZGVjX3BhdGhzIjpbIi9maWxlX3BhdGgiXSwicm9vdF93cmFwcGVyIjpudWxsLCJuYXRpdmVfaWQiOiJyZXVzZWQtbmF0aXZlLWlkIn1dLCJwcm9qZWN0aW9uX2RpZ2VzdCI6ImI0ZDA3MTdhNzhmMzRhMjE5MWVkMWNiOWRiZmUwNjNkMGFkOWU0ZTQxMWRiNTUwYWUwYjdiNzkyNDAzMTZiNzYifQ"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/changed.txt",
+              "offset": 1
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "session-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjogMSwgInByb2ZpbGVfaWQiOiAic3ludGhldGljLXByb2ZpbGUiLCAicHJvamVjdF9pZCI6ICJzeW50aGV0aWMtcHJvamVjdCIsICJuYXRpdmVfbW9kZWwiOiAiZ2VtaW5pLTQtYXJnb24tbG93IiwgInNlc3Npb25faWQiOiAiOCIsICJ0aG91Z2h0X2Rpc3BsYXkiOiAib21pdHRlZCIsICJjb250ZW50cyI6IFt7InJvbGUiOiAibW9kZWwiLCAicGFydHMiOiBbeyJ0aG91Z2h0IjogdHJ1ZSwgInRleHQiOiAiR2VudWluZSBzeW50aGV0aWMgbmF0aXZlIHRob3VnaHQgXHU5NmVhIiwgInRob3VnaHRTaWduYXR1cmUiOiAicmF3LXRob3VnaHQifSwgeyJmdW5jdGlvbkNhbGwiOiB7Im5hbWUiOiAibmF0aXZlX3JlYWRfYWxpYXMiLCAiaWQiOiAicmV1c2VkLW5hdGl2ZS1pZCIsICJhcmdzIjogeyJmaWxlX3BhdGgiOiAiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwgIm9mZnNldCI6IDEuMH19LCAidGhvdWdodFNpZ25hdHVyZSI6ICJyYXctY2FsbCJ9XX1dLCAidG9vbF9tYXBwaW5nIjogW3sibG9jYWxfaWQiOiAidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwgImNhbGxlcl9uYW1lIjogIlJlYWQiLCAiY29udGVudF9pbmRleCI6IDAsICJwYXJ0X2luZGV4IjogMSwgIm5hdGl2ZV9pZF9wcmVzZW50IjogdHJ1ZSwgImNvZGVjX3BhdGhzIjogWyIvZmlsZV9wYXRoIl0sICJyb290X3dyYXBwZXIiOiBudWxsLCAibmF0aXZlX2lkIjogInJldXNlZC1uYXRpdmUtaWQifV0sICJwcm9qZWN0aW9uX2RpZ2VzdCI6ICJiNGQwNzE3YTc4ZjM0YTIxOTFlZDFjYjlkYmZlMDYzZDBhZDllNGU0MTFkYjU1MGFlMGI3Yjc5MjQwMzE2Yjc2In0"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "display-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjogMSwgInByb2ZpbGVfaWQiOiAic3ludGhldGljLXByb2ZpbGUiLCAicHJvamVjdF9pZCI6ICJzeW50aGV0aWMtcHJvamVjdCIsICJuYXRpdmVfbW9kZWwiOiAiZ2VtaW5pLTQtYXJnb24tbG93IiwgInNlc3Npb25faWQiOiAiOTIyMzM3MjAzNjg1NDc3NTgwNyIsICJ0aG91Z2h0X2Rpc3BsYXkiOiAiZnVsbCIsICJjb250ZW50cyI6IFt7InJvbGUiOiAibW9kZWwiLCAicGFydHMiOiBbeyJ0aG91Z2h0IjogdHJ1ZSwgInRleHQiOiAiR2VudWluZSBzeW50aGV0aWMgbmF0aXZlIHRob3VnaHQgXHU5NmVhIiwgInRob3VnaHRTaWduYXR1cmUiOiAicmF3LXRob3VnaHQifSwgeyJmdW5jdGlvbkNhbGwiOiB7Im5hbWUiOiAibmF0aXZlX3JlYWRfYWxpYXMiLCAiaWQiOiAicmV1c2VkLW5hdGl2ZS1pZCIsICJhcmdzIjogeyJmaWxlX3BhdGgiOiAiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwgIm9mZnNldCI6IDEuMH19LCAidGhvdWdodFNpZ25hdHVyZSI6ICJyYXctY2FsbCJ9XX1dLCAidG9vbF9tYXBwaW5nIjogW3sibG9jYWxfaWQiOiAidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwgImNhbGxlcl9uYW1lIjogIlJlYWQiLCAiY29udGVudF9pbmRleCI6IDAsICJwYXJ0X2luZGV4IjogMSwgIm5hdGl2ZV9pZF9wcmVzZW50IjogdHJ1ZSwgImNvZGVjX3BhdGhzIjogWyIvZmlsZV9wYXRoIl0sICJyb290X3dyYXBwZXIiOiBudWxsLCAibmF0aXZlX2lkIjogInJldXNlZC1uYXRpdmUtaWQifV0sICJwcm9qZWN0aW9uX2RpZ2VzdCI6ICJiNGQwNzE3YTc4ZjM0YTIxOTFlZDFjYjlkYmZlMDYzZDBhZDllNGU0MTFkYjU1MGFlMGI3Yjc5MjQwMzE2Yjc2In0"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "mapping-caller-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjogMSwgInByb2ZpbGVfaWQiOiAic3ludGhldGljLXByb2ZpbGUiLCAicHJvamVjdF9pZCI6ICJzeW50aGV0aWMtcHJvamVjdCIsICJuYXRpdmVfbW9kZWwiOiAiZ2VtaW5pLTQtYXJnb24tbG93IiwgInNlc3Npb25faWQiOiAiOTIyMzM3MjAzNjg1NDc3NTgwNyIsICJ0aG91Z2h0X2Rpc3BsYXkiOiAib21pdHRlZCIsICJjb250ZW50cyI6IFt7InJvbGUiOiAibW9kZWwiLCAicGFydHMiOiBbeyJ0aG91Z2h0IjogdHJ1ZSwgInRleHQiOiAiR2VudWluZSBzeW50aGV0aWMgbmF0aXZlIHRob3VnaHQgXHU5NmVhIiwgInRob3VnaHRTaWduYXR1cmUiOiAicmF3LXRob3VnaHQifSwgeyJmdW5jdGlvbkNhbGwiOiB7Im5hbWUiOiAibmF0aXZlX3JlYWRfYWxpYXMiLCAiaWQiOiAicmV1c2VkLW5hdGl2ZS1pZCIsICJhcmdzIjogeyJmaWxlX3BhdGgiOiAiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwgIm9mZnNldCI6IDEuMH19LCAidGhvdWdodFNpZ25hdHVyZSI6ICJyYXctY2FsbCJ9XX1dLCAidG9vbF9tYXBwaW5nIjogW3sibG9jYWxfaWQiOiAidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwgImNhbGxlcl9uYW1lIjogIk90aGVyIiwgImNvbnRlbnRfaW5kZXgiOiAwLCAicGFydF9pbmRleCI6IDEsICJuYXRpdmVfaWRfcHJlc2VudCI6IHRydWUsICJjb2RlY19wYXRocyI6IFsiL2ZpbGVfcGF0aCJdLCAicm9vdF93cmFwcGVyIjogbnVsbCwgIm5hdGl2ZV9pZCI6ICJyZXVzZWQtbmF0aXZlLWlkIn1dLCAicHJvamVjdGlvbl9kaWdlc3QiOiAiYjRkMDcxN2E3OGYzNGEyMTkxZWQxY2I5ZGJmZTA2M2QwYWQ5ZTRlNDExZGI1NTBhZTBiN2I3OTI0MDMxNmI3NiJ9"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "mapping-local-id-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjogMSwgInByb2ZpbGVfaWQiOiAic3ludGhldGljLXByb2ZpbGUiLCAicHJvamVjdF9pZCI6ICJzeW50aGV0aWMtcHJvamVjdCIsICJuYXRpdmVfbW9kZWwiOiAiZ2VtaW5pLTQtYXJnb24tbG93IiwgInNlc3Npb25faWQiOiAiOTIyMzM3MjAzNjg1NDc3NTgwNyIsICJ0aG91Z2h0X2Rpc3BsYXkiOiAib21pdHRlZCIsICJjb250ZW50cyI6IFt7InJvbGUiOiAibW9kZWwiLCAicGFydHMiOiBbeyJ0aG91Z2h0IjogdHJ1ZSwgInRleHQiOiAiR2VudWluZSBzeW50aGV0aWMgbmF0aXZlIHRob3VnaHQgXHU5NmVhIiwgInRob3VnaHRTaWduYXR1cmUiOiAicmF3LXRob3VnaHQifSwgeyJmdW5jdGlvbkNhbGwiOiB7Im5hbWUiOiAibmF0aXZlX3JlYWRfYWxpYXMiLCAiaWQiOiAicmV1c2VkLW5hdGl2ZS1pZCIsICJhcmdzIjogeyJmaWxlX3BhdGgiOiAiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwgIm9mZnNldCI6IDEuMH19LCAidGhvdWdodFNpZ25hdHVyZSI6ICJyYXctY2FsbCJ9XX1dLCAidG9vbF9tYXBwaW5nIjogW3sibG9jYWxfaWQiOiAidG9vbHVfY2hhbmdlZCIsICJjYWxsZXJfbmFtZSI6ICJSZWFkIiwgImNvbnRlbnRfaW5kZXgiOiAwLCAicGFydF9pbmRleCI6IDEsICJuYXRpdmVfaWRfcHJlc2VudCI6IHRydWUsICJjb2RlY19wYXRocyI6IFsiL2ZpbGVfcGF0aCJdLCAicm9vdF93cmFwcGVyIjogbnVsbCwgIm5hdGl2ZV9pZCI6ICJyZXVzZWQtbmF0aXZlLWlkIn1dLCAicHJvamVjdGlvbl9kaWdlc3QiOiAiYjRkMDcxN2E3OGYzNGEyMTkxZWQxY2I5ZGJmZTA2M2QwYWQ5ZTRlNDExZGI1NTBhZTBiN2I3OTI0MDMxNmI3NiJ9"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "mapping-codec-path-tamper",
+      "operation": "decode_turn",
+      "input": {
+        "blocks": [
+          {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjogMSwgInByb2ZpbGVfaWQiOiAic3ludGhldGljLXByb2ZpbGUiLCAicHJvamVjdF9pZCI6ICJzeW50aGV0aWMtcHJvamVjdCIsICJuYXRpdmVfbW9kZWwiOiAiZ2VtaW5pLTQtYXJnb24tbG93IiwgInNlc3Npb25faWQiOiAiOTIyMzM3MjAzNjg1NDc3NTgwNyIsICJ0aG91Z2h0X2Rpc3BsYXkiOiAib21pdHRlZCIsICJjb250ZW50cyI6IFt7InJvbGUiOiAibW9kZWwiLCAicGFydHMiOiBbeyJ0aG91Z2h0IjogdHJ1ZSwgInRleHQiOiAiR2VudWluZSBzeW50aGV0aWMgbmF0aXZlIHRob3VnaHQgXHU5NmVhIiwgInRob3VnaHRTaWduYXR1cmUiOiAicmF3LXRob3VnaHQifSwgeyJmdW5jdGlvbkNhbGwiOiB7Im5hbWUiOiAibmF0aXZlX3JlYWRfYWxpYXMiLCAiaWQiOiAicmV1c2VkLW5hdGl2ZS1pZCIsICJhcmdzIjogeyJmaWxlX3BhdGgiOiAiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwgIm9mZnNldCI6IDEuMH19LCAidGhvdWdodFNpZ25hdHVyZSI6ICJyYXctY2FsbCJ9XX1dLCAidG9vbF9tYXBwaW5nIjogW3sibG9jYWxfaWQiOiAidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwgImNhbGxlcl9uYW1lIjogIlJlYWQiLCAiY29udGVudF9pbmRleCI6IDAsICJwYXJ0X2luZGV4IjogMSwgIm5hdGl2ZV9pZF9wcmVzZW50IjogdHJ1ZSwgImNvZGVjX3BhdGhzIjogW10sICJyb290X3dyYXBwZXIiOiBudWxsLCAibmF0aXZlX2lkIjogInJldXNlZC1uYXRpdmUtaWQifV0sICJwcm9qZWN0aW9uX2RpZ2VzdCI6ICJiNGQwNzE3YTc4ZjM0YTIxOTFlZDFjYjlkYmZlMDYzZDBhZDllNGU0MTFkYjU1MGFlMGI3Yjc5MjQwMzE2Yjc2In0"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_golden_leaf_omitted_i64_max",
+            "name": "Read",
+            "input": {
+              "file_path": "/fixture/read.txt",
+              "offset": 1.0
+            }
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "projection digest mismatch"
+    },
+    {
+      "name": "conflicting-session-history",
+      "operation": "decode_history",
+      "input": {
+        "turns": [
+          [
+            {
+              "type": "thinking",
+              "thinking": "",
+              "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiOTIyMzM3MjAzNjg1NDc3NTgwNyIsInRob3VnaHRfZGlzcGxheSI6Im9taXR0ZWQiLCJjb250ZW50cyI6W3sicm9sZSI6Im1vZGVsIiwicGFydHMiOlt7InRob3VnaHQiOnRydWUsInRleHQiOiJHZW51aW5lIHN5bnRoZXRpYyBuYXRpdmUgdGhvdWdodCDpm6oiLCJ0aG91Z2h0U2lnbmF0dXJlIjoicmF3LXRob3VnaHQifSx7ImZ1bmN0aW9uQ2FsbCI6eyJuYW1lIjoibmF0aXZlX3JlYWRfYWxpYXMiLCJpZCI6InJldXNlZC1uYXRpdmUtaWQiLCJhcmdzIjp7ImZpbGVfcGF0aCI6IlwiL2ZpeHR1cmUvcmVhZC50eHRcIiIsIm9mZnNldCI6MS4wfX0sInRob3VnaHRTaWduYXR1cmUiOiJyYXctY2FsbCJ9XX1dLCJ0b29sX21hcHBpbmciOlt7ImxvY2FsX2lkIjoidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwiY2FsbGVyX25hbWUiOiJSZWFkIiwiY29udGVudF9pbmRleCI6MCwicGFydF9pbmRleCI6MSwibmF0aXZlX2lkX3ByZXNlbnQiOnRydWUsImNvZGVjX3BhdGhzIjpbIi9maWxlX3BhdGgiXSwicm9vdF93cmFwcGVyIjpudWxsLCJuYXRpdmVfaWQiOiJyZXVzZWQtbmF0aXZlLWlkIn1dLCJwcm9qZWN0aW9uX2RpZ2VzdCI6ImI0ZDA3MTdhNzhmMzRhMjE5MWVkMWNiOWRiZmUwNjNkMGFkOWU0ZTQxMWRiNTUwYWUwYjdiNzkyNDAzMTZiNzYifQ"
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_golden_leaf_omitted_i64_max",
+              "name": "Read",
+              "input": {
+                "file_path": "/fixture/read.txt",
+                "offset": 1.0
+              }
+            }
+          ],
+          [
+            {
+              "type": "thinking",
+              "thinking": "Genuine synthetic native thought 雪",
+              "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiLTM3IiwidGhvdWdodF9kaXNwbGF5IjoiZnVsbCIsImNvbnRlbnRzIjpbeyJyb2xlIjoibW9kZWwiLCJwYXJ0cyI6W3sidGhvdWdodCI6dHJ1ZSwidGV4dCI6IkdlbnVpbmUgc3ludGhldGljIG5hdGl2ZSB0aG91Z2h0IOmbqiIsInRob3VnaHRTaWduYXR1cmUiOiJyYXctdGhvdWdodCJ9LHsiZnVuY3Rpb25DYWxsIjp7Im5hbWUiOiJuYXRpdmVfcmVhZF9hbGlhcyIsImlkIjoicmV1c2VkLW5hdGl2ZS1pZCIsImFyZ3MiOnsiZmlsZV9wYXRoIjoiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwib2Zmc2V0IjoxLjB9fSwidGhvdWdodFNpZ25hdHVyZSI6InJhdy1jYWxsIn1dfV0sInRvb2xfbWFwcGluZyI6W3sibG9jYWxfaWQiOiJ0b29sdV9nb2xkZW5fbGVhZl9mdWxsX25lZ2F0aXZlX3Nlc3Npb24iLCJjYWxsZXJfbmFtZSI6IlJlYWQiLCJjb250ZW50X2luZGV4IjowLCJwYXJ0X2luZGV4IjoxLCJuYXRpdmVfaWRfcHJlc2VudCI6dHJ1ZSwiY29kZWNfcGF0aHMiOlsiL2ZpbGVfcGF0aCJdLCJyb290X3dyYXBwZXIiOm51bGwsIm5hdGl2ZV9pZCI6InJldXNlZC1uYXRpdmUtaWQifV0sInByb2plY3Rpb25fZGlnZXN0IjoiYTg1OTFiYTAwNjk5OWVkMmJhMTZjNjE5YTdiNzZlMzc5OTJlZWM5YmEwMDQzNDMxOWQ4YTliMTJiNmI3N2RlMSJ9"
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_golden_leaf_full_negative_session",
+              "name": "Read",
+              "input": {
+                "file_path": "/fixture/read.txt",
+                "offset": 1.0
+              }
+            }
+          ]
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        }
+      },
+      "expected_error": "conflicting session IDs in history"
+    },
+    {
+      "name": "malformed-json",
+      "operation": "project_turn",
+      "input": {
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "file_path": "not-json",
+                    "offset": 1
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        },
+        "session_id": "1",
+        "thought_display": "omitted",
+        "tool_projections": [
+          {
+            "caller_name": "Read",
+            "codec_paths": [
+              "/file_path"
+            ],
+            "root_wrapper": null
+          }
+        ]
+      },
+      "expected_error": "invalid codec JSON",
+      "emitted_tool_use": false
+    },
+    {
+      "name": "root-not-object",
+      "operation": "project_turn",
+      "input": {
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "json": "[]"
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        },
+        "session_id": "1",
+        "thought_display": "omitted",
+        "tool_projections": [
+          {
+            "caller_name": "Read",
+            "codec_paths": [],
+            "root_wrapper": "json"
+          }
+        ]
+      },
+      "expected_error": "root codec must decode an object",
+      "emitted_tool_use": false
+    },
+    {
+      "name": "root-extra-key",
+      "operation": "project_turn",
+      "input": {
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "json": "{}",
+                    "extra": 1
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        },
+        "session_id": "1",
+        "thought_display": "omitted",
+        "tool_projections": [
+          {
+            "caller_name": "Read",
+            "codec_paths": [],
+            "root_wrapper": "json"
+          }
+        ]
+      },
+      "expected_error": "root wrapper requires exactly one named key",
+      "emitted_tool_use": false
+    },
+    {
+      "name": "duplicate-path",
+      "operation": "project_turn",
+      "input": {
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "file_path": "\"/fixture/read.txt\""
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        },
+        "session_id": "1",
+        "thought_display": "omitted",
+        "tool_projections": [
+          {
+            "caller_name": "Read",
+            "codec_paths": [
+              "/file_path",
+              "/file_path"
+            ],
+            "root_wrapper": null
+          }
+        ]
+      },
+      "expected_error": "duplicate/overlapping codec paths",
+      "emitted_tool_use": false
+    },
+    {
+      "name": "overlapping-path",
+      "operation": "project_turn",
+      "input": {
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "payload": {
+                      "x": "1"
+                    }
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        },
+        "session_id": "1",
+        "thought_display": "omitted",
+        "tool_projections": [
+          {
+            "caller_name": "Read",
+            "codec_paths": [
+              "/payload",
+              "/payload/x"
+            ],
+            "root_wrapper": null
+          }
+        ]
+      },
+      "expected_error": "duplicate/overlapping codec paths",
+      "emitted_tool_use": false
+    },
+    {
+      "name": "out-of-range-path",
+      "operation": "project_turn",
+      "input": {
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "array": [
+                      "1"
+                    ]
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "binding": {
+          "profile_id": "synthetic-profile",
+          "project_id": "synthetic-project",
+          "native_model": "gemini-4-argon-low"
+        },
+        "session_id": "1",
+        "thought_display": "omitted",
+        "tool_projections": [
+          {
+            "caller_name": "Read",
+            "codec_paths": [
+              "/array/2"
+            ],
+            "root_wrapper": null
+          }
+        ]
+      },
+      "expected_error": "codec path array index out of range",
+      "emitted_tool_use": false
+    }
+  ]
+}

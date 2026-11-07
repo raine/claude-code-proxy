@@ -1,0 +1,527 @@
+{
+  "format": "FINAL ccp:antigravity:v1 after reviewed codec contract; supersedes pre-freeze draft-v1 fixtures",
+  "contains": "Only synthetic native contents/projections; no CLI system prompts or complete tool descriptions",
+  "vectors": [
+    {
+      "name": "leaf-omitted-i64-max",
+      "binding": {
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low"
+      },
+      "native_contents": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "thought": true,
+              "text": "Genuine synthetic native thought 雪",
+              "thoughtSignature": "raw-thought"
+            },
+            {
+              "functionCall": {
+                "name": "native_read_alias",
+                "id": "reused-native-id",
+                "args": {
+                  "file_path": "\"/fixture/read.txt\"",
+                  "offset": 1.0
+                }
+              },
+              "thoughtSignature": "raw-call"
+            }
+          ]
+        }
+      ],
+      "session_id": "9223372036854775807",
+      "thought_display": "omitted",
+      "tool_projections": [
+        {
+          "caller_name": "Read",
+          "codec_paths": [
+            "/file_path"
+          ],
+          "root_wrapper": null,
+          "local_id": "toolu_golden_leaf_omitted_i64_max"
+        }
+      ],
+      "projected_blocks": [
+        {
+          "type": "thinking",
+          "thinking": "",
+          "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiOTIyMzM3MjAzNjg1NDc3NTgwNyIsInRob3VnaHRfZGlzcGxheSI6Im9taXR0ZWQiLCJjb250ZW50cyI6W3sicm9sZSI6Im1vZGVsIiwicGFydHMiOlt7InRob3VnaHQiOnRydWUsInRleHQiOiJHZW51aW5lIHN5bnRoZXRpYyBuYXRpdmUgdGhvdWdodCDpm6oiLCJ0aG91Z2h0U2lnbmF0dXJlIjoicmF3LXRob3VnaHQifSx7ImZ1bmN0aW9uQ2FsbCI6eyJuYW1lIjoibmF0aXZlX3JlYWRfYWxpYXMiLCJpZCI6InJldXNlZC1uYXRpdmUtaWQiLCJhcmdzIjp7ImZpbGVfcGF0aCI6IlwiL2ZpeHR1cmUvcmVhZC50eHRcIiIsIm9mZnNldCI6MS4wfX0sInRob3VnaHRTaWduYXR1cmUiOiJyYXctY2FsbCJ9XX1dLCJ0b29sX21hcHBpbmciOlt7ImxvY2FsX2lkIjoidG9vbHVfZ29sZGVuX2xlYWZfb21pdHRlZF9pNjRfbWF4IiwiY2FsbGVyX25hbWUiOiJSZWFkIiwiY29udGVudF9pbmRleCI6MCwicGFydF9pbmRleCI6MSwibmF0aXZlX2lkX3ByZXNlbnQiOnRydWUsImNvZGVjX3BhdGhzIjpbIi9maWxlX3BhdGgiXSwicm9vdF93cmFwcGVyIjpudWxsLCJuYXRpdmVfaWQiOiJyZXVzZWQtbmF0aXZlLWlkIn1dLCJwcm9qZWN0aW9uX2RpZ2VzdCI6ImI0ZDA3MTdhNzhmMzRhMjE5MWVkMWNiOWRiZmUwNjNkMGFkOWU0ZTQxMWRiNTUwYWUwYjdiNzkyNDAzMTZiNzYifQ"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_golden_leaf_omitted_i64_max",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/read.txt",
+            "offset": 1.0
+          }
+        }
+      ],
+      "envelope": {
+        "version": 1,
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low",
+        "session_id": "9223372036854775807",
+        "thought_display": "omitted",
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "file_path": "\"/fixture/read.txt\"",
+                    "offset": 1.0
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "tool_mapping": [
+          {
+            "local_id": "toolu_golden_leaf_omitted_i64_max",
+            "caller_name": "Read",
+            "content_index": 0,
+            "part_index": 1,
+            "native_id_present": true,
+            "codec_paths": [
+              "/file_path"
+            ],
+            "root_wrapper": null,
+            "native_id": "reused-native-id"
+          }
+        ],
+        "projection_digest": "b4d0717a78f34a2191ed1cb9dbfe063d0ad9e4e411db550ae0b7b79240316b76"
+      },
+      "canonical_digest_input_utf8": "[\"object\",[[\"binding\",[\"object\",[[\"native_model\",[\"string\",\"gemini-4-argon-low\"]],[\"profile_id\",[\"string\",\"synthetic-profile\"]],[\"project_id\",[\"string\",\"synthetic-project\"]],[\"session_id\",[\"string\",\"9223372036854775807\"]],[\"thought_display\",[\"string\",\"omitted\"]],[\"tool_mapping\",[\"array\",[[\"object\",[[\"caller_name\",[\"string\",\"Read\"]],[\"codec_paths\",[\"array\",[[\"string\",\"/file_path\"]]]],[\"content_index\",[\"number\",\"0000000000000000\"]],[\"local_id\",[\"string\",\"toolu_golden_leaf_omitted_i64_max\"]],[\"native_id\",[\"string\",\"reused-native-id\"]],[\"native_id_present\",[\"bool\",true]],[\"part_index\",[\"number\",\"3ff0000000000000\"]],[\"root_wrapper\",[\"null\"]]]]]]]]]],[\"blocks\",[\"array\",[[\"object\",[[\"thinking\",[\"string\",\"\"]],[\"type\",[\"string\",\"thinking\"]]]],[\"object\",[[\"id\",[\"string\",\"toolu_golden_leaf_omitted_i64_max\"]],[\"input\",[\"object\",[[\"file_path\",[\"string\",\"/fixture/read.txt\"]],[\"offset\",[\"number\",\"3ff0000000000000\"]]]]],[\"name\",[\"string\",\"Read\"]],[\"type\",[\"string\",\"tool_use\"]]]]]]]]]",
+      "canonical_digest_input_hex": "5b226f626a656374222c5b5b2262696e64696e67222c5b226f626a656374222c5b5b226e61746976655f6d6f64656c222c5b22737472696e67222c2267656d696e692d342d6172676f6e2d6c6f77225d5d2c5b2270726f66696c655f6964222c5b22737472696e67222c2273796e7468657469632d70726f66696c65225d5d2c5b2270726f6a6563745f6964222c5b22737472696e67222c2273796e7468657469632d70726f6a656374225d5d2c5b2273657373696f6e5f6964222c5b22737472696e67222c2239323233333732303336383534373735383037225d5d2c5b2274686f756768745f646973706c6179222c5b22737472696e67222c226f6d6974746564225d5d2c5b22746f6f6c5f6d617070696e67222c5b226172726179222c5b5b226f626a656374222c5b5b2263616c6c65725f6e616d65222c5b22737472696e67222c2252656164225d5d2c5b22636f6465635f7061746873222c5b226172726179222c5b5b22737472696e67222c222f66696c655f70617468225d5d5d5d2c5b22636f6e74656e745f696e646578222c5b226e756d626572222c2230303030303030303030303030303030225d5d2c5b226c6f63616c5f6964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f6c6561665f6f6d69747465645f6936345f6d6178225d5d2c5b226e61746976655f6964222c5b22737472696e67222c227265757365642d6e61746976652d6964225d5d2c5b226e61746976655f69645f70726573656e74222c5b22626f6f6c222c747275655d5d2c5b22706172745f696e646578222c5b226e756d626572222c2233666630303030303030303030303030225d5d2c5b22726f6f745f77726170706572222c5b226e756c6c225d5d5d5d5d5d5d5d5d5d2c5b22626c6f636b73222c5b226172726179222c5b5b226f626a656374222c5b5b227468696e6b696e67222c5b22737472696e67222c22225d5d2c5b2274797065222c5b22737472696e67222c227468696e6b696e67225d5d5d5d2c5b226f626a656374222c5b5b226964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f6c6561665f6f6d69747465645f6936345f6d6178225d5d2c5b22696e707574222c5b226f626a656374222c5b5b2266696c655f70617468222c5b22737472696e67222c222f666978747572652f726561642e747874225d5d2c5b226f6666736574222c5b226e756d626572222c2233666630303030303030303030303030225d5d5d5d5d2c5b226e616d65222c5b22737472696e67222c2252656164225d5d2c5b2274797065222c5b22737472696e67222c22746f6f6c5f757365225d5d5d5d5d5d5d5d5d",
+      "sha256": "b4d0717a78f34a2191ed1cb9dbfe063d0ad9e4e411db550ae0b7b79240316b76"
+    },
+    {
+      "name": "leaf-full-negative-session",
+      "binding": {
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low"
+      },
+      "native_contents": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "thought": true,
+              "text": "Genuine synthetic native thought 雪",
+              "thoughtSignature": "raw-thought"
+            },
+            {
+              "functionCall": {
+                "name": "native_read_alias",
+                "id": "reused-native-id",
+                "args": {
+                  "file_path": "\"/fixture/read.txt\"",
+                  "offset": 1.0
+                }
+              },
+              "thoughtSignature": "raw-call"
+            }
+          ]
+        }
+      ],
+      "session_id": "-37",
+      "thought_display": "full",
+      "tool_projections": [
+        {
+          "caller_name": "Read",
+          "codec_paths": [
+            "/file_path"
+          ],
+          "root_wrapper": null,
+          "local_id": "toolu_golden_leaf_full_negative_session"
+        }
+      ],
+      "projected_blocks": [
+        {
+          "type": "thinking",
+          "thinking": "Genuine synthetic native thought 雪",
+          "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiLTM3IiwidGhvdWdodF9kaXNwbGF5IjoiZnVsbCIsImNvbnRlbnRzIjpbeyJyb2xlIjoibW9kZWwiLCJwYXJ0cyI6W3sidGhvdWdodCI6dHJ1ZSwidGV4dCI6IkdlbnVpbmUgc3ludGhldGljIG5hdGl2ZSB0aG91Z2h0IOmbqiIsInRob3VnaHRTaWduYXR1cmUiOiJyYXctdGhvdWdodCJ9LHsiZnVuY3Rpb25DYWxsIjp7Im5hbWUiOiJuYXRpdmVfcmVhZF9hbGlhcyIsImlkIjoicmV1c2VkLW5hdGl2ZS1pZCIsImFyZ3MiOnsiZmlsZV9wYXRoIjoiXCIvZml4dHVyZS9yZWFkLnR4dFwiIiwib2Zmc2V0IjoxLjB9fSwidGhvdWdodFNpZ25hdHVyZSI6InJhdy1jYWxsIn1dfV0sInRvb2xfbWFwcGluZyI6W3sibG9jYWxfaWQiOiJ0b29sdV9nb2xkZW5fbGVhZl9mdWxsX25lZ2F0aXZlX3Nlc3Npb24iLCJjYWxsZXJfbmFtZSI6IlJlYWQiLCJjb250ZW50X2luZGV4IjowLCJwYXJ0X2luZGV4IjoxLCJuYXRpdmVfaWRfcHJlc2VudCI6dHJ1ZSwiY29kZWNfcGF0aHMiOlsiL2ZpbGVfcGF0aCJdLCJyb290X3dyYXBwZXIiOm51bGwsIm5hdGl2ZV9pZCI6InJldXNlZC1uYXRpdmUtaWQifV0sInByb2plY3Rpb25fZGlnZXN0IjoiYTg1OTFiYTAwNjk5OWVkMmJhMTZjNjE5YTdiNzZlMzc5OTJlZWM5YmEwMDQzNDMxOWQ4YTliMTJiNmI3N2RlMSJ9"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_golden_leaf_full_negative_session",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/read.txt",
+            "offset": 1.0
+          }
+        }
+      ],
+      "envelope": {
+        "version": 1,
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low",
+        "session_id": "-37",
+        "thought_display": "full",
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "file_path": "\"/fixture/read.txt\"",
+                    "offset": 1.0
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "tool_mapping": [
+          {
+            "local_id": "toolu_golden_leaf_full_negative_session",
+            "caller_name": "Read",
+            "content_index": 0,
+            "part_index": 1,
+            "native_id_present": true,
+            "codec_paths": [
+              "/file_path"
+            ],
+            "root_wrapper": null,
+            "native_id": "reused-native-id"
+          }
+        ],
+        "projection_digest": "a8591ba006999ed2ba16c619a7b76e37992eec9ba00434319d8a9b12b6b77de1"
+      },
+      "canonical_digest_input_utf8": "[\"object\",[[\"binding\",[\"object\",[[\"native_model\",[\"string\",\"gemini-4-argon-low\"]],[\"profile_id\",[\"string\",\"synthetic-profile\"]],[\"project_id\",[\"string\",\"synthetic-project\"]],[\"session_id\",[\"string\",\"-37\"]],[\"thought_display\",[\"string\",\"full\"]],[\"tool_mapping\",[\"array\",[[\"object\",[[\"caller_name\",[\"string\",\"Read\"]],[\"codec_paths\",[\"array\",[[\"string\",\"/file_path\"]]]],[\"content_index\",[\"number\",\"0000000000000000\"]],[\"local_id\",[\"string\",\"toolu_golden_leaf_full_negative_session\"]],[\"native_id\",[\"string\",\"reused-native-id\"]],[\"native_id_present\",[\"bool\",true]],[\"part_index\",[\"number\",\"3ff0000000000000\"]],[\"root_wrapper\",[\"null\"]]]]]]]]]],[\"blocks\",[\"array\",[[\"object\",[[\"thinking\",[\"string\",\"Genuine synthetic native thought 雪\"]],[\"type\",[\"string\",\"thinking\"]]]],[\"object\",[[\"id\",[\"string\",\"toolu_golden_leaf_full_negative_session\"]],[\"input\",[\"object\",[[\"file_path\",[\"string\",\"/fixture/read.txt\"]],[\"offset\",[\"number\",\"3ff0000000000000\"]]]]],[\"name\",[\"string\",\"Read\"]],[\"type\",[\"string\",\"tool_use\"]]]]]]]]]",
+      "canonical_digest_input_hex": "5b226f626a656374222c5b5b2262696e64696e67222c5b226f626a656374222c5b5b226e61746976655f6d6f64656c222c5b22737472696e67222c2267656d696e692d342d6172676f6e2d6c6f77225d5d2c5b2270726f66696c655f6964222c5b22737472696e67222c2273796e7468657469632d70726f66696c65225d5d2c5b2270726f6a6563745f6964222c5b22737472696e67222c2273796e7468657469632d70726f6a656374225d5d2c5b2273657373696f6e5f6964222c5b22737472696e67222c222d3337225d5d2c5b2274686f756768745f646973706c6179222c5b22737472696e67222c2266756c6c225d5d2c5b22746f6f6c5f6d617070696e67222c5b226172726179222c5b5b226f626a656374222c5b5b2263616c6c65725f6e616d65222c5b22737472696e67222c2252656164225d5d2c5b22636f6465635f7061746873222c5b226172726179222c5b5b22737472696e67222c222f66696c655f70617468225d5d5d5d2c5b22636f6e74656e745f696e646578222c5b226e756d626572222c2230303030303030303030303030303030225d5d2c5b226c6f63616c5f6964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f6c6561665f66756c6c5f6e656761746976655f73657373696f6e225d5d2c5b226e61746976655f6964222c5b22737472696e67222c227265757365642d6e61746976652d6964225d5d2c5b226e61746976655f69645f70726573656e74222c5b22626f6f6c222c747275655d5d2c5b22706172745f696e646578222c5b226e756d626572222c2233666630303030303030303030303030225d5d2c5b22726f6f745f77726170706572222c5b226e756c6c225d5d5d5d5d5d5d5d5d5d2c5b22626c6f636b73222c5b226172726179222c5b5b226f626a656374222c5b5b227468696e6b696e67222c5b22737472696e67222c2247656e75696e652073796e746865746963206e61746976652074686f7567687420e99baa225d5d2c5b2274797065222c5b22737472696e67222c227468696e6b696e67225d5d5d5d2c5b226f626a656374222c5b5b226964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f6c6561665f66756c6c5f6e656761746976655f73657373696f6e225d5d2c5b22696e707574222c5b226f626a656374222c5b5b2266696c655f70617468222c5b22737472696e67222c222f666978747572652f726561642e747874225d5d2c5b226f6666736574222c5b226e756d626572222c2233666630303030303030303030303030225d5d5d5d5d2c5b226e616d65222c5b22737472696e67222c2252656164225d5d2c5b2274797065222c5b22737472696e67222c22746f6f6c5f757365225d5d5d5d5d5d5d5d5d",
+      "sha256": "a8591ba006999ed2ba16c619a7b76e37992eec9ba00434319d8a9b12b6b77de1"
+    },
+    {
+      "name": "root-omitted-i64-min",
+      "binding": {
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low"
+      },
+      "native_contents": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "thought": true,
+              "text": "Genuine synthetic native thought 雪",
+              "thoughtSignature": "raw-thought"
+            },
+            {
+              "functionCall": {
+                "name": "native_read_alias",
+                "id": "reused-native-id",
+                "args": {
+                  "json": "{\"file_path\": \"/fixture/read.txt\", \"offset\": 1.0}"
+                }
+              },
+              "thoughtSignature": "raw-call"
+            }
+          ]
+        }
+      ],
+      "session_id": "-9223372036854775808",
+      "thought_display": "omitted",
+      "tool_projections": [
+        {
+          "caller_name": "Read",
+          "codec_paths": [],
+          "root_wrapper": "json",
+          "local_id": "toolu_golden_root_omitted_i64_min"
+        }
+      ],
+      "projected_blocks": [
+        {
+          "type": "thinking",
+          "thinking": "",
+          "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiLTkyMjMzNzIwMzY4NTQ3NzU4MDgiLCJ0aG91Z2h0X2Rpc3BsYXkiOiJvbWl0dGVkIiwiY29udGVudHMiOlt7InJvbGUiOiJtb2RlbCIsInBhcnRzIjpbeyJ0aG91Z2h0Ijp0cnVlLCJ0ZXh0IjoiR2VudWluZSBzeW50aGV0aWMgbmF0aXZlIHRob3VnaHQg6ZuqIiwidGhvdWdodFNpZ25hdHVyZSI6InJhdy10aG91Z2h0In0seyJmdW5jdGlvbkNhbGwiOnsibmFtZSI6Im5hdGl2ZV9yZWFkX2FsaWFzIiwiaWQiOiJyZXVzZWQtbmF0aXZlLWlkIiwiYXJncyI6eyJqc29uIjoie1wiZmlsZV9wYXRoXCI6IFwiL2ZpeHR1cmUvcmVhZC50eHRcIiwgXCJvZmZzZXRcIjogMS4wfSJ9fSwidGhvdWdodFNpZ25hdHVyZSI6InJhdy1jYWxsIn1dfV0sInRvb2xfbWFwcGluZyI6W3sibG9jYWxfaWQiOiJ0b29sdV9nb2xkZW5fcm9vdF9vbWl0dGVkX2k2NF9taW4iLCJjYWxsZXJfbmFtZSI6IlJlYWQiLCJjb250ZW50X2luZGV4IjowLCJwYXJ0X2luZGV4IjoxLCJuYXRpdmVfaWRfcHJlc2VudCI6dHJ1ZSwiY29kZWNfcGF0aHMiOltdLCJyb290X3dyYXBwZXIiOiJqc29uIiwibmF0aXZlX2lkIjoicmV1c2VkLW5hdGl2ZS1pZCJ9XSwicHJvamVjdGlvbl9kaWdlc3QiOiI5OTQwY2I3YTg1ZWQ5MGQ5MzgxZTYyNTA5ZTY4ZTk0YjczM2VhNTcyNTY5M2JiZmVkOWYzZGI1OWUyODEwNDExIn0"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_golden_root_omitted_i64_min",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/read.txt",
+            "offset": 1.0
+          }
+        }
+      ],
+      "envelope": {
+        "version": 1,
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low",
+        "session_id": "-9223372036854775808",
+        "thought_display": "omitted",
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "Genuine synthetic native thought 雪",
+                "thoughtSignature": "raw-thought"
+              },
+              {
+                "functionCall": {
+                  "name": "native_read_alias",
+                  "id": "reused-native-id",
+                  "args": {
+                    "json": "{\"file_path\": \"/fixture/read.txt\", \"offset\": 1.0}"
+                  }
+                },
+                "thoughtSignature": "raw-call"
+              }
+            ]
+          }
+        ],
+        "tool_mapping": [
+          {
+            "local_id": "toolu_golden_root_omitted_i64_min",
+            "caller_name": "Read",
+            "content_index": 0,
+            "part_index": 1,
+            "native_id_present": true,
+            "codec_paths": [],
+            "root_wrapper": "json",
+            "native_id": "reused-native-id"
+          }
+        ],
+        "projection_digest": "9940cb7a85ed90d9381e62509e68e94b733ea5725693bbfed9f3db59e2810411"
+      },
+      "canonical_digest_input_utf8": "[\"object\",[[\"binding\",[\"object\",[[\"native_model\",[\"string\",\"gemini-4-argon-low\"]],[\"profile_id\",[\"string\",\"synthetic-profile\"]],[\"project_id\",[\"string\",\"synthetic-project\"]],[\"session_id\",[\"string\",\"-9223372036854775808\"]],[\"thought_display\",[\"string\",\"omitted\"]],[\"tool_mapping\",[\"array\",[[\"object\",[[\"caller_name\",[\"string\",\"Read\"]],[\"codec_paths\",[\"array\",[]]],[\"content_index\",[\"number\",\"0000000000000000\"]],[\"local_id\",[\"string\",\"toolu_golden_root_omitted_i64_min\"]],[\"native_id\",[\"string\",\"reused-native-id\"]],[\"native_id_present\",[\"bool\",true]],[\"part_index\",[\"number\",\"3ff0000000000000\"]],[\"root_wrapper\",[\"string\",\"json\"]]]]]]]]]],[\"blocks\",[\"array\",[[\"object\",[[\"thinking\",[\"string\",\"\"]],[\"type\",[\"string\",\"thinking\"]]]],[\"object\",[[\"id\",[\"string\",\"toolu_golden_root_omitted_i64_min\"]],[\"input\",[\"object\",[[\"file_path\",[\"string\",\"/fixture/read.txt\"]],[\"offset\",[\"number\",\"3ff0000000000000\"]]]]],[\"name\",[\"string\",\"Read\"]],[\"type\",[\"string\",\"tool_use\"]]]]]]]]]",
+      "canonical_digest_input_hex": "5b226f626a656374222c5b5b2262696e64696e67222c5b226f626a656374222c5b5b226e61746976655f6d6f64656c222c5b22737472696e67222c2267656d696e692d342d6172676f6e2d6c6f77225d5d2c5b2270726f66696c655f6964222c5b22737472696e67222c2273796e7468657469632d70726f66696c65225d5d2c5b2270726f6a6563745f6964222c5b22737472696e67222c2273796e7468657469632d70726f6a656374225d5d2c5b2273657373696f6e5f6964222c5b22737472696e67222c222d39323233333732303336383534373735383038225d5d2c5b2274686f756768745f646973706c6179222c5b22737472696e67222c226f6d6974746564225d5d2c5b22746f6f6c5f6d617070696e67222c5b226172726179222c5b5b226f626a656374222c5b5b2263616c6c65725f6e616d65222c5b22737472696e67222c2252656164225d5d2c5b22636f6465635f7061746873222c5b226172726179222c5b5d5d5d2c5b22636f6e74656e745f696e646578222c5b226e756d626572222c2230303030303030303030303030303030225d5d2c5b226c6f63616c5f6964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f726f6f745f6f6d69747465645f6936345f6d696e225d5d2c5b226e61746976655f6964222c5b22737472696e67222c227265757365642d6e61746976652d6964225d5d2c5b226e61746976655f69645f70726573656e74222c5b22626f6f6c222c747275655d5d2c5b22706172745f696e646578222c5b226e756d626572222c2233666630303030303030303030303030225d5d2c5b22726f6f745f77726170706572222c5b22737472696e67222c226a736f6e225d5d5d5d5d5d5d5d5d5d2c5b22626c6f636b73222c5b226172726179222c5b5b226f626a656374222c5b5b227468696e6b696e67222c5b22737472696e67222c22225d5d2c5b2274797065222c5b22737472696e67222c227468696e6b696e67225d5d5d5d2c5b226f626a656374222c5b5b226964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f726f6f745f6f6d69747465645f6936345f6d696e225d5d2c5b22696e707574222c5b226f626a656374222c5b5b2266696c655f70617468222c5b22737472696e67222c222f666978747572652f726561642e747874225d5d2c5b226f6666736574222c5b226e756d626572222c2233666630303030303030303030303030225d5d5d5d5d2c5b226e616d65222c5b22737472696e67222c2252656164225d5d2c5b2274797065222c5b22737472696e67222c22746f6f6c5f757365225d5d5d5d5d5d5d5d5d",
+      "sha256": "9940cb7a85ed90d9381e62509e68e94b733ea5725693bbfed9f3db59e2810411"
+    },
+    {
+      "name": "parallel-reused-native-id",
+      "binding": {
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low"
+      },
+      "native_contents": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "thought": true,
+              "text": "synthetic thought α",
+              "thoughtSignature": "fake-thought-1"
+            },
+            {
+              "text": "visible 雪"
+            },
+            {
+              "thought": true,
+              "text": " / synthetic thought β"
+            },
+            {
+              "functionCall": {
+                "name": "Read",
+                "args": {
+                  "file_path": "/fixture/read.txt",
+                  "offset": 1.0
+                },
+                "id": "native-second"
+              },
+              "thoughtSignature": "fake-call-signed"
+            },
+            {
+              "functionCall": {
+                "name": "Read",
+                "id": "native-second",
+                "args": {
+                  "file_path": "/fixture/read.txt",
+                  "limit": 1
+                }
+              }
+            }
+          ],
+          "unknown": {
+            "preserve": [
+              true,
+              null,
+              "é"
+            ]
+          }
+        },
+        {
+          "role": "model",
+          "parts": [
+            {
+              "thoughtSignature": "fake-late-signature"
+            },
+            {
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "session_id": "17",
+      "thought_display": "full",
+      "tool_projections": [
+        {
+          "local_id": "toolu_golden_reused_0",
+          "caller_name": "Read",
+          "codec_paths": [],
+          "root_wrapper": null
+        },
+        {
+          "local_id": "toolu_golden_reused_1",
+          "caller_name": "Read",
+          "codec_paths": [],
+          "root_wrapper": null
+        }
+      ],
+      "projected_blocks": [
+        {
+          "type": "thinking",
+          "thinking": "synthetic thought α / synthetic thought β",
+          "signature": "ccp:antigravity:v1:eyJ2ZXJzaW9uIjoxLCJwcm9maWxlX2lkIjoic3ludGhldGljLXByb2ZpbGUiLCJwcm9qZWN0X2lkIjoic3ludGhldGljLXByb2plY3QiLCJuYXRpdmVfbW9kZWwiOiJnZW1pbmktNC1hcmdvbi1sb3ciLCJzZXNzaW9uX2lkIjoiMTciLCJ0aG91Z2h0X2Rpc3BsYXkiOiJmdWxsIiwiY29udGVudHMiOlt7InJvbGUiOiJtb2RlbCIsInBhcnRzIjpbeyJ0aG91Z2h0Ijp0cnVlLCJ0ZXh0Ijoic3ludGhldGljIHRob3VnaHQgzrEiLCJ0aG91Z2h0U2lnbmF0dXJlIjoiZmFrZS10aG91Z2h0LTEifSx7InRleHQiOiJ2aXNpYmxlIOmbqiJ9LHsidGhvdWdodCI6dHJ1ZSwidGV4dCI6IiAvIHN5bnRoZXRpYyB0aG91Z2h0IM6yIn0seyJmdW5jdGlvbkNhbGwiOnsibmFtZSI6IlJlYWQiLCJhcmdzIjp7ImZpbGVfcGF0aCI6Ii9maXh0dXJlL3JlYWQudHh0Iiwib2Zmc2V0IjoxLjB9LCJpZCI6Im5hdGl2ZS1zZWNvbmQifSwidGhvdWdodFNpZ25hdHVyZSI6ImZha2UtY2FsbC1zaWduZWQifSx7ImZ1bmN0aW9uQ2FsbCI6eyJuYW1lIjoiUmVhZCIsImlkIjoibmF0aXZlLXNlY29uZCIsImFyZ3MiOnsiZmlsZV9wYXRoIjoiL2ZpeHR1cmUvcmVhZC50eHQiLCJsaW1pdCI6MX19fV0sInVua25vd24iOnsicHJlc2VydmUiOlt0cnVlLG51bGwsIsOpIl19fSx7InJvbGUiOiJtb2RlbCIsInBhcnRzIjpbeyJ0aG91Z2h0U2lnbmF0dXJlIjoiZmFrZS1sYXRlLXNpZ25hdHVyZSJ9LHsidGV4dCI6IiJ9XX1dLCJ0b29sX21hcHBpbmciOlt7ImxvY2FsX2lkIjoidG9vbHVfZ29sZGVuX3JldXNlZF8wIiwiY2FsbGVyX25hbWUiOiJSZWFkIiwiY29udGVudF9pbmRleCI6MCwicGFydF9pbmRleCI6MywibmF0aXZlX2lkX3ByZXNlbnQiOnRydWUsImNvZGVjX3BhdGhzIjpbXSwicm9vdF93cmFwcGVyIjpudWxsLCJuYXRpdmVfaWQiOiJuYXRpdmUtc2Vjb25kIn0seyJsb2NhbF9pZCI6InRvb2x1X2dvbGRlbl9yZXVzZWRfMSIsImNhbGxlcl9uYW1lIjoiUmVhZCIsImNvbnRlbnRfaW5kZXgiOjAsInBhcnRfaW5kZXgiOjQsIm5hdGl2ZV9pZF9wcmVzZW50Ijp0cnVlLCJjb2RlY19wYXRocyI6W10sInJvb3Rfd3JhcHBlciI6bnVsbCwibmF0aXZlX2lkIjoibmF0aXZlLXNlY29uZCJ9XSwicHJvamVjdGlvbl9kaWdlc3QiOiJlOWIzMGMxZTM2NjYxY2U2MDVmY2VhZmEwMmU3YjcxZGU3MjRiOTM0ZWFiZWM4ZTZiOGNiMzVlZGMzM2E1MzliIn0"
+        },
+        {
+          "type": "text",
+          "text": "visible 雪"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_golden_reused_0",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/read.txt",
+            "offset": 1.0
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_golden_reused_1",
+          "name": "Read",
+          "input": {
+            "file_path": "/fixture/read.txt",
+            "limit": 1
+          }
+        }
+      ],
+      "envelope": {
+        "version": 1,
+        "profile_id": "synthetic-profile",
+        "project_id": "synthetic-project",
+        "native_model": "gemini-4-argon-low",
+        "session_id": "17",
+        "thought_display": "full",
+        "contents": [
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thought": true,
+                "text": "synthetic thought α",
+                "thoughtSignature": "fake-thought-1"
+              },
+              {
+                "text": "visible 雪"
+              },
+              {
+                "thought": true,
+                "text": " / synthetic thought β"
+              },
+              {
+                "functionCall": {
+                  "name": "Read",
+                  "args": {
+                    "file_path": "/fixture/read.txt",
+                    "offset": 1.0
+                  },
+                  "id": "native-second"
+                },
+                "thoughtSignature": "fake-call-signed"
+              },
+              {
+                "functionCall": {
+                  "name": "Read",
+                  "id": "native-second",
+                  "args": {
+                    "file_path": "/fixture/read.txt",
+                    "limit": 1
+                  }
+                }
+              }
+            ],
+            "unknown": {
+              "preserve": [
+                true,
+                null,
+                "é"
+              ]
+            }
+          },
+          {
+            "role": "model",
+            "parts": [
+              {
+                "thoughtSignature": "fake-late-signature"
+              },
+              {
+                "text": ""
+              }
+            ]
+          }
+        ],
+        "tool_mapping": [
+          {
+            "local_id": "toolu_golden_reused_0",
+            "caller_name": "Read",
+            "content_index": 0,
+            "part_index": 3,
+            "native_id_present": true,
+            "codec_paths": [],
+            "root_wrapper": null,
+            "native_id": "native-second"
+          },
+          {
+            "local_id": "toolu_golden_reused_1",
+            "caller_name": "Read",
+            "content_index": 0,
+            "part_index": 4,
+            "native_id_present": true,
+            "codec_paths": [],
+            "root_wrapper": null,
+            "native_id": "native-second"
+          }
+        ],
+        "projection_digest": "e9b30c1e36661ce605fceafa02e7b71de724b934eabec8e6b8cb35edc33a539b"
+      },
+      "canonical_digest_input_utf8": "[\"object\",[[\"binding\",[\"object\",[[\"native_model\",[\"string\",\"gemini-4-argon-low\"]],[\"profile_id\",[\"string\",\"synthetic-profile\"]],[\"project_id\",[\"string\",\"synthetic-project\"]],[\"session_id\",[\"string\",\"17\"]],[\"thought_display\",[\"string\",\"full\"]],[\"tool_mapping\",[\"array\",[[\"object\",[[\"caller_name\",[\"string\",\"Read\"]],[\"codec_paths\",[\"array\",[]]],[\"content_index\",[\"number\",\"0000000000000000\"]],[\"local_id\",[\"string\",\"toolu_golden_reused_0\"]],[\"native_id\",[\"string\",\"native-second\"]],[\"native_id_present\",[\"bool\",true]],[\"part_index\",[\"number\",\"4008000000000000\"]],[\"root_wrapper\",[\"null\"]]]],[\"object\",[[\"caller_name\",[\"string\",\"Read\"]],[\"codec_paths\",[\"array\",[]]],[\"content_index\",[\"number\",\"0000000000000000\"]],[\"local_id\",[\"string\",\"toolu_golden_reused_1\"]],[\"native_id\",[\"string\",\"native-second\"]],[\"native_id_present\",[\"bool\",true]],[\"part_index\",[\"number\",\"4010000000000000\"]],[\"root_wrapper\",[\"null\"]]]]]]]]]],[\"blocks\",[\"array\",[[\"object\",[[\"thinking\",[\"string\",\"synthetic thought α / synthetic thought β\"]],[\"type\",[\"string\",\"thinking\"]]]],[\"object\",[[\"text\",[\"string\",\"visible 雪\"]],[\"type\",[\"string\",\"text\"]]]],[\"object\",[[\"id\",[\"string\",\"toolu_golden_reused_0\"]],[\"input\",[\"object\",[[\"file_path\",[\"string\",\"/fixture/read.txt\"]],[\"offset\",[\"number\",\"3ff0000000000000\"]]]]],[\"name\",[\"string\",\"Read\"]],[\"type\",[\"string\",\"tool_use\"]]]],[\"object\",[[\"id\",[\"string\",\"toolu_golden_reused_1\"]],[\"input\",[\"object\",[[\"file_path\",[\"string\",\"/fixture/read.txt\"]],[\"limit\",[\"number\",\"3ff0000000000000\"]]]]],[\"name\",[\"string\",\"Read\"]],[\"type\",[\"string\",\"tool_use\"]]]]]]]]]",
+      "canonical_digest_input_hex": "5b226f626a656374222c5b5b2262696e64696e67222c5b226f626a656374222c5b5b226e61746976655f6d6f64656c222c5b22737472696e67222c2267656d696e692d342d6172676f6e2d6c6f77225d5d2c5b2270726f66696c655f6964222c5b22737472696e67222c2273796e7468657469632d70726f66696c65225d5d2c5b2270726f6a6563745f6964222c5b22737472696e67222c2273796e7468657469632d70726f6a656374225d5d2c5b2273657373696f6e5f6964222c5b22737472696e67222c223137225d5d2c5b2274686f756768745f646973706c6179222c5b22737472696e67222c2266756c6c225d5d2c5b22746f6f6c5f6d617070696e67222c5b226172726179222c5b5b226f626a656374222c5b5b2263616c6c65725f6e616d65222c5b22737472696e67222c2252656164225d5d2c5b22636f6465635f7061746873222c5b226172726179222c5b5d5d5d2c5b22636f6e74656e745f696e646578222c5b226e756d626572222c2230303030303030303030303030303030225d5d2c5b226c6f63616c5f6964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f7265757365645f30225d5d2c5b226e61746976655f6964222c5b22737472696e67222c226e61746976652d7365636f6e64225d5d2c5b226e61746976655f69645f70726573656e74222c5b22626f6f6c222c747275655d5d2c5b22706172745f696e646578222c5b226e756d626572222c2234303038303030303030303030303030225d5d2c5b22726f6f745f77726170706572222c5b226e756c6c225d5d5d5d2c5b226f626a656374222c5b5b2263616c6c65725f6e616d65222c5b22737472696e67222c2252656164225d5d2c5b22636f6465635f7061746873222c5b226172726179222c5b5d5d5d2c5b22636f6e74656e745f696e646578222c5b226e756d626572222c2230303030303030303030303030303030225d5d2c5b226c6f63616c5f6964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f7265757365645f31225d5d2c5b226e61746976655f6964222c5b22737472696e67222c226e61746976652d7365636f6e64225d5d2c5b226e61746976655f69645f70726573656e74222c5b22626f6f6c222c747275655d5d2c5b22706172745f696e646578222c5b226e756d626572222c2234303130303030303030303030303030225d5d2c5b22726f6f745f77726170706572222c5b226e756c6c225d5d5d5d5d5d5d5d5d5d2c5b22626c6f636b73222c5b226172726179222c5b5b226f626a656374222c5b5b227468696e6b696e67222c5b22737472696e67222c2273796e7468657469632074686f7567687420ceb1202f2073796e7468657469632074686f7567687420ceb2225d5d2c5b2274797065222c5b22737472696e67222c227468696e6b696e67225d5d5d5d2c5b226f626a656374222c5b5b2274657874222c5b22737472696e67222c2276697369626c6520e99baa225d5d2c5b2274797065222c5b22737472696e67222c2274657874225d5d5d5d2c5b226f626a656374222c5b5b226964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f7265757365645f30225d5d2c5b22696e707574222c5b226f626a656374222c5b5b2266696c655f70617468222c5b22737472696e67222c222f666978747572652f726561642e747874225d5d2c5b226f6666736574222c5b226e756d626572222c2233666630303030303030303030303030225d5d5d5d5d2c5b226e616d65222c5b22737472696e67222c2252656164225d5d2c5b2274797065222c5b22737472696e67222c22746f6f6c5f757365225d5d5d5d2c5b226f626a656374222c5b5b226964222c5b22737472696e67222c22746f6f6c755f676f6c64656e5f7265757365645f31225d5d2c5b22696e707574222c5b226f626a656374222c5b5b2266696c655f70617468222c5b22737472696e67222c222f666978747572652f726561642e747874225d5d2c5b226c696d6974222c5b226e756d626572222c2233666630303030303030303030303030225d5d5d5d5d2c5b226e616d65222c5b22737472696e67222c2252656164225d5d2c5b2274797065222c5b22737472696e67222c22746f6f6c5f757365225d5d5d5d5d5d5d5d5d",
+      "sha256": "e9b30c1e36661ce605fceafa02e7b71de724b934eabec8e6b8cb35edc33a539b"
+    }
+  ]
+}

@@ -246,7 +246,7 @@ pub fn log_stderr() -> bool {
 
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     let file = read_file_config(&cfg.config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     let mut out = Vec::new();
     if env.contains_key("CCP_BIND_ADDRESS") {
         out.push("bindAddress (env)".to_string());
@@ -394,7 +394,7 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
 }
 
 pub fn grok_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_GROK_BASE_URL") {
         return raw.clone();
     }
@@ -407,7 +407,7 @@ pub fn grok_base_url() -> String {
 }
 
 pub fn grok_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {
         return raw.clone();
     }
@@ -578,17 +578,17 @@ fn resolve_opencode_config(
 }
 
 pub fn opencode_api_key() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).api_key
 }
 
 pub fn opencode_api_key_source() -> Option<&'static str> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).api_key_source
 }
 
 pub fn opencode_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).base_url
 }
 
@@ -597,7 +597,7 @@ pub fn is_verbose() -> bool {
 }
 
 pub fn kimi_oauth_host() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
         return raw.clone();
     }
@@ -612,7 +612,7 @@ pub fn kimi_oauth_host() -> String {
 }
 
 pub fn kimi_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
         return raw.clone();
     }
@@ -627,7 +627,7 @@ pub fn kimi_base_url() -> String {
 }
 
 pub fn kimi_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
         return raw.clone();
     }
@@ -649,7 +649,7 @@ pub fn kimi_user_agent(default: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn codex_base_url(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
         return raw.clone();
     }
@@ -667,7 +667,7 @@ pub fn codex_base_url(default: &str) -> String {
 }
 
 pub fn codex_originator(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
         return raw.clone();
     }
@@ -682,7 +682,7 @@ pub fn codex_originator(default: &str) -> String {
 }
 
 pub fn codex_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
         return raw.clone();
     }
@@ -700,7 +700,7 @@ pub fn codex_user_agent(default: &str) -> String {
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -734,7 +734,7 @@ pub fn codex_request_compression() -> bool {
 }
 
 pub fn codex_server_compaction() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => return true,
@@ -753,7 +753,7 @@ pub fn codex_server_compaction() -> bool {
 }
 
 pub fn codex_responses_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -768,7 +768,7 @@ pub fn codex_responses_api() -> bool {
 }
 
 pub fn codex_full_lane() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -783,7 +783,7 @@ pub fn codex_full_lane() -> bool {
 }
 
 pub fn codex_images_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -798,7 +798,7 @@ pub fn codex_images_api() -> bool {
 }
 
 pub fn codex_transcriptions_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -813,7 +813,7 @@ pub fn codex_transcriptions_api() -> bool {
 }
 
 pub fn codex_images_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
         return raw.clone();
     }
@@ -828,7 +828,7 @@ pub fn codex_images_base_url() -> String {
 }
 
 pub fn codex_service_tier() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
         return Some(raw.clone());
     }
@@ -842,7 +842,7 @@ pub fn codex_service_tier() -> Option<String> {
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
         return Some(raw.clone());
     }
@@ -856,7 +856,7 @@ pub fn codex_effort() -> Option<String> {
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .filter(|raw| !raw.is_empty())
@@ -874,7 +874,7 @@ pub fn codex_reasoning_summary() -> Option<String> {
 }
 
 pub fn codex_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_MODEL") {
         return Some(raw.clone());
     }
@@ -888,7 +888,7 @@ pub fn codex_model() -> Option<String> {
 }
 
 pub fn auto_review_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env
         .get("CCP_AUTO_REVIEW_MODEL")
         .filter(|raw| !raw.is_empty())
@@ -931,7 +931,7 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 }
 
 pub fn codex_transport() -> CodexTransport {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
         && let Some(transport) = parse_codex_transport(raw)
     {
@@ -964,7 +964,7 @@ pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
 pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
 
 pub fn codex_header_timeout_ms() -> u64 {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(ms) = env
         .get("CCP_CODEX_HEADER_TIMEOUT_MS")
         .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -989,7 +989,7 @@ pub fn codex_header_timeout_ms() -> u64 {
 // ---------------------------------------------------------------------------
 
 pub fn cursor_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
         return raw.clone();
     }
@@ -1004,7 +1004,7 @@ pub fn cursor_base_url() -> String {
 }
 
 pub fn cursor_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
         return raw.clone();
     }
@@ -1039,7 +1039,7 @@ fn detect_cursor_agent_version() -> Option<String> {
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
         return Some(raw.clone());
     }
