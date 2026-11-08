@@ -512,6 +512,7 @@ fn parse_tools(
                 "allowed_domains",
                 "blocked_domains",
                 "user_location",
+                "defer_loading",
             ]
             .contains(&key.as_str())
             {
@@ -532,6 +533,9 @@ fn parse_tools(
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("tool name is invalid"))?;
+        if name == "DeferredToolPlaceholder" || obj.get("defer_loading").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
         if !names.insert(name.to_string()) {
             anyhow::bail!("duplicate tool name");
         }
@@ -574,11 +578,12 @@ fn parse_tools(
             out.push(GrokTool::hosted_named("x_search", name));
             continue;
         }
-        let parameters = obj
+        let mut parameters = obj
             .get("input_schema")
             .filter(|value| value.is_object())
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("tool input_schema must be an object"))?;
+        crate::providers::translate_shared::strip_tool_schema_patterns(&mut parameters);
         out.push(GrokTool::function(
             name,
             obj.get("description")

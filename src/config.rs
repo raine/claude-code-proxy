@@ -39,6 +39,10 @@ struct FileConfig {
     pub alias_provider: Option<String>,
     #[serde(rename = "autoReviewModel")]
     pub auto_review_model: Option<String>,
+    #[serde(rename = "authToken")]
+    pub auth_token: Option<String>,
+    #[serde(rename = "requireAuth")]
+    pub require_auth: Option<bool>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -242,6 +246,70 @@ pub fn log_verbose() -> bool {
 
 pub fn log_stderr() -> bool {
     load_config().log_stderr
+}
+
+pub fn local_auth_token() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_LOCAL_AUTH_TOKEN").or_else(|| env.get("CCP_AUTH_TOKEN")) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(token) = file.auth_token
+    {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let state_file = paths::state_dir().join("local_auth_token");
+    if let Ok(token) = fs::read_to_string(state_file) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+pub fn require_local_auth() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_REQUIRE_AUTH") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(enabled) = file.require_auth
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn ensure_local_auth_token() -> Option<String> {
+    if let Some(token) = local_auth_token() {
+        return Some(token);
+    }
+    if !require_local_auth() {
+        return None;
+    }
+    let state_dir = paths::state_dir();
+    let _ = fs::create_dir_all(&state_dir);
+    let token = format!("ccp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let state_file = state_dir.join("local_auth_token");
+    if let Ok(()) = fs::write(&state_file, &token) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600));
+        }
+        Some(token)
+    } else {
+        None
+    }
 }
 
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {

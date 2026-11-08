@@ -298,6 +298,26 @@ pub struct CodexUsageLimit {
 /// (`resets_at`, `resets_in_seconds`) and in `X-Codex-*` headers mirrored into
 /// the event payload.
 pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit> {
+    if payload.get("type").and_then(Value::as_str) == Some("codex.rate_limits")
+        && let Some(limits) = payload.get("rate_limits").and_then(Value::as_object) {
+            let reached = limits.get("limit_reached").and_then(Value::as_bool).unwrap_or(false)
+                || limits.get("allowed").and_then(Value::as_bool).map(|a| !a).unwrap_or(false);
+            if reached {
+                let primary = limits.get("primary").and_then(Value::as_object);
+                let resets_at = numeric_value(primary.and_then(|p| p.get("reset_at").or_else(|| p.get("resets_at"))));
+                let window_minutes = numeric_value(primary.and_then(|p| p.get("window_minutes")));
+                let window = match window_minutes {
+                    Some(300) => Some(CodexLimitWindow::FiveHour),
+                    Some(10_080) => Some(CodexLimitWindow::SevenDay),
+                    _ => None,
+                };
+                return Some(CodexUsageLimit {
+                    message: "Usage limit reached".to_string(),
+                    resets_at,
+                    window,
+                });
+            }
+        }
     if !matches!(
         payload.get("type").and_then(Value::as_str),
         Some("response.failed" | "response.error" | "error")

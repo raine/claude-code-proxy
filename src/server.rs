@@ -34,9 +34,11 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
     http::{Request, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use subtle::ConstantTimeEq;
 use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -104,6 +106,7 @@ fn apply_auto_review_model(
         override_model: override_model.to_string(),
     };
     body.model = Some(route.override_model.clone());
+    body.extra.insert("output_config".to_string(), json!({"effort": "low"}));
     Some(route)
 }
 
@@ -292,7 +295,153 @@ pub fn app_with_features(
     } else {
         router
     };
+    let router = router.layer(middleware::from_fn(security_middleware));
     router.fallback(fallback_handler).with_state(state)
+}
+
+fn is_allowed_host(host_header: &str, bind_address: &str) -> bool {
+    let host = host_header.split(':').next().unwrap_or("").trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && ip.is_loopback() {
+            return true;
+        }
+    if host.eq_ignore_ascii_case(bind_address) {
+        return true;
+    }
+    if bind_address == "0.0.0.0" || bind_address == "::" {
+        return true;
+    }
+    false
+}
+
+fn is_allowed_origin(origin_header: &str, bind_address: &str) -> bool {
+    let origin = origin_header.trim();
+    if origin == "null" {
+        return false;
+    }
+    if let Ok(url) = url::Url::parse(origin)
+        && let Some(host) = url.host_str() {
+            return is_allowed_host(host, bind_address);
+        }
+    false
+}
+
+fn verify_token_constant_time(provided: &str, expected: &str) -> bool {
+    let prov_bytes = provided.as_bytes();
+    let exp_bytes = expected.as_bytes();
+    if prov_bytes.len() != exp_bytes.len() {
+        return false;
+    }
+    prov_bytes.ct_eq(exp_bytes).into()
+}
+
+fn extract_client_token(headers: &http::HeaderMap) -> Option<&str> {
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    if let Some(auth) = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        let trimmed = auth.trim();
+        if let Some(token) = trimmed.strip_prefix("Bearer ") {
+            let t = token.trim();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+async fn security_middleware(
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let bind_address = crate::config::bind_address();
+
+    // 1. Host Validation (against DNS rebinding)
+    if let Some(host_hdr) = req.headers().get(http::header::HOST).and_then(|v| v.to_str().ok())
+        && !is_allowed_host(host_hdr, &bind_address) {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Untrusted Host header: DNS rebinding rejected",
+            );
+        }
+
+    // 2. Origin & Sec-Fetch-Site Validation (against cross-site browser attacks)
+    if let Some(origin_hdr) = req.headers().get(http::header::ORIGIN).and_then(|v| v.to_str().ok())
+        && !is_allowed_origin(origin_hdr, &bind_address) {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Cross-origin requests are forbidden",
+            );
+        }
+    if let Some(site) = req.headers().get("sec-fetch-site").and_then(|v| v.to_str().ok())
+        && site.eq_ignore_ascii_case("cross-site") {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Cross-site requests are forbidden",
+            );
+        }
+
+    // 3. Content-Type enforcement for JSON mutation endpoints (blocks simple cross-origin requests)
+    let method = req.method().clone();
+    if matches!(method, http::Method::POST | http::Method::PUT) {
+        let is_json_endpoint = matches!(
+            path.as_str(),
+            "/v1/messages"
+                | "/v1/messages/count_tokens"
+                | "/v1/responses"
+                | "/v1/chat/completions"
+                | "/v1/images/generations"
+        );
+        if is_json_endpoint
+            && let Some(ct) = req
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                && !ct.to_ascii_lowercase().starts_with("application/json") {
+                    return json_error(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "invalid_request_error",
+                        "Content-Type must be application/json",
+                    );
+                }
+    }
+
+    // 4. Token Authentication (constant-time verification)
+    if path != "/healthz" {
+        if let Some(expected_token) = crate::config::local_auth_token() {
+            let provided = extract_client_token(req.headers());
+            let valid = provided.is_some_and(|tok| verify_token_constant_time(tok, &expected_token));
+            if !valid {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid or missing proxy authorization token",
+                );
+            }
+        } else if crate::config::require_local_auth() {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Proxy local authentication is required but no token is configured",
+            );
+        }
+    }
+
+    next.run(req).await
 }
 
 #[derive(Clone)]
@@ -2161,15 +2310,17 @@ fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
         if let Ok(raw) = value.to_str() {
+            let key_str = key.as_str();
+            let lower = key_str.to_ascii_lowercase();
             let value = if matches!(
-                key.as_str(),
+                key_str,
                 CLAUDE_AGENT_HEADER | CLAUDE_PARENT_AGENT_HEADER
-            ) {
+            ) || REDACT_KEYS.contains(&lower.as_str()) {
                 format!("[redacted len={}]", raw.len())
             } else {
                 raw.to_string()
             };
-            out.insert(key.as_str().to_string(), Value::String(value));
+            out.insert(key_str.to_string(), Value::String(value));
         }
     }
     Value::Object(out)
@@ -2470,6 +2621,10 @@ mod auto_review_tests {
             CLAUDE_PARENT_AGENT_HEADER,
             HeaderValue::from_static("parent-secret"),
         );
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token-1234"),
+        );
 
         let captured = headers_to_record(&headers);
         assert_eq!(
@@ -2481,6 +2636,7 @@ mod auto_review_tests {
             captured[CLAUDE_PARENT_AGENT_HEADER],
             json!("[redacted len=13]")
         );
+        assert_eq!(captured["authorization"], json!("[redacted len=24]"));
         let serialized = captured.to_string();
         assert!(!serialized.contains("agent-secret"));
         assert!(!serialized.contains("parent-secret"));
@@ -2497,5 +2653,103 @@ mod auto_review_tests {
             apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
         );
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+}
+
+#[cfg(test)]
+mod security_middleware_tests {
+    use super::*;
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn rejects_dns_rebinding_external_host() {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .header("host", "evil.attacker.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn allows_loopback_host() {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .header("host", "127.0.0.1:18765")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_browser_request() {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .header("origin", "https://malicious.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_site_fetch() {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_json_content_type_on_mutation_endpoints() {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("model=gpt-5.5"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn constant_time_token_verification_works() {
+        assert!(verify_token_constant_time("secret123", "secret123"));
+        assert!(!verify_token_constant_time("secret123", "secret124"));
+        assert!(!verify_token_constant_time("short", "longer_secret"));
     }
 }

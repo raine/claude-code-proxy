@@ -30,6 +30,13 @@ impl ConversationIdentity {
             _ => None,
         }
     }
+
+    pub fn storage_key(&self) -> String {
+        match self {
+            Self::Main(session_id) => session_id.clone(),
+            Self::Agent(session_id, agent_id) => format!("{session_id}:agent:{agent_id}"),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -24,6 +24,9 @@ pub enum ContentBlock {
         thinking: String,
         signature: Option<String>,
     },
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -227,6 +230,87 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
                 signature,
             })
         }
+        "tool_reference" => {
+            let tool_name = value
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(ContentBlock::ToolReference { tool_name })
+        }
         _ => None,
+    }
+}
+
+pub fn is_tool_resolved(name: &str, req: &MessagesRequest) -> bool {
+    for msg in &req.messages {
+        if let Some(arr) = msg.content.as_array() {
+            for block in arr {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(content_arr) = block.get("content").and_then(Value::as_array) {
+                        for sub in content_arr {
+                            if sub.get("type").and_then(Value::as_str) == Some("tool_reference")
+                                && sub.get("tool_name").and_then(Value::as_str) == Some(name)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+            }
+        }
+    }
+    false
+}
+
+pub fn should_skip_tool(tool_val: &Value, req: &MessagesRequest) -> bool {
+    let name = tool_val.get("name").and_then(Value::as_str).unwrap_or("");
+    if name == "DeferredToolPlaceholder" {
+        return true;
+    }
+    let is_deferred = tool_val.get("defer_loading").and_then(Value::as_bool).unwrap_or(false);
+    if is_deferred && !is_tool_resolved(name, req) {
+        return true;
+    }
+    false
+}
+
+pub fn strip_tool_schema_patterns(schema: &mut Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    schema.remove("pattern");
+
+    for (keyword, value) in schema {
+        match keyword.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for s in schemas.values_mut() {
+                        strip_tool_schema_patterns(s);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for s in schemas {
+                        strip_tool_schema_patterns(s);
+                    }
+                } else if keyword == "items" {
+                    strip_tool_schema_patterns(value);
+                }
+            }
+            "additionalProperties"
+            | "additionalItems"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => strip_tool_schema_patterns(value),
+            _ => {}
+        }
     }
 }

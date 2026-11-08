@@ -658,6 +658,9 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     };
     let mut out = Vec::new();
     for tool in tools_arr {
+        if crate::providers::translate_shared::should_skip_tool(tool, req) {
+            continue;
+        }
         let tool_type = tool
             .get("type")
             .and_then(|v| v.as_str())
@@ -1122,6 +1125,13 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
         Some("image") => render_tool_result_image(block),
+        Some("tool_reference") => {
+            let tool_name = block
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            RenderedToolResultPart::Text(format!("[tool reference: {tool_name}]"))
+        }
         Some(other) => {
             RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
         }

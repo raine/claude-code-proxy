@@ -328,12 +328,58 @@ pub fn delete_auth_file(primary: &std::path::Path, legacy: &std::path::Path) -> 
     Ok(())
 }
 
+pub struct FileLock {
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
+    #[cfg(unix)]
+    _file: File,
+}
+
+impl FileLock {
+    pub fn acquire(lock_path: &std::path::Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(lock_path)?;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { fd, _file: file })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
+}
+
 pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     let dir = std::path::Path::new(path)
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid auth path"))?;
     fs::create_dir_all(dir)?;
     set_mode(dir, 0o700);
+
+    let lock_path = format!("{path}.lock");
+    let _lock = FileLock::acquire(std::path::Path::new(&lock_path))?;
 
     let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
     #[cfg(unix)]

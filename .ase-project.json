@@ -1,0 +1,94 @@
+{
+  "name": "claude-code-proxy",
+  "version": "0.1.48",
+  "description": "Anthropic-compatible proxy bridging Claude Code to Codex, Kimi, Grok, OpenCode Go, and Cursor Agent backends.",
+  "validation_timeout_ms": 300000,
+  "tech_stack": [
+    "Rust 2024",
+    "axum 0.8",
+    "tokio (rt-multi-thread)",
+    "reqwest",
+    "prost",
+    "ratatui",
+    "tokio-tungstenite"
+  ],
+  "conventions": [
+    "Strict type safety and error-fidelity matching Anthropic Messages API specs",
+    "No blocking operations on Tokio async runtime worker threads",
+    "Security-first: constant-time token comparison, Origin/Host validation, atomic file permissions",
+    "On-demand daemon architecture with clean shutdown"
+  ],
+  "architecture_patterns": [
+    "Provider abstraction with translation layers and streaming reducers",
+    "Shared session management with composite lineage-aware state keys",
+    "SSE state machine and WebSocket protocol bridging"
+  ],
+  "file_structure": {
+    "src/app": "Next.js App Router pages and layouts",
+    "src/features": "Feature modules with co-located components, hooks, and types",
+    "src/lib": "Shared utilities, database client, auth helpers",
+    "src/components/ui": "Reusable UI primitives (Button, Modal, Input)",
+    "tests": "Test files mirroring src/ structure"
+  },
+  "testing_strategy": {
+    "framework": "Vitest + React Testing Library",
+    "coverage_target": "80%",
+    "patterns": [
+      "Unit tests for all utility functions",
+      "Integration tests for API routes",
+      "Component tests for interactive UI elements"
+    ]
+  },
+  "deployment": {
+    "platform": "Vercel",
+    "branch_strategy": "main → production, dev → preview",
+    "environments": [
+      "development",
+      "staging",
+      "production"
+    ]
+  },
+  "sprint_focus": "Building the user onboarding flow with email verification and profile setup.",
+  "sprint_skills": [
+    "security-and-hardening",
+    "api-and-interface-design",
+    "test-driven-development"
+  ],
+  "never_do": [
+    "Never use useEffect for data fetching — use Server Components or SWR",
+    "Never store secrets in .env files committed to git",
+    "Never use inline styles — always use Tailwind classes",
+    "Never use `any` TypeScript type — always type explicitly",
+    "Never mix database queries into React components",
+    "Never output verbose unsolicited recaps, exhaustive changelogs, or repetitive summaries that waste tokens — mention ONLY the most critical points unless explicitly asked",
+    "Never use purple gradients, pill buttons, fake reviews/metrics/counters, vague hero text, emoji icons, em dashes, crazy scroll/cursor animations, or AI slop photos/copy on websites",
+    "Never let an AI grade its own work without independent gate verification",
+    "Never leave completed work uncommitted or unpushed to GitHub",
+    "Never run unsolicited background daemons, update pollers, or indexing services on Arch Linux"
+  ],
+  "preferred_patterns": [
+    "Practice extreme token economy: keep responses concise, high-signal, and directly answer user requests without unprompted changelogs or filler",
+    "Use Zod for all schema validation",
+    "Use Drizzle ORM for all database access",
+    "Use server actions for mutations",
+    "Use Next.js Image component for all images",
+    "Always mandate production web essentials: custom domain, custom favicon suite, remove AI badges, /privacy page, and /terms page",
+    "Always follow the 6-step Second Brain closed loop: Load Conventions -> Select Model -> Autonomous Loop -> Validate Output -> Continuous Learning -> Automated Git Push",
+    "Always enforce Arch Linux On-Demand System Governance (run interactive tools on-demand, terminate completely on exit)"
+  ],
+  "agent_skills": {
+    "directory": "/home/thor/skiils/skills",
+    "default_skills": [
+      "using-agent-skills",
+      "context-engineering",
+      "anti-vibe-design"
+    ],
+    "mandatory_skills": {
+      "api": "api-and-interface-design",
+      "auth": "security-and-hardening",
+      "frontend": "anti-vibe-design",
+      "ui": "anti-vibe-design"
+    },
+    "session_reporting_preference": true
+  }
+}

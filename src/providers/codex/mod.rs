@@ -220,12 +220,20 @@ impl CodexProvider {
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
-        if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
+        let compaction_session_id = if body.bypass_provider_model_override {
+            None
+        } else {
+            conversation_identity
+                .as_ref()
+                .map(ConversationIdentity::storage_key)
+                .or_else(|| ctx.session_id.clone())
+        };
+        if !server_compaction_enabled && let Some(session_id) = compaction_session_id.as_deref() {
             compaction::clear_compaction(session_id);
         }
         if server_compaction_enabled
             && compact_boundary
-            && let Some(session_id) = ctx.session_id.as_deref()
+            && let Some(session_id) = compaction_session_id.as_deref()
         {
             let attempt = begin_compaction(session_id, &translated.model);
             compaction_attempt = Some(attempt);
@@ -280,7 +288,7 @@ impl CodexProvider {
             }
         } else if server_compaction_enabled
             && !compact_boundary
-            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
+            && let Some(replay) = apply_compaction_replay(compaction_session_id.as_deref(), &translated)
         {
             translated = replay.request;
             compaction_attempt = Some(replay.attempt);
@@ -343,6 +351,7 @@ impl CodexProvider {
                 LiveStreamCompaction {
                     compact_boundary,
                     attempt: compaction_attempt,
+                    session_id: compaction_session_id,
                 },
                 configured_transport,
                 tail_is_successful_tool_result(&body),
@@ -756,10 +765,11 @@ enum LiveStreamStart {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Default)]
 struct LiveStreamCompaction {
     compact_boundary: bool,
     attempt: Option<CompactionAttempt>,
+    session_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -848,7 +858,7 @@ async fn live_stream_response(
             ctx.clone(),
             request_continuation.clone(),
             request_body.clone(),
-            compaction,
+            compaction.clone(),
             transport,
             accept_empty_completion(successful_tool_tail, empty_completion_attempts),
         )
@@ -961,22 +971,34 @@ async fn live_stream_response_once(
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
     let mut pending_chunk = Vec::new();
     let mut generation_started = false;
+    let mut last_usage_limit = None;
 
     while let Some(item) = upstream_events.recv().await {
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
+                if let Some(limit) = last_usage_limit.as_ref() {
+                    abort_request_state(
+                        compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
+                        &request_continuation,
+                        compaction.attempt,
+                    );
+                    return LiveStreamStart::Response(usage_limit_response(limit));
+                }
                 if retryable_live_start_codex_error(&err) {
                     return provider_retry(&upstream_events, err);
                 }
                 abort_request_state(
-                    ctx.session_id.as_deref(),
+                    compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
                     &request_continuation,
                     compaction.attempt,
                 );
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
+        if let Some(limit) = events::usage_limit_from_event(&payload) {
+            last_usage_limit = Some(limit);
+        }
         if !generation_started && codex_generation_event(&payload) {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.generation_started(&ctx.req_id);
@@ -993,7 +1015,7 @@ async fn live_stream_response_once(
                 // Report it once, with the reset clock upstream supplied.
                 if let Some(limit) = events::usage_limit_from_event(&payload) {
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1010,7 +1032,7 @@ async fn live_stream_response_once(
                         );
                     }
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1019,7 +1041,7 @@ async fn live_stream_response_once(
                     ));
                 }
                 abort_request_state(
-                    ctx.session_id.as_deref(),
+                    compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
                     &request_continuation,
                     compaction.attempt,
                 );
@@ -1051,7 +1073,7 @@ async fn live_stream_response_once(
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
-                    ctx.session_id.as_deref(),
+                    compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
                     &request_continuation,
                     compaction.attempt,
                     &request_body,
@@ -1074,7 +1096,7 @@ async fn live_stream_response_once(
         }
         if terminal {
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
+                compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
                 &request_continuation,
                 compaction.attempt,
                 &request_body,
@@ -1089,6 +1111,15 @@ async fn live_stream_response_once(
             record_live_stream_progress(&ctx, &pending_chunk);
             return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
         }
+    }
+
+    if let Some(limit) = last_usage_limit.as_ref() {
+        abort_request_state(
+            compaction.session_id.as_deref().or(ctx.session_id.as_deref()),
+            &request_continuation,
+            compaction.attempt,
+        );
+        return LiveStreamStart::Response(usage_limit_response(limit));
     }
 
     provider_retry(
@@ -1267,9 +1298,10 @@ fn remaining_live_stream_response(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
+        let session_ref = compaction.session_id.as_deref().or(ctx.session_id.as_deref());
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
-                ctx.session_id.as_deref(),
+                session_ref,
                 &request_continuation,
                 compaction.attempt,
             );
@@ -1283,7 +1315,7 @@ fn remaining_live_stream_response(
                 biased;
                 _ = tx.closed() => {
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        session_ref,
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1296,7 +1328,7 @@ fn remaining_live_stream_response(
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                session_ref,
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1320,7 +1352,7 @@ fn remaining_live_stream_response(
                         Ok(result) => result,
                         Err(message) => {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                session_ref,
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1347,7 +1379,7 @@ fn remaining_live_stream_response(
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                session_ref,
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1356,7 +1388,7 @@ fn remaining_live_stream_response(
                     }
                     if terminal {
                         update_continuation_from_upstream(
-                            ctx.session_id.as_deref(),
+                            session_ref,
                             &request_continuation,
                             compaction.attempt,
                             &request_body,
@@ -1369,7 +1401,7 @@ fn remaining_live_stream_response(
                 }
                 Err(err) => {
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        session_ref,
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1398,7 +1430,7 @@ fn remaining_live_stream_response(
         }
 
         abort_request_state(
-            ctx.session_id.as_deref(),
+            session_ref,
             &request_continuation,
             compaction.attempt,
         );
@@ -2221,6 +2253,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: None,
+                    session_id: None,
                 },
                 config::CodexTransport::WebSocket,
                 true,
@@ -2261,6 +2294,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: None,
+                    session_id: None,
                 },
                 config::CodexTransport::WebSocket,
                 true,
@@ -2345,6 +2379,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                session_id: None,
             },
             config::CodexTransport::WebSocket,
             false,
@@ -2381,6 +2416,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                session_id: None,
             },
             config::CodexTransport::WebSocket,
             true,
@@ -2631,6 +2667,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                session_id: None,
             },
             config::CodexTransport::Http,
             false,
@@ -2942,6 +2979,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    session_id: Some(session_id.to_string()),
                 },
                 config::CodexTransport::WebSocket,
                 false,
@@ -3058,6 +3096,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    session_id: Some(session_id.to_string()),
                 },
                 config::CodexTransport::WebSocket,
                 false,
@@ -3144,6 +3183,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    session_id: Some(session_id.to_string()),
                 },
                 config::CodexTransport::WebSocket,
                 false,
@@ -3331,6 +3371,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    session_id: Some(session_id.to_string()),
                 },
                 config::CodexTransport::WebSocket,
                 false,
