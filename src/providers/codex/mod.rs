@@ -42,6 +42,7 @@ use self::compaction::{
     CompactionAttempt, CompactionError, abort_compaction_attempt, activate_compaction,
     apply_compaction_replay, begin_compaction, request_compaction, store_compaction,
 };
+pub use self::compaction::persist_compaction_states;
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
     record_continuation_for_owner,

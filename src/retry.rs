@@ -16,21 +16,41 @@ pub fn should_retry_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+fn get_base_delay_ms() -> u64 {
+    if let Ok(val) = std::env::var("CCP_RETRY_BASE_MS")
+        .or_else(|_| std::env::var("CCP_RETRY_INITIAL_DELAY_MS"))
+        && let Ok(ms) = val.parse::<u64>()
+    {
+        return ms;
+    }
+    RETRY_INITIAL_DELAY_MS
+}
+
+fn get_max_delay_ms() -> u64 {
+    if let Ok(val) = std::env::var("CCP_RETRY_MAX_DELAY_MS")
+        && let Ok(ms) = val.parse::<u64>()
+    {
+        return ms;
+    }
+    RETRY_MAX_DELAY_MS
+}
+
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
+    let max_delay = get_max_delay_ms();
     if let Some(raw) = retry_after
         && let Ok(raw_secs) = raw.parse::<f64>()
     {
         let target_ms = (raw_secs * 1000.0).ceil() as u64;
         return BackoffOutcome {
-            wait_ms: target_ms.min(RETRY_MAX_DELAY_MS),
-            exceeds_budget: target_ms > RETRY_MAX_DELAY_MS,
+            wait_ms: target_ms.min(max_delay),
+            exceeds_budget: target_ms > max_delay,
         };
     }
 
-    let mut exp =
-        RETRY_INITIAL_DELAY_MS.saturating_mul(RETRY_BACKOFF_FACTOR.saturating_pow(attempt));
-    if exp > RETRY_MAX_DELAY_MS {
-        exp = RETRY_MAX_DELAY_MS;
+    let base = get_base_delay_ms();
+    let mut exp = base.saturating_mul(RETRY_BACKOFF_FACTOR.saturating_pow(attempt));
+    if exp > max_delay {
+        exp = max_delay;
     }
     let jitter = exp / 2;
     let wait_ms = (exp / 2) + (jitter / 2);
@@ -49,10 +69,19 @@ pub fn set_zero_retry_delay_for_tests(enabled: bool) {
 }
 
 pub async fn sleep(ms: u64) {
-    if ZERO_RETRY_DELAY_FOR_TESTS.load(Ordering::SeqCst) {
+    if ZERO_RETRY_DELAY_FOR_TESTS.load(Ordering::SeqCst)
+        || std::env::var("CCP_ZERO_RETRY_DELAY").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
         return;
     }
-    tokio::time::sleep(Duration::from_millis(ms)).await;
+    let effective_ms = if let Ok(val) = std::env::var("CCP_RETRY_BASE_MS")
+        && let Ok(cap) = val.parse::<u64>()
+    {
+        ms.min(cap)
+    } else {
+        ms
+    };
+    tokio::time::sleep(Duration::from_millis(effective_ms)).await;
 }
 
 #[cfg(test)]

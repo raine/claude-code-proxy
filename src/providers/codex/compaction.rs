@@ -47,12 +47,89 @@ struct CompactionState {
     updated_at: u64,
 }
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionAttempt(u64);
 
 pub struct CompactionReplay {
     pub request: ResponsesRequest,
     pub attempt: CompactionAttempt,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedCompactionState {
+    attempt: u64,
+    model: String,
+    native_history: Vec<ResponsesInputItem>,
+    portable_summary: String,
+    updated_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PersistedCompactionStore {
+    sessions: HashMap<String, PersistedCompactionState>,
+}
+
+fn sessions_file_path() -> std::path::PathBuf {
+    crate::paths::state_dir().join("sessions.json")
+}
+
+fn load_persisted_states(registry: &mut CompactionRegistry, now: u64) {
+    let path = sessions_file_path();
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(store) = serde_json::from_str::<PersistedCompactionStore>(&data) else {
+        return;
+    };
+    for (session_id, item) in store.sessions {
+        if now.saturating_sub(item.updated_at) <= STATE_TTL_MS {
+            let state = CompactionState {
+                attempt: CompactionAttempt(item.attempt),
+                model: item.model,
+                native_history: item.native_history,
+                phase: CompactionPhase::Anchored {
+                    portable_summary: item.portable_summary,
+                },
+                updated_at: item.updated_at,
+            };
+            registry.states.insert(session_id, state);
+        }
+    }
+    update_total_bytes(registry);
+}
+
+pub fn persist_compaction_states() {
+    let mut guard = match REGISTRY.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(registry) = guard.as_mut() else {
+        return;
+    };
+    let now = now_ms();
+    evict_states(registry, now);
+
+    let mut store = PersistedCompactionStore::default();
+    for (session_id, state) in &registry.states {
+        if let CompactionPhase::Anchored { portable_summary } = &state.phase {
+            store.sessions.insert(
+                session_id.clone(),
+                PersistedCompactionState {
+                    attempt: state.attempt.0,
+                    model: state.model.clone(),
+                    native_history: state.native_history.clone(),
+                    portable_summary: portable_summary.clone(),
+                    updated_at: state.updated_at,
+                },
+            );
+        }
+    }
+
+    let path = sessions_file_path();
+    let path_str = path.to_string_lossy();
+    let _ = crate::auth::write_atomically(&path_str, &store);
 }
 
 #[derive(Default)]
@@ -101,7 +178,11 @@ pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
     };
     let now = state.updated_at;
     let mut guard = REGISTRY.lock().unwrap();
-    let registry = guard.get_or_insert_with(CompactionRegistry::default);
+    let registry = guard.get_or_insert_with(|| {
+        let mut reg = CompactionRegistry::default();
+        load_persisted_states(&mut reg, now);
+        reg
+    });
     evict_states(registry, now);
     registry.states.insert(session_id.to_string(), state);
     evict_states(registry, now);
@@ -179,7 +260,12 @@ pub fn activate_compaction(
         return false;
     }
     evict_states(registry, now);
-    registry.states.contains_key(session_id)
+    let is_anchored = registry.states.contains_key(session_id);
+    drop(guard);
+    if is_anchored {
+        persist_compaction_states();
+    }
+    is_anchored
 }
 
 pub fn apply_compaction_replay(

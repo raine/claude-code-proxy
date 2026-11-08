@@ -245,11 +245,9 @@ fn read_tools(req: &MessagesRequest) -> Result<Vec<KimiTool>, anyhow::Error> {
         Value::Array(a) => a,
         _ => return Ok(Vec::new()),
     };
+    let sorted_tools = crate::providers::translate_shared::sort_tools_stable_prefix(tools_arr, req);
     let mut out = Vec::new();
-    for tool in tools_arr {
-        if crate::providers::translate_shared::should_skip_tool(tool, req) {
-            continue;
-        }
+    for tool in sorted_tools {
         let name = tool
             .get("name")
             .and_then(|v| v.as_str())

@@ -200,7 +200,7 @@ async fn run_service(config: ServerConfig) -> Result<()> {
         let _ = stopped.await;
     });
     tokio::pin!(server);
-    tokio::select! {
+    let outcome = tokio::select! {
         result = &mut server => result,
         signal = signals.recv() => {
             signal?;
@@ -209,11 +209,14 @@ async fn run_service(config: ServerConfig) -> Result<()> {
                 result = &mut server => result,
                 signal = signals.recv() => {
                     signal?;
+                    claude_code_proxy::providers::codex::persist_compaction_states();
                     std::process::exit(130);
                 }
             }
         }
-    }
+    };
+    claude_code_proxy::providers::codex::persist_compaction_states();
+    outcome
 }
 
 #[cfg(unix)]

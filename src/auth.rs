@@ -371,6 +371,11 @@ impl Drop for FileLock {
     }
 }
 
+pub fn acquire_lock(path: &str) -> io::Result<FileLock> {
+    let lock_path = format!("{path}.lock");
+    FileLock::acquire(std::path::Path::new(&lock_path))
+}
+
 pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     let dir = std::path::Path::new(path)
         .parent()

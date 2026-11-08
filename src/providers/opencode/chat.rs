@@ -292,9 +292,9 @@ fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<Value>> {
     let tools = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools must be an array"))?;
-    tools
-        .iter()
-        .filter(|tool| !crate::providers::translate_shared::should_skip_tool(tool, req))
+    let sorted_tools = crate::providers::translate_shared::sort_tools_stable_prefix(tools, req);
+    sorted_tools
+        .into_iter()
         .map(|tool| {
             let name = tool
                 .get("name")

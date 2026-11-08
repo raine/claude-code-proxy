@@ -2239,8 +2239,32 @@ fn sanitize_path_part(raw: &str) -> String {
     }
 }
 
+static SECRET_REGEXES: std::sync::LazyLock<Vec<(regex_lite::Regex, &'static str)>> = std::sync::LazyLock::new(|| {
+    vec![
+        // Anthropic keys
+        (regex_lite::Regex::new(r"sk-ant-[a-zA-Z0-9_\-]{20,}").unwrap(), "[redacted sk-ant-***]"),
+        // OpenAI / project keys
+        (regex_lite::Regex::new(r"sk-(?:proj-)?[a-zA-Z0-9_\-]{20,}").unwrap(), "[redacted sk-***]"),
+        // GitHub tokens (classic, fine-grained, oauth, user, server, refresh)
+        (regex_lite::Regex::new(r"(?:ghp|gho|ghu|ghs|ghr|github_pat)_[a-zA-Z0-9_]{16,}").unwrap(), "[redacted ghp_***]"),
+        // AWS Access Key IDs
+        (regex_lite::Regex::new(r"\b(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}\b").unwrap(), "[redacted AKIA***]"),
+        // PEM private keys
+        (regex_lite::Regex::new(r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]* )?PRIVATE KEY-----").unwrap(), "[redacted PRIVATE KEY]"),
+    ]
+});
+
+pub fn redact_secrets_in_text(text: &str) -> String {
+    let mut scrubbed = text.to_string();
+    for (re, replacement) in SECRET_REGEXES.iter() {
+        scrubbed = re.replace_all(&scrubbed, *replacement).to_string();
+    }
+    scrubbed
+}
+
 fn redact_error_value(value: Value) -> Value {
     match value {
+        Value::String(s) => Value::String(redact_secrets_in_text(&s)),
         Value::Array(values) => Value::Array(values.into_iter().map(redact_error_value).collect()),
         Value::Object(fields) => {
             let mut out = Map::new();
@@ -2751,5 +2775,38 @@ mod security_middleware_tests {
         assert!(verify_token_constant_time("secret123", "secret123"));
         assert!(!verify_token_constant_time("secret123", "secret124"));
         assert!(!verify_token_constant_time("short", "longer_secret"));
+    }
+
+    #[test]
+    fn redacts_prompt_secrets_in_error_captures() {
+        let input = serde_json::json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Here is my key: sk-ant-api03-123456789012345678901234 and github: ghp_12345678901234567890 and aws: AKIAIOSFODNN7EXAMPLE and openai: sk-proj-123456789012345678901234"
+                },
+                {
+                    "role": "assistant",
+                    "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0\n-----END RSA PRIVATE KEY-----"
+                }
+            ],
+            "authorization": "Bearer secret-token"
+        });
+
+        let redacted = redact_error_value(input);
+        assert_eq!(redacted["authorization"], serde_json::json!("[redacted len=19]"));
+        let user_content = redacted["messages"][0]["content"].as_str().unwrap();
+        assert!(!user_content.contains("sk-ant-api03"));
+        assert!(user_content.contains("[redacted sk-ant-***]"));
+        assert!(!user_content.contains("ghp_12345"));
+        assert!(user_content.contains("[redacted ghp_***]"));
+        assert!(!user_content.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(user_content.contains("[redacted AKIA***]"));
+        assert!(!user_content.contains("sk-proj-12345"));
+        assert!(user_content.contains("[redacted sk-***]"));
+
+        let assistant_content = redacted["messages"][1]["content"].as_str().unwrap();
+        assert!(!assistant_content.contains("MIIEowIBAAKCAQEA0"));
+        assert!(assistant_content.contains("[redacted PRIVATE KEY]"));
     }
 }

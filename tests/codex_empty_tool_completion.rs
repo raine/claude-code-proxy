@@ -41,6 +41,10 @@ fn next_events(script: &Mutex<Script>) -> Vec<Value> {
 struct Child(std::process::Child);
 impl Drop for Child {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.0.id() as libc::pid_t, libc::SIGKILL);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -125,6 +129,8 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
             .env("CCP_CODEX_PREVIOUS_RESPONSE_ID", "0")
             .env("CCP_CODEX_SERVER_COMPACTION", "0")
             .env("CCP_ALIAS_PROVIDER", "codex")
+            .env("CCP_ZERO_RETRY_DELAY", "1")
+            .env("CCP_RETRY_BASE_MS", "5")
             .env("NO_PROXY", "127.0.0.1,localhost")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
