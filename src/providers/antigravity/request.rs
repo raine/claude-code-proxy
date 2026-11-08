@@ -288,6 +288,69 @@ fn text_parts(value: &Value) -> Result<Vec<Value>> {
     Ok(parts)
 }
 
+fn format_prefix_tool_result(block: &Value) -> Result<String> {
+    keys(
+        block,
+        &[
+            "type",
+            "tool_use_id",
+            "content",
+            "is_error",
+            "cache_control",
+        ],
+        &["type", "tool_use_id"],
+    )?;
+    cache_hint(block.get("cache_control"))?;
+    let id = nonempty(&block["tool_use_id"])?;
+    let rendered = match block.get("content") {
+        None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(value) => text_parts(value)?
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let is_error = block
+        .get("is_error")
+        .map(|v| v.as_bool().ok_or("invalid is_error flag"))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(if is_error {
+        format!("[tool_result ({id}) error: {rendered}]")
+    } else {
+        format!("[tool_result ({id}): {rendered}]")
+    })
+}
+
+fn user_parts(value: &Value, allow_prefix_tool_result: bool) -> Result<Vec<Value>> {
+    if !allow_prefix_tool_result {
+        return text_parts(value);
+    }
+    if let Some(text) = value.as_str() {
+        return Ok(vec![json!({"text":text})]);
+    }
+    let mut parts = Vec::new();
+    for block in value
+        .as_array()
+        .ok_or("content must be text or text blocks")?
+    {
+        match block["type"].as_str() {
+            Some("text") => {
+                keys(block, &["type", "text", "cache_control"], &["type", "text"])?;
+                cache_hint(block.get("cache_control"))?;
+                parts.push(json!({"text":block["text"].as_str().ok_or("text must be a string")?}));
+            }
+            Some("tool_result") => {
+                let formatted = format_prefix_tool_result(block)?;
+                parts.push(json!({"text":formatted}));
+            }
+            _ => return Err("non-text system/tool-result content is unsupported"),
+        }
+    }
+    Ok(parts)
+}
+
 fn options(body: &MessagesRequest) -> Result<&'static str> {
     let allowed = [
         "system",
@@ -307,17 +370,36 @@ fn options(body: &MessagesRequest) -> Result<&'static str> {
     }
     let mut display = "full";
     if let Some(thinking) = body.extra.get("thinking") {
-        keys(thinking, &["type", "display"], &["type"])?;
-        if thinking["type"] != "adaptive" {
-            return Err(
-                "Antigravity supports adaptive thinking only; model tier controls reasoning",
-            );
+        keys(thinking, &["type", "display", "budget_tokens"], &["type"])?;
+        match thinking["type"].as_str() {
+            Some("adaptive") => {
+                if thinking.get("budget_tokens").is_some() {
+                    return Err("adaptive thinking does not take budget_tokens");
+                }
+            }
+            Some("enabled") => {
+                if thinking
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|n| n < 1024)
+                {
+                    return Err(
+                        "Antigravity supports adaptive thinking or enabled thinking with budget_tokens >= 1024",
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "Antigravity supports adaptive thinking only; model tier controls reasoning",
+                );
+            }
         }
         if let Some(value) = thinking.get("display") {
-            if value != "omitted" {
-                return Err("unsupported thinking display");
+            match value.as_str() {
+                Some("omitted") => display = "omitted",
+                Some("full") => display = "full",
+                _ => return Err("unsupported thinking display"),
             }
-            display = "omitted";
         }
     }
     if let Some(output) = body.extra.get("output_config") {
@@ -493,10 +575,18 @@ fn continuation_input(envelope: &Value, user: &Message) -> Result<bool> {
     }
 }
 
+fn is_prior_or_unsigned_assistant(content: &Value, native_model: &str) -> bool {
+    content
+        .get(0)
+        .is_none_or(|block| block["type"] != "thinking")
+        || replay::is_prior_carrier_turn(content, native_model)
+}
+
 fn observed_continuation(
     messages: &[Cow<'_, Message>],
     envelopes: &[Value],
     model: &str,
+    has_prefix: bool,
 ) -> Result<Metadata> {
     let ordered = messages
         .iter()
@@ -512,7 +602,7 @@ fn observed_continuation(
     {
         return Err("unsupported continuation role sequence");
     }
-    if text_parts(&ordered[0].content)?.is_empty() {
+    if user_parts(&ordered[0].content, has_prefix)?.is_empty() {
         return Err("request needs an initial text user");
     }
     let mut new_user_execution = false;
@@ -640,17 +730,13 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
         .iter()
         .rposition(|m| {
             m.role == "assistant"
-                && m.content
-                    .get(0)
-                    .is_none_or(|block| block["type"] != "thinking")
+                && is_prior_or_unsigned_assistant(&m.content, &binding.native_model)
         })
         .filter(|&last_unsigned| {
             let prefix = &messages[..=last_unsigned];
-            let no_prior_thinking = prefix.iter().all(|m| {
+            let no_current_thinking = prefix.iter().all(|m| {
                 m.role != "assistant"
-                    || m.content
-                        .get(0)
-                        .is_none_or(|block| block["type"] != "thinking")
+                    || is_prior_or_unsigned_assistant(&m.content, &binding.native_model)
             });
             let non_system: Vec<_> = prefix.iter().filter(|m| m.role != "system").collect();
             let valid_alternation = !non_system.is_empty()
@@ -659,11 +745,12 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                     .iter()
                     .enumerate()
                     .all(|(i, m)| m.role == if i % 2 == 0 { "user" } else { "assistant" });
-            no_prior_thinking && valid_alternation && last_unsigned + 1 < messages.len()
+            no_current_thinking && valid_alternation && last_unsigned + 1 < messages.len()
         })
         .map(|idx| idx + 1)
         .unwrap_or(0);
     let (prefix_messages, active_messages) = messages.split_at(start_idx);
+    let has_prefix = !prefix_messages.is_empty();
     let mut turns = active_messages
         .iter()
         .filter(|m| m.role == "assistant")
@@ -678,13 +765,15 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
             .iter()
             .filter(|m| m.role != "system")
             .collect::<Vec<_>>();
-        if input.len() != 1 || input[0].role != "user" || text_parts(&input[0].content)?.is_empty()
+        if input.len() != 1
+            || input[0].role != "user"
+            || user_parts(&input[0].content, has_prefix)?.is_empty()
         {
             return Err("fresh execution requires one text user input");
         }
         Metadata::Fresh
     } else {
-        observed_continuation(active_messages, &envelopes, model)?
+        observed_continuation(active_messages, &envelopes, model, has_prefix)?
     };
     let session = String::new();
     let mut history = envelopes.into_iter();
@@ -726,38 +815,7 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                         parts.push(json!({"text":value}));
                     }
                     Some("tool_result") => {
-                        keys(
-                            &block,
-                            &[
-                                "type",
-                                "tool_use_id",
-                                "content",
-                                "is_error",
-                                "cache_control",
-                            ],
-                            &["type", "tool_use_id"],
-                        )?;
-                        cache_hint(block.get("cache_control"))?;
-                        let id = nonempty(&block["tool_use_id"])?;
-                        let rendered = match block.get("content") {
-                            None => String::new(),
-                            Some(Value::String(s)) => s.clone(),
-                            Some(value) => text_parts(value)?
-                                .iter()
-                                .filter_map(|p| p["text"].as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        };
-                        let is_error = block
-                            .get("is_error")
-                            .map(|v| v.as_bool().ok_or("invalid is_error flag"))
-                            .transpose()?
-                            .unwrap_or(false);
-                        let formatted = if is_error {
-                            format!("[tool_result ({id}) error: {rendered}]")
-                        } else {
-                            format!("[tool_result ({id}): {rendered}]")
-                        };
+                        let formatted = format_prefix_tool_result(&block)?;
                         estimate_bytes += formatted.len();
                         parts.push(json!({"text":formatted}));
                     }
@@ -831,11 +889,13 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
             return Err("unsupported message role");
         }
     }
+    let mut allow_prefix_tool_result = has_prefix;
     for message in active_messages {
         if message.role == "system" {
             continue;
         }
         if message.role == "assistant" {
+            allow_prefix_tool_result = false;
             if !pending.is_empty() {
                 return Err("missing tool results before next assistant turn");
             }
@@ -913,6 +973,12 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                         text.push(json!({"text":value}));
                     }
                     Some("tool_result") => {
+                        if allow_prefix_tool_result {
+                            let formatted = format_prefix_tool_result(&block)?;
+                            estimate_bytes += formatted.len();
+                            text.push(json!({"text":formatted}));
+                            continue;
+                        }
                         keys(
                             &block,
                             &[
@@ -959,6 +1025,7 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                     _ => return Err("unsupported user content/media"),
                 }
             }
+            allow_prefix_tool_result = false;
             if results.len() != pending.len() {
                 return Err("incomplete tool result batch");
             }

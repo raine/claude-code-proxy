@@ -966,6 +966,17 @@ fn antigravity_agy_count_value_inputs_preserve_semantics_without_effects() {
                     configured_project: Some("project")
                 }
             )
+            .is_ok()
+        );
+        changed_model.model = Some("antigravity/unsupported-model".into());
+        assert!(
+            request::estimate(
+                &changed_model,
+                CountInputs {
+                    serving_scope: None,
+                    configured_project: Some("project")
+                }
+            )
             .is_err()
         );
         assert_eq!(effects::snapshot(), [0; 5]);
@@ -2890,6 +2901,29 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
         json!(
             "cd /data/chrisliu/DataFactory && git pull --ff-only -q origin master 2>&1 | tail -2; git log -1 --oneline"
         )
+    );
+
+    // Switching mid-session from Opus 5.5 to Gemini 4 Argon low after an interrupted tool_use
+    // with Claude Code's `thinking: {"type": "enabled", "budget_tokens": 31999}` succeeds by
+    // folding prior-model turns and the trailing prefix tool_result into prefix_messages.
+    let mut switched = request.clone();
+    switched["model"] = json!("antigravity/gemini-4-argon-low");
+    switched["thinking"] = json!({"type":"enabled","budget_tokens":31999});
+    switched["messages"][2]["content"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!({"type":"text","text":"[Request interrupted by user]"}),
+            json!({"type":"text","text":"continue"}),
+        ]);
+    let argon_prepared = prepare(&serde_json::from_value(switched).unwrap(), &binding()).unwrap();
+    assert_eq!(argon_prepared.wire["model"], json!("gemini-4-argon-low"));
+    assert_eq!(
+        argon_prepared.wire["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
     );
 
     // Tampering with the carrier signature itself still fails closed in prepare.

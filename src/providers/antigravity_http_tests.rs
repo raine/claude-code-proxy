@@ -1491,7 +1491,7 @@ async fn antigravity_http_replay_restores_native_calls_after_fresh_provider() {
             json!([{"text":"ordered system after resume"}])
         );
     }
-    body["model"] = json!("antigravity/gemini-4-argon-high");
+    body["model"] = json!("antigravity/unsupported-model");
     let response = client()
         .post(second.url.join("/v1/messages").unwrap())
         .json(&body)
@@ -1502,7 +1502,7 @@ async fn antigravity_http_replay_restores_native_calls_after_fresh_provider() {
     assert_eq!(
         captured.lock().unwrap().len(),
         2,
-        "model switch must not purchase inference"
+        "unsupported model switch must not purchase inference"
     );
 }
 

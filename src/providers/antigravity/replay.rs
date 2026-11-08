@@ -585,6 +585,43 @@ pub(crate) fn canonicalize_tool_inputs(blocks: &mut Value) {
     }
 }
 
+/// Returns true when `blocks` carries a valid Antigravity envelope from a
+/// different `native_model` (mid-session `/model` switch between Antigravity
+/// models/tiers) or from an older envelope version (`v2`), so `request::prepare`
+/// can include it in `prefix_messages` instead of failing `decode_history`.
+pub(crate) fn is_prior_carrier_turn(blocks: &Value, current_native_model: &str) -> bool {
+    let Some(first) = blocks
+        .as_array()
+        .and_then(|b| b.first())
+        .filter(|b| b["type"] == "thinking")
+    else {
+        return false;
+    };
+    let Some(signature) = first["signature"].as_str() else {
+        return false;
+    };
+    let (encoded, is_old_version) = if let Some(enc) = signature.strip_prefix(PREFIX) {
+        (enc, false)
+    } else if let Some(enc) = signature.strip_prefix("ccp:antigravity:v2:") {
+        (enc, true)
+    } else {
+        return false;
+    };
+    if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
+        return false;
+    }
+    let Ok(raw) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return false;
+    };
+    let Ok(envelope) = parse_json(&raw, MAX_DECODED) else {
+        return false;
+    };
+    let Ok(turn_model) = nonempty(&envelope["native_model"]) else {
+        return false;
+    };
+    is_old_version || turn_model != current_native_model
+}
+
 /// Extract only an UNTRUSTED scope claim for local estimation when no serving
 /// snapshot exists. The caller must still run the original full version/digest/
 /// history validators with this binding. Never publish it or use it as admission.
@@ -601,6 +638,7 @@ pub(crate) fn claimed_binding(
     let signature = nonempty(&first["signature"])?;
     let encoded = signature
         .strip_prefix(PREFIX)
+        .or_else(|| signature.strip_prefix("ccp:antigravity:v2:"))
         .ok_or("missing/foreign carrier")?;
     if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
         return Err("carrier byte limit");
@@ -610,7 +648,8 @@ pub(crate) fn claimed_binding(
         .map_err(|_| "malformed carrier")?;
     let envelope = parse_json(&raw, MAX_DECODED)?;
     let project = nonempty(&envelope["project_id"])?;
-    if envelope["native_model"].as_str() != Some(native_model)
+    let turn_model = nonempty(&envelope["native_model"])?;
+    if !super::request::MODELS.contains(&format!("antigravity/{turn_model}").as_str())
         || configured_project.is_some_and(|p| p != project)
     {
         return Err("model/configured-project estimate scope mismatch");
