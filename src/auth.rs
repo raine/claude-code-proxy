@@ -328,12 +328,126 @@ pub fn delete_auth_file(primary: &std::path::Path, legacy: &std::path::Path) -> 
     Ok(())
 }
 
+pub struct FileLock {
+    #[cfg(unix)]
+    fd: std::os::unix::io::RawFd,
+    #[cfg(unix)]
+    _file: Option<File>,
+}
+
+impl FileLock {
+    pub fn acquire(lock_path: &std::path::Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(lock_path)?;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { fd, _file: Some(file) })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    pub fn try_acquire(lock_path: &std::path::Path) -> io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(lock_path)?;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+            Ok(Some(Self { fd, _file: Some(file) }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Some(Self {}))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                libc::flock(self.fd, libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+pub fn acquire_lock(path: &str) -> io::Result<FileLock> {
+    if path == "memory" || path.is_empty() {
+        return Ok(FileLock {
+            #[cfg(unix)]
+            fd: -1,
+            #[cfg(unix)]
+            _file: None,
+        });
+    }
+    let lock_path = format!("{path}.lock");
+    FileLock::acquire(std::path::Path::new(&lock_path))
+}
+
+pub async fn acquire_lock_async(path: &str) -> io::Result<FileLock> {
+    if path == "memory" || path.is_empty() {
+        return Ok(FileLock {
+            #[cfg(unix)]
+            fd: -1,
+            #[cfg(unix)]
+            _file: None,
+        });
+    }
+    let lock_path = format!("{path}.lock");
+    let path_buf = std::path::PathBuf::from(lock_path);
+    // Non-blocking poll loop with async sleep so Tokio worker thread is never parked
+    for _ in 0..100 {
+        if let Some(lock) = FileLock::try_acquire(&path_buf)? {
+            return Ok(lock);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Fallback to spawn_blocking if lock is held across a longer window
+    tokio::task::spawn_blocking(move || FileLock::acquire(&path_buf))
+        .await
+        .map_err(io::Error::other)?
+}
+
 pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     let dir = std::path::Path::new(path)
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid auth path"))?;
     fs::create_dir_all(dir)?;
     set_mode(dir, 0o700);
+
+    let lock_path = format!("{path}.lock");
+    let _lock = FileLock::acquire(std::path::Path::new(&lock_path))?;
 
     let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
     #[cfg(unix)]

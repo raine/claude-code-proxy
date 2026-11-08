@@ -245,8 +245,9 @@ fn read_tools(req: &MessagesRequest) -> Result<Vec<KimiTool>, anyhow::Error> {
         Value::Array(a) => a,
         _ => return Ok(Vec::new()),
     };
+    let sorted_tools = crate::providers::translate_shared::sort_tools_stable_prefix(tools_arr, req);
     let mut out = Vec::new();
-    for tool in tools_arr {
+    for tool in sorted_tools {
         let name = tool
             .get("name")
             .and_then(|v| v.as_str())
@@ -256,10 +257,11 @@ fn read_tools(req: &MessagesRequest) -> Result<Vec<KimiTool>, anyhow::Error> {
             .get("description")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let parameters = tool
+        let mut parameters = tool
             .get("input_schema")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+        crate::providers::translate_shared::strip_tool_schema_patterns(&mut parameters);
         out.push(KimiTool {
             kind: "function".to_string(),
             function: KimiToolFunction {
@@ -527,6 +529,15 @@ fn tool_result_content(content: &Value, is_error: Option<bool>) -> Value {
                         let url = image_block_to_url(b);
                         parts.push(KimiToolResultPart::ImageUrl {
                             image_url: KimiImageUrl { url },
+                        });
+                    }
+                    Some("tool_reference") => {
+                        let tool_name = b
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        parts.push(KimiToolResultPart::Text {
+                            text: format!("[tool reference: {tool_name}]"),
                         });
                     }
                     Some(other) => {

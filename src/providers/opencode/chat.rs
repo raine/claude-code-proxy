@@ -168,7 +168,9 @@ fn push_user_messages(messages: &mut Vec<Value>, blocks: &[ContentBlock]) {
                 }));
                 content.extend(rendered.images);
             }
-            ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => {}
+            ContentBlock::Thinking { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolReference { .. } => {}
         }
     }
     // A parallel assistant tool-call turn requires every matching tool
@@ -208,7 +210,9 @@ fn assistant_message(blocks: &[ContentBlock], deepseek: bool) -> anyhow::Result<
                     },
                 }));
             }
-            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {}
+            ContentBlock::Image { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::ToolReference { .. } => {}
         }
     }
     if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
@@ -288,8 +292,9 @@ fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<Value>> {
     let tools = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools must be an array"))?;
-    tools
-        .iter()
+    let sorted_tools = crate::providers::translate_shared::sort_tools_stable_prefix(tools, req);
+    sorted_tools
+        .into_iter()
         .map(|tool| {
             let name = tool
                 .get("name")
@@ -297,10 +302,11 @@ fn read_tools(req: &MessagesRequest) -> anyhow::Result<Vec<Value>> {
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("tool name must be a non-empty string"))?;
             let description = tool.get("description").cloned();
-            let parameters = tool
+            let mut parameters = tool
                 .get("input_schema")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            crate::providers::translate_shared::strip_tool_schema_patterns(&mut parameters);
             let mut function = serde_json::Map::new();
             function.insert("name".into(), Value::String(name.to_string()));
             if let Some(description) = description.filter(|value| !value.is_null()) {

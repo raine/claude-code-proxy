@@ -24,6 +24,9 @@ pub enum ContentBlock {
         thinking: String,
         signature: Option<String>,
     },
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -227,6 +230,222 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
                 signature,
             })
         }
+        "tool_reference" => {
+            let tool_name = value
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(ContentBlock::ToolReference { tool_name })
+        }
         _ => None,
+    }
+}
+
+pub fn is_tool_resolved(name: &str, req: &MessagesRequest) -> bool {
+    for msg in &req.messages {
+        if let Some(arr) = msg.content.as_array() {
+            for block in arr {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(content_arr) = block.get("content").and_then(Value::as_array) {
+                        for sub in content_arr {
+                            if sub.get("type").and_then(Value::as_str) == Some("tool_reference")
+                                && sub.get("tool_name").and_then(Value::as_str) == Some(name)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+            }
+        }
+    }
+    false
+}
+
+pub fn should_skip_tool(tool_val: &Value, req: &MessagesRequest) -> bool {
+    let name = tool_val.get("name").and_then(Value::as_str).unwrap_or("");
+    if name == "DeferredToolPlaceholder" {
+        return true;
+    }
+    let is_deferred = tool_val.get("defer_loading").and_then(Value::as_bool).unwrap_or(false);
+    if is_deferred && !is_tool_resolved(name, req) {
+        return true;
+    }
+    false
+}
+
+pub fn first_seen_tool_resolution_orders(req: &MessagesRequest) -> std::collections::HashMap<String, usize> {
+    let mut order_map = std::collections::HashMap::new();
+    let mut counter = 0;
+    for msg in &req.messages {
+        if let Some(arr) = msg.content.as_array() {
+            for block in arr {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(content_arr) = block.get("content").and_then(Value::as_array)
+                {
+                    for sub in content_arr {
+                        if sub.get("type").and_then(Value::as_str) == Some("tool_reference")
+                            && let Some(name) = sub.get("tool_name").and_then(Value::as_str)
+                        {
+                            order_map.entry(name.to_string()).or_insert_with(|| {
+                                let idx = counter;
+                                counter += 1;
+                                idx
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    order_map
+}
+
+pub fn sort_tools_stable_prefix<'a>(tools_arr: &'a [Value], req: &MessagesRequest) -> Vec<&'a Value> {
+    let order_map = first_seen_tool_resolution_orders(req);
+    let mut partitioned: Vec<(usize, usize, usize, &'a Value)> = Vec::new();
+
+    for (original_idx, tool) in tools_arr.iter().enumerate() {
+        if should_skip_tool(tool, req) {
+            continue;
+        }
+        let is_deferred = tool.get("defer_loading").and_then(Value::as_bool).unwrap_or(false);
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+        if is_deferred {
+            let resolution_order = order_map.get(name).copied().unwrap_or(usize::MAX);
+            partitioned.push((1, resolution_order, original_idx, tool));
+        } else {
+            partitioned.push((0, 0, original_idx, tool));
+        }
+    }
+
+    partitioned.sort_by_key(|&(group, res_order, orig_idx, _)| (group, res_order, orig_idx));
+    partitioned.into_iter().map(|(_, _, _, tool)| tool).collect()
+}
+
+pub fn strip_tool_schema_patterns(schema: &mut Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    schema.remove("pattern");
+
+    for (keyword, value) in schema {
+        match keyword.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for s in schemas.values_mut() {
+                        strip_tool_schema_patterns(s);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for s in schemas {
+                        strip_tool_schema_patterns(s);
+                    }
+                } else if keyword == "items" {
+                    strip_tool_schema_patterns(value);
+                }
+            }
+            "additionalProperties"
+            | "additionalItems"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => strip_tool_schema_patterns(value),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sort_tools_stable_prefix_preserves_base_and_appends_resolved_in_turn_order() {
+        let tools = vec![
+            json!({"name": "base1", "defer_loading": false}),
+            json!({"name": "deferred_early_in_decl", "defer_loading": true}),
+            json!({"name": "base2", "defer_loading": false}),
+            json!({"name": "deferred_late_in_decl", "defer_loading": true}),
+            json!({"name": "DeferredToolPlaceholder", "defer_loading": true}),
+        ];
+
+        // Turn 1: No deferred tools resolved
+        let req_turn1: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "hello"}]
+        })).unwrap();
+        let sorted1 = sort_tools_stable_prefix(&tools, &req_turn1);
+        let names1: Vec<&str> = sorted1.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names1, vec!["base1", "base2"]);
+
+        // Turn 2: deferred_late_in_decl resolved first
+        let req_turn2: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": [
+                                {"type": "tool_reference", "tool_name": "deferred_late_in_decl"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })).unwrap();
+        let sorted2 = sort_tools_stable_prefix(&tools, &req_turn2);
+        let names2: Vec<&str> = sorted2.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // deferred_late_in_decl is appended at the tail
+        assert_eq!(names2, vec!["base1", "base2", "deferred_late_in_decl"]);
+
+        // Turn 3: deferred_early_in_decl resolved second
+        let req_turn3: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": [
+                                {"type": "tool_reference", "tool_name": "deferred_late_in_decl"}
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_2",
+                            "content": [
+                                {"type": "tool_reference", "tool_name": "deferred_early_in_decl"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })).unwrap();
+        let sorted3 = sort_tools_stable_prefix(&tools, &req_turn3);
+        let names3: Vec<&str> = sorted3.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // Notice: ["base1", "base2", "deferred_late_in_decl"] is an immutable exact prefix of names3!
+        assert_eq!(names3, vec!["base1", "base2", "deferred_late_in_decl", "deferred_early_in_decl"]);
     }
 }
