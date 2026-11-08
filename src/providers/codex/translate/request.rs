@@ -350,11 +350,21 @@ fn is_compact_message_content(content: &Value) -> bool {
     }
 }
 
+/// Claude Code appends a `system`-role message after the user turn when a
+/// `UserPromptSubmit` hook or an output style emits text, so the compaction
+/// instruction is carried by the final *user* message, not the final message.
+/// Trailing `system` messages are skipped; any other trailing role still means
+/// the request is not a compaction boundary.
 pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
     is_compact_request(flatten_system_text(request.extra.get("system")).as_deref())
-        || request.messages.last().is_some_and(|message| {
-            message.role == "user" && is_compact_message_content(&message.content)
-        })
+        || request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role != "system")
+            .is_some_and(|message| {
+                message.role == "user" && is_compact_message_content(&message.content)
+            })
 }
 
 /// Reasoning-effort cap applied to compaction requests, or None when the
@@ -1935,6 +1945,60 @@ mod tests {
         .unwrap();
 
         assert!(is_compact_messages_request(&req));
+    }
+
+    #[test]
+    fn compact_request_detected_when_hook_system_message_follows_user() {
+        // Claude Code 2.1.319 shape: the compaction instruction is appended to the
+        // user's text and a `system`-role hook/output-style message comes last.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                {"role": "user", "content": "prior turn"},
+                {"role": "assistant", "content": "prior reply"},
+                {
+                    "role": "user",
+                    "content": concat!(
+                        "Filler 3 of 3: write about 150 words on an everyday object.\n",
+                        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+                        "Your task is to create a detailed summary of the conversation so far, ",
+                        "paying close attention to the user's explicit requests."
+                    )
+                },
+                {
+                    "role": "system",
+                    "content": concat!(
+                        "Concise output style is active.\n\n",
+                        "UserPromptSubmit hook success: [TOPOLOGY] least-complex topology"
+                    )
+                }
+            ],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+
+        assert!(is_compact_messages_request(&req));
+    }
+
+    #[test]
+    fn compact_message_not_detected_when_assistant_message_follows_user() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-astra",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": concat!(
+                        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n",
+                        "Your task is to create a detailed summary of the conversation so far."
+                    )
+                },
+                {"role": "assistant", "content": "Summary: ..."}
+            ],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+
+        assert!(!is_compact_messages_request(&req));
     }
 
     #[test]
