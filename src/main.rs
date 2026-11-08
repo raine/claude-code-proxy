@@ -200,6 +200,15 @@ async fn run_service(config: ServerConfig) -> Result<()> {
         let _ = stopped.await;
     });
     tokio::pin!(server);
+
+    let debounce_task = tokio::spawn(async {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            claude_code_proxy::providers::codex::persist_compaction_states_if_dirty();
+        }
+    });
+
     let outcome = tokio::select! {
         result = &mut server => result,
         signal = signals.recv() => {
@@ -215,6 +224,7 @@ async fn run_service(config: ServerConfig) -> Result<()> {
             }
         }
     };
+    debounce_task.abort();
     claude_code_proxy::providers::codex::persist_compaction_states();
     outcome
 }

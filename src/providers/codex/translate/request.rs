@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -490,8 +490,17 @@ fn translate_request_inner(
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
-    let tools = read_tools(req)?;
+    let (base_tools, mut deferred_tools) = read_base_and_deferred_tools(req)?;
+    let input = if opts.use_responses_lite {
+        build_input(req, &mut deferred_tools)
+    } else {
+        build_input(req, &mut HashMap::new())
+    };
+    let tools = if opts.use_responses_lite {
+        None
+    } else {
+        read_tools(req)?
+    };
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
@@ -530,10 +539,8 @@ fn translate_request_inner(
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();
-        if let Some(ref tools) = tools
-            && !tools.is_empty()
-        {
-            let tools = tools
+        if !base_tools.is_empty() {
+            let tools = base_tools
                 .iter()
                 .map(serde_json::to_value)
                 .collect::<Result<Vec<_>, _>>()?;
@@ -648,6 +655,67 @@ fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     }
 }
 
+fn tool_value_to_responses_tool(tool: &Value) -> ResponsesTool {
+    let tool_type = tool
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("function");
+    if tool_type == "web_search_20250305" {
+        let mut filters = ResponsesWebSearchFilters {
+            allowed_domains: None,
+            blocked_domains: None,
+        };
+        let allowed = tool.get("allowed_domains").and_then(|v| v.as_array());
+        if allowed.is_some_and(|a| !a.is_empty()) {
+            filters.allowed_domains = allowed.map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+        }
+        let blocked = tool.get("blocked_domains").and_then(|v| v.as_array());
+        if blocked.is_some_and(|a| !a.is_empty()) {
+            filters.blocked_domains = blocked.map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
+        }
+        let has_filters =
+            filters.allowed_domains.is_some() || filters.blocked_domains.is_some();
+        ResponsesTool::WebSearch(ResponsesWebSearchTool {
+            kind: "web_search".to_string(),
+            external_web_access: true,
+            search_content_types: vec!["text".to_string(), "image".to_string()],
+            filters: if has_filters { Some(filters) } else { None },
+        })
+    } else {
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = tool
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let mut parameters = tool
+            .get("input_schema")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        crate::providers::translate_shared::strip_tool_schema_patterns(&mut parameters);
+        let description = codex_tool_description(&name, description);
+        let parameters = codex_tool_parameters(&name, parameters);
+        ResponsesTool::Function(ResponsesFunctionTool {
+            kind: "function".to_string(),
+            name,
+            description,
+            parameters,
+            strict: false,
+        })
+    }
+}
+
 fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
     let Some(tools) = req.extra.get("tools") else {
         return Ok(None);
@@ -659,69 +727,46 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     let sorted_tools = crate::providers::translate_shared::sort_tools_stable_prefix(tools_arr, req);
     let mut out = Vec::new();
     for tool in sorted_tools {
-        let tool_type = tool
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("function");
-        if tool_type == "web_search_20250305" {
-            let mut filters = ResponsesWebSearchFilters {
-                allowed_domains: None,
-                blocked_domains: None,
-            };
-            let allowed = tool.get("allowed_domains").and_then(|v| v.as_array());
-            if allowed.is_some_and(|a| !a.is_empty()) {
-                filters.allowed_domains = allowed.map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
-            }
-            let blocked = tool.get("blocked_domains").and_then(|v| v.as_array());
-            if blocked.is_some_and(|a| !a.is_empty()) {
-                filters.blocked_domains = blocked.map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
-            }
-            let has_filters =
-                filters.allowed_domains.is_some() || filters.blocked_domains.is_some();
-            out.push(ResponsesTool::WebSearch(ResponsesWebSearchTool {
-                kind: "web_search".to_string(),
-                external_web_access: true,
-                search_content_types: vec!["text".to_string(), "image".to_string()],
-                filters: if has_filters { Some(filters) } else { None },
-            }));
-        } else {
-            let name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let parameters = tool
-                .get("input_schema")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            let description = codex_tool_description(&name, description);
-            let parameters = codex_tool_parameters(&name, parameters);
-            out.push(ResponsesTool::Function(ResponsesFunctionTool {
-                kind: "function".to_string(),
-                name,
-                description,
-                parameters,
-                strict: false,
-            }));
-        }
+        out.push(tool_value_to_responses_tool(tool));
     }
     if out.is_empty() {
         Ok(None)
     } else {
         Ok(Some(out))
     }
+}
+
+fn read_base_and_deferred_tools(
+    req: &MessagesRequest,
+) -> Result<(Vec<ResponsesTool>, HashMap<String, Value>), anyhow::Error> {
+    let Some(tools) = req.extra.get("tools") else {
+        return Ok((Vec::new(), HashMap::new()));
+    };
+    let tools_arr = match tools {
+        Value::Array(a) => a,
+        _ => return Ok((Vec::new(), HashMap::new())),
+    };
+
+    let mut base_tools = Vec::new();
+    let mut deferred_map = HashMap::new();
+
+    for tool in tools_arr {
+        if crate::providers::translate_shared::should_skip_tool(tool, req) {
+            continue;
+        }
+        let is_deferred = tool.get("defer_loading").and_then(Value::as_bool).unwrap_or(false);
+        let resp_tool = tool_value_to_responses_tool(tool);
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+
+        if is_deferred {
+            let val = serde_json::to_value(&resp_tool)?;
+            deferred_map.insert(name, val);
+        } else {
+            base_tools.push(resp_tool);
+        }
+    }
+
+    Ok((base_tools, deferred_map))
 }
 
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
@@ -868,7 +913,10 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(
+    req: &MessagesRequest,
+    deferred_tools: &mut HashMap<String, Value>,
+) -> Vec<ResponsesInputItem> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
@@ -919,6 +967,35 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 call_id: tool_use_id.clone(),
                                 output: function_call_output(rendered),
                             });
+                            if !deferred_tools.is_empty() {
+                                let mut resolved_in_turn = Vec::new();
+                                let mut check_sub = |sub: &Value| {
+                                    if sub.get("type").and_then(Value::as_str) == Some("tool_reference")
+                                        && let Some(name) = sub.get("tool_name").and_then(Value::as_str)
+                                        && let Some(tool_val) = deferred_tools.remove(name)
+                                    {
+                                        resolved_in_turn.push(tool_val);
+                                    }
+                                };
+                                match content {
+                                    Value::Array(arr) => {
+                                        for sub in arr {
+                                            check_sub(sub);
+                                        }
+                                    }
+                                    Value::Object(_) => {
+                                        check_sub(content);
+                                    }
+                                    _ => {}
+                                }
+                                if !resolved_in_turn.is_empty() {
+                                    out.push(ResponsesInputItem::AdditionalTools {
+                                        id: None,
+                                        role: "developer".to_string(),
+                                        tools: resolved_in_turn,
+                                    });
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -997,6 +1074,15 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                 flush_text(&mut out, &mut text_parts);
             }
         }
+    }
+
+    if !deferred_tools.is_empty() {
+        let remaining: Vec<Value> = deferred_tools.drain().map(|(_, v)| v).collect();
+        out.push(ResponsesInputItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: remaining,
+        });
     }
 
     out
@@ -2697,4 +2783,94 @@ mod tests {
             Some(ResponsesInputItem::Message { role, .. }) if role == "assistant"
         ));
     }
+
+    #[test]
+    fn responses_lite_deferred_tool_prefix_preservation() {
+        let tools = json!([
+            {
+                "name": "base_calc",
+                "description": "basic calculator",
+                "input_schema": {"type": "object", "properties": {"expr": {"type": "string"}}}
+            },
+            {
+                "name": "deferred_weather",
+                "description": "weather lookup",
+                "defer_loading": true,
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        ]);
+
+        // Turn 1: before deferred tool is resolved
+        let req_turn1: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "calculate 2+2"}
+            ],
+            "tools": tools
+        })).unwrap();
+
+        let out_turn1 = translate_request(&req_turn1, TranslateOptions {
+            use_responses_lite: true,
+            ..opts()
+        }).unwrap();
+
+        // input[0] must be AdditionalTools containing ONLY base_calc
+        match &out_turn1.input[0] {
+            ResponsesInputItem::AdditionalTools { tools, .. } => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0]["name"], "base_calc");
+            }
+            _ => panic!("expected AdditionalTools at input[0]"),
+        }
+
+        // Turn 2: deferred tool is resolved via tool_reference in tool_result
+        let req_turn2: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "calculate 2+2"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "base_calc", "input": {"expr": "2+2"}}
+                ]},
+                {"role": "user", "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": [
+                            {"type": "text", "text": "4"},
+                            {"type": "tool_reference", "tool_name": "deferred_weather"}
+                        ]
+                    }
+                ]}
+            ],
+            "tools": tools
+        })).unwrap();
+
+        let out_turn2 = translate_request(&req_turn2, TranslateOptions {
+            use_responses_lite: true,
+            ..opts()
+        }).unwrap();
+
+        // input[0] must STILL be AdditionalTools containing ONLY base_calc (KV prefix preserved!)
+        match &out_turn2.input[0] {
+            ResponsesInputItem::AdditionalTools { tools, .. } => {
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0]["name"], "base_calc");
+            }
+            _ => panic!("expected AdditionalTools at input[0]"),
+        }
+
+        // The deferred tool must be injected as AdditionalTools at the turn boundary
+        let dynamic_tools = out_turn2.input.iter().filter_map(|item| {
+            if let ResponsesInputItem::AdditionalTools { tools, .. } = item {
+                Some(tools)
+            } else {
+                None
+            }
+        }).collect::<Vec<_>>();
+
+        assert_eq!(dynamic_tools.len(), 2);
+        assert_eq!(dynamic_tools[0][0]["name"], "base_calc");
+        assert_eq!(dynamic_tools[1][0]["name"], "deferred_weather");
+    }
 }
+

@@ -87,7 +87,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         let _refresh_guard = self.refresh_lock.lock().await;
 
         let auth_path = self.store.auth_path();
-        let _file_lock = crate::auth::acquire_lock(&auth_path).ok();
+        let _file_lock = crate::auth::acquire_lock_async(&auth_path).await.ok();
 
         // Reload from durable storage after acquiring the single-flight cross-process lock.
         // Another process or request may have rotated and persisted the token while this

@@ -76,6 +76,18 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
     }
 
     fn refresh_now(&self, current: &StoredAuth) -> Result<StoredAuth, anyhow::Error> {
+        let auth_path = self.store.auth_path();
+        let _lock = crate::auth::acquire_lock(&auth_path).ok();
+
+        // Re-read inside critical section to avoid race with concurrent process
+        if let Ok(Some(latest)) = self.store.load_auth()
+            && (latest.expires > Self::now_ms() + REFRESH_MARGIN_MS || latest.access != current.access)
+        {
+            let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            *guard = Some(latest.clone());
+            return Ok(latest);
+        }
+
         if current.refresh.is_empty() {
             anyhow::bail!("No refresh token stored; re-authenticate");
         }

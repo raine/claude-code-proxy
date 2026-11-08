@@ -70,6 +70,10 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         rejected_access: Option<&str>,
     ) -> anyhow::Result<StoredAuth> {
         let _guard = self.refresh_lock.lock().await;
+
+        let auth_path = self.store.auth_path();
+        let _file_lock = crate::auth::acquire_lock_async(&auth_path).await.ok();
+
         let auth = self
             .store
             .load_auth()?

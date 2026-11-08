@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::sse::parse_sse_events;
@@ -130,6 +130,21 @@ pub fn persist_compaction_states() {
     let path = sessions_file_path();
     let path_str = path.to_string_lossy();
     let _ = crate::auth::write_atomically(&path_str, &store);
+}
+
+static COMPACTION_DIRTY: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_compaction_dirty() {
+    COMPACTION_DIRTY.store(true, Ordering::Release);
+}
+
+pub fn persist_compaction_states_if_dirty() -> bool {
+    if COMPACTION_DIRTY.swap(false, Ordering::AcqRel) {
+        persist_compaction_states();
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -263,7 +278,7 @@ pub fn activate_compaction(
     let is_anchored = registry.states.contains_key(session_id);
     drop(guard);
     if is_anchored {
-        persist_compaction_states();
+        mark_compaction_dirty();
     }
     is_anchored
 }

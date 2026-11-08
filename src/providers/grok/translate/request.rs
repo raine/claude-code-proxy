@@ -173,7 +173,7 @@ pub fn translate_request_with_options(
 ) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
     let mut instructions = parse_system(req.extra.get("system"))?;
-    let mut tools = parse_tools(req.extra.get("tools"), hosted_search)?;
+    let mut tools = parse_tools(req.extra.get("tools"), hosted_search, req)?;
     let hosted_web_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
@@ -489,14 +489,16 @@ fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
 fn parse_tools(
     value: Option<&Value>,
     hosted_search: bool,
+    req: &MessagesRequest,
 ) -> anyhow::Result<Option<Vec<GrokTool>>> {
     let Some(value) = value else { return Ok(None) };
     let tools = value
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools must be an array"))?;
+    let sorted_tools = crate::providers::translate_shared::sort_tools_stable_prefix(tools, req);
     let mut names = HashSet::new();
     let mut out = Vec::new();
-    for tool in tools {
+    for tool in sorted_tools {
         let obj = tool
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("tool must be an object"))?;
@@ -533,7 +535,7 @@ fn parse_tools(
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("tool name is invalid"))?;
-        if name == "DeferredToolPlaceholder" || obj.get("defer_loading").and_then(Value::as_bool).unwrap_or(false) {
+        if name == "DeferredToolPlaceholder" {
             continue;
         }
         if !names.insert(name.to_string()) {
