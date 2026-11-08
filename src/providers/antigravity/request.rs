@@ -183,15 +183,10 @@ impl Prepared {
 
 pub(crate) fn cache_hint(value: Option<&Value>) -> Result<()> {
     let Some(value) = value else { return Ok(()) };
-    keys(value, &["type", "ttl", "scope"], &["type"])?;
-    if value["type"] != "ephemeral"
-        || value
-            .get("ttl")
-            .is_some_and(|v| !matches!(v.as_str(), Some("5m" | "1h")))
-        || value
-            .get("scope")
-            .is_some_and(|v| v.as_str() != Some("global"))
-    {
+    let Some(obj) = value.as_object() else {
+        return Err("unsupported cache hint");
+    };
+    if obj.get("type").and_then(Value::as_str) != Some("ephemeral") {
         return Err("unsupported cache hint");
     }
     Ok(())
@@ -303,6 +298,9 @@ fn options(body: &MessagesRequest) -> Result<&'static str> {
         "metadata",
         "tool_choice",
         "cache_control",
+        "service_tier",
+        "betas",
+        "anthropic_beta",
     ];
     if body.extra.keys().any(|k| !allowed.contains(&k.as_str())) {
         return Err("unsupported Antigravity semantic request option");
@@ -327,7 +325,7 @@ fn options(body: &MessagesRequest) -> Result<&'static str> {
         if output.get("effort").is_some_and(|v| {
             !matches!(
                 v.as_str(),
-                Some("low" | "medium" | "high" | "xhigh" | "max")
+                Some("low" | "medium" | "high" | "xhigh" | "max" | "auto")
             )
         }) {
             return Err("unsupported advisory effort");
@@ -344,11 +342,10 @@ fn options(body: &MessagesRequest) -> Result<&'static str> {
             }
         }
     }
-    if let Some(metadata) = body.extra.get("metadata") {
-        keys(metadata, &["user_id"], &[])?;
-        if metadata.get("user_id").is_some_and(|v| !v.is_string()) {
-            return Err("invalid metadata");
-        }
+    if let Some(metadata) = body.extra.get("metadata")
+        && (!metadata.is_object() || metadata.get("user_id").is_some_and(|v| !v.is_string()))
+    {
+        return Err("invalid metadata");
     }
     cache_hint(body.extra.get("cache_control"))?;
     Ok(display)

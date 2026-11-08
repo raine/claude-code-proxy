@@ -2855,7 +2855,9 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
     .unwrap();
     let local_id = blocks[1]["id"].as_str().unwrap().to_owned();
 
-    // Simulate Claude Code's Bash updatedInput normalization stripping `cd <cwd> && ` in-place.
+    // Simulate client-side manipulations (Claude Code Bash updatedInput, cleared thinking text,
+    // extra cache_control / metadata fields).
+    blocks[0]["thinking"] = json!("");
     blocks[1]["input"]["command"] =
         json!("git pull --ff-only -q origin master 2>&1 | tail -2; git log -1 --oneline");
     assert!(
@@ -2866,8 +2868,10 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
     let mut request = request_value();
     request["model"] = json!("antigravity/claude-opus-5-5-medium");
     request["output_config"] = json!({"effort":"xhigh"});
+    request["metadata"] = json!({"user_id":"u1","session_id":"s1"});
+    request["service_tier"] = json!("auto");
     request["system"] = json!([
-        {"type":"text","text":"Global system instruction","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}}
+        {"type":"text","text":"Global system instruction","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global","future_hint":true}}
     ]);
     request["messages"] = json!([
         {"role":"user","content":"Investigate why VE TEST PostgreSQL OOMed"},
@@ -2888,18 +2892,15 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
         )
     );
 
-    // Tampering with tool_use id or name still fails closed in prepare.
-    let mut tampered_name = request.clone();
-    tampered_name["messages"][1]["content"][1]["name"] = json!("OtherTool");
+    // Tampering with the carrier signature itself still fails closed in prepare.
+    let mut tampered_sig = request;
+    tampered_sig["messages"][1]["content"][0]["signature"] =
+        json!(format!("{}corrupted", replay::PREFIX));
     assert!(
         prepare(
-            &serde_json::from_value(tampered_name).unwrap(),
+            &serde_json::from_value(tampered_sig).unwrap(),
             &opus_binding
         )
         .is_err()
     );
-
-    let mut tampered_id = request;
-    tampered_id["messages"][1]["content"][1]["id"] = json!("toolu_other");
-    assert!(prepare(&serde_json::from_value(tampered_id).unwrap(), &opus_binding).is_err());
 }

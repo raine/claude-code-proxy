@@ -534,20 +534,30 @@ pub(crate) fn projection_values(blocks: &Value) -> Result<Value> {
     Ok(json!(result))
 }
 
-/// Restore original model-emitted `tool_use.input` values from the signed
-/// carrier envelope when a client normalizes tool inputs in-place (such as
-/// Claude Code's `Bash` tool stripping a redundant `cd <cwd> && ` prefix via
-/// `updatedInput`) while keeping `id`, `name`, and block structure intact.
+/// Canonicalize an assistant turn's projected blocks from its leading
+/// `ccp:antigravity:v1:` carrier envelope before `decode_history`. Because
+/// upstream `v1internal` requests are reconstructed from `envelope["contents"]`
+/// and `envelope["tool_mapping"]` inside the carrier rather than the client's
+/// echoed blocks, client-side manipulations by Claude Code (such as hook
+/// `updatedInput` rewrites, thinking-text clearing, text edits, or extra block
+/// metadata) should not trigger a `projection digest mismatch`.
 pub(crate) fn canonicalize_tool_inputs(blocks: &mut Value) {
-    let Some(list) = blocks.as_array_mut() else {
+    let Some(list) = blocks.as_array() else {
         return;
     };
-    let Some(encoded) = list
-        .first()
-        .filter(|b| b["type"] == "thinking")
-        .and_then(|b| b["signature"].as_str())
-        .and_then(|s| s.strip_prefix(PREFIX))
-    else {
+    if list.is_empty()
+        || list[0]["type"] != "thinking"
+        || list.iter().filter(|b| b["type"] == "thinking").count() != 1
+        || list
+            .iter()
+            .any(|b| !matches!(b["type"].as_str(), Some("thinking" | "text" | "tool_use")))
+    {
+        return;
+    }
+    let Some(signature) = list[0]["signature"].as_str().map(str::to_owned) else {
+        return;
+    };
+    let Some(encoded) = signature.strip_prefix(PREFIX) else {
         return;
     };
     if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
@@ -562,49 +572,16 @@ pub(crate) fn canonicalize_tool_inputs(blocks: &mut Value) {
     let Ok(thought_display) = nonempty(&envelope["thought_display"]) else {
         return;
     };
-    let Ok(expected) = projection(
+    let Ok(mut expected) = projection(
         &envelope["contents"],
         thought_display,
         &envelope["tool_mapping"],
     ) else {
         return;
     };
-    let Some(expected_list) = expected.as_array() else {
-        return;
-    };
-    let expected_calls: Vec<&Value> = expected_list
-        .iter()
-        .filter(|b| b["type"] == "tool_use")
-        .collect();
-    if expected_calls.is_empty() {
-        return;
-    }
-    let actual_calls: Vec<usize> = list
-        .iter()
-        .enumerate()
-        .filter_map(|(i, b)| (b["type"] == "tool_use").then_some(i))
-        .collect();
-    if actual_calls.len() != expected_calls.len() {
-        return;
-    }
-    for (&idx, exp) in actual_calls.iter().zip(&expected_calls) {
-        let block = &list[idx];
-        if keys(
-            block,
-            &["type", "signature", "cache_control", "id", "name", "input"],
-            &["type", "id", "name", "input"],
-        )
-        .is_err()
-            || !block["input"].is_object()
-            || block["id"] != exp["id"]
-            || block["name"] != exp["name"]
-            || canonical(&block["input"]).is_err()
-        {
-            return;
-        }
-    }
-    for (&idx, exp) in actual_calls.iter().zip(&expected_calls) {
-        list[idx]["input"] = exp["input"].clone();
+    if let Some(first) = expected.as_array_mut().and_then(|b| b.first_mut()) {
+        first["signature"] = json!(signature);
+        *blocks = expected;
     }
 }
 
