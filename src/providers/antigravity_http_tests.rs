@@ -149,7 +149,6 @@ async fn provider_with_user_agent(
         .unwrap();
     drop(lock);
     let config = Config {
-        request_metadata: super::antigravity::config::RequestMetadata::Legacy,
         base_url: url.clone(),
         client_id: Some("synthetic-client".into()),
         ..Config::read(&directory.join("config.json"), |key| {
@@ -255,7 +254,7 @@ async fn assert_generation_cap_ingress(stream: bool) {
         assert_eq!(wire["model"], "gemini-4-argon-low");
         assert_eq!(wire["userAgent"], "antigravity");
         assert_eq!(wire["requestType"], "agent");
-        assert_eq!(wire["request"].as_object().unwrap().len(), 3);
+        assert_eq!(wire["request"].as_object().unwrap().len(), 4);
         assert_eq!(
             wire["request"]["generationConfig"]["thinkingConfig"],
             json!({"includeThoughts":true,"thinkingLevel":"LOW"})
@@ -1313,8 +1312,29 @@ async fn antigravity_opaque_native_signature_corruption_is_upstream_not_local_au
         project_id: "project".into(),
         native_model: "gemini-4-argon-low".into(),
     };
+    let lineage = replay::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let state = replay::State {
+        lineage,
+        native_checkpoint_index: 0,
+        user_execution: replay::UserExecution {
+            active_id: "aaaaaaaa-aaaa-4aaa-8aaa-000000000000".into(),
+            prior_recorded_id: None,
+        },
+    };
     let native_contents = json!([{"role":"model","parts":[{"text":"same projection","thoughtSignature":"original-native-signature"}]}]);
-    let mut blocks = replay::encode(&native_contents, &binding, "17", "full", &json!([])).unwrap();
+    let mut blocks = replay::encode(
+        &native_contents,
+        &binding,
+        &state,
+        "end_turn",
+        "full",
+        &json!([]),
+    )
+    .unwrap();
     let original = replay::decode(&blocks, &binding).unwrap();
     let mut mutated = original.clone();
     mutated["contents"][0]["parts"][0]["thoughtSignature"] = json!("corrupt-native-signature");
@@ -2438,11 +2458,32 @@ async fn antigravity_count_estimate_is_signature_size_invariant_and_network_free
         project_id: "project".into(),
         native_model: "gemini-4-argon-low".into(),
     };
+    let lineage = replay::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap();
+    let state = replay::State {
+        lineage,
+        native_checkpoint_index: 0,
+        user_execution: replay::UserExecution {
+            active_id: "aaaaaaaa-aaaa-4aaa-8aaa-000000000000".into(),
+            prior_recorded_id: None,
+        },
+    };
     let mut estimates = Vec::new();
     for signature in ["x".to_string(), "x".repeat(100000)] {
         let contents =
             json!([{"role":"model","parts":[{"text":"same text","thoughtSignature":signature}]}]);
-        let blocks = replay::encode(&contents, &binding, "123", "omitted", &json!([])).unwrap();
+        let blocks = replay::encode(
+            &contents,
+            &binding,
+            &state,
+            "end_turn",
+            "omitted",
+            &json!([]),
+        )
+        .unwrap();
         let mut body = request(false);
         body["messages"].as_array_mut().unwrap().extend([
             json!({"role":"assistant","content":blocks}),

@@ -136,21 +136,29 @@ fn execution_id(index: u64) -> String {
     format!("aaaaaaaa-aaaa-4aaa-8aaa-{index:012x}")
 }
 
-fn v2_state(lineage: &replay::v2::Lineage, index: u64) -> replay::v2::State {
-    replay::v2::State {
+fn default_lineage() -> replay::Lineage {
+    replay::Lineage::new(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "22222222-2222-4222-8222-222222222222".into(),
+    )
+    .unwrap()
+}
+
+fn state_at(lineage: &replay::Lineage, index: u64) -> replay::State {
+    replay::State {
         lineage: lineage.clone(),
         native_checkpoint_index: index,
-        user_execution: replay::v2::UserExecution {
+        user_execution: replay::UserExecution {
             active_id: execution_id(index),
             prior_recorded_id: index.checked_sub(1).map(execution_id),
         },
     }
 }
 
-fn v2_encode(
+fn encode_turn(
     contents: &Value,
     binding: &replay::Binding,
-    lineage: &replay::v2::Lineage,
+    lineage: &replay::Lineage,
     index: u64,
     display: &str,
     mapping: &Value,
@@ -160,22 +168,32 @@ fn v2_encode(
     } else {
         "end_turn"
     };
-    replay::v2::encode(
+    replay::encode(
         contents,
         binding,
-        &v2_state(lineage, index),
+        &state_at(lineage, index),
         stop,
         display,
         mapping,
     )
 }
 
+fn encode_default(
+    contents: &Value,
+    binding: &replay::Binding,
+    display: &str,
+    mapping: &Value,
+) -> replay::Result<Value> {
+    encode_turn(contents, binding, &default_lineage(), 0, display, mapping)
+}
+
 #[test]
-fn antigravity_v2_first_checkpoint_is_separate_bounded_and_scope_bound() {
+fn antigravity_first_checkpoint_is_bounded_and_scope_bound() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
+    let lineage = default_lineage();
+    let other_lineage = replay::Lineage::new(
+        "33333333-3333-4333-8333-333333333333".into(),
+        "44444444-4444-4444-8444-444444444444".into(),
     )
     .unwrap();
     let contents = json!([{"role":"model","parts":[
@@ -187,24 +205,23 @@ fn antigravity_v2_first_checkpoint_is_separate_bounded_and_scope_bound() {
         json!([{"local_id":"toolu_fixed","caller_name":"caller_name","codec_paths":["/payload"]}]);
     let mapping = replay::mapping(&contents, Some(&recipes)).unwrap();
     for display in ["full", "omitted"] {
-        let v1 = replay::encode(&contents, &binding(), "19", display, &mapping).unwrap();
-        let v2 = v2_encode(&contents, &binding(), &lineage, 0, display, &mapping).unwrap();
+        let other =
+            encode_turn(&contents, &binding(), &other_lineage, 0, display, &mapping).unwrap();
+        let blocks = encode_turn(&contents, &binding(), &lineage, 0, display, &mapping).unwrap();
         assert_eq!(
-            replay::projection_values(&v1).unwrap(),
-            replay::projection_values(&v2).unwrap()
+            replay::projection_values(&other).unwrap(),
+            replay::projection_values(&blocks).unwrap()
         );
         assert!(
-            v2[0]["signature"]
+            blocks[0]["signature"]
                 .as_str()
                 .unwrap()
-                .starts_with(replay::v2::PREFIX)
+                .starts_with(replay::PREFIX)
         );
-        assert!(replay::decode(&v2, &binding()).is_err());
-        assert!(replay::v2::decode(&v1, &binding()).is_err());
-        let envelope = replay::v2::decode(&v2, &binding()).unwrap();
+        let envelope = replay::decode(&blocks, &binding()).unwrap();
         assert_eq!(envelope["contents"], contents);
         assert_eq!(envelope["tool_mapping"], mapping);
-        assert_eq!(envelope["version"], 2);
+        assert_eq!(envelope["version"], 1);
         assert_eq!(envelope["backend_session_id"], "-3750763034362895579");
         assert_eq!(
             envelope["lineage"]["conversation_id"],
@@ -213,16 +230,16 @@ fn antigravity_v2_first_checkpoint_is_separate_bounded_and_scope_bound() {
         assert_eq!(envelope["lineage"]["trajectory_id"], lineage.trajectory_id);
         assert_ne!(
             envelope["projection_digest"],
-            replay::decode(&v1, &binding()).unwrap()["projection_digest"]
+            replay::decode(&other, &binding()).unwrap()["projection_digest"]
         );
         for key in ["profile_id", "project_id", "native_model"] {
             let mut scope = serde_json::to_value(binding()).unwrap();
             scope[key] = json!("different");
             let scope = serde_json::from_value(scope).unwrap();
-            assert!(replay::v2::decode(&v2, &scope).is_err());
+            assert!(replay::decode(&blocks, &scope).is_err());
         }
         for (key, value) in [
-            ("version", json!(1)),
+            ("version", json!(2)),
             ("version", json!(3)),
             ("backend_session_id", json!("19")),
             ("native_checkpoint_index", json!(1)),
@@ -237,31 +254,31 @@ fn antigravity_v2_first_checkpoint_is_separate_bounded_and_scope_bound() {
             ),
             (
                 "projection_digest",
-                replay::decode(&v1, &binding()).unwrap()["projection_digest"].clone(),
+                replay::decode(&other, &binding()).unwrap()["projection_digest"].clone(),
             ),
             ("extra", json!(true)),
         ] {
             let mut tampered = envelope.clone();
             tampered[key] = value;
-            let mut blocks = v2.clone();
-            blocks[0]["signature"] = json!(format!(
+            let mut candidate = blocks.clone();
+            candidate[0]["signature"] = json!(format!(
                 "{}{}",
-                replay::v2::PREFIX,
+                replay::PREFIX,
                 URL_SAFE_NO_PAD.encode(serde_json::to_vec(&tampered).unwrap())
             ));
             assert!(
-                replay::v2::decode(&blocks, &binding()).is_err(),
+                replay::decode(&candidate, &binding()).is_err(),
                 "accepted {key}"
             );
         }
-        let mut modified = v2.clone();
+        let mut modified = blocks.clone();
         modified[1]["input"]["payload"]["x"] = json!(18);
-        assert!(replay::v2::decode(&modified, &binding()).is_err());
-        let mut foreign = v2.clone();
+        assert!(replay::decode(&modified, &binding()).is_err());
+        let mut foreign = blocks.clone();
         foreign[0]["signature"] = json!("ccp:antigravity:v3:unknown");
-        assert!(replay::v2::decode(&foreign, &binding()).is_err());
-        foreign[0]["signature"] = json!(format!("{}!", replay::v2::PREFIX));
-        assert!(replay::v2::decode(&foreign, &binding()).is_err());
+        assert!(replay::decode(&foreign, &binding()).is_err());
+        foreign[0]["signature"] = json!(format!("{}!", replay::PREFIX));
+        assert!(replay::decode(&foreign, &binding()).is_err());
     }
     for id in [
         "not-a-uuid",
@@ -270,39 +287,32 @@ fn antigravity_v2_first_checkpoint_is_separate_bounded_and_scope_bound() {
         "11111111-1111-4111-0111-111111111111",
         "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
     ] {
-        assert!(replay::v2::Lineage::new(id.into(), lineage.trajectory_id.clone()).is_err());
+        assert!(replay::Lineage::new(id.into(), lineage.trajectory_id.clone()).is_err());
     }
     let oversized = json!([{"role":"model","parts":[{"text":"x".repeat(replay::MAX_DECODED)}]}]);
     assert_eq!(
-        v2_encode(&oversized, &binding(), &lineage, 0, "full", &json!([])).err(),
+        encode_turn(&oversized, &binding(), &lineage, 0, "full", &json!([])).err(),
         Some("JSON byte limit")
     );
     let too_many = json!(vec![json!({"role":"model","parts":[]}); 513]);
-    assert!(v2_encode(&too_many, &binding(), &lineage, 0, "full", &json!([])).is_err());
+    assert!(encode_turn(&too_many, &binding(), &lineage, 0, "full", &json!([])).is_err());
     assert!(
-        replay::v2::Lineage::new(lineage.conversation_id.clone(), lineage.conversation_id).is_err()
+        replay::Lineage::new(lineage.conversation_id.clone(), lineage.conversation_id).is_err()
     );
 }
 
 #[test]
-fn antigravity_metadata_first_request_and_legacy_history_boundary() {
-    use super::antigravity::{
-        config::RequestMetadata,
-        request::{Metadata, prepare_with_policy},
-    };
+fn antigravity_metadata_first_request_and_history_continuation() {
+    use super::antigravity::request::Metadata;
     let body = serde_json::from_value(request_value()).unwrap();
-    let mut fresh = prepare_with_policy(&body, &binding(), RequestMetadata::Agy).unwrap();
+    let mut fresh = prepare(&body, &binding()).unwrap();
     assert!(
         matches!(fresh.metadata, Metadata::Fresh),
         "preparation must not allocate Go identifiers"
     );
     assert_eq!(fresh.wire["requestId"], "");
     assert_eq!(fresh.wire["request"]["sessionId"], "");
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
+    let lineage = default_lineage();
     assert!(
         fresh
             .finalize_metadata(-1, || panic!("invalid clock must not allocate"))
@@ -347,62 +357,16 @@ fn antigravity_metadata_first_request_and_legacy_history_boundary() {
             .is_err()
     );
     let contents = json!([{"role":"model","parts":[{"text":"previous"}]}]);
-    let v1 = replay::encode(&contents, &binding(), "19", "full", &json!([])).unwrap();
-    let v2 = v2_encode(&contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let turn = encode_turn(&contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
     let mut history = request_value();
     history["messages"].as_array_mut().unwrap().extend([
-        json!({"role":"assistant","content":v1}),
+        json!({"role":"assistant","content":turn}),
         json!({"role":"user","content":"next"}),
     ]);
-    let mut legacy = prepare_with_policy(
-        &serde_json::from_value(history.clone()).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
-    assert_eq!(legacy.session, "19");
-    assert!(legacy.wire["request"].get("labels").is_none());
-    assert!(
-        legacy.wire["requestId"]
-            .as_str()
-            .unwrap()
-            .starts_with("ccp-")
-    );
-    assert!(matches!(legacy.metadata, Metadata::Legacy));
-    assert!(
-        legacy
-            .finalize_metadata(1_799_999_999_123, || panic!(
-                "legacy must not allocate Go IDs"
-            ))
-            .is_err()
-    );
-    // Ignored noncarrier signatures have always been projection metadata in V1.
-    // A V2-looking string there must not reclassify a valid V1 turn as mixed.
+    // Ignored noncarrier signatures on text blocks must not invalidate a valid signed turn.
     history["messages"][1]["content"][1]["signature"] =
-        json!("ccp:antigravity:v2:ignored-text-signature");
-    assert!(
-        prepare_with_policy(
-            &serde_json::from_value(history.clone()).unwrap(),
-            &binding(),
-            RequestMetadata::Agy
-        )
-        .is_ok()
-    );
-    history["messages"][1]["content"] = v2;
-    let error = prepare_with_policy(
-        &serde_json::from_value(history.clone()).unwrap(),
-        &binding(),
-        RequestMetadata::Legacy,
-    )
-    .err()
-    .unwrap();
-    assert_eq!(error, "V2 history requires the agy request metadata policy");
-    let resumed = prepare_with_policy(
-        &serde_json::from_value(history).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
+        json!("ccp:antigravity:v1:ignored-text-signature");
+    let resumed = prepare(&serde_json::from_value(history).unwrap(), &binding()).unwrap();
     assert!(matches!(
         resumed.metadata,
         Metadata::Continuation {
@@ -410,28 +374,17 @@ fn antigravity_metadata_first_request_and_legacy_history_boundary() {
             ..
         }
     ));
-    let default = prepare(&body, &binding()).unwrap();
-    assert!(matches!(default.metadata, Metadata::Legacy));
-    assert!(default.wire["request"].get("labels").is_none());
-    assert!(default.session.parse::<i64>().unwrap() > 0);
 }
 
 #[test]
-fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
-    use super::antigravity::{
-        config::RequestMetadata,
-        request::{Metadata, prepare_with_policy},
-    };
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
+fn antigravity_two_user_text_checkpoint_progress_and_history_consistency() {
+    use super::antigravity::request::Metadata;
+    let lineage = default_lineage();
     let first_contents =
         json!([{"role":"model","parts":[{"text":"first","thoughtSignature":"original-opaque"}]}]);
     let second_contents = json!([{"role":"model","parts":[{"text":"second"}]}]);
-    let first = v2_encode(&first_contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
-    let second = v2_encode(
+    let first = encode_turn(&first_contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let second = encode_turn(
         &second_contents,
         &binding(),
         &lineage,
@@ -440,12 +393,12 @@ fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
         &json!([]),
     )
     .unwrap();
-    let decoded = replay::v2::decode_history(&json!([first, second]), &binding()).unwrap();
+    let decoded = replay::decode_history(&json!([first, second]), &binding()).unwrap();
     assert_eq!(decoded[0]["native_checkpoint_index"], 0);
     assert_eq!(decoded[1]["native_checkpoint_index"], 1);
     assert_eq!(decoded[0]["contents"], first_contents);
     assert!(
-        v2_encode(
+        encode_turn(
             &second_contents,
             &binding(),
             &lineage,
@@ -461,16 +414,16 @@ fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
         json!([first, first]),
     ] {
         assert!(
-            replay::v2::decode_history(&history, &binding()).is_err(),
+            replay::decode_history(&history, &binding()).is_err(),
             "checkpoint omission/reorder/duplicate"
         );
     }
-    let foreign = replay::v2::Lineage::new(
+    let foreign = replay::Lineage::new(
         "33333333-3333-4333-8333-333333333333".into(),
         "44444444-4444-4444-8444-444444444444".into(),
     )
     .unwrap();
-    let other_second = v2_encode(
+    let other_second = encode_turn(
         &second_contents,
         &binding(),
         &foreign,
@@ -479,38 +432,13 @@ fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
         &json!([]),
     )
     .unwrap();
-    assert!(replay::v2::decode_history(&json!([first, other_second]), &binding()).is_err());
-    let v1 = replay::encode(&first_contents, &binding(), "19", "full", &json!([])).unwrap();
-    for mixed in [json!([first, v1]), json!([v1, first])] {
-        let mut body = request_value();
-        for blocks in mixed.as_array().unwrap() {
-            body["messages"].as_array_mut().unwrap().extend([
-                json!({"role":"assistant","content":blocks}),
-                json!({"role":"user","content":"next"}),
-            ]);
-        }
-        for policy in [RequestMetadata::Legacy, RequestMetadata::Agy] {
-            assert!(
-                prepare_with_policy(
-                    &serde_json::from_value(body.clone()).unwrap(),
-                    &binding(),
-                    policy
-                )
-                .is_err()
-            );
-        }
-    }
+    assert!(replay::decode_history(&json!([first, other_second]), &binding()).is_err());
     let mut body = request_value();
     body["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":first}),
         json!({"role":"user","content":"next"}),
     ]);
-    let mut prepared = prepare_with_policy(
-        &serde_json::from_value(body.clone()).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
+    let mut prepared = prepare(&serde_json::from_value(body.clone()).unwrap(), &binding()).unwrap();
     let Metadata::Continuation {
         state,
         new_user_execution: true,
@@ -572,15 +500,10 @@ fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
         {"role":"model","parts":[{"text":"part two","thoughtSignature":"opaque-two"}]}
     ]);
     let fragmented_blocks =
-        v2_encode(&fragmented, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+        encode_turn(&fragmented, &binding(), &lineage, 0, "full", &json!([])).unwrap();
     let mut split_body = body.clone();
     split_body["messages"][1]["content"] = fragmented_blocks;
-    let mut split = prepare_with_policy(
-        &serde_json::from_value(split_body).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
+    let mut split = prepare(&serde_json::from_value(split_body).unwrap(), &binding()).unwrap();
     split
         .finalize_metadata(1_799_999_999_456, || execution_id(1))
         .unwrap();
@@ -591,12 +514,7 @@ fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
         json!({"role":"assistant","content":second}),
         json!({"role":"user","content":"unobserved third user"}),
     ]);
-    let mut third = prepare_with_policy(
-        &serde_json::from_value(body).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
+    let mut third = prepare(&serde_json::from_value(body).unwrap(), &binding()).unwrap();
     assert!(
         third
             .finalize_metadata(1_799_999_999_789, || execution_id(0))
@@ -619,30 +537,18 @@ fn antigravity_v2_two_user_text_checkpoint_progress_and_history_consistency() {
 }
 
 #[test]
-fn antigravity_v2_unqualified_tool_and_noncanonical_text_transitions_reject() {
-    use super::antigravity::{config::RequestMetadata, request::prepare_with_policy};
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
+fn antigravity_unqualified_tool_and_noncanonical_text_transitions_reject() {
+    let lineage = default_lineage();
     let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"tool","args":{}}}]}]);
     let mapping = replay::mapping(&contents, None).unwrap();
-    let tool_turn = v2_encode(&contents, &binding(), &lineage, 0, "full", &mapping).unwrap();
+    let tool_turn = encode_turn(&contents, &binding(), &lineage, 0, "full", &mapping).unwrap();
     let mut body = request_value();
     body["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":tool_turn}),
-        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":tool_turn[1]["id"],"content":"done"}]})
+        json!({"role":"user","content":"ordinary text without tool_result"}),
     ]);
-    assert!(
-        prepare_with_policy(
-            &serde_json::from_value(body).unwrap(),
-            &binding(),
-            RequestMetadata::Agy
-        )
-        .is_err()
-    );
-    let text = v2_encode(
+    assert!(prepare(&serde_json::from_value(body).unwrap(), &binding(),).is_err());
+    let text = encode_turn(
         &json!([{"role":"model","parts":[{"text":"first"}]}]),
         &binding(),
         &lineage,
@@ -657,28 +563,21 @@ fn antigravity_v2_unqualified_tool_and_noncanonical_text_transitions_reject() {
         json!({"role":"user","content":"next"}),
     ]);
     for signature in [
-        "ccp:antigravity:v2:!",
+        "ccp:antigravity:v1:!",
+        "ccp:antigravity:v2:unknown",
         "ccp:antigravity:v3:unknown",
         "foreign",
     ] {
         let mut invalid = body.clone();
         invalid["messages"][1]["content"][0]["signature"] = json!(signature);
-        assert!(
-            prepare_with_policy(
-                &serde_json::from_value(invalid).unwrap(),
-                &binding(),
-                RequestMetadata::Agy
-            )
-            .is_err()
-        );
+        assert!(prepare(&serde_json::from_value(invalid).unwrap(), &binding(),).is_err());
     }
     let mut changed_scope = binding();
     changed_scope.profile_id = "other".into();
     assert!(
-        prepare_with_policy(
+        prepare(
             &serde_json::from_value(body.clone()).unwrap(),
             &changed_scope,
-            RequestMetadata::Agy
         )
         .is_err()
     );
@@ -686,33 +585,18 @@ fn antigravity_v2_unqualified_tool_and_noncanonical_text_transitions_reject() {
         .as_array_mut()
         .unwrap()
         .push(json!({"role":"user","content":"additional unobserved role"}));
-    assert!(
-        prepare_with_policy(
-            &serde_json::from_value(body).unwrap(),
-            &binding(),
-            RequestMetadata::Agy
-        )
-        .is_err()
-    );
+    assert!(prepare(&serde_json::from_value(body).unwrap(), &binding(),).is_err());
 }
 
 #[test]
-fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user() {
-    use super::antigravity::{
-        config::RequestMetadata,
-        request::{Metadata, prepare_with_policy},
-    };
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
-    let initial = v2_state(&lineage, 0);
+fn antigravity_user_execution_survives_read_loop_then_records_for_next_user() {
+    use super::antigravity::request::Metadata;
+    let lineage = default_lineage();
+    let initial = state_at(&lineage, 0);
     let call = json!([{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"Path":"/synthetic/owned"},"id":"synthetic-read-call-1"},"thoughtSignature":"c3ludGhldGljLXNpZ25hdHVyZQ=="}]}]);
     let mapping = replay::mapping(&call, None).unwrap();
-    let first =
-        replay::v2::encode(&call, &binding(), &initial, "tool_use", "full", &mapping).unwrap();
-    let saved = replay::v2::decode(&first, &binding()).unwrap();
+    let first = replay::encode(&call, &binding(), &initial, "tool_use", "full", &mapping).unwrap();
+    let saved = replay::decode(&first, &binding()).unwrap();
     assert_eq!(saved["checkpoint_stop_reason"], "tool_use");
     assert!(saved["user_execution"]["prior_recorded_id"].is_null());
     let mut body = request_value();
@@ -720,12 +604,7 @@ fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user()
         json!({"role":"assistant","content":first}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":first[1]["id"],"content":"read marker"}]})
     ]);
-    let mut tool = prepare_with_policy(
-        &serde_json::from_value(body.clone()).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
+    let mut tool = prepare(&serde_json::from_value(body.clone()).unwrap(), &binding()).unwrap();
     assert!(matches!(
         tool.metadata,
         Metadata::Continuation {
@@ -755,7 +634,7 @@ fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user()
         json!({"role":"model","parts":[{"functionResponse":{"name":"read_file","response":{"output":"read marker"},"id":"synthetic-read-call-1"}}]})
     );
     let completion = json!([{"role":"model","parts":[{"text":"done"}]}]);
-    let second = replay::v2::encode(
+    let second = replay::encode(
         &completion,
         &binding(),
         running,
@@ -764,8 +643,8 @@ fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user()
         &json!([]),
     )
     .unwrap();
-    let decoded = replay::v2::decode(&second, &binding()).unwrap();
-    let complete = replay::v2::State::from_envelope(&decoded).unwrap();
+    let decoded = replay::decode(&second, &binding()).unwrap();
+    let complete = replay::State::from_envelope(&decoded).unwrap();
     assert_eq!(
         complete.recorded_after("end_turn").unwrap(),
         Some(execution_id(0).as_str())
@@ -778,12 +657,7 @@ fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user()
         json!({"role":"assistant","content":second}),
         json!({"role":"user","content":"next ordinary user"}),
     ]);
-    let mut next = prepare_with_policy(
-        &serde_json::from_value(body).unwrap(),
-        &binding(),
-        RequestMetadata::Agy,
-    )
-    .unwrap();
+    let mut next = prepare(&serde_json::from_value(body).unwrap(), &binding()).unwrap();
     let mut calls = 0;
     next.finalize_metadata(1_799_999_999_789, || {
         calls += 1;
@@ -811,7 +685,7 @@ fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user()
         next.wire["request"]["labels"]["request_id"],
         format!("{}-2", lineage.trajectory_id)
     );
-    let third = replay::v2::encode(
+    let third = replay::encode(
         &completion,
         &binding(),
         next_state,
@@ -820,44 +694,32 @@ fn antigravity_v2_user_execution_survives_read_loop_then_records_for_next_user()
         &json!([]),
     )
     .unwrap();
-    assert!(replay::v2::decode_history(&json!([first, second, third]), &binding()).is_ok());
+    assert!(replay::decode_history(&json!([first, second, third]), &binding()).is_ok());
 }
 
 #[test]
-fn antigravity_v2_incomplete_or_invalid_terminal_state_never_records_success() {
-    use super::antigravity::{config::RequestMetadata, request::prepare_with_policy};
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
-    let state = v2_state(&lineage, 0);
+fn antigravity_incomplete_or_invalid_terminal_state_never_records_success() {
+    let lineage = default_lineage();
+    let state = state_at(&lineage, 0);
     let text = json!([{"role":"model","parts":[{"text":"limited"}]}]);
     let limited =
-        replay::v2::encode(&text, &binding(), &state, "max_tokens", "full", &json!([])).unwrap();
-    let saved = replay::v2::decode(&limited, &binding()).unwrap();
-    let incomplete = replay::v2::State::from_envelope(&saved).unwrap();
+        replay::encode(&text, &binding(), &state, "max_tokens", "full", &json!([])).unwrap();
+    let saved = replay::decode(&limited, &binding()).unwrap();
+    let incomplete = replay::State::from_envelope(&saved).unwrap();
     assert_eq!(incomplete.recorded_after("max_tokens").unwrap(), None);
     let mut body = request_value();
     body["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":limited}),
         json!({"role":"user","content":"not a proven continuation"}),
     ]);
-    assert!(
-        prepare_with_policy(
-            &serde_json::from_value(body).unwrap(),
-            &binding(),
-            RequestMetadata::Agy
-        )
-        .is_err()
-    );
-    assert!(replay::v2::encode(&text, &binding(), &state, "tool_use", "full", &json!([])).is_err());
+    assert!(prepare(&serde_json::from_value(body).unwrap(), &binding(),).is_err());
+    assert!(replay::encode(&text, &binding(), &state, "tool_use", "full", &json!([])).is_err());
     for stop in ["STOP", "", "error", "cancelled"] {
-        assert!(replay::v2::encode(&text, &binding(), &state, stop, "full", &json!([])).is_err());
+        assert!(replay::encode(&text, &binding(), &state, stop, "full", &json!([])).is_err());
     }
     let call = json!([{"role":"model","parts":[{"functionCall":{"name":"tool","id":"native","args":{}}}]}]);
     let map = replay::mapping(&call, None).unwrap();
-    assert!(replay::v2::encode(&call, &binding(), &state, "end_turn", "full", &map).is_err());
+    assert!(replay::encode(&call, &binding(), &state, "end_turn", "full", &map).is_err());
     for id in [
         lineage.conversation_id.clone(),
         lineage.trajectory_id.clone(),
@@ -866,30 +728,25 @@ fn antigravity_v2_incomplete_or_invalid_terminal_state_never_records_success() {
         let mut invalid = state.clone();
         invalid.user_execution.active_id = id;
         assert!(
-            replay::v2::encode(&text, &binding(), &invalid, "end_turn", "full", &json!([]))
-                .is_err()
+            replay::encode(&text, &binding(), &invalid, "end_turn", "full", &json!([])).is_err()
         );
     }
     let mut invalid = state;
     invalid.user_execution.prior_recorded_id = Some(execution_id(7));
     assert!(
-        replay::v2::encode(&text, &binding(), &invalid, "end_turn", "full", &json!([])).is_err(),
+        replay::encode(&text, &binding(), &invalid, "end_turn", "full", &json!([])).is_err(),
         "first checkpoint has no previous execution"
     );
 }
 
 #[test]
-fn antigravity_v2_execution_predecessors_and_termination_are_digest_bound() {
+fn antigravity_execution_predecessors_and_termination_are_digest_bound() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
+    let lineage = default_lineage();
     let text = json!([{"role":"model","parts":[{"text":"complete"}]}]);
-    let first = v2_encode(&text, &binding(), &lineage, 0, "full", &json!([])).unwrap();
-    let second = v2_encode(&text, &binding(), &lineage, 1, "full", &json!([])).unwrap();
-    let envelope = replay::v2::decode(&first, &binding()).unwrap();
+    let first = encode_turn(&text, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let second = encode_turn(&text, &binding(), &lineage, 1, "full", &json!([])).unwrap();
+    let envelope = replay::decode(&first, &binding()).unwrap();
     for (key, value) in [
         (
             "user_execution",
@@ -911,14 +768,14 @@ fn antigravity_v2_execution_predecessors_and_termination_are_digest_bound() {
         let mut blocks = first.clone();
         blocks[0]["signature"] = json!(format!(
             "{}{}",
-            replay::v2::PREFIX,
+            replay::PREFIX,
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&modified).unwrap())
         ));
-        assert!(replay::v2::decode(&blocks, &binding()).is_err());
+        assert!(replay::decode(&blocks, &binding()).is_err());
     }
-    let mut wrong_predecessor = v2_state(&lineage, 1);
+    let mut wrong_predecessor = state_at(&lineage, 1);
     wrong_predecessor.user_execution.prior_recorded_id = Some(execution_id(7));
-    let wrong = replay::v2::encode(
+    let wrong = replay::encode(
         &text,
         &binding(),
         &wrong_predecessor,
@@ -927,29 +784,28 @@ fn antigravity_v2_execution_predecessors_and_termination_are_digest_bound() {
         &json!([]),
     )
     .unwrap();
-    assert!(replay::v2::decode_history(&json!([first, wrong]), &binding()).is_err());
-    let mut reused = v2_state(&lineage, 2);
+    assert!(replay::decode_history(&json!([first, wrong]), &binding()).is_err());
+    let mut reused = state_at(&lineage, 2);
     reused.user_execution.active_id = execution_id(0);
-    let wrong =
-        replay::v2::encode(&text, &binding(), &reused, "end_turn", "full", &json!([])).unwrap();
-    assert!(replay::v2::decode_history(&json!([first, second, wrong]), &binding()).is_err());
+    let wrong = replay::encode(&text, &binding(), &reused, "end_turn", "full", &json!([])).unwrap();
+    assert!(replay::decode_history(&json!([first, second, wrong]), &binding()).is_err());
     let call = json!([{"role":"model","parts":[{"functionCall":{"name":"read_file","id":"native","args":{}},"thoughtSignature":"opaque"}]}]);
     let mapping = replay::mapping(&call, None).unwrap();
-    let tool_first = replay::v2::encode(
+    let tool_first = replay::encode(
         &call,
         &binding(),
-        &v2_state(&lineage, 0),
+        &state_at(&lineage, 0),
         "tool_use",
         "full",
         &mapping,
     )
     .unwrap();
-    let mut reset = v2_state(&lineage, 1);
+    let mut reset = state_at(&lineage, 1);
     reset.user_execution.prior_recorded_id = None;
     let changed_active =
-        replay::v2::encode(&text, &binding(), &reset, "end_turn", "full", &json!([])).unwrap();
+        replay::encode(&text, &binding(), &reset, "end_turn", "full", &json!([])).unwrap();
     assert!(
-        replay::v2::decode_history(&json!([tool_first, changed_active]), &binding()).is_err(),
+        replay::decode_history(&json!([tool_first, changed_active]), &binding()).is_err(),
         "tool continuation cannot reset active execution"
     );
 }
@@ -968,7 +824,6 @@ fn metadata_count_context() -> crate::provider::RequestContext {
 async fn counting_provider(
     directory: &std::path::Path,
     url: &url::Url,
-    mode: super::antigravity::config::RequestMetadata,
     project: Option<&str>,
     expires: u64,
 ) -> (super::antigravity::AntigravityProvider, Store) {
@@ -988,7 +843,6 @@ async fn counting_provider(
         .unwrap();
     drop(lock);
     let config = Config {
-        request_metadata: mode,
         base_url: url.clone(),
         token_url: url.join("/token").unwrap(),
         client_id: Some("public-synthetic-client".into()),
@@ -1021,8 +875,8 @@ async fn pure_count_response(
     let value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         effects::snapshot(),
-        [0; 6],
-        "no credential/profile load, access, factory, clock or native/legacy identity source"
+        [0; 5],
+        "no credential/profile load, access, factory, clock or native identity source"
     );
     assert_eq!(
         provider.count_scope_snapshot(),
@@ -1033,17 +887,13 @@ async fn pure_count_response(
 }
 
 #[test]
-fn antigravity_agy_count_value_inputs_preserve_v1_v2_semantics_without_effects() {
+fn antigravity_agy_count_value_inputs_preserve_semantics_without_effects() {
     use super::antigravity::request::{self, CountInputs, ServingScope, effects};
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
+    let lineage = default_lineage();
     let contents =
         json!([{"role":"model","parts":[{"text":"prior","thoughtSignature":"untouched"}]}]);
-    let v1 = replay::encode(&contents, &binding(), "19", "full", &json!([])).unwrap();
-    let v2 = v2_encode(&contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let full = encode_turn(&contents, &binding(), &lineage, 0, "full", &json!([])).unwrap();
+    let omitted = encode_turn(&contents, &binding(), &lineage, 0, "omitted", &json!([])).unwrap();
     let known = ServingScope {
         profile_id: "profile".into(),
         project_id: "project".into(),
@@ -1053,7 +903,7 @@ fn antigravity_agy_count_value_inputs_preserve_v1_v2_semantics_without_effects()
         project_id: "project".into(),
     };
     let mut expected = None;
-    for blocks in [v1, v2] {
+    for blocks in [full, omitted] {
         let mut value = request_value();
         value["messages"].as_array_mut().unwrap().extend([
             json!({"role":"assistant","content":blocks}),
@@ -1083,7 +933,7 @@ fn antigravity_agy_count_value_inputs_preserve_v1_v2_semantics_without_effects()
                 before,
                 "count never mutates caller history/lineage"
             );
-            assert_eq!(effects::snapshot(), [0; 6]);
+            assert_eq!(effects::snapshot(), [0; 5]);
         }
         effects::reset();
         assert!(
@@ -1118,7 +968,7 @@ fn antigravity_agy_count_value_inputs_preserve_v1_v2_semantics_without_effects()
             )
             .is_err()
         );
-        assert_eq!(effects::snapshot(), [0; 6]);
+        assert_eq!(effects::snapshot(), [0; 5]);
     }
     effects::reset();
     let fresh = serde_json::from_value(request_value()).unwrap();
@@ -1134,16 +984,11 @@ fn antigravity_agy_count_value_inputs_preserve_v1_v2_semantics_without_effects()
             > 0,
         "unknown scope is estimate-only, not admission"
     );
-    assert_eq!(effects::snapshot(), [0; 6]);
+    assert_eq!(effects::snapshot(), [0; 5]);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn antigravity_agy_count_never_loads_credentials_accesses_or_constructs_factories() {
-    use super::antigravity::{
-        config::RequestMetadata,
-        request::effects::{self, Kind},
-    };
-    use crate::provider::Provider;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1160,14 +1005,8 @@ async fn antigravity_agy_count_never_loads_credentials_accesses_or_constructs_fa
         }))
         .await;
     let directory = tempfile::tempdir().unwrap();
-    let (provider, _) = counting_provider(
-        directory.path(),
-        &server.url,
-        RequestMetadata::Agy,
-        Some("project"),
-        u64::MAX,
-    )
-    .await;
+    let (provider, _) =
+        counting_provider(directory.path(), &server.url, Some("project"), u64::MAX).await;
     let path = directory.path().join("antigravity/auth.json");
     let body = serde_json::from_value(request_value()).unwrap();
     for kind in ["invalid", "unreadable", "missing"] {
@@ -1199,58 +1038,19 @@ async fn antigravity_agy_count_never_loads_credentials_accesses_or_constructs_fa
         }
         assert!(provider.count_scope_snapshot().is_none());
     }
-    let (expired, _) = counting_provider(
-        directory.path(),
-        &server.url,
-        RequestMetadata::Agy,
-        Some("project"),
-        1,
-    )
-    .await;
+    let (expired, _) = counting_provider(directory.path(), &server.url, Some("project"), 1).await;
     assert_eq!(pure_count_response(&expired, &body).await.0, 200);
-    let (undiscovered, _) = counting_provider(
-        directory.path(),
-        &server.url,
-        RequestMetadata::Agy,
-        None,
-        u64::MAX,
-    )
-    .await;
+    let (undiscovered, _) = counting_provider(directory.path(), &server.url, None, u64::MAX).await;
     assert_eq!(pure_count_response(&undiscovered, &body).await.0, 200);
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
         "no refresh/discovery/generation transport calls"
     );
-    let (legacy, _) = counting_provider(
-        directory.path(),
-        &server.url,
-        RequestMetadata::Legacy,
-        Some("project"),
-        u64::MAX,
-    )
-    .await;
-    effects::reset();
-    let response = legacy
-        .handle_count_tokens(body, metadata_count_context())
-        .await;
-    assert_eq!(response.status(), 200);
-    assert_eq!(
-        effects::count(Kind::CredentialLoad),
-        1,
-        "legacy file semantics retained and spy is live"
-    );
-    assert_eq!(
-        effects::count(Kind::LegacyId),
-        2,
-        "legacy nonce/outer identity semantics retained and spy is live"
-    );
-    assert_eq!(effects::count(Kind::Access), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn antigravity_agy_count_claims_are_estimates_never_authoritative_scope() {
-    use super::antigravity::config::RequestMetadata;
     use crate::provider::Provider;
     use std::sync::{
         Arc,
@@ -1268,22 +1068,12 @@ async fn antigravity_agy_count_claims_are_estimates_never_authoritative_scope() 
         }))
         .await;
     let directory = tempfile::tempdir().unwrap();
-    let (provider, _) = counting_provider(
-        directory.path(),
-        &server.url,
-        RequestMetadata::Agy,
-        Some("project"),
-        u64::MAX,
-    )
-    .await;
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
+    let (provider, _) =
+        counting_provider(directory.path(), &server.url, Some("project"), u64::MAX).await;
+    let lineage = default_lineage();
     let mut claim = binding();
     claim.profile_id = "untrusted-carrier-claim".into();
-    let blocks = v2_encode(
+    let blocks = encode_turn(
         &json!([{"role":"model","parts":[{"text":"prior"}]}]),
         &claim,
         &lineage,
@@ -1319,7 +1109,7 @@ async fn antigravity_agy_count_claims_are_estimates_never_authoritative_scope() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn antigravity_agy_count_scope_is_published_only_by_validated_serving() {
-    use super::antigravity::{config::RequestMetadata, request::ServingScope};
+    use super::antigravity::request::ServingScope;
     use crate::provider::Provider;
     use std::sync::{
         Arc,
@@ -1342,14 +1132,8 @@ async fn antigravity_agy_count_scope_is_published_only_by_validated_serving() {
         }))
         .await;
     let directory = tempfile::tempdir().unwrap();
-    let (provider, _) = counting_provider(
-        directory.path(),
-        &server.url,
-        RequestMetadata::Agy,
-        Some("project"),
-        u64::MAX,
-    )
-    .await;
+    let (provider, _) =
+        counting_provider(directory.path(), &server.url, Some("project"), u64::MAX).await;
     assert!(provider.count_scope_snapshot().is_none());
     let generated = provider
         .handle_messages(
@@ -1385,12 +1169,8 @@ async fn antigravity_agy_count_scope_is_published_only_by_validated_serving() {
     assert_eq!(pure_count_response(&provider, &body).await.0, 200);
     let mut foreign_scope = binding();
     foreign_scope.profile_id = "untrusted-carrier-claim".into();
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
-    let foreign = v2_encode(
+    let lineage = default_lineage();
+    let foreign = encode_turn(
         &json!([{"role":"model","parts":[{"text":"foreign"}]}]),
         &foreign_scope,
         &lineage,
@@ -1428,7 +1208,6 @@ async fn antigravity_agy_count_scope_is_published_only_by_validated_serving() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn antigravity_agy_failed_and_cancelled_turns_do_not_publish_count_scope() {
-    use super::antigravity::config::RequestMetadata;
     use crate::provider::Provider;
     use futures_util::StreamExt;
     for cancel in [false, true] {
@@ -1440,14 +1219,8 @@ async fn antigravity_agy_failed_and_cancelled_turns_do_not_publish_count_scope()
             axum::response::Response::builder().header("content-type","text/event-stream").body(body).unwrap()
         })).await;
         let directory = tempfile::tempdir().unwrap();
-        let (provider, _) = counting_provider(
-            directory.path(),
-            &server.url,
-            RequestMetadata::Agy,
-            Some("project"),
-            u64::MAX,
-        )
-        .await;
+        let (provider, _) =
+            counting_provider(directory.path(), &server.url, Some("project"), u64::MAX).await;
         let mut body = request_value();
         body["stream"] = json!(cancel);
         let response = provider
@@ -1474,7 +1247,7 @@ fn antigravity_absent_native_args_project_empty_without_changing_replay() {
     )
     .unwrap();
     let mapping = set.mapping(&contents).unwrap();
-    let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
     assert_eq!(blocks[1]["input"], json!({}));
     let decoded = replay::decode(&blocks, &binding()).unwrap();
     assert_eq!(decoded["contents"], contents);
@@ -1628,7 +1401,7 @@ fn antigravity_typeless_anyof_keeps_every_sibling_in_complete_codec_guidance() {
         let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"union","args":{"value":"17"}},"thoughtSignature":"unchanged"}]}]);
         let mapping = set.mapping(&contents).unwrap();
         assert_eq!(mapping[0]["codec_paths"], json!(["/value"]));
-        let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+        let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
         assert_eq!(blocks[1]["input"]["value"], 17);
         assert_eq!(
             replay::decode(&blocks, &binding()).unwrap()["contents"],
@@ -1717,7 +1490,7 @@ fn antigravity_nonstring_enum_values_survive_native_guidance() {
 fn antigravity_adjacent_assistant_fragments_preserve_original_system_boundaries() {
     let contents =
         json!([{"role":"model","parts":[{"thought":true,"text":"thought"},{"text":"answer"}]}]);
-    let blocks = replay::encode(&contents, &binding(), "19", "full", &json!([])).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &json!([])).unwrap();
     let mut request = request_value();
     request["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":[blocks[0]]}),
@@ -1756,7 +1529,6 @@ fn antigravity_adjacent_assistant_fragments_preserve_original_system_boundaries(
     distinct["messages"].as_array_mut().unwrap().extend([
         json!({"role":"assistant","content":blocks}),
         json!({"role":"system","content":"privileged"}),
-        json!({"role":"assistant","content":blocks}),
         json!({"role":"user","content":"<system-reminder>ordinary user text</system-reminder>"}),
     ]);
     let prepared = prepare(&serde_json::from_value(distinct).unwrap(), &binding()).unwrap();
@@ -1765,13 +1537,13 @@ fn antigravity_adjacent_assistant_fragments_preserve_original_system_boundaries(
             .as_array()
             .unwrap()
             .len(),
-        4
+        3
     );
     assert_eq!(
         prepared.wire["request"]["systemInstruction"]["parts"],
         json!([{"text":"privileged"}])
     );
-    assert_eq!(prepared.wire["request"]["contents"][3]["role"], "user");
+    assert_eq!(prepared.wire["request"]["contents"][2]["role"], "user");
 }
 
 #[test]
@@ -1779,7 +1551,7 @@ fn antigravity_count_estimate_is_independent_of_thought_display_and_fragmentatio
     let contents = json!([{"role":"model","parts":[{"thought":true,"text":"retained hidden thought ".repeat(200)},{"text":"answer","thoughtSignature":"opaque"}]}]);
     let mut counts = Vec::new();
     for display in ["full", "omitted"] {
-        let blocks = replay::encode(&contents, &binding(), "19", display, &json!([])).unwrap();
+        let blocks = encode_default(&contents, &binding(), display, &json!([])).unwrap();
         let mut request = request_value();
         request["messages"].as_array_mut().unwrap().extend([
             json!({"role":"assistant","content":blocks}),
@@ -1796,7 +1568,7 @@ fn antigravity_count_estimate_is_independent_of_thought_display_and_fragmentatio
         "presentation changed estimated native history: {counts:?}"
     );
     for display in ["full", "omitted"] {
-        let blocks = replay::encode(&contents, &binding(), "19", display, &json!([])).unwrap();
+        let blocks = encode_default(&contents, &binding(), display, &json!([])).unwrap();
         let mut request = request_value();
         request["messages"].as_array_mut().unwrap().extend([
             json!({"role":"assistant","content":[blocks[0]]}),
@@ -1823,10 +1595,9 @@ fn antigravity_count_reconstructs_recorded_name_and_json_codecs_without_transpor
             for signature_bytes in [1, 100000] {
                 let mut native = vector["native_contents"].clone();
                 native[0]["parts"][0]["thoughtSignature"] = json!("x".repeat(signature_bytes));
-                let blocks = replay::encode(
+                let blocks = encode_default(
                     &native,
                     &scope,
-                    "19",
                     display,
                     &vector["envelope"]["tool_mapping"],
                 )
@@ -1865,7 +1636,7 @@ fn antigravity_large_text_coalescing_preserves_unicode_and_unknown_field_checks(
     let text = "雪a".repeat(256);
     let contents = json!([{"role":"model","parts":vec![json!({"text":text});4096]}]);
     let mapping = json!([]);
-    let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
     let envelope = replay::decode(&blocks, &binding()).unwrap();
     let merged = json!([blocks[0], {"type":"text","text":text.repeat(4096)}]);
     let start = std::time::Instant::now();
@@ -1996,7 +1767,7 @@ fn antigravity_property_names_records_keep_complete_codec_and_replay() {
         property_names_call(json!({"metadata":serde_json::to_string(&metadata).unwrap()}));
     let mapping = set.mapping(&contents).unwrap();
     assert_eq!(mapping[0]["codec_paths"], json!(["/metadata"]));
-    let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
     assert_eq!(blocks[1]["input"], json!({"metadata":metadata}));
     assert_eq!(
         replay::decode(&blocks, &binding()).unwrap()["contents"],
@@ -2089,7 +1860,7 @@ fn antigravity_property_names_structured_guidance_validates_every_key_and_value(
             let contents = property_names_call(args.clone());
             let mapping = set.mapping(&contents).unwrap();
             assert_eq!(mapping[0]["codec_paths"], json!([]));
-            let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+            let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
             assert_eq!(blocks[1]["input"], args, "defaults must not be inserted");
         }
         for args in [
@@ -2178,7 +1949,7 @@ fn antigravity_property_names_enums_and_freeform_value_constraints_are_original(
         assert_eq!(set.mapping(&contents).is_ok(), valid);
         if valid {
             let mapping = set.mapping(&contents).unwrap();
-            let blocks = replay::encode(&contents, &binding(), "19", "full", &mapping).unwrap();
+            let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
             assert_eq!(blocks[1]["input"], value);
         }
     }
@@ -2311,7 +2082,7 @@ fn antigravity_freeform_codec_and_mapped_names_are_lossless() {
     assert_ne!(native_name, name);
     let contents = json!([{"role":"model","parts":[{"functionCall":{"name":native_name,"args":{"args":"[1, {\"x\":true}]"}},"thoughtSignature":"unchanged"}]}]);
     let mapping = set.mapping(&contents).unwrap();
-    let blocks = replay::encode(&contents, &binding(), "1", "omitted", &mapping).unwrap();
+    let blocks = encode_default(&contents, &binding(), "omitted", &mapping).unwrap();
     assert_eq!(blocks[1]["name"], name);
     assert_eq!(blocks[1]["input"]["args"], json!([1,{"x":true}]));
     assert_eq!(
@@ -2364,7 +2135,7 @@ fn antigravity_request_accepts_observed_options_without_changing_tier() {
     assert_eq!(prepared.wire["userAgent"], "antigravity");
     assert_eq!(prepared.wire["requestType"], "agent");
     assert!(prepared.wire["request"].get("toolConfig").is_none());
-    replay::session_id(prepared.wire["request"]["sessionId"].as_str().unwrap()).unwrap();
+    assert_eq!(prepared.wire["request"]["sessionId"], "");
 }
 
 #[test]
@@ -2382,7 +2153,7 @@ fn antigravity_request_system_role_user_preserves_parts_and_order() {
     .unwrap();
     assert_eq!(
         prepared.wire["request"]["systemInstruction"],
-        json!({"role":"user","parts":[{"text":"top"},{"text":"first"},{"text":"second"}]})
+        json!({"role":"user","parts":[{"text":"top\n\nfirst\n\nsecond"}]})
     );
     assert_eq!(
         prepared.wire["request"]["contents"],
@@ -2536,8 +2307,7 @@ fn antigravity_request_multiple_tools_have_one_declaration_per_object() {
         {"functionCall":{"name":"limited","args":{"limit":1}}}
     ]}]);
     let mapping = prepared.tools.mapping(&contents).unwrap();
-    let blocks =
-        replay::encode(&contents, &binding(), &prepared.session, "full", &mapping).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
     assert_eq!(blocks[1]["name"], "caller/tool with spaces");
     assert_eq!(blocks[1]["input"], json!({"payload":[1,true]}));
     assert_eq!(blocks[2]["input"], json!({}));
@@ -2668,20 +2438,6 @@ fn antigravity_native_sse_errors_never_become_successful_turns() {
 
 #[test]
 fn antigravity_boundaries_and_canonical_sessions_fail_closed() {
-    for session in [
-        "0",
-        "-0",
-        "+1",
-        "01",
-        "-01",
-        "9223372036854775808",
-        "-9223372036854775809",
-    ] {
-        assert!(replay::session_id(session).is_err());
-    }
-    for session in ["1", "-1", "9223372036854775807", "-9223372036854775808"] {
-        assert_eq!(replay::session_id(session).unwrap(), session);
-    }
     assert!(replay::calls(&json!(vec![json!({"role":"model","parts":[]}); 513])).is_err());
     assert!(
         replay::calls(&json!([{"role":"model","parts":vec![json!({"text":""});4097]}])).is_err()
@@ -2717,7 +2473,7 @@ fn antigravity_complete_result_prefix_uses_native_order_without_synthetic_contin
         {"functionCall":{"name":"Other","args":{}}}
     ]}]);
     let mapping = replay::mapping(&contents, None).unwrap();
-    let blocks = replay::encode(&contents, &binding(), "123", "full", &mapping).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
     let first =
         json!({"type":"tool_result","tool_use_id":mapping[0]["local_id"],"content":"first"});
     let second = json!({"type":"tool_result","tool_use_id":mapping[1]["local_id"],"content":[{"type":"text","text":"second"}],"is_error":true});
@@ -2778,7 +2534,7 @@ fn antigravity_schema_root_freeform_and_closed_no_argument_tools_are_explicit() 
     assert_eq!(set.declarations[1]["parameters"], json!({"type":"OBJECT"}));
     let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"json":"{\"x\":[1,true]}"}}},{"functionCall":{"name":"empty","args":{}}}]}]);
     let map = set.mapping(&contents).unwrap();
-    let blocks = replay::encode(&contents, &binding(), "1", "full", &map).unwrap();
+    let blocks = encode_default(&contents, &binding(), "full", &map).unwrap();
     assert_eq!(blocks[1]["input"], json!({"x":[1,true]}));
     assert_eq!(blocks[2]["input"], json!({}));
     let invalid = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"json":"{}","extra":true}}}]}]);
@@ -2817,10 +2573,12 @@ fn antigravity_final_v1_goldens_decode_and_reencode_without_native_mutation() {
         let binding: replay::Binding = serde_json::from_value(vector["binding"].clone()).unwrap();
         let envelope = replay::decode(&vector["projected_blocks"], &binding).unwrap();
         assert_eq!(envelope, vector["envelope"], "{}", vector["name"]);
+        let state = replay::State::from_envelope(&envelope).unwrap();
         let blocks = replay::encode(
             &vector["native_contents"],
             &binding,
-            vector["session_id"].as_str().unwrap(),
+            &state,
+            envelope["checkpoint_stop_reason"].as_str().unwrap(),
             vector["thought_display"].as_str().unwrap(),
             &envelope["tool_mapping"],
         )
@@ -2850,10 +2608,9 @@ fn antigravity_final_v1_negative_vectors_fail_closed() {
             "decode_history" => replay::decode_history(&input["turns"], &binding).is_err(),
             "project_turn" => replay::mapping(&input["contents"], Some(&input["tool_projections"]))
                 .and_then(|mapping| {
-                    replay::encode(
+                    encode_default(
                         &input["contents"],
                         &binding,
-                        input["session_id"].as_str().unwrap(),
                         input["thought_display"].as_str().unwrap(),
                         &mapping,
                     )
@@ -2921,9 +2678,6 @@ fn antigravity_local_tool_ids_are_unique_despite_reused_native_ids() {
 
 #[test]
 fn antigravity_strips_claude_code_billing_and_sdk_headers_and_consolidates_agy_system_parts() {
-    use super::antigravity::config::RequestMetadata;
-    use super::antigravity::request::prepare_with_policy;
-
     for sdk_header in [
         "You are Claude Code, Anthropic's official CLI for Claude.",
         "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
@@ -2940,34 +2694,12 @@ fn antigravity_strips_claude_code_billing_and_sdk_headers_and_consolidates_agy_s
             {"role":"user","content":"Reply with OK."}
         ]);
 
-        let agy_prepared = prepare_with_policy(
-            &serde_json::from_value(request.clone()).unwrap(),
-            &binding(),
-            RequestMetadata::Agy,
-        )
-        .unwrap();
+        let prepared = prepare(&serde_json::from_value(request).unwrap(), &binding()).unwrap();
         assert_eq!(
-            agy_prepared.wire["request"]["systemInstruction"],
+            prepared.wire["request"]["systemInstruction"],
             json!({
                 "role":"user",
                 "parts":[{"text":"\nYou are an interactive agent.\n\n# Environment\n - Primary working directory: /workspace"}]
-            })
-        );
-
-        let legacy_prepared = prepare_with_policy(
-            &serde_json::from_value(request).unwrap(),
-            &binding(),
-            RequestMetadata::Legacy,
-        )
-        .unwrap();
-        assert_eq!(
-            legacy_prepared.wire["request"]["systemInstruction"],
-            json!({
-                "role":"user",
-                "parts":[
-                    {"text":"\nYou are an interactive agent."},
-                    {"text":"# Environment\n - Primary working directory: /workspace"}
-                ]
             })
         );
 
@@ -2976,12 +2708,8 @@ fn antigravity_strips_claude_code_billing_and_sdk_headers_and_consolidates_agy_s
         flattened["system"] = json!(format!(
             "x-anthropic-billing-header: cc_version=2.1.270.dd6\n\n{sdk_header}\n\n\nYou are an interactive agent."
         ));
-        let flattened_prepared = prepare_with_policy(
-            &serde_json::from_value(flattened).unwrap(),
-            &binding(),
-            RequestMetadata::Agy,
-        )
-        .unwrap();
+        let flattened_prepared =
+            prepare(&serde_json::from_value(flattened).unwrap(), &binding()).unwrap();
         assert_eq!(
             flattened_prepared.wire["request"]["systemInstruction"],
             json!({
@@ -2996,20 +2724,14 @@ fn antigravity_strips_claude_code_billing_and_sdk_headers_and_consolidates_agy_s
             {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.270.dd6"},
             {"type":"text","text":sdk_header}
         ]);
-        let omitted = prepare_with_policy(
-            &serde_json::from_value(headers_only).unwrap(),
-            &binding(),
-            RequestMetadata::Agy,
-        )
-        .unwrap();
+        let omitted = prepare(&serde_json::from_value(headers_only).unwrap(), &binding()).unwrap();
         assert!(omitted.wire["request"].get("systemInstruction").is_none());
     }
 }
 
 #[test]
 fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks() {
-    use super::antigravity::config::RequestMetadata;
-    use super::antigravity::request::{CountInputs, estimate, prepare_with_policy};
+    use super::antigravity::request::{CountInputs, estimate};
     use crate::MessagesRequest;
 
     let opus_binding = replay::Binding {
@@ -3017,12 +2739,8 @@ fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks()
         project_id: "project".into(),
         native_model: "claude-opus-5-5-low".into(),
     };
-    let lineage = replay::v2::Lineage::new(
-        "11111111-1111-4111-8111-111111111111".into(),
-        "22222222-2222-4222-8222-222222222222".into(),
-    )
-    .unwrap();
-    let v2_turn = v2_encode(
+    let lineage = default_lineage();
+    let signed_turn = encode_turn(
         &json!([{"role":"model","parts":[{"thought":true,"text":"thinking","thoughtSignature":"sig-1"},{"text":"Turn 2 reply."}]}]),
         &opus_binding,
         &lineage,
@@ -3032,7 +2750,7 @@ fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks()
     )
     .unwrap();
 
-    // Carrier-less prefix (from mid-session /model switch) + active signed V2 turn
+    // Carrier-less prefix (from mid-session /model switch) + active signed turn
     let mut switched = request_value();
     switched["model"] = json!("antigravity/claude-opus-5-5-low");
     switched["messages"] = json!([
@@ -3048,12 +2766,12 @@ fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks()
             {"type":"text","text":"Token ALPHA recorded."}
         ]},
         {"role":"user","content":"Now switch model."},
-        {"role":"assistant","content":v2_turn},
+        {"role":"assistant","content":signed_turn},
         {"role":"user","content":"What was the token?"}
     ]);
 
     let body: MessagesRequest = serde_json::from_value(switched).unwrap();
-    let mut prepared = prepare_with_policy(&body, &opus_binding, RequestMetadata::Agy).unwrap();
+    let mut prepared = prepare(&body, &opus_binding).unwrap();
     let mut ids = [execution_id(1)].into_iter();
     prepared
         .finalize_metadata(1_799_999_999_456, || ids.next().unwrap())
@@ -3104,4 +2822,84 @@ fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks()
     )
     .unwrap();
     assert!(counted > 0);
+}
+
+#[test]
+fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_cache_scope_and_xhigh_effort()
+ {
+    let opus_binding = replay::Binding {
+        profile_id: "profile".into(),
+        project_id: "project".into(),
+        native_model: "claude-opus-5-5-medium".into(),
+    };
+    let native_call = json!([{"role":"model","parts":[
+        {"thought":true,"text":"Running git pull.","thoughtSignature":"sig-bash"},
+        {"functionCall":{
+            "name":"Bash",
+            "id":"toolu_vrtx_014vTPhzW5gH8g73V1H3aPPh",
+            "args":{
+                "command":"cd /data/chrisliu/DataFactory && git pull --ff-only -q origin master 2>&1 | tail -2; git log -1 --oneline",
+                "description":"Pull latest master"
+            }
+        }}
+    ]}]);
+    let mapping = replay::mapping(&native_call, None).unwrap();
+    let mut blocks = encode_turn(
+        &native_call,
+        &opus_binding,
+        &default_lineage(),
+        0,
+        "full",
+        &mapping,
+    )
+    .unwrap();
+    let local_id = blocks[1]["id"].as_str().unwrap().to_owned();
+
+    // Simulate Claude Code's Bash updatedInput normalization stripping `cd <cwd> && ` in-place.
+    blocks[1]["input"]["command"] =
+        json!("git pull --ff-only -q origin master 2>&1 | tail -2; git log -1 --oneline");
+    assert!(
+        replay::decode(&blocks, &opus_binding).is_err(),
+        "raw decode remains strict on uncanonicalized blocks"
+    );
+
+    let mut request = request_value();
+    request["model"] = json!("antigravity/claude-opus-5-5-medium");
+    request["output_config"] = json!({"effort":"xhigh"});
+    request["system"] = json!([
+        {"type":"text","text":"Global system instruction","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}}
+    ]);
+    request["messages"] = json!([
+        {"role":"user","content":"Investigate why VE TEST PostgreSQL OOMed"},
+        {"role":"assistant","content":blocks.clone()},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":local_id,"content":"96672b397 Merge branch"}
+        ]}
+    ]);
+    let prepared = prepare(
+        &serde_json::from_value(request.clone()).unwrap(),
+        &opus_binding,
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.wire["request"]["contents"][1]["parts"][1]["functionCall"]["args"]["command"],
+        json!(
+            "cd /data/chrisliu/DataFactory && git pull --ff-only -q origin master 2>&1 | tail -2; git log -1 --oneline"
+        )
+    );
+
+    // Tampering with tool_use id or name still fails closed in prepare.
+    let mut tampered_name = request.clone();
+    tampered_name["messages"][1]["content"][1]["name"] = json!("OtherTool");
+    assert!(
+        prepare(
+            &serde_json::from_value(tampered_name).unwrap(),
+            &opus_binding
+        )
+        .is_err()
+    );
+
+    let mut tampered_id = request;
+    tampered_id["messages"][1]["content"][1]["id"] = json!("toolu_other");
+    assert!(prepare(&serde_json::from_value(tampered_id).unwrap(), &opus_binding).is_err());
 }

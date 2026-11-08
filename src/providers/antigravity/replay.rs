@@ -10,6 +10,8 @@ use std::collections::HashSet;
 
 pub(crate) type Result<T> = std::result::Result<T, &'static str>;
 pub const PREFIX: &str = "ccp:antigravity:v1:";
+pub(crate) const BACKEND_SESSION: &str = "-3750763034362895579";
+pub(crate) const MAX_CHECKPOINTS: u64 = 512;
 pub const MAX_DECODED: usize = 8 * 1024 * 1024;
 pub const MAX_ENCODED: usize = 12 * 1024 * 1024;
 pub const MAX_ARGUMENT: usize = 1024 * 1024;
@@ -170,21 +172,6 @@ pub(crate) fn canonical(value: &Value) -> Result<Vec<u8>> {
         })
     }
     serde_json::to_vec(&tagged(value, 0)?).map_err(|_| "JSON serialization failed")
-}
-
-pub(crate) fn session_id(value: &str) -> Result<&str> {
-    if value.len() > 20 {
-        return Err("invalid session ID");
-    }
-    let n = value.parse::<i64>().map_err(|_| "invalid session ID")?;
-    if n == 0 || n.to_string() != value {
-        return Err("invalid session ID");
-    }
-    Ok(value)
-}
-
-pub(crate) fn mint_session() -> String {
-    ((rand::random::<u64>() >> 1).max(1)).to_string()
 }
 
 fn display(value: &str) -> Result<()> {
@@ -547,22 +534,258 @@ pub(crate) fn projection_values(blocks: &Value) -> Result<Value> {
     Ok(json!(result))
 }
 
+/// Restore original model-emitted `tool_use.input` values from the signed
+/// carrier envelope when a client normalizes tool inputs in-place (such as
+/// Claude Code's `Bash` tool stripping a redundant `cd <cwd> && ` prefix via
+/// `updatedInput`) while keeping `id`, `name`, and block structure intact.
+pub(crate) fn canonicalize_tool_inputs(blocks: &mut Value) {
+    let Some(list) = blocks.as_array_mut() else {
+        return;
+    };
+    let Some(encoded) = list
+        .first()
+        .filter(|b| b["type"] == "thinking")
+        .and_then(|b| b["signature"].as_str())
+        .and_then(|s| s.strip_prefix(PREFIX))
+    else {
+        return;
+    };
+    if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
+        return;
+    }
+    let Ok(raw) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return;
+    };
+    let Ok(envelope) = parse_json(&raw, MAX_DECODED) else {
+        return;
+    };
+    let Ok(thought_display) = nonempty(&envelope["thought_display"]) else {
+        return;
+    };
+    let Ok(expected) = projection(
+        &envelope["contents"],
+        thought_display,
+        &envelope["tool_mapping"],
+    ) else {
+        return;
+    };
+    let Some(expected_list) = expected.as_array() else {
+        return;
+    };
+    let expected_calls: Vec<&Value> = expected_list
+        .iter()
+        .filter(|b| b["type"] == "tool_use")
+        .collect();
+    if expected_calls.is_empty() {
+        return;
+    }
+    let actual_calls: Vec<usize> = list
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| (b["type"] == "tool_use").then_some(i))
+        .collect();
+    if actual_calls.len() != expected_calls.len() {
+        return;
+    }
+    for (&idx, exp) in actual_calls.iter().zip(&expected_calls) {
+        let block = &list[idx];
+        if keys(
+            block,
+            &["type", "signature", "cache_control", "id", "name", "input"],
+            &["type", "id", "name", "input"],
+        )
+        .is_err()
+            || !block["input"].is_object()
+            || block["id"] != exp["id"]
+            || block["name"] != exp["name"]
+            || canonical(&block["input"]).is_err()
+        {
+            return;
+        }
+    }
+    for (&idx, exp) in actual_calls.iter().zip(&expected_calls) {
+        list[idx]["input"] = exp["input"].clone();
+    }
+}
+
+/// Extract only an UNTRUSTED scope claim for local estimation when no serving
+/// snapshot exists. The caller must still run the original full version/digest/
+/// history validators with this binding. Never publish it or use it as admission.
+pub(crate) fn claimed_binding(
+    blocks: &Value,
+    native_model: &str,
+    configured_project: Option<&str>,
+) -> Result<Binding> {
+    let first = blocks
+        .as_array()
+        .and_then(|b| b.first())
+        .filter(|b| b["type"] == "thinking")
+        .ok_or("missing carrier")?;
+    let signature = nonempty(&first["signature"])?;
+    let encoded = signature
+        .strip_prefix(PREFIX)
+        .ok_or("missing/foreign carrier")?;
+    if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
+        return Err("carrier byte limit");
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "malformed carrier")?;
+    let envelope = parse_json(&raw, MAX_DECODED)?;
+    let project = nonempty(&envelope["project_id"])?;
+    if envelope["native_model"].as_str() != Some(native_model)
+        || configured_project.is_some_and(|p| p != project)
+    {
+        return Err("model/configured-project estimate scope mismatch");
+    }
+    Ok(Binding {
+        profile_id: nonempty(&envelope["profile_id"])?.to_owned(),
+        project_id: project.to_owned(),
+        native_model: native_model.to_owned(),
+    })
+}
+
+fn uuid_v4(value: &str) -> Result<()> {
+    let id = uuid::Uuid::parse_str(value).map_err(|_| "invalid logical UUID")?;
+    if id.get_version_num() != 4
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.to_string() != value
+    {
+        return Err("invalid logical UUID");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Lineage {
+    pub conversation_id: String,
+    pub trajectory_id: String,
+}
+
+impl Lineage {
+    pub(crate) fn new(conversation_id: String, trajectory_id: String) -> Result<Self> {
+        let value = Self {
+            conversation_id,
+            trajectory_id,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        for value in [&self.conversation_id, &self.trajectory_id] {
+            uuid_v4(value)?;
+        }
+        if self.conversation_id == self.trajectory_id {
+            return Err("logical UUID collision");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UserExecution {
+    pub active_id: String,
+    /// Last recorded predecessor when THIS user execution began. Immutable
+    /// through its tool loop; never minted while rendering the label.
+    pub prior_recorded_id: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct State {
+    pub lineage: Lineage,
+    /// Our native assistant-checkpoint ordinal, not a hidden Go counter.
+    pub native_checkpoint_index: u64,
+    pub user_execution: UserExecution,
+}
+
+impl State {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.lineage.validate()?;
+        if self.native_checkpoint_index >= MAX_CHECKPOINTS {
+            return Err("checkpoint limit");
+        }
+        let execution = &self.user_execution;
+        uuid_v4(&execution.active_id)?;
+        if let Some(prior) = &execution.prior_recorded_id {
+            uuid_v4(prior)?;
+            if self.native_checkpoint_index == 0 || prior == &execution.active_id {
+                return Err("invalid execution predecessor");
+            }
+        }
+        for id in std::iter::once(&execution.active_id).chain(execution.prior_recorded_id.iter()) {
+            if id == &self.lineage.conversation_id || id == &self.lineage.trajectory_id {
+                return Err("execution/lineage UUID collision");
+            }
+        }
+        Ok(())
+    }
+
+    /// Read only after bounded envelope validation. No allocation sources,
+    /// clock, auth/profile access or publication of authoritative scope.
+    pub(crate) fn from_envelope(envelope: &Value) -> Result<Self> {
+        keys(
+            &envelope["user_execution"],
+            &["active_id", "prior_recorded_id"],
+            &["active_id", "prior_recorded_id"],
+        )?;
+        let state: Self = serde_json::from_value(json!({
+            "lineage":envelope["lineage"],
+            "native_checkpoint_index":envelope["native_checkpoint_index"],
+            "user_execution":envelope["user_execution"]
+        }))
+        .map_err(|_| "invalid state")?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// Successful final completion records active for the NEXT user.
+    pub(crate) fn recorded_after(&self, stop: &str) -> Result<Option<&str>> {
+        match stop {
+            "end_turn" => Ok(Some(&self.user_execution.active_id)),
+            "tool_use" | "max_tokens" => Ok(self.user_execution.prior_recorded_id.as_deref()),
+            _ => Err("unsupported checkpoint stop reason"),
+        }
+    }
+}
+
+fn stop_reason(stop: &str, mapping: &Value) -> Result<()> {
+    let has_calls = !mapping.as_array().ok_or("invalid tool mapping")?.is_empty();
+    match stop {
+        "end_turn" if !has_calls => Ok(()),
+        "tool_use" if has_calls => Ok(()),
+        "max_tokens" => Ok(()),
+        _ => Err("inconsistent checkpoint stop reason"),
+    }
+}
+
 pub(crate) fn digest_input(blocks: &Value, envelope: &Value) -> Result<Vec<u8>> {
     let mut binding = Map::new();
     for key in [
+        "version",
         "profile_id",
         "project_id",
         "native_model",
-        "session_id",
+        "backend_session_id",
+        "lineage",
+        "native_checkpoint_index",
+        "user_execution",
+        "checkpoint_stop_reason",
         "thought_display",
         "tool_mapping",
     ] {
         binding.insert(
-            key.to_string(),
+            key.to_owned(),
             envelope.get(key).ok_or("missing binding")?.clone(),
         );
     }
-    canonical(&json!({"binding":binding, "blocks":projection_values(blocks)?}))
+    canonical(&json!({
+        "domain":"ccp:antigravity:v1:projection", "binding":binding,
+        "blocks":projection_values(blocks)?
+    }))
 }
 
 fn digest(blocks: &Value, envelope: &Value) -> Result<String> {
@@ -575,37 +798,35 @@ fn digest(blocks: &Value, envelope: &Value) -> Result<String> {
 pub(crate) fn encode(
     contents: &Value,
     binding: &Binding,
-    session: &str,
+    state: &State,
+    checkpoint_stop_reason: &str,
     thought_display: &str,
     mapping: &Value,
 ) -> Result<Value> {
-    session_id(session)?;
+    state.validate()?;
     let mut blocks = projection(contents, thought_display, mapping)?;
+    stop_reason(checkpoint_stop_reason, mapping)?;
     let mut envelope = serde_json::to_value(binding).map_err(|_| "invalid binding")?;
-    if [
-        &binding.profile_id,
-        &binding.project_id,
-        &binding.native_model,
-    ]
-    .iter()
-    .any(|v| v.is_empty())
-    {
-        return Err("empty binding");
-    }
-    let fields = json!({"version":1, "session_id":session, "thought_display":thought_display, "contents":contents, "tool_mapping":mapping});
+    let fields = json!({
+        "version":1, "backend_session_id":BACKEND_SESSION, "lineage":state.lineage,
+        "native_checkpoint_index":state.native_checkpoint_index,
+        "user_execution":state.user_execution,
+        "checkpoint_stop_reason":checkpoint_stop_reason,
+        "thought_display":thought_display, "contents":contents, "tool_mapping":mapping
+    });
     envelope
         .as_object_mut()
         .unwrap()
         .extend(fields.as_object().unwrap().clone());
     envelope["projection_digest"] = json!(digest(&blocks, &envelope)?);
     let raw = serde_json::to_vec(&envelope).map_err(|_| "invalid envelope")?;
-    // Same bounded parser as replay; don't emit a carrier we cannot decode.
     parse_json(&raw, MAX_DECODED)?;
     let encoded = URL_SAFE_NO_PAD.encode(raw);
     if encoded.len() > MAX_ENCODED {
         return Err("encoded byte limit");
     }
     blocks[0]["signature"] = json!(format!("{PREFIX}{encoded}"));
+    decode(&blocks, binding)?;
     Ok(blocks)
 }
 
@@ -634,7 +855,11 @@ pub(crate) fn decode(blocks: &Value, binding: &Binding) -> Result<Value> {
         "profile_id",
         "project_id",
         "native_model",
-        "session_id",
+        "backend_session_id",
+        "lineage",
+        "native_checkpoint_index",
+        "user_execution",
+        "checkpoint_stop_reason",
         "thought_display",
         "contents",
         "tool_mapping",
@@ -653,10 +878,17 @@ pub(crate) fn decode(blocks: &Value, binding: &Binding) -> Result<Value> {
             return Err("model/profile/project binding mismatch; start a fresh session");
         }
     }
-    session_id(nonempty(&envelope["session_id"])?)?;
+    if envelope["backend_session_id"] != BACKEND_SESSION {
+        return Err("invalid backend session");
+    }
+    State::from_envelope(&envelope)?;
     let expected = projection(
         &envelope["contents"],
         nonempty(&envelope["thought_display"])?,
+        &envelope["tool_mapping"],
+    )?;
+    stop_reason(
+        nonempty(&envelope["checkpoint_stop_reason"])?,
         &envelope["tool_mapping"],
     )?;
     let hash = digest(&expected, &envelope)?;
@@ -669,387 +901,49 @@ pub(crate) fn decode(blocks: &Value, binding: &Binding) -> Result<Value> {
 pub(crate) fn decode_history(turns: &Value, binding: &Binding) -> Result<Vec<Value>> {
     let turns = turns
         .as_array()
-        .filter(|t| t.len() <= 512)
+        .filter(|t| t.len() <= MAX_CHECKPOINTS as usize)
         .ok_or("history limit/type")?;
     let mut result = Vec::new();
-    let mut session = None;
+    let mut previous: Option<(State, String)> = None;
+    let mut executions = HashSet::new();
     let mut ids = HashSet::new();
-    for turn in turns {
+    for (index, turn) in turns.iter().enumerate() {
         let envelope = decode(turn, binding)?;
-        let current = envelope["session_id"].as_str().unwrap().to_string();
-        if session.as_ref().is_some_and(|s| s != &current) {
-            return Err("conflicting session IDs");
+        let state = State::from_envelope(&envelope)?;
+        if state.native_checkpoint_index != index as u64 {
+            return Err("conflicting checkpoint order");
         }
-        session = Some(current);
+        if let Some((prior, stop)) = &previous {
+            if prior.lineage != state.lineage {
+                return Err("conflicting logical conversation IDs");
+            }
+            if state.user_execution.prior_recorded_id.as_deref() != prior.recorded_after(stop)? {
+                return Err("conflicting recorded execution predecessor");
+            }
+            match stop.as_str() {
+                "end_turn" if executions.contains(&state.user_execution.active_id) => {
+                    return Err("reused USER execution identity");
+                }
+                "tool_use" if state.user_execution.active_id != prior.user_execution.active_id => {
+                    return Err("tool loop changed active execution");
+                }
+                "max_tokens" => {
+                    return Err("unqualified continuation after incomplete checkpoint");
+                }
+                _ => {}
+            }
+        }
+        executions.insert(state.user_execution.active_id.clone());
+        previous = Some((
+            state,
+            nonempty(&envelope["checkpoint_stop_reason"])?.to_owned(),
+        ));
         for entry in envelope["tool_mapping"].as_array().unwrap() {
-            if !ids.insert(entry["local_id"].as_str().unwrap().to_string()) {
+            if !ids.insert(entry["local_id"].as_str().unwrap().to_owned()) {
                 return Err("duplicate local ID across history");
             }
         }
         result.push(envelope);
     }
     Ok(result)
-}
-
-/// Extract only an UNTRUSTED scope claim for local estimation when no serving
-/// snapshot exists. The caller must still run the original full version/digest/
-/// history validators with this binding. Never publish it or use it as admission.
-pub(crate) fn claimed_binding(
-    blocks: &Value,
-    native_model: &str,
-    configured_project: Option<&str>,
-) -> Result<Binding> {
-    let first = blocks
-        .as_array()
-        .and_then(|b| b.first())
-        .filter(|b| b["type"] == "thinking")
-        .ok_or("missing carrier")?;
-    let signature = nonempty(&first["signature"])?;
-    let encoded = signature
-        .strip_prefix(PREFIX)
-        .or_else(|| signature.strip_prefix(v2::PREFIX))
-        .ok_or("missing/foreign carrier")?;
-    if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
-        return Err("carrier byte limit");
-    }
-    let raw = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| "malformed carrier")?;
-    let envelope = parse_json(&raw, MAX_DECODED)?;
-    let project = nonempty(&envelope["project_id"])?;
-    if envelope["native_model"].as_str() != Some(native_model)
-        || configured_project.is_some_and(|p| p != project)
-    {
-        return Err("model/configured-project estimate scope mismatch");
-    }
-    Ok(Binding {
-        profile_id: nonempty(&envelope["profile_id"])?.to_owned(),
-        project_id: project.to_owned(),
-        native_model: native_model.to_owned(),
-    })
-}
-
-/// Separate bounded V2 consistency state. V1 bytes/semantics above remain frozen.
-/// Client-carried consistency is NOT ownership authentication, server-side
-/// stale-parent rejection or at-most-once execution; replay remains possible.
-/// IDs and checkpoint ordinals below are proxy-owned representations, not copied
-/// native IDs or claims about hidden Go allocation timing. Successful user
-/// completion records active for the next user; its tool loop retains prior.
-/// Native Go can append nonnil metadata on errors too: conservative no-checkpoint
-/// failure/cancellation here is NOT a claim of native error-path equivalence.
-pub(crate) mod v2 {
-    use super::*;
-
-    pub(crate) const PREFIX: &str = "ccp:antigravity:v2:";
-    pub(crate) const BACKEND_SESSION: &str = "-3750763034362895579";
-    pub(crate) const MAX_CHECKPOINTS: u64 = 512;
-
-    fn uuid_v4(value: &str) -> Result<()> {
-        let id = uuid::Uuid::parse_str(value).map_err(|_| "invalid V2 logical UUID")?;
-        if id.get_version_num() != 4
-            || id.get_variant() != uuid::Variant::RFC4122
-            || id.to_string() != value
-        {
-            return Err("invalid V2 logical UUID");
-        }
-        Ok(())
-    }
-
-    #[derive(Clone, Eq, PartialEq, serde::Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(crate) struct Lineage {
-        pub conversation_id: String,
-        pub trajectory_id: String,
-    }
-
-    impl Lineage {
-        pub(crate) fn new(conversation_id: String, trajectory_id: String) -> Result<Self> {
-            let value = Self {
-                conversation_id,
-                trajectory_id,
-            };
-            value.validate()?;
-            Ok(value)
-        }
-
-        pub(crate) fn validate(&self) -> Result<()> {
-            for value in [&self.conversation_id, &self.trajectory_id] {
-                uuid_v4(value)?;
-            }
-            if self.conversation_id == self.trajectory_id {
-                return Err("V2 logical UUID collision");
-            }
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, serde::Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(crate) struct UserExecution {
-        pub active_id: String,
-        /// Last recorded predecessor when THIS user execution began. Immutable
-        /// through its tool loop; never minted while rendering the label.
-        pub prior_recorded_id: Option<String>,
-    }
-
-    #[derive(Clone, serde::Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(crate) struct State {
-        pub lineage: Lineage,
-        /// Our native assistant-checkpoint ordinal, not a hidden Go counter.
-        pub native_checkpoint_index: u64,
-        pub user_execution: UserExecution,
-    }
-
-    impl State {
-        pub(crate) fn validate(&self) -> Result<()> {
-            self.lineage.validate()?;
-            if self.native_checkpoint_index >= MAX_CHECKPOINTS {
-                return Err("V2 checkpoint limit");
-            }
-            let execution = &self.user_execution;
-            uuid_v4(&execution.active_id)?;
-            if let Some(prior) = &execution.prior_recorded_id {
-                uuid_v4(prior)?;
-                if self.native_checkpoint_index == 0 || prior == &execution.active_id {
-                    return Err("invalid V2 execution predecessor");
-                }
-            }
-            for id in
-                std::iter::once(&execution.active_id).chain(execution.prior_recorded_id.iter())
-            {
-                if id == &self.lineage.conversation_id || id == &self.lineage.trajectory_id {
-                    return Err("V2 execution/lineage UUID collision");
-                }
-            }
-            Ok(())
-        }
-
-        /// Read only after bounded envelope validation. No allocation sources,
-        /// clock, auth/profile access or publication of authoritative scope.
-        pub(crate) fn from_envelope(envelope: &Value) -> Result<Self> {
-            keys(
-                &envelope["user_execution"],
-                &["active_id", "prior_recorded_id"],
-                &["active_id", "prior_recorded_id"],
-            )?;
-            let state: Self = serde_json::from_value(json!({
-                "lineage":envelope["lineage"],
-                "native_checkpoint_index":envelope["native_checkpoint_index"],
-                "user_execution":envelope["user_execution"]
-            }))
-            .map_err(|_| "invalid V2 state")?;
-            state.validate()?;
-            Ok(state)
-        }
-
-        /// Successful final completion records active for the NEXT user. This
-        /// pure derivation is our conservative policy, not Go error/cancel parity.
-        pub(crate) fn recorded_after(&self, stop: &str) -> Result<Option<&str>> {
-            match stop {
-                "end_turn" => Ok(Some(&self.user_execution.active_id)),
-                "tool_use" | "max_tokens" => Ok(self.user_execution.prior_recorded_id.as_deref()),
-                _ => Err("unsupported V2 checkpoint stop reason"),
-            }
-        }
-    }
-
-    fn stop_reason(stop: &str, mapping: &Value) -> Result<()> {
-        let has_calls = !mapping.as_array().ok_or("invalid tool mapping")?.is_empty();
-        match stop {
-            "end_turn" if !has_calls => Ok(()),
-            "tool_use" if has_calls => Ok(()),
-            "max_tokens" => Ok(()),
-            _ => Err("inconsistent V2 checkpoint stop reason"),
-        }
-    }
-
-    fn digest(blocks: &Value, envelope: &Value) -> Result<String> {
-        let mut binding = Map::new();
-        for key in [
-            "version",
-            "profile_id",
-            "project_id",
-            "native_model",
-            "backend_session_id",
-            "lineage",
-            "native_checkpoint_index",
-            "user_execution",
-            "checkpoint_stop_reason",
-            "thought_display",
-            "tool_mapping",
-        ] {
-            binding.insert(
-                key.to_owned(),
-                envelope.get(key).ok_or("missing V2 binding")?.clone(),
-            );
-        }
-        let input = canonical(&json!({
-            "domain":"ccp:antigravity:v2:projection", "binding":binding,
-            "blocks":projection_values(blocks)?
-        }))?;
-        Ok(format!("{:x}", Sha256::digest(input)))
-    }
-
-    pub(crate) fn encode(
-        contents: &Value,
-        binding: &Binding,
-        state: &State,
-        checkpoint_stop_reason: &str,
-        thought_display: &str,
-        mapping: &Value,
-    ) -> Result<Value> {
-        state.validate()?;
-        let mut blocks = projection(contents, thought_display, mapping)?;
-        stop_reason(checkpoint_stop_reason, mapping)?;
-        let mut envelope = serde_json::to_value(binding).map_err(|_| "invalid binding")?;
-        let fields = json!({
-            "version":2, "backend_session_id":BACKEND_SESSION, "lineage":state.lineage,
-            "native_checkpoint_index":state.native_checkpoint_index,
-            "user_execution":state.user_execution,
-            "checkpoint_stop_reason":checkpoint_stop_reason,
-            "thought_display":thought_display, "contents":contents, "tool_mapping":mapping
-        });
-        envelope
-            .as_object_mut()
-            .unwrap()
-            .extend(fields.as_object().unwrap().clone());
-        envelope["projection_digest"] = json!(digest(&blocks, &envelope)?);
-        let raw = serde_json::to_vec(&envelope).map_err(|_| "invalid V2 envelope")?;
-        parse_json(&raw, MAX_DECODED)?;
-        let encoded = URL_SAFE_NO_PAD.encode(raw);
-        if encoded.len() > MAX_ENCODED {
-            return Err("encoded byte limit");
-        }
-        blocks[0]["signature"] = json!(format!("{PREFIX}{encoded}"));
-        // A production encoder must not emit state that its bounded scope and
-        // projection/state validator rejects. No completed checkpoint is encoded
-        // by the generation pipeline until the native turn and tool mapping pass.
-        decode(&blocks, binding)?;
-        Ok(blocks)
-    }
-
-    pub(crate) fn decode(blocks: &Value, binding: &Binding) -> Result<Value> {
-        let list = blocks
-            .as_array()
-            .filter(|b| !b.is_empty())
-            .ok_or("missing V2 carrier")?;
-        if list[0]["type"] != "thinking"
-            || list.iter().filter(|b| b["type"] == "thinking").count() != 1
-        {
-            return Err("missing/duplicate/nonleading V2 carrier");
-        }
-        let encoded = list[0]["signature"]
-            .as_str()
-            .and_then(|s| s.strip_prefix(PREFIX))
-            .ok_or("missing/foreign V2 carrier")?;
-        if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED
-        {
-            return Err("carrier byte limit");
-        }
-        let raw = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| "malformed V2 carrier")?;
-        let envelope = parse_json(&raw, MAX_DECODED)?;
-        let fields = [
-            "version",
-            "profile_id",
-            "project_id",
-            "native_model",
-            "backend_session_id",
-            "lineage",
-            "native_checkpoint_index",
-            "user_execution",
-            "checkpoint_stop_reason",
-            "thought_display",
-            "contents",
-            "tool_mapping",
-            "projection_digest",
-        ];
-        keys(&envelope, &fields, &fields)?;
-        if envelope["version"].as_u64() != Some(2) {
-            return Err("unsupported V2 carrier version");
-        }
-        for (key, value) in [
-            ("profile_id", &binding.profile_id),
-            ("project_id", &binding.project_id),
-            ("native_model", &binding.native_model),
-        ] {
-            if value.is_empty() || envelope[key].as_str() != Some(value) {
-                return Err("model/profile/project binding mismatch; start a fresh session");
-            }
-        }
-        if envelope["backend_session_id"] != BACKEND_SESSION {
-            return Err("invalid V2 backend session");
-        }
-        State::from_envelope(&envelope)?;
-        let expected = projection(
-            &envelope["contents"],
-            nonempty(&envelope["thought_display"])?,
-            &envelope["tool_mapping"],
-        )?;
-        stop_reason(
-            nonempty(&envelope["checkpoint_stop_reason"])?,
-            &envelope["tool_mapping"],
-        )?;
-        let hash = digest(&expected, &envelope)?;
-        if envelope["projection_digest"] != hash || digest(blocks, &envelope)? != hash {
-            return Err("V2 projection digest mismatch");
-        }
-        Ok(envelope)
-    }
-
-    pub(crate) fn decode_history(turns: &Value, binding: &Binding) -> Result<Vec<Value>> {
-        let turns = turns
-            .as_array()
-            .filter(|t| t.len() <= MAX_CHECKPOINTS as usize)
-            .ok_or("history limit/type")?;
-        let mut result = Vec::new();
-        let mut previous: Option<(State, String)> = None;
-        let mut executions = HashSet::new();
-        let mut ids = HashSet::new();
-        for (index, turn) in turns.iter().enumerate() {
-            let envelope = decode(turn, binding)?;
-            let state = State::from_envelope(&envelope)?;
-            if state.native_checkpoint_index != index as u64 {
-                return Err("conflicting V2 checkpoint order");
-            }
-            if let Some((prior, stop)) = &previous {
-                if prior.lineage != state.lineage {
-                    return Err("conflicting V2 logical conversation IDs");
-                }
-                if state.user_execution.prior_recorded_id.as_deref()
-                    != prior.recorded_after(stop)?
-                {
-                    return Err("conflicting V2 recorded execution predecessor");
-                }
-                match stop.as_str() {
-                    "end_turn" if executions.contains(&state.user_execution.active_id) => {
-                        return Err("reused V2 USER execution identity");
-                    }
-                    "tool_use"
-                        if state.user_execution.active_id != prior.user_execution.active_id =>
-                    {
-                        return Err("V2 tool loop changed active execution");
-                    }
-                    "max_tokens" => {
-                        return Err("unqualified continuation after incomplete V2 checkpoint");
-                    }
-                    _ => {}
-                }
-            }
-            executions.insert(state.user_execution.active_id.clone());
-            previous = Some((
-                state,
-                nonempty(&envelope["checkpoint_stop_reason"])?.to_owned(),
-            ));
-            for entry in envelope["tool_mapping"].as_array().unwrap() {
-                if !ids.insert(entry["local_id"].as_str().unwrap().to_owned()) {
-                    return Err("duplicate local ID across history");
-                }
-            }
-            result.push(envelope);
-        }
-        Ok(result)
-    }
 }

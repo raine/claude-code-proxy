@@ -715,7 +715,7 @@ pub fn codex_previous_response_id() -> bool {
 }
 
 pub fn codex_request_compression() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env: HashMap<_, _> = crate::environment::legacy_vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_REQUEST_COMPRESSION") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => return true,

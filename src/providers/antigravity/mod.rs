@@ -96,11 +96,10 @@ impl AntigravityProvider {
             Err(_) => return authentication("Antigravity credentials are invalid or unreadable"),
         };
         let binding = binding(auth, &body, stored.as_ref());
-        let mut prepared =
-            match request::prepare_with_policy(&body, &binding, auth.config.request_metadata) {
-                Ok(p) => p,
-                Err(e) => return invalid(e),
-            };
+        let mut prepared = match request::prepare(&body, &binding) {
+            Ok(p) => p,
+            Err(e) => return invalid(e),
+        };
         let generation = match &self.generation {
             Ok(client) => client,
             Err(_) => {
@@ -138,15 +137,12 @@ impl AntigravityProvider {
                 "Antigravity project missing; run auth login or configure your authorized project",
             );
         }
-        if !matches!(prepared.metadata, request::Metadata::Legacy) {
-            // Fresh UUIDs are allocated only after access/discovery and actual
-            // scope validation. Observed text continuations keep carried IDs;
-            // legacy preparation and its existing nonce behavior are unchanged.
-            let metadata = request::metadata_millis()
-                .and_then(|millis| prepared.finalize_metadata(millis, request::metadata_uuid));
-            if let Err(error) = metadata {
-                return upstream_error(error);
-            }
+        // Fresh UUIDs are allocated only after access/discovery and actual
+        // scope validation. Observed continuations keep carried IDs.
+        let metadata = request::metadata_millis()
+            .and_then(|millis| prepared.finalize_metadata(millis, request::metadata_uuid));
+        if let Err(error) = metadata {
+            return upstream_error(error);
         }
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, body.model.as_deref().unwrap_or_default());
@@ -193,8 +189,7 @@ impl AntigravityProvider {
             return upstream_error("Antigravity returned an unexpected content type");
         }
         let model = body.model.unwrap_or_default();
-        let serving_scope = (auth.config.request_metadata == config::RequestMetadata::Agy)
-            .then(|| self.serving_scope.clone());
+        let serving_scope = self.serving_scope.clone();
         let work = async move {
             let turn = tokio::time::timeout_at(request_deadline, transport::collect(upstream))
                 .await
@@ -208,18 +203,11 @@ impl AntigravityProvider {
             }
             let mapping = prepared.tools.mapping(&turn.contents)?;
             let blocks = match &prepared.metadata {
-                request::Metadata::Ready(state) => replay::v2::encode(
+                request::Metadata::Ready(state) => replay::encode(
                     &turn.contents,
                     &binding,
                     state,
                     &turn.stop_reason,
-                    &prepared.display,
-                    &mapping,
-                )?,
-                request::Metadata::Legacy => replay::encode(
-                    &turn.contents,
-                    &binding,
-                    &prepared.session,
                     &prepared.display,
                     &mapping,
                 )?,
@@ -229,9 +217,7 @@ impl AntigravityProvider {
             // turn/projection may publish these nonsecret count inputs. Errors or
             // cancellation before this point publish nothing; no carrier claim is
             // authoritative and this snapshot never authorizes generation.
-            if let Some(scope) = &serving_scope
-                && let Ok(mut published) = scope.write()
-            {
+            if let Ok(mut published) = serving_scope.write() {
                 *published = Some(request::ServingScope {
                     profile_id: binding.profile_id.clone(),
                     project_id: binding.project_id.clone(),
@@ -349,29 +335,16 @@ impl Provider for AntigravityProvider {
             Ok(auth) => auth,
             Err(_) => return invalid("Antigravity configuration is invalid"),
         };
-        if auth.config.request_metadata == config::RequestMetadata::Agy {
-            let scope = self.count_scope_snapshot();
-            return match request::estimate(
-                &body,
-                request::CountInputs {
-                    serving_scope: scope.as_ref(),
-                    configured_project: auth.config.project.as_deref(),
-                },
-            ) {
-                Ok(estimate) => Json(json!({"input_tokens":estimate})).into_response(),
-                Err(error) => invalid(error),
-            };
-        }
-        // Frozen default/legacy count behavior intentionally remains separate.
-        #[cfg(test)]
-        request::effects::note(request::effects::Kind::CredentialLoad);
-        let credential = match auth.store.load() {
-            Ok(c) => c,
-            Err(_) => return authentication("Antigravity credentials invalid or unreadable"),
-        };
-        match request::prepare(&body, &binding(auth, &body, credential.as_ref())) {
-            Ok(p) => Json(json!({"input_tokens":p.estimate})).into_response(),
-            Err(e) => invalid(e),
+        let scope = self.count_scope_snapshot();
+        match request::estimate(
+            &body,
+            request::CountInputs {
+                serving_scope: scope.as_ref(),
+                configured_project: auth.config.project.as_deref(),
+            },
+        ) {
+            Ok(estimate) => Json(json!({"input_tokens":estimate})).into_response(),
+            Err(error) => invalid(error),
         }
     }
     async fn finish_maintenance(&self) -> anyhow::Result<()> {

@@ -320,7 +320,7 @@ impl Fixture {
         std::fs::write(
             config_dir.join("config.json"),
             serde_json::to_vec(&json!({"antigravity":{
-                "enabled":true,"baseUrl":origin,"projectId":PROJECT,"requestMetadata":"legacy"
+                "enabled":true,"baseUrl":origin,"projectId":PROJECT
             }}))?,
         )?;
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -776,106 +776,141 @@ async fn exercise(case: &str, f: &mut Fixture) -> Result<()> {
 }
 
 async fn first_agent_metadata(f: &mut Fixture) -> Result<()> {
-    let config_path = f
-        .auth_path
-        .parent()
-        .and_then(|p| p.parent())
-        .context("synthetic config parent")?
-        .join("config.json");
-    let original = std::fs::read(&config_path)?;
-    let mut config: Value = serde_json::from_slice(&original)?;
-    config["antigravity"]["requestMetadata"] = json!("agy");
-    std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
-    f.provider = AntigravityProvider::new();
-    let result = async {
-        let mut previous_conversation = None;
-        for stream in [false, true] {
-            let mut body = request(stream);
-            body["model"] = json!("antigravity/gemini-4-argon-low");
-            body["max_tokens"] = json!(65536);
-            body["system"] = json!([
-                {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.270.dd6; cc_entrypoint=sdk-cli;"},
-                {"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral"}},
-                {"type":"text","text":"Synthetic metadata system instruction.","cache_control":{"type":"ephemeral"}}
-            ]);
-            body["messages"].as_array_mut().context("messages")?.insert(
-                0,
-                json!({"role":"system","content":"Synthetic environment instruction."}),
+    let mut previous_conversation = None;
+    for stream in [false, true] {
+        let mut body = request(stream);
+        body["model"] = json!("antigravity/gemini-4-argon-low");
+        body["max_tokens"] = json!(65536);
+        body["system"] = json!([
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.270.dd6; cc_entrypoint=sdk-cli;"},
+            {"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK.","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"Synthetic metadata system instruction.","cache_control":{"type":"ephemeral"}}
+        ]);
+        body["messages"].as_array_mut().context("messages")?.insert(
+            0,
+            json!({"role":"system","content":"Synthetic environment instruction."}),
+        );
+        let exchange = f
+            .exchange(body, json!([{"text":"Synthetic metadata completion."}]))
+            .await?;
+        exchange.success(stream)?;
+        let wire = exchange.wire()?;
+        ensure!(
+            wire["model"] == "gemini-4-argon-low"
+                && wire["requestType"] == "agent"
+                && wire["userAgent"] == "antigravity",
+            "observed agent envelope"
+        );
+        let request = &wire["request"];
+        exact(
+            &request["systemInstruction"],
+            &json!({"role":"user","parts":[{"text":"Synthetic metadata system instruction.\n\nSynthetic environment instruction."}]}),
+            "agy single-part systemInstruction with Claude Code headers stripped",
+        )?;
+        exact(
+            &request["generationConfig"],
+            &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}),
+            "observed generation controls",
+        )?;
+        ensure!(
+            request["sessionId"] == "-3750763034362895579",
+            "observed signed empty-input FNV session"
+        );
+        let labels = request["labels"]
+            .as_object()
+            .context("observed lineage labels")?;
+        ensure!(labels.len() == 9, "exact observed label set");
+        for (key, expected) in [
+            ("model_enum", "MODEL_PLACEHOLDER_M419"),
+            ("used_claude", "false"),
+            ("used_claude_conservative", "false"),
+            ("used_non_gemini_model", "false"),
+            ("last_step_index", "0"),
+        ] {
+            ensure!(
+                labels.get(key).and_then(Value::as_str) == Some(expected),
+                "observed string-valued label"
             );
-            let exchange = f.exchange(body, json!([{"text":"Synthetic metadata completion."}])).await?;
-            exchange.success(stream)?;
-            let wire = exchange.wire()?;
-            ensure!(wire["model"] == "gemini-4-argon-low" && wire["requestType"] == "agent" && wire["userAgent"] == "antigravity", "observed agent envelope");
-            let request = &wire["request"];
-            exact(
-                &request["systemInstruction"],
-                &json!({"role":"user","parts":[{"text":"Synthetic metadata system instruction.\n\nSynthetic environment instruction."}]}),
-                "agy single-part systemInstruction with Claude Code headers stripped",
-            )?;
-            exact(&request["generationConfig"], &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}), "observed generation controls")?;
-            ensure!(request["sessionId"] == "-3750763034362895579", "observed signed empty-input FNV session");
-            let labels = request["labels"].as_object().context("observed lineage labels")?;
-            ensure!(labels.len() == 9, "exact observed label set");
-            for (key, expected) in [
-                ("model_enum", "MODEL_PLACEHOLDER_M419"),
-                ("used_claude", "false"),
-                ("used_claude_conservative", "false"),
-                ("used_non_gemini_model", "false"),
-                ("last_step_index", "0"),
-            ] {
-                ensure!(labels.get(key).and_then(Value::as_str) == Some(expected), "observed string-valued label");
-            }
-            let conversation = labels["cascade_id"].as_str().context("cascade ID")?;
-            let trajectory = labels["trajectory_id"].as_str().context("trajectory ID")?;
-            for value in [conversation, trajectory] {
-                let id = uuid::Uuid::parse_str(value)?;
-                ensure!(id.get_version_num() == 4 && id.to_string() == value, "canonical UUIDv4 metadata");
-            }
-            ensure!(labels["root_cascade_id"] == conversation && conversation != trajectory, "root and trajectory relationships");
-            ensure!(labels["request_id"] == format!("{trajectory}-0"), "first request uses zero-based generation counter");
-            let outer = wire["requestId"].as_str().context("outer request ID")?;
-            let components: Vec<_> = outer.split('/').collect();
-            ensure!(components.len() == 5 && components[0] == "agent" && components[1] == conversation && components[3] == trajectory && components[4] == "1", "outer request component relationships");
-            let timestamp = components[2].parse::<i64>()?;
-            ensure!((946_684_800_000..4_102_444_800_000).contains(&timestamp) && timestamp.to_string() == components[2], "canonical plausible Unix milliseconds");
-            ensure!(previous_conversation.as_deref() != Some(conversation), "independent fresh conversations");
-            previous_conversation = Some(conversation.to_owned());
-            let blocks = exchange.blocks()?;
-            let signature = blocks[0]["signature"].as_str().context("versioned native carrier")?;
-            let encoded = signature.strip_prefix("ccp:antigravity:v2:").context("explicit V2 carrier, not V1 reinterpretation")?;
-            let raw = URL_SAFE_NO_PAD.decode(encoded)?;
-            ensure!(raw.len() <= BODY_LIMIT, "synthetic V2 carrier bound");
-            let saved: Value = serde_json::from_slice(&raw)?;
-            ensure!(saved["version"] == 2 && saved["profile_id"] == PROFILE && saved["project_id"] == PROJECT, "V2 scope and version");
-            ensure!(saved["native_model"] == "gemini-4-argon-low" && saved["backend_session_id"] == "-3750763034362895579", "V2 model and separate backend session");
-            exact(&saved["lineage"], &json!({"conversation_id":conversation,"trajectory_id":trajectory}), "V2 logical UUIDs")?;
-            ensure!(saved.get("session_id").is_none(), "V2 must not reinterpret the V1 session field");
-            ensure!(wire.get("enabledCreditTypes").is_none() && request.get("enabledCreditTypes").is_none(), "no invented billing consent");
-            exact(&saved["contents"], &json!([{"role":"model","parts":[{"text":"Synthetic metadata completion."}]}]), "unchanged native response contents")?;
-            let mut continuation = self::request(stream);
-            continuation["model"] = json!("antigravity/gemini-4-argon-low");
-            continuation["messages"].as_array_mut().context("messages")?.extend([
-                json!({"role":"assistant","content":blocks}),
-                json!({"role":"user","content":"Unsupported next transition."}),
-            ]);
-            config["antigravity"]["requestMetadata"] = json!("legacy");
-            std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
-            tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
-            f.provider = AntigravityProvider::new();
-            let rejected = f.exchange(continuation, json!([{"text":"must not dispatch"}])).await?;
-            ensure!(rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(), "V2 continuation must never downgrade under legacy policy");
-            let error: Value = serde_json::from_slice(&rejected.bytes)?;
-            ensure!(error["error"]["message"].as_str().is_some_and(|s| s.contains("V2 history requires the agy request metadata policy")), "explicit V2 policy boundary");
-            config["antigravity"]["requestMetadata"] = json!("agy");
-            std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
-            tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
-            f.provider = AntigravityProvider::new();
         }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-    std::fs::write(config_path, original)?;
-    result
+        let conversation = labels["cascade_id"].as_str().context("cascade ID")?;
+        let trajectory = labels["trajectory_id"].as_str().context("trajectory ID")?;
+        for value in [conversation, trajectory] {
+            let id = uuid::Uuid::parse_str(value)?;
+            ensure!(
+                id.get_version_num() == 4 && id.to_string() == value,
+                "canonical UUIDv4 metadata"
+            );
+        }
+        ensure!(
+            labels["root_cascade_id"] == conversation && conversation != trajectory,
+            "root and trajectory relationships"
+        );
+        ensure!(
+            labels["request_id"] == format!("{trajectory}-0"),
+            "first request uses zero-based generation counter"
+        );
+        let outer = wire["requestId"].as_str().context("outer request ID")?;
+        let components: Vec<_> = outer.split('/').collect();
+        ensure!(
+            components.len() == 5
+                && components[0] == "agent"
+                && components[1] == conversation
+                && components[3] == trajectory
+                && components[4] == "1",
+            "outer request component relationships"
+        );
+        let timestamp = components[2].parse::<i64>()?;
+        ensure!(
+            (946_684_800_000..4_102_444_800_000).contains(&timestamp)
+                && timestamp.to_string() == components[2],
+            "canonical plausible Unix milliseconds"
+        );
+        ensure!(
+            previous_conversation.as_deref() != Some(conversation),
+            "independent fresh conversations"
+        );
+        previous_conversation = Some(conversation.to_owned());
+        let blocks = exchange.blocks()?;
+        let signature = blocks[0]["signature"]
+            .as_str()
+            .context("versioned native carrier")?;
+        let encoded = signature
+            .strip_prefix("ccp:antigravity:v1:")
+            .context("explicit V1 carrier")?;
+        let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+        ensure!(raw.len() <= BODY_LIMIT, "synthetic V1 carrier bound");
+        let saved: Value = serde_json::from_slice(&raw)?;
+        ensure!(
+            saved["version"] == 1
+                && saved["profile_id"] == PROFILE
+                && saved["project_id"] == PROJECT,
+            "V1 scope and version"
+        );
+        ensure!(
+            saved["native_model"] == "gemini-4-argon-low"
+                && saved["backend_session_id"] == "-3750763034362895579",
+            "V1 model and separate backend session"
+        );
+        exact(
+            &saved["lineage"],
+            &json!({"conversation_id":conversation,"trajectory_id":trajectory}),
+            "V1 logical UUIDs",
+        )?;
+        ensure!(
+            saved.get("session_id").is_none(),
+            "V1 uses backend_session_id"
+        );
+        ensure!(
+            wire.get("enabledCreditTypes").is_none() && request.get("enabledCreditTypes").is_none(),
+            "no invented billing consent"
+        );
+        exact(
+            &saved["contents"],
+            &json!([{"role":"model","parts":[{"text":"Synthetic metadata completion."}]}]),
+            "unchanged native response contents",
+        )?;
+    }
+    Ok(())
 }
 
 // Official CLI one-process/two-user trace, served LOCAL_SYNTHETIC_SSE (no
@@ -883,93 +918,191 @@ async fn first_agent_metadata(f: &mut Fixture) -> Result<()> {
 // relations, not hidden Go state. The later three-user/source fixture below
 // separately checks the full last_execution_id predecessor relationship.
 async fn two_user_text_metadata(f: &mut Fixture) -> Result<()> {
-    let config_path = f
-        .auth_path
-        .parent()
-        .and_then(|p| p.parent())
-        .context("synthetic config parent")?
-        .join("config.json");
-    let original = std::fs::read(&config_path)?;
-    let mut config: Value = serde_json::from_slice(&original)?;
-    config["antigravity"]["requestMetadata"] = json!("agy");
-    std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
-    f.provider = AntigravityProvider::new();
-    let result = async {
-        for stream in [false, true] {
-            let mut body = request(stream);
-            body["model"] = json!("antigravity/gemini-4-argon-low");
-            body["max_tokens"] = json!(65536);
-            body["system"] = json!("Synthetic two-user system instruction.");
-            body["messages"][0]["content"] = json!("Synthetic first user.");
-            let first = f.exchange(body.clone(), json!([{"text":"Synthetic first completion."}])).await?;
-            first.success(stream)?;
-            let first_blocks = first.blocks()?;
-            body["messages"].as_array_mut().context("messages")?.extend([
+    for stream in [false, true] {
+        let mut body = request(stream);
+        body["model"] = json!("antigravity/gemini-4-argon-low");
+        body["max_tokens"] = json!(65536);
+        body["system"] = json!("Synthetic two-user system instruction.");
+        body["messages"][0]["content"] = json!("Synthetic first user.");
+        let first = f
+            .exchange(
+                body.clone(),
+                json!([{"text":"Synthetic first completion."}]),
+            )
+            .await?;
+        first.success(stream)?;
+        let first_blocks = first.blocks()?;
+        body["messages"]
+            .as_array_mut()
+            .context("messages")?
+            .extend([
                 json!({"role":"assistant","content":first_blocks}),
                 json!({"role":"user","content":"Synthetic second user."}),
             ]);
-            let second = f.exchange(body.clone(), json!([{"text":"Synthetic second completion."}])).await?;
-            if second.status != StatusCode::OK {
-                let error: Value = serde_json::from_slice(&second.bytes)?;
-                bail!("observed second-user text continuation must succeed; status={} error={}", second.status, error["error"]["message"]);
+        let second = f
+            .exchange(
+                body.clone(),
+                json!([{"text":"Synthetic second completion."}]),
+            )
+            .await?;
+        if second.status != StatusCode::OK {
+            let error: Value = serde_json::from_slice(&second.bytes)?;
+            bail!(
+                "observed second-user text continuation must succeed; status={} error={}",
+                second.status,
+                error["error"]["message"]
+            );
+        }
+        second.success(stream)?;
+        let first_wire = first.wire()?;
+        let second_wire = second.wire()?;
+        let conversation = first_wire["request"]["labels"]["cascade_id"]
+            .as_str()
+            .context("conversation")?;
+        let trajectory = first_wire["request"]["labels"]["trajectory_id"]
+            .as_str()
+            .context("trajectory")?;
+        ensure!(
+            conversation != trajectory,
+            "distinct conversation/trajectory"
+        );
+        for id in [conversation, trajectory] {
+            let uuid = uuid::Uuid::parse_str(id)?;
+            ensure!(
+                uuid.get_version_num() == 4
+                    && uuid.get_variant() == uuid::Variant::RFC4122
+                    && uuid.to_string() == id,
+                "canonical independent UUIDv4"
+            );
+        }
+        for (wire, generation, last_step, outer_step) in
+            [(first_wire, "0", "0", "1"), (second_wire, "1", "2", "3")]
+        {
+            ensure!(
+                wire["model"] == "gemini-4-argon-low"
+                    && wire["project"] == PROJECT
+                    && wire["requestType"] == "agent"
+                    && wire["userAgent"] == "antigravity",
+                "same actual bound model/project/type"
+            );
+            ensure!(
+                wire["request"]["sessionId"] == "-3750763034362895579",
+                "same signed empty FNV backend session"
+            );
+            let labels = &wire["request"]["labels"];
+            for (key, value) in [
+                ("model_enum", "MODEL_PLACEHOLDER_M419"),
+                ("used_claude", "false"),
+                ("used_claude_conservative", "false"),
+                ("used_non_gemini_model", "false"),
+                ("cascade_id", conversation),
+                ("root_cascade_id", conversation),
+                ("trajectory_id", trajectory),
+                ("last_step_index", last_step),
+            ] {
+                ensure!(
+                    labels[key].as_str() == Some(value),
+                    "observed stable string-valued label {key}"
+                );
             }
-            second.success(stream)?;
-            let first_wire = first.wire()?;
-            let second_wire = second.wire()?;
-            let conversation = first_wire["request"]["labels"]["cascade_id"].as_str().context("conversation")?;
-            let trajectory = first_wire["request"]["labels"]["trajectory_id"].as_str().context("trajectory")?;
-            ensure!(conversation != trajectory, "distinct conversation/trajectory");
-            for id in [conversation, trajectory] {
-                let uuid = uuid::Uuid::parse_str(id)?;
-                ensure!(uuid.get_version_num() == 4 && uuid.get_variant() == uuid::Variant::RFC4122 && uuid.to_string() == id, "canonical independent UUIDv4");
-            }
-            for (wire, generation, last_step, outer_step) in [(first_wire, "0", "0", "1"), (second_wire, "1", "2", "3")] {
-                ensure!(wire["model"] == "gemini-4-argon-low" && wire["project"] == PROJECT && wire["requestType"] == "agent" && wire["userAgent"] == "antigravity", "same actual bound model/project/type");
-                ensure!(wire["request"]["sessionId"] == "-3750763034362895579", "same signed empty FNV backend session");
-                let labels = &wire["request"]["labels"];
-                for (key, value) in [("model_enum", "MODEL_PLACEHOLDER_M419"), ("used_claude", "false"), ("used_claude_conservative", "false"), ("used_non_gemini_model", "false"), ("cascade_id", conversation), ("root_cascade_id", conversation), ("trajectory_id", trajectory), ("last_step_index", last_step)] {
-                    ensure!(labels[key].as_str() == Some(value), "observed stable string-valued label {key}");
-                }
-                ensure!(labels["request_id"] == format!("{trajectory}-{generation}"), "generation suffix must not reset at second user");
-                let outer = wire["requestId"].as_str().context("outer ID")?;
-                let components: Vec<_> = outer.split('/').collect();
-                ensure!(components.len() == 5 && components[0] == "agent" && components[1] == conversation && components[3] == trajectory && components[4] == outer_step, "observed outer step and stable identities");
-                let millis = components[2].parse::<i64>()?;
-                ensure!((946_684_800_000..4_102_444_800_000).contains(&millis) && millis.to_string() == components[2], "canonical Unix milliseconds");
-                exact(&wire["request"]["generationConfig"], &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}), "unchanged generation config")?;
-                exact(&wire["request"]["systemInstruction"], &json!({"role":"user","parts":[{"text":"Synthetic two-user system instruction."}]}), "unchanged system role")?;
-            }
-            exact(&first_wire["request"]["contents"], &json!([{"role":"user","parts":[{"text":"Synthetic first user."}]}]), "first native user contents")?;
-            exact(&second_wire["request"]["contents"], &json!([
+            ensure!(
+                labels["request_id"] == format!("{trajectory}-{generation}"),
+                "generation suffix must not reset at second user"
+            );
+            let outer = wire["requestId"].as_str().context("outer ID")?;
+            let components: Vec<_> = outer.split('/').collect();
+            ensure!(
+                components.len() == 5
+                    && components[0] == "agent"
+                    && components[1] == conversation
+                    && components[3] == trajectory
+                    && components[4] == outer_step,
+                "observed outer step and stable identities"
+            );
+            let millis = components[2].parse::<i64>()?;
+            ensure!(
+                (946_684_800_000..4_102_444_800_000).contains(&millis)
+                    && millis.to_string() == components[2],
+                "canonical Unix milliseconds"
+            );
+            exact(
+                &wire["request"]["generationConfig"],
+                &json!({"maxOutputTokens":65536,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"LOW"}}),
+                "unchanged generation config",
+            )?;
+            exact(
+                &wire["request"]["systemInstruction"],
+                &json!({"role":"user","parts":[{"text":"Synthetic two-user system instruction."}]}),
+                "unchanged system role",
+            )?;
+        }
+        exact(
+            &first_wire["request"]["contents"],
+            &json!([{"role":"user","parts":[{"text":"Synthetic first user."}]}]),
+            "first native user contents",
+        )?;
+        exact(
+            &second_wire["request"]["contents"],
+            &json!([
                 {"role":"user","parts":[{"text":"Synthetic first user."}]},
                 {"role":"model","parts":[{"text":"Synthetic first completion."}]},
                 {"role":"user","parts":[{"text":"Synthetic second user."}]}
-            ]), "exact observed user/model/user history; no synthetic role rewriting")?;
-            let second_blocks = second.blocks()?;
-            for (blocks, index, text) in [(&first_blocks, 0, "Synthetic first completion."), (&second_blocks, 1, "Synthetic second completion.")] {
-                let encoded = blocks[0]["signature"].as_str().context("V2 signature")?.strip_prefix("ccp:antigravity:v2:").context("V2 prefix")?;
-                let raw = URL_SAFE_NO_PAD.decode(encoded)?;
-                let saved: Value = serde_json::from_slice(&raw)?;
-                ensure!(saved["version"] == 2 && saved["profile_id"] == PROFILE && saved["project_id"] == PROJECT && saved["native_model"] == "gemini-4-argon-low", "V2 actual scope");
-                exact(&saved["lineage"], &json!({"conversation_id":conversation,"trajectory_id":trajectory}), "same carried logical IDs")?;
-                ensure!(saved["native_checkpoint_index"] == index, "proxy-owned completed checkpoint ordinal, not hidden Go state");
-                ensure!(saved["backend_session_id"] == "-3750763034362895579", "separate fixed backend session");
-                exact(&saved["contents"], &json!([{"role":"model","parts":[{"text":text}]}]), "original native checkpoint contents")?;
-            }
-            // Normal text recurrence is separately observed. Unsupported media
-            // must still reject before identity allocation or native dispatch.
-            body["messages"].as_array_mut().context("messages")?.extend([
-                json!({"role":"assistant","content":second_blocks}),
-                json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"synthetic"}}]}),
-            ]);
-            let rejected = f.exchange(body, json!([{"text":"must not dispatch"}])).await?;
-            ensure!(rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(), "unsupported media must reject without reminting or dispatch");
+            ]),
+            "exact observed user/model/user history; no synthetic role rewriting",
+        )?;
+        let second_blocks = second.blocks()?;
+        for (blocks, index, text) in [
+            (&first_blocks, 0, "Synthetic first completion."),
+            (&second_blocks, 1, "Synthetic second completion."),
+        ] {
+            let encoded = blocks[0]["signature"]
+                .as_str()
+                .context("V1 signature")?
+                .strip_prefix("ccp:antigravity:v1:")
+                .context("V1 prefix")?;
+            let raw = URL_SAFE_NO_PAD.decode(encoded)?;
+            let saved: Value = serde_json::from_slice(&raw)?;
+            ensure!(
+                saved["version"] == 1
+                    && saved["profile_id"] == PROFILE
+                    && saved["project_id"] == PROJECT
+                    && saved["native_model"] == "gemini-4-argon-low",
+                "V1 actual scope"
+            );
+            exact(
+                &saved["lineage"],
+                &json!({"conversation_id":conversation,"trajectory_id":trajectory}),
+                "same carried logical IDs",
+            )?;
+            ensure!(
+                saved["native_checkpoint_index"] == index,
+                "proxy-owned completed checkpoint ordinal, not hidden Go state"
+            );
+            ensure!(
+                saved["backend_session_id"] == "-3750763034362895579",
+                "separate fixed backend session"
+            );
+            exact(
+                &saved["contents"],
+                &json!([{"role":"model","parts":[{"text":text}]}]),
+                "original native checkpoint contents",
+            )?;
         }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-    std::fs::write(config_path, original)?;
-    result
+        // Normal text recurrence is separately observed. Unsupported media
+        // must still reject before identity allocation or native dispatch.
+        body["messages"].as_array_mut().context("messages")?.extend([
+            json!({"role":"assistant","content":second_blocks}),
+            json!({"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"synthetic"}}]}),
+        ]);
+        let rejected = f
+            .exchange(body, json!([{"text":"must not dispatch"}]))
+            .await?;
+        ensure!(
+            rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(),
+            "unsupported media must reject without reminting or dispatch"
+        );
+    }
+    Ok(())
 }
 
 fn uuid_v4(value: &str) -> Result<()> {
@@ -991,9 +1124,6 @@ async fn observed_policy(f: &mut Fixture) -> Result<(PathBuf, Vec<u8>)> {
         .context("synthetic config parent")?
         .join("config.json");
     let original = std::fs::read(&path)?;
-    let mut config: Value = serde_json::from_slice(&original)?;
-    config["antigravity"]["requestMetadata"] = json!("agy");
-    std::fs::write(&path, serde_json::to_vec(&config)?)?;
     tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
     f.provider = AntigravityProvider::new();
     Ok((path, original))
@@ -1003,8 +1133,8 @@ fn v2_saved(blocks: &Value) -> Result<Value> {
     let encoded = blocks[0]["signature"]
         .as_str()
         .context("native carrier")?
-        .strip_prefix("ccp:antigravity:v2:")
-        .context("V2 carrier prefix")?;
+        .strip_prefix("ccp:antigravity:v1:")
+        .context("V1 carrier prefix")?;
     let raw = URL_SAFE_NO_PAD.decode(encoded)?;
     ensure!(raw.len() <= BODY_LIMIT, "bounded synthetic carrier");
     Ok(serde_json::from_slice(&raw)?)
@@ -1300,7 +1430,7 @@ async fn invalid_native_checkpoint(f: &mut Fixture) -> Result<()> {
             );
             let output = std::str::from_utf8(&exchange.bytes)?;
             ensure!(
-                !output.contains("ccp:antigravity:v2:"),
+                !output.contains("ccp:antigravity:v1:"),
                 "invalid upstream turn must never fabricate a successful checkpoint"
             );
             if stream {
@@ -1391,28 +1521,6 @@ async fn observed_count_purity(f: &mut Fixture) -> Result<()> {
         ensure!(
             estimates.iter().all(|n| *n == estimates[0]),
             "estimate does not depend on credential contents/permissions/presence"
-        );
-        // New policy must not silently change the default/legacy count behavior.
-        std::fs::write(&f.auth_path, b"public synthetic invalid auth JSON")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&f.auth_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut config: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        config["antigravity"]["requestMetadata"] = json!("legacy");
-        std::fs::write(&path, serde_json::to_vec(&config)?)?;
-        tokio::time::timeout(STEP_LIMIT, f.provider.finish_maintenance()).await??;
-        f.provider = AntigravityProvider::new();
-        let legacy = tokio::time::timeout(
-            STEP_LIMIT,
-            f.provider
-                .handle_count_tokens(serde_json::from_value(body)?, context()),
-        )
-        .await?;
-        ensure!(
-            legacy.status() == StatusCode::UNAUTHORIZED,
-            "legacy profile validation remains unchanged"
         );
         Ok::<(), anyhow::Error>(())
     }
@@ -1515,16 +1623,11 @@ async fn tls_control(f: &mut Fixture) -> Result<()> {
             let session = wire["request"]["sessionId"]
                 .as_str()
                 .context("session ID")?;
-            ensure!(
-                session
-                    .parse::<i64>()
-                    .is_ok_and(|n| n > 0 && n.to_string() == session),
-                "baseline session format"
-            );
+            ensure!(session == "-3750763034362895579", "baseline session format");
             ensure!(
                 wire["requestId"]
                     .as_str()
-                    .is_some_and(|s| s.starts_with("ccp-") && s.len() == 40),
+                    .is_some_and(|s| s.starts_with("agent/")),
                 "request identity format"
             );
             exact(
@@ -1532,7 +1635,8 @@ async fn tls_control(f: &mut Fixture) -> Result<()> {
                 &json!({
                     "project":PROJECT,"model":model.strip_prefix("antigravity/").unwrap(),
                     "requestId":wire["requestId"],"userAgent":"antigravity","requestType":"agent",
-                    "request":{"sessionId":session,"contents":[{"role":"user","parts":[{"text":"Synthetic schema request."}]}],
+                    "request":{"sessionId":session,"labels":wire["request"]["labels"],
+                        "contents":[{"role":"user","parts":[{"text":"Synthetic schema request."}]}],
                         "generationConfig":{"maxOutputTokens":137,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":level}}}
                 }),
                 "baseline complete wire",
@@ -2376,7 +2480,7 @@ async fn continuation_control(f: &mut Fixture) -> Result<()> {
             "V1 native history exact reuse",
         )?;
         ensure!(
-            second.wire()?["request"]["sessionId"] == saved["session_id"],
+            second.wire()?["request"]["sessionId"] == saved["backend_session_id"],
             "V1 session reuse"
         );
         ensure!(

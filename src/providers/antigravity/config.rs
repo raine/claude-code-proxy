@@ -7,16 +7,9 @@ use url::Url;
 
 pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RequestMetadata {
-    Legacy,
-    Agy,
-}
-
 #[derive(Clone)]
 pub(crate) struct Config {
     pub enabled: bool,
-    pub request_metadata: RequestMetadata,
     pub base_url: Url,
     pub token_url: Url,
     pub authorization_url: Url,
@@ -48,7 +41,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            request_metadata: RequestMetadata::Agy,
             base_url: Url::parse("https://daily-cloudcode-pa.googleapis.com").unwrap(),
             token_url: Url::parse("https://oauth2.googleapis.com/token").unwrap(),
             authorization_url: Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap(),
@@ -114,18 +106,10 @@ impl Config {
                 "clientSecret",
                 "projectId",
                 "userAgent",
-                "requestMetadata",
             ],
             &[],
         )?;
         let mut result = Self::default();
-        if let Some(mode) = section.get("requestMetadata") {
-            result.request_metadata = match mode.as_str() {
-                Some("legacy") => RequestMetadata::Legacy,
-                Some("agy") => RequestMetadata::Agy,
-                _ => return Err("invalid Antigravity request metadata policy"),
-            };
-        }
         let file_user_agent = section
             .get("userAgent")
             .map(|value| value.as_str().ok_or("invalid Antigravity user agent"))
@@ -199,54 +183,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn antigravity_request_metadata_policy_is_explicit_and_closed() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.json");
-        let default = Config::read(&path, |key| {
-            (key == "CCP_ANTIGRAVITY_REQUEST_METADATA").then(|| "legacy".into())
-        })
-        .unwrap();
-        assert_eq!(default.request_metadata, RequestMetadata::Agy);
-        assert!(!default.enabled);
-        for (value, expected) in [
-            ("legacy", RequestMetadata::Legacy),
-            ("agy", RequestMetadata::Agy),
-        ] {
-            std::fs::write(
-                &path,
-                json!({"antigravity":{"requestMetadata":value}}).to_string(),
-            )
-            .unwrap();
-            let config = Config::read(&path, |_| None).unwrap();
-            assert_eq!(config.request_metadata, expected);
-            assert!(!config.enabled);
-            assert_eq!(config.native_headers()["user-agent"], default_user_agent());
-        }
-        for value in [
-            json!(null),
-            json!(false),
-            json!(1),
-            json!([]),
-            json!({}),
-            json!(""),
-            json!("AGY"),
-            json!(" agy"),
-            json!("agy "),
-            json!("unknown-sentinel"),
-        ] {
-            std::fs::write(
-                &path,
-                json!({"antigravity":{"requestMetadata":value}}).to_string(),
-            )
-            .unwrap();
-            assert_eq!(
-                Config::read(&path, |_| None).err(),
-                Some("invalid Antigravity request metadata policy")
-            );
-        }
-    }
 
     #[test]
     fn antigravity_consumer_default_origin_preserves_oauth_and_identity() {
