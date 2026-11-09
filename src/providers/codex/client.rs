@@ -697,6 +697,7 @@ pub struct CodexHttpClient {
     base_url: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
+    request_compression: bool,
 }
 
 impl Default for CodexHttpClient {
@@ -722,6 +723,7 @@ impl CodexHttpClient {
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+            request_compression: config::codex_request_compression(),
         }
     }
 
@@ -744,6 +746,7 @@ impl CodexHttpClient {
             base_url,
             header_timeout_ms: config::codex_header_timeout_ms(),
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+            request_compression: config::codex_request_compression(),
         }
     }
 
@@ -764,7 +767,18 @@ impl CodexHttpClient {
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
+            request_compression: false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_request_compression(mut self, enabled: bool) -> Self {
+        self.request_compression = enabled;
+        self
+    }
+
+    fn should_compress_request_body(&self) -> bool {
+        self.request_compression || config::codex_request_compression()
     }
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
@@ -984,13 +998,24 @@ impl CodexHttpClient {
 
         loop {
             let started_at = Instant::now();
-            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+            let mut headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+            let (request_body, compressed_bytes) = encode_codex_http_body(
+                &mut headers,
+                &body_json,
+                self.should_compress_request_body(),
+            );
             if let Some(traffic) = ctx.traffic.as_deref() {
-                write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
+                write_codex_http_request_capture(
+                    traffic,
+                    &self.base_url,
+                    &headers,
+                    &body_json,
+                    compressed_bytes,
+                );
             }
 
             let response = self
-                .attempt_native_responses(&headers, body_json.clone())
+                .attempt_native_responses(&headers, request_body)
                 .await?;
             let status = response.status().as_u16();
             if status == 401 && !refresh_attempted {
@@ -1014,7 +1039,7 @@ impl CodexHttpClient {
     async fn attempt_native_responses(
         &self,
         headers: &http::HeaderMap,
-        body_json: String,
+        request_body: Vec<u8>,
     ) -> Result<reqwest::Response, CodexError> {
         let mut request = self.native_client.post(&self.base_url);
         for (key, value) in headers {
@@ -1023,7 +1048,7 @@ impl CodexHttpClient {
 
         tokio::time::timeout(
             Duration::from_millis(self.header_timeout_ms),
-            request.body(body_json).send(),
+            request.body(request_body).send(),
         )
         .await
         .map_err(|_| CodexError {
@@ -2356,10 +2381,12 @@ impl CodexHttpClient {
         use_responses_lite: bool,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
         let url = &self.base_url;
-        let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+        let mut headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+        let (request_body, compressed_bytes) =
+            encode_codex_http_body(&mut headers, body_json, self.should_compress_request_body());
 
         if let Some(traffic) = ctx.traffic.as_deref() {
-            write_codex_http_request_capture(traffic, url, &headers, body_json);
+            write_codex_http_request_capture(traffic, url, &headers, body_json, compressed_bytes);
         }
 
         // Build headers
@@ -2370,7 +2397,7 @@ impl CodexHttpClient {
 
         // Apply header timeout
         let started_at = Instant::now();
-        let send_fut = req_builder.body(body_json.to_string()).send();
+        let send_fut = req_builder.body(request_body).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
         let resp = tokio::time::timeout(header_timeout_dur, send_fut)
@@ -2489,10 +2516,12 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<CodexResponse, CodexError> {
         let url = search_endpoint(&self.base_url);
-        let headers = build_codex_search_headers(auth, ctx)?;
+        let mut headers = build_codex_search_headers(auth, ctx)?;
+        let (request_body, compressed_bytes) =
+            encode_codex_http_body(&mut headers, body_json, self.should_compress_request_body());
 
         if let Some(traffic) = ctx.traffic.as_deref() {
-            write_codex_http_request_capture(traffic, &url, &headers, body_json);
+            write_codex_http_request_capture(traffic, &url, &headers, body_json, compressed_bytes);
         }
 
         let mut request = self.client.post(&url);
@@ -2502,7 +2531,7 @@ impl CodexHttpClient {
         let started_at = Instant::now();
         let mut response = tokio::time::timeout(
             Duration::from_millis(self.header_timeout_ms),
-            request.body(body_json.to_string()).send(),
+            request.body(request_body).send(),
         )
         .await
         .map_err(|_| CodexError {
@@ -2677,11 +2706,33 @@ fn log_http_stream_end(
     }
 }
 
+fn encode_codex_http_body(
+    headers: &mut http::HeaderMap,
+    body_json: &str,
+    compress: bool,
+) -> (Vec<u8>, Option<usize>) {
+    if compress && !body_json.is_empty() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        if std::io::Write::write_all(&mut encoder, body_json.as_bytes()).is_ok()
+            && let Ok(compressed) = encoder.finish()
+        {
+            headers.insert(
+                http::header::CONTENT_ENCODING,
+                http::HeaderValue::from_static("gzip"),
+            );
+            let compressed_len = compressed.len();
+            return (compressed, Some(compressed_len));
+        }
+    }
+    (body_json.as_bytes().to_vec(), None)
+}
+
 fn write_codex_http_request_capture(
     traffic: &TrafficCapture,
     url: &str,
     headers: &http::HeaderMap,
     body_json: &str,
+    compressed_bytes: Option<usize>,
 ) {
     let body = serde_json::from_str(body_json).unwrap_or_else(|_| {
         serde_json::json!({
@@ -2698,7 +2749,7 @@ fn write_codex_http_request_capture(
             "url": url,
             "method": "POST",
             "headers": headers_to_json(headers),
-            "size": summarize_json_request_size(&body, body_json),
+            "size": summarize_json_request_size(&body, body_json, compressed_bytes),
         }),
     );
 }
@@ -2821,8 +2872,12 @@ fn headers_to_json_from_pairs(headers: &[(String, String)]) -> serde_json::Value
     serde_json::Value::Object(out)
 }
 
-fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> serde_json::Value {
-    serde_json::json!({
+fn summarize_json_request_size(
+    body: &serde_json::Value,
+    body_json: &str,
+    compressed_bytes: Option<usize>,
+) -> serde_json::Value {
+    let mut size = serde_json::json!({
         "bytes": body_json.len(),
         "inputCount": body
             .get("input")
@@ -2832,7 +2887,16 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
             .get("tools")
             .and_then(|v| v.as_array())
             .map(|items| items.len()),
-    })
+    });
+    if let Some(compressed_bytes) = compressed_bytes
+        && let Some(obj) = size.as_object_mut()
+    {
+        obj.insert(
+            "compressedBytes".to_string(),
+            serde_json::json!(compressed_bytes),
+        );
+    }
+    size
 }
 
 fn auth_refresh_error(err: anyhow::Error) -> CodexError {
@@ -5626,5 +5690,85 @@ mod tests {
         assert!(!should_retry_without_continuation(&idle, Some(&append)));
         assert!(!should_retry_without_continuation(&timeout, Some(&initial)));
         assert!(!should_retry_without_continuation(&timeout, None));
+    }
+
+    #[tokio::test]
+    async fn http_request_compression_gzip_encodes_body_and_preserves_traffic_capture() {
+        use std::io::Read;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let raw_request = read_http_request(&mut stream).await;
+            let header_end = raw_request
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let headers = String::from_utf8_lossy(&raw_request[..header_end]).to_ascii_lowercase();
+            assert!(
+                headers.contains("content-encoding: gzip\r\n"),
+                "expected gzip content-encoding header, got: {headers}"
+            );
+            let compressed_body = &raw_request[header_end + 4..];
+            let mut decoded = String::new();
+            flate2::read::GzDecoder::new(compressed_body)
+                .read_to_string(&mut decoded)
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+            assert_eq!(parsed["model"], "gpt-5.6-sol");
+
+            let response_body =
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_gz\"}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(response_body).await.unwrap();
+        });
+
+        let capture_dir = tempfile::TempDir::new().unwrap();
+        let mut ctx = http_test_context();
+        ctx.traffic = Some(Arc::new(crate::traffic::test_capture(
+            capture_dir.path().to_path_buf(),
+        )));
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .with_request_compression(true);
+        let response = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &ctx,
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.status, 200);
+
+        let captured_request: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(capture_dir.path().join("001-020-upstream-request.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured_request["model"], "gpt-5.6-sol");
+
+        let captured_meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                capture_dir
+                    .path()
+                    .join("002-021-upstream-request-metadata.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured_meta["headers"]["content-encoding"], "gzip");
+        assert!(
+            captured_meta["size"]["compressedBytes"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+        );
     }
 }
