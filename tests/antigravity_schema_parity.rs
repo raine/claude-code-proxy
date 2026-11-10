@@ -1129,7 +1129,7 @@ async fn observed_policy(f: &mut Fixture) -> Result<(PathBuf, Vec<u8>)> {
     Ok((path, original))
 }
 
-fn v2_saved(blocks: &Value) -> Result<Value> {
+fn carrier_saved(blocks: &Value) -> Result<Value> {
     let encoded = blocks[0]["signature"]
         .as_str()
         .context("native carrier")?
@@ -1269,7 +1269,7 @@ async fn user_text_sequence(f: &mut Fixture, check_execution: bool) -> Result<()
                     "exact alternating user/model history",
                 )?;
                 let blocks = exchange.blocks()?;
-                let saved = v2_saved(&blocks)?;
+                let saved = carrier_saved(&blocks)?;
                 ensure!(
                     saved["native_checkpoint_index"] == generation,
                     "proxy native checkpoint ordinal"
@@ -1401,9 +1401,9 @@ async fn read_tool_metadata(f: &mut Fixture) -> Result<()> {
                 {"role":"model","parts":[{"functionResponse":{"name":"read_file","response":{"output":"Synthetic read fixture marker."},"id":NATIVE_ID}}]}
             ]);
             exact(second_wire, &expected, "complete observed read-loop wire, including separate MODEL functionResponse and untouched signature/native ID")?;
-            let first_saved = v2_saved(&blocks)?;
+            let first_saved = carrier_saved(&blocks)?;
             exact(&first_saved["contents"], &json!([{"role":"model","parts":[native_part]}]), "raw call/signature checkpoint")?;
-            let second_saved = v2_saved(&second.blocks()?)?;
+            let second_saved = carrier_saved(&second.blocks()?)?;
             ensure!(first_saved["checkpoint_stop_reason"] == "tool_use" && first_saved["user_execution"]["prior_recorded_id"].is_null(), "tool call is not a completed user execution");
             let active = first_saved["user_execution"]["active_id"].as_str().context("active execution")?;
             uuid_v4(active)?;
@@ -1559,7 +1559,7 @@ async fn source_all_tier_metadata(f: &mut Fixture) -> Result<()> {
                 let first = f.exchange(body.clone(), json!([{"text":"Synthetic source-tier completion."}])).await?;
                 first.success(stream)?;
                 let blocks = first.blocks()?;
-                let saved = v2_saved(&blocks)?;
+                let saved = carrier_saved(&blocks)?;
                 body["messages"].as_array_mut().context("messages")?.extend([json!({"role":"assistant","content":blocks}), json!({"role":"user","content":"Synthetic source-tier next user."})]);
                 let second = f.exchange(body, json!([{"text":"Synthetic source-tier second completion."}])).await?;
                 if second.status != StatusCode::OK {
@@ -1580,9 +1580,16 @@ async fn source_all_tier_metadata(f: &mut Fixture) -> Result<()> {
                 ensure!(second.wire()?["request"]["labels"]["last_execution_id"] == saved["user_execution"]["active_id"], "same predecessor relationship independent of tier");
                 let mut switched = request(stream);
                 switched["model"] = json!(if model == "gemini-4-argon-low" { "antigravity/gemini-4-argon-high" } else { "antigravity/gemini-4-argon-low" });
-                switched["messages"].as_array_mut().context("messages")?.extend([json!({"role":"assistant","content":blocks}), json!({"role":"user","content":"Must not switch tier on a carried history."})]);
-                let rejected = f.exchange(switched, json!([{"text":"must not dispatch"}])).await?;
-                ensure!(rejected.status == StatusCode::BAD_REQUEST && rejected.wire.is_none(), "fixed-model tier binding is still closed");
+                switched["messages"].as_array_mut().context("messages")?.extend([json!({"role":"assistant","content":blocks}), json!({"role":"user","content":"Switch tier on a carried history."})]);
+                let switched_resp = f.exchange(switched, json!([{"text":"Switched tier completion."}])).await?;
+                switched_resp.success(stream)?;
+                let switched_wire = switched_resp.wire()?;
+                ensure!(
+                    switched_wire["request"]["contents"][0]["parts"][0]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("<prior_conversation_transcript>")),
+                    "cross-tier switch folds prior model history into transcript"
+                );
             }
         }
         Ok::<(), anyhow::Error>(())
