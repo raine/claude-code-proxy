@@ -2799,10 +2799,7 @@ fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks()
     assert!(prefix_text.contains("[Assistant invoked tool Read (id=toolu_prefix_1) with input: {\"file_path\":\"/tmp/a.txt\"}]"));
     assert!(prefix_text.contains("[Tool result (toolu_prefix_1): ALPHA]"));
     assert!(!prefix_text.contains("[tool_use "));
-    assert_eq!(
-        contents[0]["parts"][1],
-        json!({"text":"Now switch model."})
-    );
+    assert_eq!(contents[0]["parts"][1], json!({"text":"Now switch model."}));
     assert_eq!(contents[1]["role"], json!("model"));
     assert_eq!(
         contents[2],
