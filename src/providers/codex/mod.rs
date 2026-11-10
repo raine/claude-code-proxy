@@ -227,12 +227,15 @@ impl CodexProvider {
             && compact_boundary
             && let Some(session_id) = ctx.session_id.as_deref()
         {
+            let compaction_source = apply_compaction_replay(Some(session_id), &translated)
+                .map(|replay| replay.request)
+                .unwrap_or_else(|| translated.clone());
             let attempt = begin_compaction(session_id, &translated.model);
             compaction_attempt = Some(attempt);
             log_compaction_event(
                 "server_compaction_triggered",
                 &ctx,
-                translated.input.len(),
+                compaction_source.input.len(),
                 None,
             );
             if let Some(monitor) = ctx.monitor.as_ref() {
@@ -240,21 +243,23 @@ impl CodexProvider {
             }
             let mut compaction_ctx = ctx.clone();
             compaction_ctx.monitor = None;
-            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
+            match request_compaction(self.client.as_ref(), &compaction_source, &compaction_ctx)
+                .await
+            {
                 Ok(native_history) => {
                     if store_compaction(session_id, attempt, native_history) {
                         log_compaction_event(
                             "server_compaction_completed",
                             &ctx,
-                            translated.input.len(),
+                            compaction_source.input.len(),
                             None,
                         );
                     } else {
                         log_compaction_event(
                             "server_compaction_failed",
                             &ctx,
-                            translated.input.len(),
-                            Some("compaction state was superseded or exceeded the in-memory limit"),
+                            compaction_source.input.len(),
+                            Some("compaction state was superseded"),
                         );
                     }
                 }
@@ -263,7 +268,7 @@ impl CodexProvider {
                     log_compaction_event(
                         "server_compaction_failed",
                         &ctx,
-                        translated.input.len(),
+                        compaction_source.input.len(),
                         Some(&error.to_string()),
                     );
                     return map_codex_error_to_response(&error);
@@ -273,7 +278,7 @@ impl CodexProvider {
                     log_compaction_event(
                         "server_compaction_failed",
                         &ctx,
-                        translated.input.len(),
+                        compaction_source.input.len(),
                         Some(&error.to_string()),
                     );
                 }

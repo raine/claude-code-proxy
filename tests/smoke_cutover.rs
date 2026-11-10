@@ -1774,6 +1774,114 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_server_compaction_chains_across_multiple_compactions() {
+    let _guard = env_lock();
+    let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "0");
+    clear_all_compactions_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let is_compaction = body["input"].as_array().is_some_and(|input| {
+                input.last().and_then(|item| item["type"].as_str())
+                    == Some("compaction_trigger")
+            });
+            let request_number = {
+                let mut requests = captured.lock().unwrap();
+                requests.push(body);
+                requests.len()
+            };
+            if is_compaction {
+                let encrypted = if request_number == 1 {
+                    "opaque-history-1"
+                } else {
+                    "opaque-history-2"
+                };
+                format!(
+                    "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"compaction\",\"encrypted_content\":\"{encrypted}\"}}}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_compact_{request_number}\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":1}}}}}}\n\n"
+                )
+                .into_bytes()
+            } else {
+                let text = match request_number {
+                    2 => "first portable summary with enough detail to anchor the compacted conversation",
+                    4 => "second portable summary with enough detail to anchor the second compaction",
+                    _ => "compacted ok",
+                };
+                format!(
+                    "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_up\"}}}}\n\n\
+                     data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"{text}\"}}\n\n\
+                     data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{request_number}\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
+                )
+                .into_bytes()
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+
+    let compact_1 = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"turn one"},
+            {"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+        ]
+    }))
+    .await;
+    assert_eq!(compact_1.status(), StatusCode::OK);
+
+    let compact_2 = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"<summary>first portable summary with enough detail to anchor the compacted conversation</summary>"},
+            {"role":"user","content":"turn two"},
+            {"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+        ]
+    }))
+    .await;
+    assert_eq!(compact_2.status(), StatusCode::OK);
+
+    let post_compact_2 = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"<summary>second portable summary with enough detail to anchor the second compaction</summary>"},
+            {"role":"user","content":"turn three"}
+        ]
+    }))
+    .await;
+    assert_eq!(post_compact_2.status(), StatusCode::OK);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    // Request #3 (index 2) is the second compaction_trigger request; it must include opaque-history-1
+    let second_compaction_input = requests[2]["input"].as_array().unwrap();
+    assert!(second_compaction_input.iter().any(|item| {
+        item["type"] == "compaction" && item["encrypted_content"] == "opaque-history-1"
+    }));
+    // Request #5 (index 4) is the post-second-compaction turn; it must replay opaque-history-2
+    let final_replay_input = requests[4]["input"].as_array().unwrap();
+    assert!(final_replay_input.iter().any(|item| {
+        item["type"] == "compaction" && item["encrypted_content"] == "opaque-history-2"
+    }));
+    clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();

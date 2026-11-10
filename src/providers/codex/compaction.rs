@@ -12,10 +12,8 @@ use super::translate::request::{
 };
 
 const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
-const STATE_TTL_MS: u64 = 30 * 60 * 1_000;
+const STATE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_STATES: usize = 1_000;
-const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TOTAL_STATE_BYTES: usize = 20_000_000;
 const MIN_PORTABLE_SUMMARY_BYTES: usize = 32;
 
 #[derive(Debug)]
@@ -58,7 +56,6 @@ pub struct CompactionReplay {
 #[derive(Default)]
 struct CompactionRegistry {
     states: HashMap<String, CompactionState>,
-    total_bytes: usize,
 }
 
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
@@ -128,11 +125,6 @@ pub fn store_compaction(
     state.native_history = native_history;
     state.phase = CompactionPhase::Unconfirmed;
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return false;
-    }
     evict_states(registry, now);
     registry
         .states
@@ -168,16 +160,10 @@ pub fn activate_compaction(
     }
     if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
         registry.states.remove(session_id);
-        update_total_bytes(registry);
         return false;
     }
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return false;
-    }
     evict_states(registry, now);
     registry.states.contains_key(session_id)
 }
@@ -197,7 +183,6 @@ pub fn apply_compaction_replay(
     }
     if state.model != request.model {
         registry.states.remove(session_id);
-        update_total_bytes(registry);
         return None;
     }
     let CompactionPhase::Anchored { portable_summary } = &state.phase else {
@@ -208,12 +193,10 @@ pub fn apply_compaction_replay(
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
         registry.states.remove(session_id);
-        update_total_bytes(registry);
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
         registry.states.remove(session_id);
-        update_total_bytes(registry);
         return None;
     }
     if conversation.len() == 1 {
@@ -227,11 +210,6 @@ pub fn apply_compaction_replay(
         .chain(state.native_history.iter().cloned())
         .chain(conversation[1..].iter().cloned())
         .collect();
-    if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
-    }
     state.updated_at = now;
     Some(CompactionReplay {
         request: replay,
@@ -253,7 +231,6 @@ pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<Compac
         .is_some_and(|state| state.attempt == attempt)
     {
         registry.states.remove(session_id);
-        update_total_bytes(registry);
     }
 }
 
@@ -261,7 +238,6 @@ pub fn clear_compaction(session_id: &str) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut() {
         registry.states.remove(session_id);
-        update_total_bytes(registry);
     }
 }
 
@@ -277,10 +253,17 @@ fn split_input_envelope(
 
 fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<ResponsesInputItem> {
     let mut input = input.to_vec();
-    let remove_empty_message = if let Some(ResponsesInputItem::Message { role, content }) =
-        input.last_mut()
+    let target_idx = input.iter().rposition(|item| {
+        !matches!(
+            item,
+            ResponsesInputItem::Message { role, .. } if role == "developer"
+        )
+    });
+    if let Some(idx) = target_idx
+        && let Some(ResponsesInputItem::Message { role, content }) = input.get_mut(idx)
         && role == "user"
     {
+        let before_len = content.len();
         content.retain(|part| {
             !matches!(
                 part,
@@ -288,12 +271,17 @@ fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<Responses
                     if is_compact_message_text(text)
             )
         });
-        content.is_empty()
-    } else {
-        false
-    };
-    if remove_empty_message {
-        input.pop();
+        if content.len() != before_len {
+            input.truncate(idx + 1);
+            if input.last().is_some_and(|item| {
+                matches!(
+                    item,
+                    ResponsesInputItem::Message { content, .. } if content.is_empty()
+                )
+            }) {
+                input.pop();
+            }
+        }
     }
     input
 }
@@ -501,18 +489,6 @@ fn truncate_text(mut text: String, remaining_chars: &mut usize) -> String {
     text
 }
 
-fn serialized_size(items: &[ResponsesInputItem]) -> usize {
-    serde_json::to_vec(items).map_or(usize::MAX, |value| value.len())
-}
-
-fn state_size(session_id: &str, state: &CompactionState) -> usize {
-    let summary_len = match &state.phase {
-        CompactionPhase::Preparing | CompactionPhase::Unconfirmed => 0,
-        CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
-    };
-    session_id.len() + state.model.len() + summary_len + serialized_size(&state.native_history)
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -520,20 +496,11 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn update_total_bytes(registry: &mut CompactionRegistry) {
-    registry.total_bytes = registry
-        .states
-        .iter()
-        .map(|(session_id, state)| state_size(session_id, state))
-        .sum();
-}
-
 fn evict_states(registry: &mut CompactionRegistry, now: u64) {
     registry
         .states
         .retain(|_, state| now.saturating_sub(state.updated_at) <= STATE_TTL_MS);
-    update_total_bytes(registry);
-    while registry.states.len() > MAX_STATES || registry.total_bytes > MAX_TOTAL_STATE_BYTES {
+    while registry.states.len() > MAX_STATES {
         let oldest = registry
             .states
             .iter()
@@ -543,7 +510,6 @@ fn evict_states(registry: &mut CompactionRegistry, now: u64) {
             break;
         };
         registry.states.remove(&oldest);
-        update_total_bytes(registry);
     }
 }
 
@@ -973,5 +939,63 @@ mod tests {
         };
         assert!(text.len() <= RETAINED_MESSAGE_TOKEN_BUDGET as usize * 4);
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn large_post_compaction_transcripts_beyond_4mb_preserve_replay() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let attempt = stored_compaction(
+            "session-large",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque-compacted".to_string(),
+            }],
+        );
+        assert!(activate_compaction(
+            Some("session-large"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+
+        let large_encrypted = "x".repeat(5 * 1024 * 1024);
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"reasoning","id":"rs_1","encrypted_content":large_encrypted,"summary":[]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("session-large"), &next)
+            .expect("compaction replay should survive large post-compaction transcripts")
+            .request;
+        assert!(matches!(
+            replay.input[0],
+            ResponsesInputItem::Compaction { ref encrypted_content }
+                if encrypted_content == "opaque-compacted"
+        ));
+    }
+
+    #[test]
+    fn without_compaction_instruction_strips_trailing_hook_developer_message() {
+        let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"prior turn"}]},
+            {
+                "type":"message",
+                "role":"user",
+                "content":[{
+                    "type":"input_text",
+                    "text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far."
+                }]
+            },
+            {
+                "type":"message",
+                "role":"developer",
+                "content":[{"type":"input_text","text":"UserPromptSubmit hook output"}]
+            }
+        ]))
+        .unwrap();
+
+        let stripped = without_compaction_instruction(&input);
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(message_text(&stripped[0]).as_deref(), Some("prior turn"));
     }
 }
