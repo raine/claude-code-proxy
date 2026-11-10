@@ -2952,3 +2952,48 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
         .is_err()
     );
 }
+
+#[test]
+fn antigravity_task_update_string_anyof_leaf_accepts_raw_or_json_encoded_string() {
+    let set = ToolSet::compile(&json!([{
+        "name": "TaskUpdate",
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "taskId": {"type": "string"},
+                "status": {
+                    "description": "New status for the task",
+                    "anyOf": [
+                        {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        {"type": "string", "const": "deleted"}
+                    ]
+                },
+                "metadata": {
+                    "type": "object",
+                    "propertyNames": {"type": "string"},
+                    "additionalProperties": {}
+                }
+            },
+            "required": ["taskId"],
+            "additionalProperties": false
+        }
+    }]))
+    .unwrap();
+    let direct = json!([{"role": "model", "parts": [{"functionCall": {"name": "TaskUpdate", "args": {"taskId": "1", "status": "in_progress", "metadata": "{\"step\":1}"}}, "thoughtSignature": "sig"}]}]);
+    let mapping = set.mapping(&direct).unwrap();
+    assert_eq!(mapping[0]["codec_paths"], json!(["/metadata"]));
+    let blocks = encode_default(&direct, &binding(), "full", &mapping).unwrap();
+    assert_eq!(
+        blocks[1]["input"],
+        json!({"taskId": "1", "status": "in_progress", "metadata": {"step": 1}})
+    );
+    let encoded_str = json!([{"role": "model", "parts": [{"functionCall": {"name": "TaskUpdate", "args": {"taskId": "1", "status": "\"deleted\""}}, "thoughtSignature": "sig"}]}]);
+    let mapping2 = set.mapping(&encoded_str).unwrap();
+    assert_eq!(mapping2[0]["codec_paths"], json!(["/status"]));
+    let blocks2 = encode_default(&encoded_str, &binding(), "full", &mapping2).unwrap();
+    assert_eq!(
+        blocks2[1]["input"],
+        json!({"taskId": "1", "status": "deleted"})
+    );
+}

@@ -167,7 +167,26 @@ impl ToolSet {
             if !tool.root {
                 codec_paths(&tool.codec, raw_args, "", &mut paths)?;
             }
-            let args = replay::decode_arguments(raw_args, &json!(paths), &root)?;
+            let mut args = replay::decode_arguments(raw_args, &json!(paths), &root)?;
+            if !tool.root && !paths.is_empty() && !tool.validator.is_valid(&args) {
+                if tool.validator.is_valid(raw_args) {
+                    paths.clear();
+                    args = raw_args.clone();
+                } else {
+                    for i in (0..paths.len()).rev() {
+                        let mut candidate = paths.clone();
+                        candidate.remove(i);
+                        if let Ok(decoded) =
+                            replay::decode_arguments(raw_args, &json!(candidate), &root)
+                            && tool.validator.is_valid(&decoded)
+                        {
+                            paths = candidate;
+                            args = decoded;
+                            break;
+                        }
+                    }
+                }
+            }
             if (tool.empty && args != json!({})) || !tool.validator.is_valid(&args) {
                 return Err("upstream tool arguments violate original schema");
             }
@@ -676,9 +695,21 @@ fn identity(codec: &Codec) -> bool {
     }
 }
 
+fn can_decode_json_leaf(value: &Value) -> bool {
+    value
+        .as_str()
+        .and_then(|raw| replay::parse_json(raw.as_bytes(), replay::MAX_ARGUMENT).ok())
+        .and_then(|parsed| replay::canonical(&parsed).ok())
+        .is_some()
+}
+
 fn codec_paths(codec: &Codec, args: &Value, path: &str, paths: &mut Vec<String>) -> Result<()> {
     match codec {
-        Codec::Json => paths.push(path.to_string()),
+        Codec::Json => {
+            if can_decode_json_leaf(args) {
+                paths.push(path.to_string());
+            }
+        }
         Codec::Object(children) => {
             if let Some(object) = args.as_object() {
                 for (name, child) in children {
