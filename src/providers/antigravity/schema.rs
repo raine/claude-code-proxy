@@ -51,11 +51,22 @@ impl ToolSet {
         for tool in tools {
             keys(
                 tool,
-                &["name", "description", "input_schema", "cache_control"],
+                &[
+                    "name",
+                    "description",
+                    "input_schema",
+                    "cache_control",
+                    "defer_loading",
+                ],
                 &["name", "input_schema"],
             )?;
             super::request::cache_hint(tool.get("cache_control"))?;
             let caller = nonempty(&tool["name"])?;
+            if caller == "DeferredToolPlaceholder"
+                || tool.get("defer_loading") == Some(&Value::Bool(true))
+            {
+                continue;
+            }
             if caller.len() > 1024 || !names.insert(caller) {
                 return Err("invalid/duplicate caller tool name");
             }

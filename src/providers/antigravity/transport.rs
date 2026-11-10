@@ -503,14 +503,52 @@ impl Reducer {
                     self.contents.push(content.clone());
                 }
                 if let Some(reason) = candidate.get("finishReason") {
-                    let reason = reason
+                    let raw_reason = reason
                         .as_str()
-                        .filter(|r| matches!(*r, "STOP" | "MAX_TOKENS"))
+                        .filter(|r| {
+                            matches!(
+                                *r,
+                                "STOP"
+                                    | "MAX_TOKENS"
+                                    | "MALFORMED_FUNCTION_CALL"
+                                    | "UNEXPECTED_TOOL_CALL"
+                                    | "OTHER"
+                            )
+                        })
                         .ok_or("unsupported native termination/refusal")?;
-                    if self.terminal.as_ref().is_some_and(|old| old != reason) {
+                    let normalized = if raw_reason == "MAX_TOKENS" {
+                        "MAX_TOKENS"
+                    } else {
+                        "STOP"
+                    };
+                    if raw_reason != "STOP" && raw_reason != "MAX_TOKENS" {
+                        let has_visible_or_call = self.contents.iter().any(|c| {
+                            c["parts"].as_array().is_some_and(|parts| {
+                                parts.iter().any(|p| {
+                                    p.get("functionCall").is_some()
+                                        || (p["thought"] != true
+                                            && p.get("text")
+                                                .and_then(Value::as_str)
+                                                .is_some_and(|t| !t.is_empty()))
+                                })
+                            })
+                        });
+                        if !has_visible_or_call {
+                            let detail = candidate
+                                .get("finishMessage")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(raw_reason);
+                            self.contents.push(json!({
+                                "role": "model",
+                                "parts": [{"text": format!("[Model generation stopped early ({raw_reason}): {detail}]")}]
+                            }));
+                        }
+                    }
+                    if self.terminal.as_ref().is_some_and(|old| old != normalized) {
                         return Err("conflicting native terminal state");
                     }
-                    self.terminal = Some(reason.to_string());
+                    self.terminal = Some(normalized.to_string());
                 }
             }
         }

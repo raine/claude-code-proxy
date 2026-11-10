@@ -278,12 +278,24 @@ fn text_parts(value: &Value) -> Result<Vec<Value>> {
         .as_array()
         .ok_or("content must be text or text blocks")?
     {
-        keys(block, &["type", "text", "cache_control"], &["type", "text"])?;
-        if block["type"] != "text" {
-            return Err("non-text system/tool-result content is unsupported");
+        match block["type"].as_str() {
+            Some("text") => {
+                keys(block, &["type", "text", "cache_control"], &["type", "text"])?;
+                cache_hint(block.get("cache_control"))?;
+                parts.push(json!({"text":block["text"].as_str().ok_or("text must be a string")?}));
+            }
+            Some("tool_reference") => {
+                keys(
+                    block,
+                    &["type", "tool_name", "cache_control"],
+                    &["type", "tool_name"],
+                )?;
+                cache_hint(block.get("cache_control"))?;
+                let name = nonempty(&block["tool_name"])?;
+                parts.push(json!({"text":format!("Tool reference: {name}")}));
+            }
+            _ => return Err("non-text system/tool-result content is unsupported"),
         }
-        cache_hint(block.get("cache_control"))?;
-        parts.push(json!({"text":block["text"].as_str().ok_or("text must be a string")?}));
     }
     Ok(parts)
 }
@@ -317,9 +329,9 @@ fn format_prefix_tool_result(block: &Value) -> Result<String> {
         .transpose()?
         .unwrap_or(false);
     Ok(if is_error {
-        format!("[tool_result ({id}) error: {rendered}]")
+        format!("[Tool result ({id}) error: {rendered}]")
     } else {
-        format!("[tool_result ({id}): {rendered}]")
+        format!("[Tool result ({id}): {rendered}]")
     })
 }
 
@@ -575,11 +587,26 @@ fn continuation_input(envelope: &Value, user: &Message) -> Result<bool> {
     }
 }
 
+fn has_polluted_prefix_artefact(content: &Value) -> bool {
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+    blocks.iter().any(|block| {
+        (block["type"] == "text"
+            && block["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("[tool_use ")))
+            || (block["type"] == "tool_use"
+                && block["name"].as_str() == Some("DeferredToolPlaceholder"))
+    })
+}
+
 fn is_prior_or_unsigned_assistant(content: &Value, native_model: &str) -> bool {
     content
         .get(0)
         .is_none_or(|block| block["type"] != "thinking")
         || replay::is_prior_carrier_turn(content, native_model)
+        || has_polluted_prefix_artefact(content)
 }
 
 fn observed_continuation(
@@ -734,18 +761,18 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
         })
         .filter(|&last_unsigned| {
             let prefix = &messages[..=last_unsigned];
-            let no_current_thinking = prefix.iter().all(|m| {
-                m.role != "assistant"
-                    || is_prior_or_unsigned_assistant(&m.content, &binding.native_model)
-            });
+            let last_has_carrier = messages[last_unsigned]
+                .content
+                .get(0)
+                .is_some_and(|block| block["type"] == "thinking");
+            let no_current_thinking = last_has_carrier
+                || prefix.iter().all(|m| {
+                    m.role != "assistant"
+                        || is_prior_or_unsigned_assistant(&m.content, &binding.native_model)
+                });
             let non_system: Vec<_> = prefix.iter().filter(|m| m.role != "system").collect();
-            let valid_alternation = !non_system.is_empty()
-                && non_system.len() % 2 == 0
-                && non_system
-                    .iter()
-                    .enumerate()
-                    .all(|(i, m)| m.role == if i % 2 == 0 { "user" } else { "assistant" });
-            no_current_thinking && valid_alternation && last_unsigned + 1 < messages.len()
+            let starts_with_user = non_system.first().is_some_and(|m| m.role == "user");
+            no_current_thinking && starts_with_user && last_unsigned + 1 < messages.len()
         })
         .map(|idx| idx + 1)
         .unwrap_or(0);
@@ -786,108 +813,82 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
     estimate_bytes += serde_json::to_vec(&tools.declarations)
         .map_err(|_| "invalid tools")?
         .len();
-    for message in prefix_messages {
-        if message.role == "system" {
-            continue;
-        }
-        if message.role == "user" {
-            let blocks = if let Some(text) = message.content.as_str() {
-                vec![json!({"type":"text","text":text})]
-            } else {
-                message
+    if !prefix_messages.is_empty() {
+        let mut transcript = String::from("<prior_conversation_transcript>\n");
+        for message in prefix_messages {
+            if message.role == "system" {
+                continue;
+            }
+            if message.role == "user" {
+                let blocks = if let Some(text) = message.content.as_str() {
+                    vec![json!({"type":"text","text":text})]
+                } else {
+                    message
+                        .content
+                        .as_array()
+                        .ok_or("invalid user content")?
+                        .clone()
+                };
+                for block in blocks {
+                    match block["type"].as_str() {
+                        Some("text") => {
+                            keys(
+                                &block,
+                                &["type", "text", "cache_control"],
+                                &["type", "text"],
+                            )?;
+                            cache_hint(block.get("cache_control"))?;
+                            let value = block["text"].as_str().ok_or("invalid user text")?;
+                            transcript.push_str("[User]:\n");
+                            transcript.push_str(value);
+                            transcript.push('\n');
+                        }
+                        Some("tool_result") => {
+                            let formatted = format_prefix_tool_result(&block)?;
+                            transcript.push_str(&formatted);
+                            transcript.push('\n');
+                        }
+                        _ => return Err("unsupported user content/media"),
+                    }
+                }
+            } else if message.role == "assistant" {
+                let blocks = message
                     .content
                     .as_array()
-                    .ok_or("invalid user content")?
-                    .clone()
-            };
-            let mut parts = Vec::new();
-            for block in blocks {
-                match block["type"].as_str() {
-                    Some("text") => {
-                        keys(
-                            &block,
-                            &["type", "text", "cache_control"],
-                            &["type", "text"],
-                        )?;
-                        cache_hint(block.get("cache_control"))?;
-                        let value = block["text"].as_str().ok_or("invalid user text")?;
-                        estimate_bytes += value.len();
-                        parts.push(json!({"text":value}));
-                    }
-                    Some("tool_result") => {
-                        let formatted = format_prefix_tool_result(&block)?;
-                        estimate_bytes += formatted.len();
-                        parts.push(json!({"text":formatted}));
-                    }
-                    _ => return Err("unsupported user content/media"),
-                }
-            }
-            if !parts.is_empty() {
-                if contents.last().is_some_and(|c| c["role"] == "user") {
-                    contents
-                        .last_mut()
-                        .unwrap()
-                        .get_mut("parts")
-                        .and_then(Value::as_array_mut)
-                        .unwrap()
-                        .extend(parts);
-                } else {
-                    if contents.len() >= 1024 {
-                        return Err("native history content limit");
-                    }
-                    contents.push(json!({"role":"user","parts":parts}));
-                }
-                last_role = "user";
-            }
-        } else if message.role == "assistant" {
-            let blocks = message
-                .content
-                .as_array()
-                .ok_or("invalid assistant content")?;
-            let mut parts = Vec::new();
-            for block in blocks {
-                match block["type"].as_str() {
-                    Some("thinking") => {}
-                    Some("text") => {
-                        let text = block["text"].as_str().ok_or("invalid display text")?;
-                        if !text.is_empty() {
-                            estimate_bytes += text.len();
-                            parts.push(json!({"text":text}));
+                    .ok_or("invalid assistant content")?;
+                for block in blocks {
+                    match block["type"].as_str() {
+                        Some("thinking") => {}
+                        Some("text") => {
+                            let text = block["text"].as_str().ok_or("invalid display text")?;
+                            if !text.is_empty() {
+                                let sanitized =
+                                    text.replace("[tool_use ", "[Assistant invoked tool ");
+                                transcript.push_str("[Assistant]:\n");
+                                transcript.push_str(&sanitized);
+                                transcript.push('\n');
+                            }
                         }
+                        Some("tool_use") => {
+                            let id = nonempty(&block["id"])?;
+                            let name = nonempty(&block["name"])?;
+                            let input = serde_json::to_string(&block["input"])
+                                .map_err(|_| "invalid tool input")?;
+                            transcript.push_str(&format!(
+                                "[Assistant invoked tool {name} (id={id}) with input: {input}]\n"
+                            ));
+                        }
+                        _ => return Err("unsupported projection block"),
                     }
-                    Some("tool_use") => {
-                        let id = nonempty(&block["id"])?;
-                        let name = nonempty(&block["name"])?;
-                        let input = serde_json::to_string(&block["input"])
-                            .map_err(|_| "invalid tool input")?;
-                        let formatted = format!("[tool_use {name}(id={id}): {input}]");
-                        estimate_bytes += formatted.len();
-                        parts.push(json!({"text":formatted}));
-                    }
-                    _ => return Err("unsupported projection block"),
                 }
-            }
-            if parts.is_empty() {
-                parts.push(json!({"text":"..."}));
-            }
-            if contents.last().is_some_and(|c| c["role"] == "model") {
-                contents
-                    .last_mut()
-                    .unwrap()
-                    .get_mut("parts")
-                    .and_then(Value::as_array_mut)
-                    .unwrap()
-                    .extend(parts);
             } else {
-                if contents.len() >= 1024 {
-                    return Err("native history content limit");
-                }
-                contents.push(json!({"role":"model","parts":parts}));
+                return Err("unsupported message role");
             }
-            last_role = "assistant";
-        } else {
-            return Err("unsupported message role");
         }
+        transcript.push_str("</prior_conversation_transcript>");
+        estimate_bytes += transcript.len();
+        contents.push(json!({"role":"user","parts":[{"text":transcript}]}));
+        last_role = "user";
     }
     let mut allow_prefix_tool_result = has_prefix;
     for message in active_messages {
@@ -1044,10 +1045,20 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                 contents.push(json!({"role":"model","parts":parts}));
             }
             if !text.is_empty() {
-                if contents.len() >= 1024 {
-                    return Err("native history content limit");
+                if contents.last().is_some_and(|c| c["role"] == "user") {
+                    contents
+                        .last_mut()
+                        .unwrap()
+                        .get_mut("parts")
+                        .and_then(Value::as_array_mut)
+                        .unwrap()
+                        .extend(text);
+                } else {
+                    if contents.len() >= 1024 {
+                        return Err("native history content limit");
+                    }
+                    contents.push(json!({"role":"user","parts":text}));
                 }
-                contents.push(json!({"role":"user","parts":text}));
             }
         } else {
             return Err("unsupported message role");

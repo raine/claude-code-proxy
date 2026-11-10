@@ -2792,35 +2792,20 @@ fn antigravity_opus_5_5_and_carrierless_prefix_turns_and_coalesced_text_blocks()
         json!("MODEL_PLACEHOLDER_M400")
     );
     let contents = prepared.wire["request"]["contents"].as_array().unwrap();
-    assert_eq!(contents.len(), 7);
+    assert_eq!(contents.len(), 3);
+    assert_eq!(contents[0]["role"], json!("user"));
+    let prefix_text = contents[0]["parts"][0]["text"].as_str().unwrap();
+    assert!(prefix_text.starts_with("<prior_conversation_transcript>\n"));
+    assert!(prefix_text.contains("[Assistant invoked tool Read (id=toolu_prefix_1) with input: {\"file_path\":\"/tmp/a.txt\"}]"));
+    assert!(prefix_text.contains("[Tool result (toolu_prefix_1): ALPHA]"));
+    assert!(!prefix_text.contains("[tool_use "));
     assert_eq!(
-        contents[0],
-        json!({"role":"user","parts":[{"text":"Remember token ALPHA."}]})
+        contents[0]["parts"][1],
+        json!({"text":"Now switch model."})
     );
-    assert_eq!(
-        contents[1],
-        json!({"role":"model","parts":[
-            {"text":"Checking tool."},
-            {"text":"[tool_use Read(id=toolu_prefix_1): {\"file_path\":\"/tmp/a.txt\"}]"}
-        ]})
-    );
+    assert_eq!(contents[1]["role"], json!("model"));
     assert_eq!(
         contents[2],
-        json!({"role":"user","parts":[
-            {"text":"[tool_result (toolu_prefix_1): ALPHA]"}
-        ]})
-    );
-    assert_eq!(
-        contents[3],
-        json!({"role":"model","parts":[{"text":"Token ALPHA recorded."}]})
-    );
-    assert_eq!(
-        contents[4],
-        json!({"role":"user","parts":[{"text":"Now switch model."}]})
-    );
-    assert_eq!(contents[5]["role"], json!("model"));
-    assert_eq!(
-        contents[6],
         json!({"role":"user","parts":[{"text":"What was the token?"}]})
     );
 
@@ -2904,11 +2889,16 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
     );
 
     // Switching mid-session from Opus 5.5 to Gemini 4 Argon low after an interrupted tool_use
-    // with Claude Code's `thinking: {"type": "enabled", "budget_tokens": 31999}` succeeds by
-    // folding prior-model turns and the trailing prefix tool_result into prefix_messages.
+    // with Claude Code's `thinking: {"type": "enabled", "budget_tokens": 31999}` and
+    // `DeferredToolPlaceholder` succeeds by folding prior-model turns into a user-side
+    // `<prior_conversation_transcript>` (with zero fake `role: "model"` text tool calls).
     let mut switched = request.clone();
     switched["model"] = json!("antigravity/gemini-4-argon-low");
     switched["thinking"] = json!({"type":"enabled","budget_tokens":31999});
+    switched["tools"] = json!([
+        {"name":"Bash","description":"Run bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+        {"name":"DeferredToolPlaceholder","description":"Placeholder","input_schema":{"type":"object"},"defer_loading":true}
+    ]);
     switched["messages"][2]["content"]
         .as_array_mut()
         .unwrap()
@@ -2918,13 +2908,40 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
         ]);
     let argon_prepared = prepare(&serde_json::from_value(switched).unwrap(), &binding()).unwrap();
     assert_eq!(argon_prepared.wire["model"], json!("gemini-4-argon-low"));
-    assert_eq!(
-        argon_prepared.wire["request"]["contents"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
+    let argon_contents = argon_prepared.wire["request"]["contents"]
+        .as_array()
+        .unwrap();
+    assert_eq!(argon_contents.len(), 1);
+    assert_eq!(argon_contents[0]["role"], json!("user"));
+    assert!(
+        !argon_prepared.wire["request"]["tools"]
+            .to_string()
+            .contains("DeferredToolPlaceholder")
     );
+    let mut reducer = Reducer::default();
+    reducer
+        .push(
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "response": {
+                        "candidates": [{
+                            "finishReason": "UNEXPECTED_TOOL_CALL",
+                            "finishMessage": "SendMessage is not declared"
+                        }],
+                        "usageMetadata": {
+                            "promptTokenCount": 10,
+                            "candidatesTokenCount": 1,
+                            "totalTokenCount": 11
+                        }
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let recovered_turn = reducer.finish().unwrap();
+    assert_eq!(recovered_turn.stop_reason, "end_turn");
 
     // Tampering with the carrier signature itself still fails closed in prepare.
     let mut tampered_sig = request;
