@@ -2245,7 +2245,7 @@ mod antigravity_entry_tests {
             .unwrap();
         assert_eq!(
             line,
-            "antigravity: antigravity/claude-opus-5-5-high, antigravity/claude-opus-5-5-low, antigravity/claude-opus-5-5-medium, antigravity/gemini-4-argon-high, antigravity/gemini-4-argon-low, antigravity/gemini-4-argon-medium"
+            "antigravity: antigravity/claude-opus-5-5-high, antigravity/claude-opus-5-5-low, antigravity/claude-opus-5-5-medium, antigravity/gemini-4-argon-high, antigravity/gemini-4-argon-low, antigravity/gemini-4-argon-medium, antigravity/gemini-4-carbon-high, antigravity/gemini-4-carbon-low, antigravity/gemini-4-carbon-medium"
         );
         assert!(
             !run("0", &["codex", "auth", "status", "--json"])

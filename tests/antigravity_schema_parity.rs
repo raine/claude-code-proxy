@@ -1550,6 +1550,9 @@ async fn source_all_tier_metadata(f: &mut Fixture) -> Result<()> {
     let result = async {
         for stream in [false, true] {
             for (model, enumeration, level) in [
+                ("gemini-4-carbon-low", "MODEL_PLACEHOLDER_M438", "LOW"),
+                ("gemini-4-carbon-medium", "MODEL_PLACEHOLDER_M437", "MEDIUM"),
+                ("gemini-4-carbon-high", "MODEL_PLACEHOLDER_M427", "HIGH"),
                 ("gemini-4-argon-low", "MODEL_PLACEHOLDER_M419", "LOW"),
                 ("gemini-4-argon-medium", "MODEL_PLACEHOLDER_M418", "MEDIUM"),
                 ("gemini-4-argon-high", "MODEL_PLACEHOLDER_M417", "HIGH"),

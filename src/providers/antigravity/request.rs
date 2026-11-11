@@ -8,6 +8,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
 pub const MODELS: &[&str] = &[
+    "antigravity/gemini-4-carbon-low",
+    "antigravity/gemini-4-carbon-medium",
+    "antigravity/gemini-4-carbon-high",
     "antigravity/gemini-4-argon-low",
     "antigravity/gemini-4-argon-medium",
     "antigravity/gemini-4-argon-high",
@@ -18,11 +21,15 @@ pub const MODELS: &[&str] = &[
 
 pub(crate) fn effective_tier(model: &str) -> Option<&'static str> {
     match model {
-        "antigravity/gemini-4-argon-low" | "antigravity/claude-opus-5-5-low" => Some("low"),
-        "antigravity/gemini-4-argon-medium" | "antigravity/claude-opus-5-5-medium" => {
-            Some("medium")
-        }
-        "antigravity/gemini-4-argon-high" | "antigravity/claude-opus-5-5-high" => Some("high"),
+        "antigravity/gemini-4-carbon-low"
+        | "antigravity/gemini-4-argon-low"
+        | "antigravity/claude-opus-5-5-low" => Some("low"),
+        "antigravity/gemini-4-carbon-medium"
+        | "antigravity/gemini-4-argon-medium"
+        | "antigravity/claude-opus-5-5-medium" => Some("medium"),
+        "antigravity/gemini-4-carbon-high"
+        | "antigravity/gemini-4-argon-high"
+        | "antigravity/claude-opus-5-5-high" => Some("high"),
         _ => None,
     }
 }
@@ -120,6 +127,9 @@ impl Prepared {
         // LOW is runtime-observed. MEDIUM/HIGH enum values are compiled public
         // ModelSource facts, not a claim that all tiers were runtime-observed.
         let model_enum = match self.wire["model"].as_str() {
+            Some("gemini-4-carbon-low") => "MODEL_PLACEHOLDER_M438",
+            Some("gemini-4-carbon-medium") => "MODEL_PLACEHOLDER_M437",
+            Some("gemini-4-carbon-high") => "MODEL_PLACEHOLDER_M427",
             Some("gemini-4-argon-low") => "MODEL_PLACEHOLDER_M419",
             Some("gemini-4-argon-medium") => "MODEL_PLACEHOLDER_M418",
             Some("gemini-4-argon-high") => "MODEL_PLACEHOLDER_M417",
@@ -719,8 +729,12 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
         return Err("unsupported Antigravity model or replay scope");
     }
     let tier = match model {
-        "antigravity/gemini-4-argon-low" | "antigravity/claude-opus-5-5-low" => "LOW",
-        "antigravity/gemini-4-argon-medium" | "antigravity/claude-opus-5-5-medium" => "MEDIUM",
+        "antigravity/gemini-4-carbon-low"
+        | "antigravity/gemini-4-argon-low"
+        | "antigravity/claude-opus-5-5-low" => "LOW",
+        "antigravity/gemini-4-carbon-medium"
+        | "antigravity/gemini-4-argon-medium"
+        | "antigravity/claude-opus-5-5-medium" => "MEDIUM",
         _ => "HIGH",
     };
     let cap = body.max_tokens.unwrap_or(65536);
