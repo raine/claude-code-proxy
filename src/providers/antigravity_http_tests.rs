@@ -2510,3 +2510,74 @@ async fn antigravity_count_estimate_is_signature_size_invariant_and_network_free
     assert_eq!(estimates[0], estimates[1]);
     assert!(captured.lock().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn antigravity_downstream_sse_heartbeats_bridge_long_buffered_turns() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}", upstream.local_addr().unwrap())).unwrap();
+    let sse_payload = successful(json!([{"text":"after deep thought"}]));
+    let (headers_observed_tx, headers_observed_rx) = tokio::sync::oneshot::channel();
+    let native_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_request(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                    sse_payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        headers_observed_rx.await.unwrap();
+        // Pause 35s (> legacy 30s READ_IDLE and > 2x 15s downstream heartbeat) before
+        // flushing the native SSE turn.
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        socket.write_all(sse_payload.as_bytes()).await.unwrap();
+    });
+
+    let directory = tempfile::tempdir().unwrap();
+    let registry = Registry::from_providers(
+        AliasProvider::Codex,
+        [Arc::new(provider(directory.path(), &url).await) as Arc<dyn Provider>],
+    );
+    let app = app_with_features(
+        Arc::new(registry),
+        None,
+        AppFeatures {
+            responses_api: true,
+            ..AppFeatures::default()
+        },
+    );
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(request(true).to_string()))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    headers_observed_tx.send(()).unwrap();
+    let mut body = response.into_body();
+    let mut frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            frames.push(String::from_utf8(data.to_vec()).unwrap());
+        }
+    }
+    native_task.await.unwrap();
+    assert_eq!(
+        frames.len(),
+        3,
+        "expected 2 heartbeats + final SSE message: {frames:?}"
+    );
+    assert_eq!(frames[0], ": ping\n\n");
+    assert_eq!(frames[1], ": ping\n\n");
+    assert!(frames[2].contains("event: message_start"));
+    assert!(frames[2].contains("after deep thought"));
+    assert!(frames[2].contains("event: message_stop"));
+}

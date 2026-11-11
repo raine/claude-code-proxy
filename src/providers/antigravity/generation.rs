@@ -40,7 +40,13 @@ use tower::Service;
 const MAX_TURN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const DECODE_INPUT_CHUNK: usize = 1024;
-const READ_IDLE: Duration = Duration::from_secs(30);
+// Match agy's sendModelStreamRequest / idleTimeoutReadCloser (300s) and Codex's
+// HTTP/WS header + body idle timeouts (300_000ms). 1M-context prefill and deep
+// reasoning pauses on Carbon/Argon/Opus 5.5 routinely exceed 30s before headers
+// or between SSE chunks, while TCP+TLS handshakes stay bounded by CONNECT_TIMEOUT.
+pub(super) const HEADER_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const READ_IDLE: Duration = Duration::from_secs(300);
+pub(super) const TURN_DEADLINE: Duration = Duration::from_secs(3600);
 type BoxError = Box<dyn Error + Send + Sync>;
 type Connecting =
     Pin<Box<dyn Future<Output = std::result::Result<MaybeHttpsStream<RouteIo>, BoxError>> + Send>>;
@@ -916,14 +922,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn antigravity_generation_idle_and_total_errors_remain_typed() {
-        for (budget, expected) in [(180, BodyError::Idle), (10, BodyError::Deadline)] {
+        for (budget, expected, elapsed) in [
+            (3600, BodyError::Idle, READ_IDLE),
+            (180, BodyError::Deadline, Duration::from_secs(180)),
+            (10, BodyError::Deadline, Duration::from_secs(10)),
+        ] {
+            let started = Instant::now();
             let mut native = NativeResponse::new(
                 StatusCode::OK,
                 HeaderMap::new(),
                 futures_util::stream::pending().boxed(),
-                Instant::now() + Duration::from_secs(budget),
+                started + Duration::from_secs(budget),
             );
             assert_eq!(native.chunk().await.unwrap_err(), expected);
+            assert_eq!(Instant::now() - started, elapsed);
         }
         assert_eq!(BodyError::ByteLimit.message(), "native turn byte limit");
         assert_eq!(BodyError::Idle.message(), "native stream idle timeout");
@@ -931,6 +943,41 @@ mod tests {
             BodyError::Deadline.message(),
             "native turn deadline exceeded"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_generation_long_reasoning_pause_under_idle_budget_succeeds() {
+        let started = Instant::now();
+        let stream = futures_util::stream::unfold(0_usize, |step| async move {
+            match step {
+                0 => {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    Some((Ok(Bytes::from_static(b"data: first\n\n")), 1))
+                }
+                1 => {
+                    tokio::time::sleep(Duration::from_secs(240)).await;
+                    Some((Ok(Bytes::from_static(b"data: second\n\n")), 2))
+                }
+                _ => None,
+            }
+        })
+        .boxed();
+        let mut native = NativeResponse::new(
+            StatusCode::OK,
+            HeaderMap::new(),
+            stream,
+            started + TURN_DEADLINE,
+        );
+        assert_eq!(
+            native.chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
+        assert_eq!(
+            native.chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"data: second\n\n")
+        );
+        assert_eq!(native.chunk().await.unwrap(), None);
+        assert_eq!(Instant::now() - started, Duration::from_secs(360));
     }
 
     #[tokio::test(start_paused = true)]

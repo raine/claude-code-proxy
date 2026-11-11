@@ -24,7 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use config::Config;
-use generation::GenerationClient;
+use generation::{GenerationClient, HEADER_TIMEOUT, TURN_DEADLINE};
 use replay::{Binding, Result};
 use serde_json::{Value, json};
 use std::{
@@ -156,8 +156,8 @@ impl AntigravityProvider {
             Err(_) => return invalid("invalid native endpoint"),
         };
         let request_started = tokio::time::Instant::now();
-        let header_deadline = request_started + Duration::from_secs(30);
-        let request_deadline = request_started + Duration::from_secs(180);
+        let header_deadline = request_started + HEADER_TIMEOUT;
+        let request_deadline = request_started + TURN_DEADLINE;
         let sent = tokio::time::timeout_at(
             header_deadline,
             generation.send(
@@ -233,19 +233,47 @@ impl AntigravityProvider {
         }
         // The returned Body owns this future, including the native response and
         // decoder. No worker survives a downstream drop. Initial errors occurred above.
+        // Emit periodic SSE comment heartbeats while collecting the buffered native turn
+        // so standalone SSE clients (e.g. undici bodyTimeout = 300s) do not drop idle
+        // downstream bodies during multi-minute reasoning turns.
+        const DOWNSTREAM_SSE_HEARTBEAT: Duration = Duration::from_secs(15);
         let outcome = NativeResponseOutcome::default();
         let shared = outcome.clone();
-        let stream = futures_util::stream::once(async move {
-            let result = work.await.and_then(|message| transport::sse(&message));
-            let bytes = match result {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    shared.fail(format!("Antigravity: {error}"));
-                    format!("event: error\ndata: {}\n\n",json!({"type":"error","error":{"type":"api_error","message":format!("Antigravity: {error}")}})).into_bytes()
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + DOWNSTREAM_SSE_HEARTBEAT,
+            DOWNSTREAM_SSE_HEARTBEAT,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let stream = futures_util::stream::unfold(
+            Some((Box::pin(work), heartbeat, shared)),
+            |state| async move {
+                let (mut work, mut heartbeat, shared) = state?;
+                tokio::select! {
+                    biased;
+                    result = work.as_mut() => {
+                        let bytes = match result.and_then(|message| transport::sse(&message)) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                shared.fail(format!("Antigravity: {error}"));
+                                format!(
+                                    "event: error\ndata: {}\n\n",
+                                    json!({"type":"error","error":{"type":"api_error","message":format!("Antigravity: {error}")}})
+                                )
+                                .into_bytes()
+                            }
+                        };
+                        Some((
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(bytes)),
+                            None,
+                        ))
+                    }
+                    _ = heartbeat.tick() => Some((
+                        Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b": ping\n\n")),
+                        Some((work, heartbeat, shared)),
+                    )),
                 }
-            };
-            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(bytes))
-        });
+            },
+        );
         let mut response = Response::new(Body::from_stream(stream));
         response.headers_mut().insert(
             "content-type",
