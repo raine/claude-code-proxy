@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
 use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
@@ -148,6 +150,60 @@ pub(crate) fn continuation_candidate_for_owner(
     enabled: bool,
 ) -> ContinuationReservation {
     continuation_candidate_inner(owner, body, enabled, "missing_identity")
+}
+
+/// Derives a conversation owner when `x-claude-code-agent-id` is absent
+/// (`ConversationIdentity::Main(session_id)`) by hashing `prompt_signature`
+/// (including leading developer envelope items for Responses Lite) plus the
+/// first user message in `body.input`. Explicit `ConversationIdentity::Agent`
+/// headers are preserved unchanged.
+pub(crate) fn resolve_continuation_owner(
+    owner: Option<&ConversationIdentity>,
+    body: &ResponsesRequest,
+) -> Option<ConversationIdentity> {
+    match owner {
+        Some(ConversationIdentity::Main(session_id)) => Some(ConversationIdentity::Agent(
+            session_id.clone(),
+            synthetic_subagent_key(body),
+        )),
+        Some(ConversationIdentity::Agent(session_id, agent_id)) => Some(
+            ConversationIdentity::Agent(session_id.clone(), agent_id.clone()),
+        ),
+        None => None,
+    }
+}
+
+pub(crate) fn synthetic_subagent_key(body: &ResponsesRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prompt_signature(body).as_bytes());
+    hasher.update(b"\0");
+    for item in body
+        .input
+        .iter()
+        .take_while(|item| is_developer_envelope_item(item))
+    {
+        let value = serde_json::to_value(item).unwrap_or_default();
+        hasher.update(stable_json(&value).as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"\0");
+    if let Some(first_user) = body
+        .input
+        .iter()
+        .find(|item| matches!(item, ResponsesInputItem::Message { role, .. } if role == "user"))
+    {
+        let value = serde_json::to_value(first_user).unwrap_or_default();
+        hasher.update(stable_json(&value).as_bytes());
+    }
+    format!("synthetic,{:x}", hasher.finalize())
+}
+
+fn is_developer_envelope_item(item: &ResponsesInputItem) -> bool {
+    match item {
+        ResponsesInputItem::AdditionalTools { .. } => true,
+        ResponsesInputItem::Message { role, .. } => role == "developer",
+        _ => false,
+    }
 }
 
 fn continuation_candidate_inner(
@@ -1182,5 +1238,57 @@ mod tests {
             Some("resp_large")
         );
         assert_eq!(reservation.candidate().input_delta_count, 1);
+    }
+
+    #[test]
+    fn resolve_continuation_owner_derives_synthetic_key_when_agent_header_absent() {
+        let _registry_guard = lock_registry();
+        let main = main_owner("session-shared");
+        let explicit_agent = agent_owner("session-shared", "explicit-agent");
+
+        let main_turn1 = request_with_input(
+            vec![input("main task")],
+            Some(json!({"instructions": "You are the main coding agent."})),
+        );
+        let main_turn2 = request_with_input(
+            vec![input("main task"), input("follow up")],
+            Some(json!({"instructions": "You are the main coding agent."})),
+        );
+        let subagent_diff_first_user = request_with_input(
+            vec![input("subagent task")],
+            Some(json!({"instructions": "You are the main coding agent."})),
+        );
+        let subagent_diff_prompt = request_with_input(
+            vec![input("main task")],
+            Some(json!({"instructions": "You are a research subagent."})),
+        );
+
+        let main_owner_1 = resolve_continuation_owner(Some(&main), &main_turn1).unwrap();
+        let main_owner_2 = resolve_continuation_owner(Some(&main), &main_turn2).unwrap();
+        let sub_owner_user =
+            resolve_continuation_owner(Some(&main), &subagent_diff_first_user).unwrap();
+        let sub_owner_prompt =
+            resolve_continuation_owner(Some(&main), &subagent_diff_prompt).unwrap();
+        let explicit_resolved =
+            resolve_continuation_owner(Some(&explicit_agent), &main_turn1).unwrap();
+
+        assert_eq!(main_owner_1, main_owner_2);
+        assert_ne!(main_owner_1, sub_owner_user);
+        assert_ne!(main_owner_1, sub_owner_prompt);
+        assert_ne!(sub_owner_user, sub_owner_prompt);
+        assert_eq!(explicit_resolved, explicit_agent);
+        assert_eq!(resolve_continuation_owner(None, &main_turn1), None);
+
+        start_and_record(&main_owner_1, &main_turn1, "resp_main_1");
+        start_and_record(&sub_owner_user, &subagent_diff_first_user, "resp_sub_1");
+
+        let main_continued =
+            continuation_candidate_for_owner(Some(&main_owner_2), &main_turn2, true);
+        assert_eq!(
+            main_continued.candidate().previous_response_id.as_deref(),
+            Some("resp_main_1")
+        );
+        assert_eq!(main_continued.candidate().input_delta_count, 1);
+        assert!(has_continuation_for_owner_for_tests(&sub_owner_user));
     }
 }

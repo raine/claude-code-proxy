@@ -44,7 +44,7 @@ use self::compaction::{
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
-    record_continuation_for_owner,
+    record_continuation_for_owner, resolve_continuation_owner,
 };
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
@@ -293,8 +293,10 @@ impl CodexProvider {
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
+        let resolved_identity =
+            resolve_continuation_owner(conversation_identity.as_ref(), &translated);
         let continuation = continuation_candidate_for_owner(
-            conversation_identity.as_ref(),
+            resolved_identity.as_ref(),
             &translated,
             previous_response_id_enabled,
         );
