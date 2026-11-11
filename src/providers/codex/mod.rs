@@ -345,7 +345,7 @@ impl CodexProvider {
                     attempt: compaction_attempt,
                 },
                 configured_transport,
-                tail_is_successful_tool_result(&body),
+                empty_completion_may_end_turn(&body),
             )
             .await;
             log.info(
@@ -369,7 +369,7 @@ impl CodexProvider {
         let request_continuation = continuation.clone();
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
-        let successful_tool_tail = tail_is_successful_tool_result(&body);
+        let successful_tool_tail = empty_completion_may_end_turn(&body);
         let upstream = loop {
             let response = match client
                 .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
@@ -1183,6 +1183,14 @@ fn buffered_terminal_is_completed(upstream_sse: &[u8]) -> bool {
 /// Repetition is a heuristic, not proof that the tool delivered a user-visible answer.
 fn accept_empty_completion(successful_tool_tail: bool, empty_attempts: u32) -> bool {
     successful_tool_tail && empty_attempts >= 1
+}
+
+/// Whether a repeated empty completion may become a valid empty end_turn for this request:
+/// after resolved tool results, or for any request when `CCP_CODEX_EMPTY_COMPLETION` /
+/// `codex.emptyCompletion` is `end_turn`. Claude Code's end-of-turn side queries and turns
+/// that answer a Monitor event often end empty by design.
+fn empty_completion_may_end_turn(body: &MessagesRequest) -> bool {
+    tail_is_successful_tool_result(body) || config::codex_empty_completion_end_turn()
 }
 
 fn empty_live_completion_error() -> client::CodexError {

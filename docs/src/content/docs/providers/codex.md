@@ -119,6 +119,10 @@ An absent, malformed, or ambiguous identity does not reject the HTTP request; th
 
 Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership.
 
+### Empty completions
+
+When Codex finishes a turn without output, the proxy retries with full context, up to 11 calls, and then answers 503. After resolved tool results it retries once and then returns an empty `end_turn`. Set `CCP_CODEX_EMPTY_COMPLETION=end_turn` or `codex.emptyCompletion: "end_turn"` to apply that one-retry rule to every request. With Claude Code, a turn that answers a Monitor event, and some of its end-of-turn background requests, can end empty by design.
+
 ## Server compaction
 
 Claude Code normally compacts a long conversation by asking the active model to write a portable text summary. Later turns contain that summary instead of the original transcript. This works across providers, but a prose summary can flatten details from a long, tool-heavy Codex session.
