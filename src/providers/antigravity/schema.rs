@@ -1,36 +1,25 @@
-//! Source validation and honest Gemini generation projection are separate layers.
+//! Antigravity tool schema bridge modeled on `agy`'s `paramsToSchema` /
+//! `convertMapToSchema` (`v1main.Schema` protobuf projection).
+//!
+//! External MCP and Claude Code tool `input_schema` definitions are projected
+//! directly into `v1main.Schema` without stringifying fields into `Codec::Json`
+//! wrappers or rejecting turns post-generation on local JSON Schema validation
+//! mismatches. Downstream callers (Claude Code / MCP servers) validate tool
+//! arguments and return `tool_result` (`is_error: true`) so the model can
+//! self-correct on the next turn.
 use super::replay::{self, Result, keys, nonempty};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 const MAX_SCHEMA_BYTES: usize = 256 * 1024;
 const MAX_SCHEMA_NODES: usize = 8192;
-
-struct Offline;
-impl jsonschema::Retrieve for Offline {
-    fn retrieve(
-        &self,
-        _: &jsonschema::Uri<String>,
-    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        Err("external schema retrieval disabled".into())
-    }
-}
-
-enum Codec {
-    Identity,
-    Json,
-    Object(BTreeMap<String, Codec>),
-    Array(Box<Codec>),
-}
+const MAX_SCHEMA_DEPTH: usize = 32;
+const MAX_REF_DEPTH: usize = 16;
 
 struct Tool {
     caller: String,
     native: String,
-    validator: jsonschema::Validator,
-    codec: Codec,
-    root: bool,
-    empty: bool,
 }
 
 pub(crate) struct ToolSet {
@@ -57,9 +46,19 @@ impl ToolSet {
                     "input_schema",
                     "cache_control",
                     "defer_loading",
+                    "type",
+                    "strict",
+                    "eager_input_streaming",
+                    "input_examples",
                 ],
                 &["name", "input_schema"],
             )?;
+            if let Some(kind) = tool.get("type")
+                && !kind.is_null()
+                && kind.as_str() != Some("custom")
+            {
+                return Err("unsupported tool type");
+            }
             super::request::cache_hint(tool.get("cache_control"))?;
             let caller = nonempty(&tool["name"])?;
             if caller == "DeferredToolPlaceholder"
@@ -86,61 +85,34 @@ impl ToolSet {
             {
                 return Err("schema byte limit");
             }
+            let root_obj = schema.as_object().ok_or("schema must be object")?;
+            if let Some(root_type) = root_obj.get("type")
+                && !root_type_allows_object(root_type)
+            {
+                return Err("tool input_schema root must be an object");
+            }
             let mut nodes = 0;
-            validate_source(schema, 0, &mut nodes)?;
-            let draft = match schema.get("$schema").and_then(Value::as_str) {
-                None | Some("https://json-schema.org/draft/2020-12/schema") => {
-                    jsonschema::Draft::Draft202012
-                }
-                Some(
-                    "http://json-schema.org/draft-07/schema"
-                    | "http://json-schema.org/draft-07/schema#",
-                ) => jsonschema::Draft::Draft7,
-                _ => return Err("unsupported schema dialect"),
-            };
-            let validator = jsonschema::options()
-                .with_draft(draft)
-                .should_validate_formats(true)
-                .with_retriever(Offline)
-                .build(schema)
-                .map_err(|_| "invalid original tool schema")?;
-            let (projected, codec) = project(schema)?;
-            let empty = schema["type"] == "object"
-                && schema["additionalProperties"] == false
-                && schema
-                    .get("properties")
-                    .is_none_or(|v| v.as_object().is_some_and(|v| v.is_empty()));
-            let root = matches!(codec, Codec::Json);
-            let mut declaration = json!({"name":native});
-            if let Some(description) = tool.get("description") {
+            validate_tree(schema, 0, &mut nodes)?;
+            let mut declaration = json!({"name": native});
+            if let Some(description) = tool.get("description")
+                && !description.is_null()
+            {
                 let text = description
                     .as_str()
                     .filter(|v| v.len() <= 32768)
                     .ok_or("invalid tool description")?;
-                declaration["description"] = json!(text);
+                if !text.is_empty() {
+                    declaration["description"] = json!(text);
+                }
             }
-            let compatible = if caller == native && identity(&codec) {
-                compatible_projection(schema)
-            } else {
-                None
-            };
-            if let Some(parameters) = compatible {
-                declaration["parameters"] = parameters;
-            } else if !empty {
-                declaration["parameters"] = if root {
-                    json!({"type":"OBJECT","properties":{"json":projected},"required":["json"],"description":"Encode the entire original caller argument object as JSON in the single json string field; no extra wrapper keys."})
-                } else {
-                    projected
-                };
-            }
+            let mut visited = HashSet::new();
+            let mut budget = ProjectionBudget::default();
+            declaration["parameters"] =
+                project_schema(schema, schema, &mut visited, 0, true, &mut budget);
             declarations.push(declaration);
             compiled.push(Tool {
                 caller: caller.to_string(),
                 native,
-                validator,
-                codec,
-                root,
-                empty,
             });
         }
         Ok(Self {
@@ -157,41 +129,13 @@ impl ToolSet {
                 .iter()
                 .find(|t| call["name"] == t.native)
                 .ok_or("upstream returned unknown tool")?;
-            let mut paths = Vec::new();
-            let root = if tool.root {
-                json!("json")
-            } else {
-                Value::Null
-            };
             let raw_args = replay::call_arguments(call)?;
-            if !tool.root {
-                codec_paths(&tool.codec, raw_args, "", &mut paths)?;
-            }
-            let mut args = replay::decode_arguments(raw_args, &json!(paths), &root)?;
-            if !tool.root && !paths.is_empty() && !tool.validator.is_valid(&args) {
-                if tool.validator.is_valid(raw_args) {
-                    paths.clear();
-                    args = raw_args.clone();
-                } else {
-                    for i in (0..paths.len()).rev() {
-                        let mut candidate = paths.clone();
-                        candidate.remove(i);
-                        if let Ok(decoded) =
-                            replay::decode_arguments(raw_args, &json!(candidate), &root)
-                            && tool.validator.is_valid(&decoded)
-                        {
-                            paths = candidate;
-                            args = decoded;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (tool.empty && args != json!({})) || !tool.validator.is_valid(&args) {
-                return Err("upstream tool arguments violate original schema");
-            }
-            recipes
-                .push(json!({"caller_name":tool.caller,"codec_paths":paths,"root_wrapper":root}));
+            replay::decode_arguments(raw_args, &json!([]), &Value::Null)?;
+            recipes.push(json!({
+                "caller_name": tool.caller,
+                "codec_paths": [],
+                "root_wrapper": Value::Null,
+            }));
         }
         replay::mapping(contents, Some(&json!(recipes)))
     }
@@ -205,329 +149,49 @@ fn native_name(name: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
         && name
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
 }
 
-fn required_undeclared(schema: &Value) -> bool {
-    let properties = schema.get("properties").and_then(Value::as_object);
-    schema
-        .get("required")
-        .and_then(Value::as_array)
-        .is_some_and(|required| {
-            required
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|name| properties.is_none_or(|props| !props.contains_key(name)))
-        })
+fn root_type_allows_object(value: &Value) -> bool {
+    match value {
+        Value::String(kind) => kind.eq_ignore_ascii_case("object"),
+        Value::Array(kinds) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|k| k.eq_ignore_ascii_case("object")),
+        _ => false,
+    }
 }
 
-fn validate_source(schema: &Value, depth: usize, nodes: &mut usize) -> Result<()> {
+fn validate_tree(value: &Value, depth: usize, nodes: &mut usize) -> Result<()> {
     *nodes += 1;
-    if depth > 32 || *nodes > MAX_SCHEMA_NODES {
+    if depth > MAX_SCHEMA_DEPTH || *nodes > MAX_SCHEMA_NODES {
         return Err("schema depth/node limit");
     }
-    if schema.is_boolean() {
-        return Ok(());
-    }
-    let object = schema
-        .as_object()
-        .ok_or("schema must be object or boolean")?;
-    if schema["type"] == "object"
-        && schema["additionalProperties"] == false
-        && required_undeclared(schema)
-    {
-        return Err(
-            "unsatisfiable tool contract: required undeclared property is forbidden by additionalProperties:false",
-        );
-    }
-    let allowed = [
-        "$schema",
-        "type",
-        "properties",
-        "propertyNames",
-        "required",
-        "items",
-        "additionalProperties",
-        "allOf",
-        "anyOf",
-        "oneOf",
-        "default",
-        "description",
-        "title",
-        "enum",
-        "const",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minItems",
-        "maxItems",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "format",
-        "multipleOf",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-    ];
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        return Err("unsupported schema keyword or reference");
-    }
-    if let Some(dialect) = object.get("$schema") {
-        if !matches!(
-            dialect.as_str(),
-            Some(
-                "https://json-schema.org/draft/2020-12/schema"
-                    | "http://json-schema.org/draft-07/schema"
-                    | "http://json-schema.org/draft-07/schema#"
-            )
-        ) {
-            return Err("unsupported schema dialect");
-        }
-        if depth != 0 {
-            return Err("nested dialect is unsupported");
-        }
-    }
-    if let Some(format) = object.get("format")
-        && !matches!(
-            format.as_str(),
-            Some(
-                "date-time"
-                    | "date"
-                    | "time"
-                    | "duration"
-                    | "email"
-                    | "idn-email"
-                    | "hostname"
-                    | "idn-hostname"
-                    | "ipv4"
-                    | "ipv6"
-                    | "uri"
-                    | "uri-reference"
-                    | "uuid"
-                    | "regex"
-                    | "json-pointer"
-                    | "relative-json-pointer"
-            )
-        )
-    {
-        return Err("unsupported schema format");
-    }
-    if let Some(properties) = object.get("properties") {
-        for child in properties
-            .as_object()
-            .ok_or("invalid schema properties")?
-            .values()
-        {
-            validate_source(child, depth + 1, nodes)?;
-        }
-    }
-    for key in ["items", "additionalProperties", "propertyNames"] {
-        if let Some(child) = object.get(key) {
-            validate_source(child, depth + 1, nodes)?;
-        }
-    }
-    for key in ["allOf", "anyOf", "oneOf"] {
-        if let Some(branches) = object.get(key) {
-            for child in branches.as_array().ok_or("invalid schema branches")? {
-                validate_source(child, depth + 1, nodes)?;
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => Ok(()),
+        Value::Number(n) => {
+            if n.as_f64().is_none_or(|f| !f.is_finite()) {
+                return Err("invalid schema number");
             }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_tree(item, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        Value::Object(fields) => {
+            for child in fields.values() {
+                validate_tree(child, depth + 1, nodes)?;
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
-fn json_codec(schema: &Value) -> Result<(Value, Codec)> {
-    // Complete deterministic JSON, not a lossy summary: the model must know the
-    // caller's names/types/requirements even when the native carrier is STRING.
-    let original = serde_json::to_string(schema).map_err(|_| "invalid original schema guidance")?;
-    let description = format!(
-        "JSON-string transport: encode the original JSON value exactly as a JSON string. The proxy decodes and validates this original schema before returning a tool call. Original JSON Schema: {original}"
-    );
-    if description.len() > 16384 {
-        return Err("complete schema guidance exceeds the 16 KiB limit");
-    }
-    Ok((
-        json!({"type":"STRING","description":description}),
-        Codec::Json,
-    ))
-}
-
-fn project(schema: &Value) -> Result<(Value, Codec)> {
-    let Some(kind) = schema.get("type").and_then(Value::as_str) else {
-        // Only a bare union (apart from dialect metadata) can return directly.
-        // Otherwise sibling constraints/annotations would bypass the normal
-        // projection path. Use the complete bounded JSON codec, not just anyOf.
-        if let Some(branches) = schema.get("anyOf").and_then(Value::as_array)
-            && schema.as_object().is_some_and(|fields| {
-                fields
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "anyOf" | "$schema"))
-            })
-        {
-            let projected = branches.iter().map(project).collect::<Result<Vec<_>>>()?;
-            if projected.iter().all(|(_, c)| identity(c)) {
-                return Ok((
-                    json!({"anyOf":projected.into_iter().map(|(s,_)|s).collect::<Vec<_>>()}),
-                    Codec::Identity,
-                ));
-            }
-        }
-        return json_codec(schema);
-    };
-    if schema.get("oneOf").is_some()
-        || !matches!(
-            kind,
-            "object" | "array" | "string" | "integer" | "number" | "boolean"
-        )
-    {
-        return json_codec(schema);
-    }
-    let mut out = Map::new();
-    out.insert("type".into(), json!(kind.to_ascii_uppercase()));
-    let mut codec = Codec::Identity;
-    if kind == "object" {
-        let props = schema.get("properties").and_then(Value::as_object);
-        if required_undeclared(schema) {
-            if schema["additionalProperties"] == false {
-                return Err(
-                    "unsatisfiable tool contract: required undeclared property is forbidden by additionalProperties:false",
-                );
-            }
-            return json_codec(schema);
-        }
-        if props.is_none_or(|p| p.is_empty()) && schema["additionalProperties"] != false {
-            return json_codec(schema);
-        }
-        if schema
-            .get("additionalProperties")
-            .is_some_and(Value::is_object)
-        {
-            return json_codec(schema);
-        }
-        let mut projected = Map::new();
-        let mut children = BTreeMap::new();
-        for (name, child) in props.into_iter().flatten() {
-            let (schema, child_codec) = project(child)?;
-            projected.insert(name.clone(), schema);
-            children.insert(name.clone(), child_codec);
-        }
-        out.insert("properties".into(), Value::Object(projected));
-        codec = Codec::Object(children);
-        if let Some(required) = schema.get("required") {
-            out.insert("required".into(), required.clone());
-        }
-    } else if kind == "array" {
-        let (item, item_codec) = project(schema.get("items").unwrap_or(&Value::Bool(true)))?;
-        out.insert("items".into(), item);
-        codec = Codec::Array(Box::new(item_codec));
-    }
-    for key in [
-        "description",
-        "title",
-        "minimum",
-        "maximum",
-        "minItems",
-        "maxItems",
-        "minLength",
-        "maxLength",
-        "pattern",
-    ] {
-        if let Some(value) = schema.get(key) {
-            out.insert(key.to_string(), value.clone());
-        }
-    }
-    if let Some(values) = schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .filter(|v| v.iter().all(Value::is_string))
-    {
-        out.insert("enum".into(), json!(values));
-    }
-    for (exclusive, inclusive, lower) in [
-        ("exclusiveMinimum", "minimum", true),
-        ("exclusiveMaximum", "maximum", false),
-    ] {
-        if kind == "integer"
-            && let Some(value) = schema.get(exclusive).and_then(Value::as_f64)
-        {
-            let bound = if lower {
-                value.floor() + 1.0
-            } else {
-                value.ceil() - 1.0
-            };
-            if bound.abs() <= 9007199254740991.0 {
-                let existing = out.get(inclusive).and_then(Value::as_f64);
-                let bound = existing.map_or(bound, |old| {
-                    if lower {
-                        old.ceil().max(bound)
-                    } else {
-                        old.floor().min(bound)
-                    }
-                });
-                if bound.abs() <= 9007199254740991.0 {
-                    out.insert(inclusive.to_string(), json!(bound as i64));
-                }
-            }
-        }
-    }
-    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
-        let projected = branches.iter().map(project).collect::<Result<Vec<_>>>()?;
-        if !projected.iter().all(|(_, c)| identity(c)) {
-            return json_codec(schema);
-        }
-        out.insert(
-            "anyOf".into(),
-            json!(projected.into_iter().map(|(v, _)| v).collect::<Vec<_>>()),
-        );
-    }
-    let local = [
-        "additionalProperties",
-        "propertyNames",
-        "allOf",
-        "format",
-        "multipleOf",
-        "uniqueItems",
-        "minProperties",
-        "maxProperties",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "const",
-    ];
-    let mut constraints: Map<String, Value> = local
-        .iter()
-        .filter_map(|k| schema.get(*k).map(|v| ((*k).to_string(), v.clone())))
-        .collect();
-    if let Some(values) = schema
-        .get("enum")
-        .and_then(Value::as_array)
-        .filter(|values| values.iter().any(|v| !v.is_string()))
-    {
-        constraints.insert("enum".to_string(), json!(values));
-    }
-    if !constraints.is_empty() {
-        let hint = format!(
-            "Original schema constraints are validated locally after JSON decoding; invalid calls are rejected, never repaired. Constraints: {}",
-            Value::Object(constraints)
-        );
-        let prior = out.get("description").and_then(Value::as_str).unwrap_or("");
-        let description = format!("{prior}\n{hint}");
-        if description.len() > 16384 {
-            return Err("complete schema guidance exceeds the 16 KiB limit");
-        }
-        out.insert("description".into(), json!(description));
-    }
-    Ok((Value::Object(out), codec))
-}
-
-fn compatible_projection(schema: &Value) -> Option<Value> {
-    // Check the whole tool before copying defaults or selecting any child.
-    (ProjectionBudget::default().visit(schema, 0) && compatible_schema(schema))
-        .then(|| typed_projection(schema))
-}
-
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProjectionBudget {
     nodes: usize,
     strings: usize,
@@ -547,7 +211,7 @@ impl ProjectionBudget {
 
     fn visit(&mut self, value: &Value, depth: usize) -> bool {
         self.nodes += 1;
-        if depth > 32 || self.nodes > 4096 {
+        if depth > MAX_SCHEMA_DEPTH || self.nodes > 4096 {
             return false;
         }
         match value {
@@ -586,155 +250,469 @@ fn length_value(value: &Value) -> Option<u64> {
         .map(|value| value as u64)
 }
 
-fn compatible_schema(schema: &Value) -> bool {
-    let Some(fields) = schema.as_object() else {
-        return false;
-    };
-    let Some(kind) = schema.get("type").and_then(Value::as_str) else {
-        return false;
-    };
-    fields
-        .iter()
-        .all(|(key, value)| match (kind, key.as_str()) {
-            (_, "type") => matches!(
-                kind,
-                "object" | "array" | "string" | "integer" | "number" | "boolean"
-            ),
-            (_, "description" | "title" | "$schema") => value.is_string(),
-            (_, "default") => true,
-            ("object", "properties") => value
-                .as_object()
-                .is_some_and(|properties| properties.values().all(compatible_schema)),
-            ("object", "required") => value.as_array().is_some_and(|required| {
-                required.iter().all(|name| {
-                    name.as_str().is_some_and(|name| {
-                        schema
-                            .get("properties")
-                            .and_then(Value::as_object)
-                            .is_some_and(|properties| properties.contains_key(name))
-                    })
-                })
-            }),
-            ("object", "additionalProperties") => value.is_boolean(),
-            ("array", "items") => value.is_object() && compatible_schema(value),
-            ("array", "minItems" | "maxItems") | ("string", "minLength" | "maxLength") => {
-                length_value(value).is_some()
-            }
-            ("string", "enum") => value
-                .as_array()
-                .is_some_and(|values| values.iter().all(Value::is_string)),
-            ("string", "pattern" | "format") => value.is_string(),
-            ("integer" | "number", "minimum" | "maximum")
-            | ("integer", "exclusiveMinimum" | "exclusiveMaximum") => number_value(value).is_some(),
-            _ => false,
-        })
+fn genai_type(kind: &str) -> Option<&'static str> {
+    if kind.eq_ignore_ascii_case("string") {
+        Some("STRING")
+    } else if kind.eq_ignore_ascii_case("number") {
+        Some("NUMBER")
+    } else if kind.eq_ignore_ascii_case("integer") {
+        Some("INTEGER")
+    } else if kind.eq_ignore_ascii_case("boolean") {
+        Some("BOOLEAN")
+    } else if kind.eq_ignore_ascii_case("array") {
+        Some("ARRAY")
+    } else if kind.eq_ignore_ascii_case("object") {
+        Some("OBJECT")
+    } else if kind.eq_ignore_ascii_case("null") {
+        Some("NULL")
+    } else {
+        None
+    }
 }
 
-fn typed_projection(schema: &Value) -> Value {
-    let mut out = Map::new();
-    out.insert(
-        "type".into(),
-        json!(schema["type"].as_str().unwrap().to_ascii_uppercase()),
-    );
-    for key in ["description", "format", "pattern"] {
-        if let Some(text) = schema
-            .get(key)
+fn resolve_local_refs(
+    map: &Map<String, Value>,
+    root: &Value,
+    visited: &mut HashSet<String>,
+) -> (Map<String, Value>, Vec<String>) {
+    let mut current = map.clone();
+    let mut added = Vec::new();
+    for _ in 0..MAX_REF_DEPTH {
+        let Some(pointer) = current
+            .get("$ref")
             .and_then(Value::as_str)
-            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+        else {
+            break;
+        };
+        current.remove("$ref");
+        if !pointer.starts_with("#/")
+            || visited.len() >= MAX_REF_DEPTH
+            || !visited.insert(pointer.clone())
         {
-            out.insert(key.into(), json!(text));
+            break;
         }
+        added.push(pointer.clone());
+        let Some(target) = root.pointer(&pointer[1..]).and_then(Value::as_object) else {
+            break;
+        };
+        let mut merged = target.clone();
+        for (k, v) in current {
+            merged.insert(k, v);
+        }
+        current = merged;
     }
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object)
-        && !properties.is_empty()
+    (current, added)
+}
+
+fn is_null_branch(branch: &Map<String, Value>) -> bool {
+    branch
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("null"))
+        || branch.get("const") == Some(&Value::Null)
+}
+
+fn branch_string_values(branch: &Map<String, Value>) -> Option<Vec<String>> {
+    if let Some(kind) = branch.get("type").and_then(Value::as_str)
+        && !kind.eq_ignore_ascii_case("string")
     {
-        out.insert(
-            "properties".into(),
-            Value::Object(
-                properties
-                    .iter()
-                    .map(|(name, child)| (name.clone(), typed_projection(child)))
-                    .collect(),
-            ),
-        );
+        return None;
     }
-    if let Some(items) = schema.get("items") {
-        out.insert("items".into(), typed_projection(items));
+    if let Some(c) = branch.get("const").and_then(Value::as_str) {
+        return Some(vec![c.to_owned()]);
     }
-    for key in ["required", "enum"] {
-        if let Some(values) = schema
-            .get(key)
-            .and_then(Value::as_array)
-            .filter(|v| !v.is_empty())
-        {
-            out.insert(key.into(), json!(values));
-        }
+    let values = branch.get("enum")?.as_array()?;
+    if values.is_empty() || !values.iter().all(Value::is_string) {
+        return None;
     }
-    for key in ["minimum", "maximum"] {
-        if let Some(value) = schema.get(key).and_then(number_value).filter(|v| *v != 0.0) {
-            out.insert(key.into(), json!(value));
-        }
-    }
-    for key in ["minLength", "maxLength", "minItems", "maxItems"] {
-        if let Some(value) = schema.get(key).and_then(length_value).filter(|v| *v != 0) {
-            out.insert(key.into(), json!(value.to_string()));
-        }
-    }
-    if let Some(value) = schema.get("default") {
-        out.insert("default".into(), value.clone());
-    }
-    Value::Object(out)
+    Some(
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
-fn identity(codec: &Codec) -> bool {
-    match codec {
-        Codec::Identity => true,
-        Codec::Json => false,
-        Codec::Object(c) => c.values().all(identity),
-        Codec::Array(c) => identity(c),
+fn branch_genai_type(branch: &Map<String, Value>) -> Option<&'static str> {
+    if let Some(kind) = branch.get("type").and_then(Value::as_str) {
+        return genai_type(kind);
+    }
+    if let Some(c) = branch.get("const") {
+        return match c {
+            Value::String(_) => Some("STRING"),
+            Value::Bool(_) => Some("BOOLEAN"),
+            Value::Number(n) => Some(if n.is_i64() || n.is_u64() {
+                "INTEGER"
+            } else {
+                "NUMBER"
+            }),
+            Value::Null => Some("NULL"),
+            _ => None,
+        };
+    }
+    if branch.get("properties").is_some_and(Value::is_object) {
+        return Some("OBJECT");
+    }
+    if branch.get("items").is_some_and(Value::is_object) {
+        return Some("ARRAY");
+    }
+    None
+}
+
+fn allowed_format(kind: &str, format: &str) -> bool {
+    match kind {
+        "STRING" => matches!(
+            format,
+            "enum"
+                | "date-time"
+                | "date"
+                | "time"
+                | "duration"
+                | "email"
+                | "idn-email"
+                | "hostname"
+                | "idn-hostname"
+                | "ipv4"
+                | "ipv6"
+                | "uuid"
+                | "uri"
+                | "uri-reference"
+                | "regex"
+                | "json-pointer"
+                | "relative-json-pointer"
+        ),
+        "INTEGER" => matches!(format, "int32" | "int64"),
+        "NUMBER" => matches!(format, "float" | "double"),
+        _ => false,
     }
 }
 
-fn can_decode_json_leaf(value: &Value) -> bool {
-    value
-        .as_str()
-        .and_then(|raw| replay::parse_json(raw.as_bytes(), replay::MAX_ARGUMENT).ok())
-        .and_then(|parsed| replay::canonical(&parsed).ok())
-        .is_some()
-}
+fn project_schema(
+    schema: &Value,
+    root: &Value,
+    visited: &mut HashSet<String>,
+    depth: usize,
+    is_root: bool,
+    budget: &mut ProjectionBudget,
+) -> Value {
+    if depth > MAX_SCHEMA_DEPTH {
+        return if is_root {
+            json!({"type": "OBJECT"})
+        } else {
+            json!({})
+        };
+    }
+    let Some(raw_map) = schema.as_object() else {
+        return if is_root {
+            json!({"type": "OBJECT"})
+        } else {
+            json!({})
+        };
+    };
+    let (mut map, added_refs) = resolve_local_refs(raw_map, root, visited);
 
-fn codec_paths(codec: &Codec, args: &Value, path: &str, paths: &mut Vec<String>) -> Result<()> {
-    match codec {
-        Codec::Json => {
-            if can_decode_json_leaf(args) {
-                paths.push(path.to_string());
+    // Fold simple `allOf` object compositions (common in OpenAPI / MCP).
+    if let Some(all_of) = map.get("allOf").and_then(Value::as_array).cloned() {
+        for item in &all_of {
+            let Some(branch_raw) = item.as_object() else {
+                continue;
+            };
+            let (branch, branch_refs) = resolve_local_refs(branch_raw, root, visited);
+            for r in branch_refs {
+                visited.remove(&r);
             }
-        }
-        Codec::Object(children) => {
-            if let Some(object) = args.as_object() {
-                for (name, child) in children {
-                    if let Some(value) = object.get(name) {
-                        codec_paths(
-                            child,
-                            value,
-                            &format!("{path}/{}", name.replace('~', "~0").replace('/', "~1")),
-                            paths,
-                        )?;
+            for key in ["type", "description", "items"] {
+                if !map.contains_key(key)
+                    && let Some(val) = branch.get(key)
+                {
+                    map.insert(key.to_owned(), val.clone());
+                }
+            }
+            if let Some(branch_props) = branch.get("properties").and_then(Value::as_object) {
+                let target = map
+                    .entry("properties")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(target_props) = target.as_object_mut() {
+                    for (k, v) in branch_props {
+                        target_props.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+            if let Some(branch_req) = branch.get("required").and_then(Value::as_array) {
+                let target = map
+                    .entry("required")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(target_req) = target.as_array_mut() {
+                    for req in branch_req {
+                        if req.is_string() && !target_req.contains(req) {
+                            target_req.push(req.clone());
+                        }
                     }
                 }
             }
         }
-        Codec::Array(child) => {
-            if let Some(array) = args.as_array() {
-                for (i, value) in array.iter().enumerate() {
-                    codec_paths(child, value, &format!("{path}/{i}"), paths)?;
+    }
+
+    let mut nullable = map.get("nullable") == Some(&Value::Bool(true));
+    let mut inferred_union_type: Option<&'static str> = None;
+
+    let union_branches = map
+        .get("anyOf")
+        .or_else(|| map.get("oneOf"))
+        .and_then(Value::as_array)
+        .cloned();
+    if let Some(branches) = union_branches {
+        let mut null_count = 0usize;
+        let mut non_null = Vec::new();
+        let mut saw_non_object = false;
+        for item in &branches {
+            if let Some(branch_raw) = item.as_object() {
+                let (resolved, branch_refs) = resolve_local_refs(branch_raw, root, visited);
+                for r in branch_refs {
+                    visited.remove(&r);
+                }
+                if is_null_branch(&resolved) {
+                    null_count += 1;
+                } else {
+                    non_null.push(resolved);
+                }
+            } else {
+                saw_non_object = true;
+            }
+        }
+        if null_count > 0 {
+            nullable = true;
+        }
+        if !saw_non_object {
+            if non_null.len() == 1 && null_count > 0 {
+                // Unwrap nullable `Optional[T]` (`anyOf: [T, {"type": "null"}]`).
+                for (k, v) in &non_null[0] {
+                    if !map.contains_key(k) {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+            } else if !non_null.is_empty()
+                && non_null.iter().all(|b| branch_string_values(b).is_some())
+            {
+                // Flatten string enum/const unions (e.g., `TaskUpdate.status`).
+                let mut combined = Vec::new();
+                for b in &non_null {
+                    for s in branch_string_values(b).unwrap() {
+                        if !combined.contains(&s) {
+                            combined.push(s);
+                        }
+                    }
+                }
+                if !map.contains_key("type") {
+                    map.insert("type".into(), json!("string"));
+                }
+                if !map.contains_key("enum") && !combined.is_empty() {
+                    map.insert("enum".into(), json!(combined));
+                }
+            } else if !non_null.is_empty() && !map.contains_key("type") {
+                let types: Option<Vec<&'static str>> =
+                    non_null.iter().map(branch_genai_type).collect();
+                if let Some(types) = types {
+                    let first = types[0];
+                    if types.iter().all(|t| *t == first) {
+                        inferred_union_type = Some(first);
+                    } else if types.iter().all(|t| matches!(*t, "INTEGER" | "NUMBER")) {
+                        inferred_union_type = Some("NUMBER");
+                    }
                 }
             }
         }
-        Codec::Identity => {}
     }
-    if paths.len() > 64 {
-        return Err("codec path count limit");
+
+    let mut kind: Option<&'static str> = match map.get("type") {
+        Some(Value::String(s)) => genai_type(s),
+        Some(Value::Array(arr)) => {
+            let mut non_null_types: Vec<&'static str> = Vec::new();
+            let mut saw_null = false;
+            let mut valid = !arr.is_empty();
+            for entry in arr {
+                let Some(s) = entry.as_str().and_then(genai_type) else {
+                    valid = false;
+                    break;
+                };
+                if s == "NULL" {
+                    saw_null = true;
+                } else if !non_null_types.contains(&s) {
+                    non_null_types.push(s);
+                }
+            }
+            if !valid {
+                None
+            } else {
+                if saw_null {
+                    nullable = true;
+                }
+                match non_null_types.as_slice() {
+                    [single] => Some(*single),
+                    [a, b] if matches!((*a, *b), ("INTEGER", "NUMBER") | ("NUMBER", "INTEGER")) => {
+                        Some("NUMBER")
+                    }
+                    [] if saw_null => Some("NULL"),
+                    _ => None,
+                }
+            }
+        }
+        _ => inferred_union_type,
+    };
+
+    if let Some(c) = map.get("const") {
+        match c {
+            Value::String(s) => {
+                if kind.is_none() {
+                    kind = Some("STRING");
+                }
+                if kind == Some("STRING") && !map.contains_key("enum") {
+                    map.insert("enum".into(), json!([s]));
+                }
+            }
+            Value::Bool(_) if kind.is_none() => kind = Some("BOOLEAN"),
+            Value::Number(n) if kind.is_none() => {
+                kind = Some(if n.is_i64() || n.is_u64() {
+                    "INTEGER"
+                } else {
+                    "NUMBER"
+                });
+            }
+            Value::Null if kind.is_none() => kind = Some("NULL"),
+            _ => {}
+        }
     }
-    Ok(())
+
+    if kind.is_none() {
+        if map.get("properties").is_some_and(Value::is_object) {
+            kind = Some("OBJECT");
+        } else if map.get("items").is_some_and(Value::is_object) {
+            kind = Some("ARRAY");
+        }
+    }
+    if is_root && kind.is_none() {
+        kind = Some("OBJECT");
+    }
+
+    let mut out = Map::new();
+    if let Some(t) = kind {
+        out.insert("type".into(), json!(t));
+    }
+    if nullable && !is_root && !matches!(kind, None | Some("NULL")) {
+        out.insert("nullable".into(), json!(true));
+    }
+    if let Some(desc) = map
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    {
+        out.insert("description".into(), json!(desc));
+    }
+
+    match kind {
+        Some("STRING") => {
+            if let Some(fmt) = map
+                .get("format")
+                .and_then(Value::as_str)
+                .filter(|f| allowed_format("STRING", f))
+            {
+                out.insert("format".into(), json!(fmt));
+            }
+            if let Some(pat) = map
+                .get("pattern")
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+            {
+                out.insert("pattern".into(), json!(pat));
+            }
+            if let Some(values) = map.get("enum").and_then(Value::as_array) {
+                let strings: Vec<&str> = values.iter().filter_map(Value::as_str).collect();
+                if !strings.is_empty() {
+                    out.insert("enum".into(), json!(strings));
+                }
+            }
+            for key in ["minLength", "maxLength"] {
+                if let Some(value) = map.get(key).and_then(length_value).filter(|v| *v != 0) {
+                    out.insert(key.into(), json!(value.to_string()));
+                }
+            }
+        }
+        Some("INTEGER" | "NUMBER") => {
+            let t = kind.unwrap();
+            if let Some(fmt) = map
+                .get("format")
+                .and_then(Value::as_str)
+                .filter(|f| allowed_format(t, f))
+            {
+                out.insert("format".into(), json!(fmt));
+            }
+            for key in ["minimum", "maximum"] {
+                if let Some(value) = map.get(key).and_then(number_value).filter(|v| *v != 0.0) {
+                    out.insert(key.into(), json!(value));
+                }
+            }
+        }
+        Some("OBJECT") => {
+            if let Some(properties) = map.get("properties").and_then(Value::as_object)
+                && !properties.is_empty()
+            {
+                let projected_props: Map<String, Value> = properties
+                    .iter()
+                    .map(|(name, child)| {
+                        (
+                            name.clone(),
+                            project_schema(child, root, visited, depth + 1, false, budget),
+                        )
+                    })
+                    .collect();
+                out.insert("properties".into(), Value::Object(projected_props));
+                if let Some(required) = map.get("required").and_then(Value::as_array) {
+                    let mut req_names: Vec<&str> = Vec::new();
+                    for entry in required {
+                        if let Some(name) = entry.as_str()
+                            && properties.contains_key(name)
+                            && !req_names.contains(&name)
+                        {
+                            req_names.push(name);
+                        }
+                    }
+                    if !req_names.is_empty() {
+                        out.insert("required".into(), json!(req_names));
+                    }
+                }
+            }
+        }
+        Some("ARRAY") => {
+            if let Some(items) = map.get("items")
+                && items.is_object()
+            {
+                out.insert(
+                    "items".into(),
+                    project_schema(items, root, visited, depth + 1, false, budget),
+                );
+            }
+            for key in ["minItems", "maxItems"] {
+                if let Some(value) = map.get(key).and_then(length_value).filter(|v| *v != 0) {
+                    out.insert(key.into(), json!(value.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(default_val) = map.get("default") {
+        let mut candidate = budget.clone();
+        if candidate.visit(default_val, 0) {
+            *budget = candidate;
+            out.insert("default".into(), default_val.clone());
+        }
+    }
+
+    for r in added_refs {
+        visited.remove(&r);
+    }
+
+    Value::Object(out)
 }

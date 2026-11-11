@@ -482,23 +482,8 @@ fn root(node: Value) -> Value {
 fn selected_root(node: Value) -> Value {
     json!({"type":"OBJECT","properties":{"value":node},"required":["value"]})
 }
-fn legacy_hint(constraints: Value) -> String {
-    format!(
-        "\nOriginal schema constraints are validated locally after JSON decoding; invalid calls are rejected, never repaired. Constraints: {constraints}"
-    )
-}
-fn legacy_root(node: Value) -> Value {
-    let mut result = selected_root(node);
-    result["description"] = json!(legacy_hint(json!({"additionalProperties":false})));
-    result
-}
-fn json_transport(schema: &Value) -> Value {
-    json!({"type":"STRING","description":format!(
-        "JSON-string transport: encode the original JSON value exactly as a JSON string. The proxy decodes and validates this original schema before returning a tool call. Original JSON Schema: {schema}"
-    )})
-}
 
-// Preserved legacy/original values use serde_json's exact integer-aware equality.
+// Preserved original values use serde_json's exact integer-aware equality.
 // In particular, never round an unsafe integer through f64 in these assertions.
 fn exact(actual: &Value, expected: &Value, label: &str) -> Result<()> {
     ensure!(
@@ -593,17 +578,17 @@ fn comparison_oracle_control() -> Result<()> {
             json!(9_007_199_254_740_992.0),
         ),
     ] {
-        let left = legacy_root(json!({"type":"NUMBER","maximum":left}));
-        let right = legacy_root(json!({"type":"NUMBER","maximum":right}));
+        let left = selected_root(json!({"type":"NUMBER","maximum":left}));
+        let right = selected_root(json!({"type":"NUMBER","maximum":right}));
         ensure!(
-            exact(&left, &right, "oracle unequal legacy integers").is_err(),
-            "legacy oracle hid integer corruption"
+            exact(&left, &right, "oracle unequal integers").is_err(),
+            "oracle hid integer corruption"
         );
         ensure!(
-            exact(&right, &left, "oracle unequal legacy integers reversed").is_err(),
-            "legacy oracle comparison is asymmetric"
+            exact(&right, &left, "oracle unequal integers reversed").is_err(),
+            "oracle comparison is asymmetric"
         );
-        exact(&left, &left, "oracle unchanged legacy value")?;
+        exact(&left, &left, "oracle unchanged value")?;
     }
     selected_exact(
         &selected_root(json!({"type":"NUMBER","minimum":1.0,"default":{"nested":[0.0,-0.0,1e20]}})),
@@ -703,10 +688,10 @@ impl Exchange {
         ensure!(stopped, "missing SSE terminal event");
         Ok(json!(blocks))
     }
-    fn rejected_arguments(&self, stream: bool) -> Result<()> {
+    fn rejected_call(&self, stream: bool, expected_msg: &str) -> Result<()> {
         ensure!(
             self.wire.is_some(),
-            "argument validation must occur after actual HTTPS generation"
+            "call validation must occur after actual HTTPS generation"
         );
         if stream {
             ensure!(
@@ -715,9 +700,8 @@ impl Exchange {
             );
             let text = std::str::from_utf8(&self.bytes)?;
             ensure!(
-                text.contains("event: error\n")
-                    && text.contains("upstream tool arguments violate original schema"),
-                "missing streaming original-schema validation error"
+                text.contains("event: error\n") && text.contains(expected_msg),
+                "missing streaming structural validation error"
             );
             ensure!(
                 !text.contains("event: message_stop\n"),
@@ -732,8 +716,8 @@ impl Exchange {
             ensure!(
                 error["error"]["message"]
                     .as_str()
-                    .is_some_and(|s| s.contains("upstream tool arguments violate original schema")),
-                "wrong local validation error"
+                    .is_some_and(|s| s.contains(expected_msg)),
+                "wrong structural validation error"
             );
         }
         Ok(())
@@ -1686,7 +1670,7 @@ async fn validation_control(f: &mut Fixture) -> Result<()> {
         let mut body = request(stream);
         body["tools"] = json!([tool(
             "generic_checked",
-            root(json!({"type":"integer","minimum":2}))
+            root(json!({"type":"integer","minimum":2,"default":3}))
         )]);
         let valid = f.exchange(body.clone(), json!([{"functionCall":{"name":"generic_checked","args":{"value":2},"id":"synthetic-native-id"}}])).await?;
         valid.success(stream)?;
@@ -1697,39 +1681,39 @@ async fn validation_control(f: &mut Fixture) -> Result<()> {
                 .unwrap()
                 .iter()
                 .any(|b| b["type"] == "tool_use" && b["input"] == json!({"value":2})),
-            "valid original-schema tool input"
+            "valid tool input forwarded unchanged"
         );
+        // Downstream callers (Claude Code / MCP servers) validate schema constraints;
+        // missing defaults are never synthetically injected by the proxy.
+        let omitted = f
+            .exchange(
+                body.clone(),
+                json!([{"functionCall":{"name":"generic_checked","args":{}}}]),
+            )
+            .await?;
+        omitted.success(stream)?;
+        ensure!(
+            omitted
+                .blocks()?
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == "tool_use" && b["input"] == json!({})),
+            "defaults must never be synthetically inserted"
+        );
+        // Unknown tool names and non-object `args` still fail closed structurally.
         f.exchange(
-            body,
-            json!([{"functionCall":{"name":"generic_checked","args":{"value":1}}}]),
+            body.clone(),
+            json!([{"functionCall":{"name":"undeclared_tool","args":{}}}]),
         )
         .await?
-        .rejected_arguments(stream)?;
-        // Draft 2020-12 admits an empty enum, but it validates no values.
-        // Preserve that original admission/validation rather than inventing a rejection.
-        let mut body = request(stream);
-        body["tools"] = json!([tool(
-            "generic_enum",
-            root(json!({"type":"string","enum":[]}))
-        )]);
+        .rejected_call(stream, "upstream returned unknown tool")?;
         f.exchange(
             body,
-            json!([{"functionCall":{"name":"generic_enum","args":{"value":""}}}]),
+            json!([{"functionCall":{"name":"generic_checked","args":[]}}]),
         )
         .await?
-        .rejected_arguments(stream)?;
-        // A default is guidance only: missing required arguments are never repaired.
-        let mut body = request(stream);
-        body["tools"] = json!([tool(
-            "generic_default",
-            root(json!({"type":"integer","default":3}))
-        )]);
-        f.exchange(
-            body,
-            json!([{"functionCall":{"name":"generic_default","args":{}}}]),
-        )
-        .await?
-        .rejected_arguments(stream)?;
+        .rejected_call(stream, "invalid native call arguments")?;
     }
     Ok(())
 }
@@ -1831,19 +1815,6 @@ async fn zero_constraints(f: &mut Fixture) -> Result<()> {
         },"required":["text","list","number"]}),
             "zero constraints omit but default remains",
         )?;
-        for invalid in [
-            json!({"text":"x","list":[],"number":0}),
-            json!({"text":"","list":[true],"number":0}),
-            json!({"text":"","list":[],"number":1}),
-            json!({"text":"","list":[],"number":-1}),
-        ] {
-            f.exchange(
-                body.clone(),
-                json!([{"functionCall":{"name":"generic_zero","args":invalid}}]),
-            )
-            .await?
-            .rejected_arguments(stream)?;
-        }
     }
     Ok(())
 }
@@ -1854,10 +1825,7 @@ async fn closed_empty(f: &mut Fixture) -> Result<()> {
         let mut body = request(stream);
         body["tools"] = json!([tool("generic_empty", schema)]);
         let exchange = f
-            .exchange(
-                body.clone(),
-                json!([{"functionCall":{"name":"generic_empty"}}]),
-            )
+            .exchange(body, json!([{"functionCall":{"name":"generic_empty"}}]))
             .await?;
         exchange.success(stream)?;
         exact(
@@ -1890,12 +1858,6 @@ async fn closed_empty(f: &mut Fixture) -> Result<()> {
             envelope["tool_mapping"][0]["root_wrapper"].is_null(),
             "closed-empty root recipe changed"
         );
-        f.exchange(
-            body,
-            json!([{"functionCall":{"name":"generic_empty","args":{"extra":true}}}]),
-        )
-        .await?
-        .rejected_arguments(stream)?;
     }
     Ok(())
 }
@@ -1984,31 +1946,42 @@ async fn choice_controls(f: &mut Fixture) -> Result<()> {
 }
 
 async fn fallback(f: &mut Fixture) -> Result<()> {
-    let constrained = |kind: &str, key: &str, value: Value| {
-        let mut source = json!({"type":kind});
-        source[key] = value.clone();
-        let mut expected = json!({"type":kind.to_ascii_uppercase()});
-        expected["description"] = json!(legacy_hint(json!({(key):value})));
-        (source, expected)
-    };
-    let mut cases = vec![
-        constrained("string", "const", json!("x")),
-        constrained("number", "multipleOf", json!(2)),
-        constrained("number", "exclusiveMinimum", json!(1.5)),
-        constrained("integer", "format", json!("date")),
-        constrained("string", "enum", json!(["x", 7, ""])),
-        constrained("number", "enum", json!([1, 2])),
+    let cases = vec![
+        (
+            json!({"type":"string","const":"x"}),
+            json!({"type":"STRING","enum":["x"]}),
+        ),
+        (
+            json!({"type":"number","multipleOf":2}),
+            json!({"type":"NUMBER"}),
+        ),
+        (
+            json!({"type":"number","exclusiveMinimum":1.5}),
+            json!({"type":"NUMBER"}),
+        ),
+        (
+            json!({"type":"integer","format":"date"}),
+            json!({"type":"INTEGER"}),
+        ),
+        (
+            json!({"type":"string","enum":["x", 7, ""]}),
+            json!({"type":"STRING","enum":["x", ""]}),
+        ),
+        (
+            json!({"type":"number","enum":[1, 2]}),
+            json!({"type":"NUMBER"}),
+        ),
         (
             json!({"type":"string","minimum":1}),
-            json!({"type":"STRING","minimum":1}),
+            json!({"type":"STRING"}),
         ),
         (
             json!({"type":"array","items":{"type":"string"},"uniqueItems":true}),
-            json!({"type":"ARRAY","items":{"type":"STRING"},"description":legacy_hint(json!({"uniqueItems":true}))}),
+            json!({"type":"ARRAY","items":{"type":"STRING"}}),
         ),
         (
             json!({"type":"object","properties":{"x":{"type":"string"}},"minProperties":1}),
-            json!({"type":"OBJECT","properties":{"x":{"type":"STRING"}},"description":legacy_hint(json!({"minProperties":1}))}),
+            json!({"type":"OBJECT","properties":{"x":{"type":"STRING"}}}),
         ),
         (
             json!({"type":"array","items":{"type":"string"},"properties":{"x":{"type":"string"}}}),
@@ -2018,39 +1991,40 @@ async fn fallback(f: &mut Fixture) -> Result<()> {
             json!({"type":"string","default":9007199254740992_u64}),
             json!({"type":"STRING"}),
         ),
+        (
+            json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
+            json!({}),
+        ),
+        (
+            json!({"type":"object","properties":{"x":{"type":"string"}},"additionalProperties":{"type":"boolean"}}),
+            json!({"type":"OBJECT","properties":{"x":{"type":"STRING"}}}),
+        ),
+        (json!(true), json!({})),
     ];
-    let union = json!({"oneOf":[{"type":"string"},{"type":"integer"}]});
-    cases.push((union.clone(), json_transport(&union)));
-    let object_extra = json!({"type":"object","properties":{"x":{"type":"string"}},"additionalProperties":{"type":"boolean"}});
-    cases.push((object_extra.clone(), json_transport(&object_extra)));
-    let boolean = json!(true);
-    cases.push((boolean.clone(), json_transport(&boolean)));
     for stream in [false, true] {
         for (source, expected) in &cases {
             let mut schema = root(source.clone());
-            schema["title"] = json!("Synthetic legacy marker");
-            let mut expected = legacy_root(expected.clone());
-            expected["title"] = json!("Synthetic legacy marker");
+            schema["title"] = json!("Synthetic marker");
             let exchange = f
                 .project(stream, json!([tool("generic_fallback", schema)]), None)
                 .await?;
             exact(
                 exchange.parameters(0)?,
-                &expected,
-                "whole-tool fallback, including unsupported child",
+                &selected_root(expected.clone()),
+                "agy-style permissive projection",
             )?;
         }
-        // Aliased names must keep their full legacy declaration and codec plan.
+        // Aliased names keep their hashed native declaration name and native schema projection.
         let name = "generic spaced name";
-        let schema = root(json!({"type":"string","default":"ignored by legacy"}));
+        let schema = root(json!({"type":"string","default":"kept natively"}));
         let exchange = f.project(stream, json!([tool(name, schema)]), None).await?;
         let native = format!("ccp_{:x}", Sha256::digest(name.as_bytes()))[..64].to_owned();
         exact(
             &exchange.wire()?["request"]["tools"][0],
             &json!({"functionDeclarations":[{
-                "name":native,"description":"Synthetic function.","parameters":legacy_root(json!({"type":"STRING"}))
+                "name":native,"description":"Synthetic function.","parameters":selected_root(json!({"type":"STRING","default":"kept natively"}))
             }]}),
-            "aliased legacy declaration",
+            "aliased native declaration",
         )?;
         for schema in [
             json!({"type":"object","additionalProperties":false,"allOf":[{}]}),
@@ -2065,8 +2039,8 @@ async fn fallback(f: &mut Fixture) -> Result<()> {
                 .await?;
             exact(
                 &exchange.wire()?["request"]["tools"][0],
-                &json!({"functionDeclarations":[{"name":"generic_ineligible_empty","description":"Synthetic function."}]}),
-                "ineligible closed-empty omission",
+                &json!({"functionDeclarations":[{"name":"generic_ineligible_empty","description":"Synthetic function.","parameters":{"type":"OBJECT"}}]}),
+                "closed-empty object parameters retained",
             )?;
         }
     }
@@ -2125,7 +2099,7 @@ async fn eligibility(f: &mut Fixture) -> Result<()> {
         )]);
         let valid = f
             .exchange(
-                body.clone(),
+                body,
                 json!([{"functionCall":{"name":"generic_exclusive","args":{"value":1}}}]),
             )
             .await?;
@@ -2135,14 +2109,6 @@ async fn eligibility(f: &mut Fixture) -> Result<()> {
             &selected_root(json!({"type":"INTEGER","minimum":-5,"maximum":5})),
             "exclusive bounds omitted without conversion",
         )?;
-        for value in [0, 3] {
-            f.exchange(
-                body.clone(),
-                json!([{"functionCall":{"name":"generic_exclusive","args":{"value":value}}}]),
-            )
-            .await?
-            .rejected_arguments(stream)?;
-        }
         let exchange = f
             .project(
                 stream,
@@ -2151,7 +2117,7 @@ async fn eligibility(f: &mut Fixture) -> Result<()> {
                         "generic_selected",
                         root(json!({"type":"string","default":false}))
                     ),
-                    tool("generic_old", root(json!({"type":"string","const":"x"})))
+                    tool("generic_const", root(json!({"type":"string","const":"x"})))
                 ]),
                 None,
             )
@@ -2163,8 +2129,8 @@ async fn eligibility(f: &mut Fixture) -> Result<()> {
         )?;
         exact(
             exchange.parameters(1)?,
-            &legacy_root(json!({"type":"STRING","description":legacy_hint(json!({"const":"x"}))})),
-            "mixed legacy tool",
+            &selected_root(json!({"type":"STRING","enum":["x"]})),
+            "const projects natively to enum",
         )?;
     }
     Ok(())
@@ -2206,8 +2172,8 @@ async fn numeric_budgets(f: &mut Fixture) -> Result<()> {
                 .await?;
             exact(
                 exchange.parameters(0)?,
-                &legacy_root(json!({"type":"NUMBER"})),
-                "unsafe integer default whole-tool fallback",
+                &selected_root(json!({"type":"NUMBER"})),
+                "unsafe integer default omitted cleanly",
             )?;
             let source = root(json!({"type":"number","maximum":value}));
             let exchange = f
@@ -2215,8 +2181,8 @@ async fn numeric_budgets(f: &mut Fixture) -> Result<()> {
                 .await?;
             exact(
                 exchange.parameters(0)?,
-                &legacy_root(json!({"type":"NUMBER","maximum":value})),
-                "unsafe integer bound whole-tool fallback",
+                &selected_root(json!({"type":"NUMBER"})),
+                "unsafe integer bound omitted cleanly",
             )?;
         }
         for (value, expected) in [
@@ -2256,46 +2222,49 @@ async fn numeric_budgets(f: &mut Fixture) -> Result<()> {
                 .await?;
             exact(
                 exchange.parameters(0)?,
-                &legacy_root(json!({"type":"STRING","minLength":value})),
-                "unsafe length falls back",
+                &selected_root(json!({"type":"STRING"})),
+                "unsafe length omitted cleanly",
             )?;
         }
-        let mut deep = json!(null);
-        for _ in 0..34 {
-            deep = json!([deep]);
+        let mut deep_default = json!(null);
+        for _ in 0..24 {
+            deep_default = json!([deep_default]);
         }
-        for value in [deep, json!(vec![Value::Null; 4100])] {
-            let exchange = f
-                .project(
-                    stream,
-                    json!([tool(
-                        "generic_budget",
-                        root(json!({"type":"string","default":value}))
-                    )]),
-                    None,
-                )
-                .await?;
-            exact(
-                exchange.parameters(0)?,
-                &legacy_root(json!({"type":"STRING"})),
-                "default projection depth/node budget fallback",
-            )?;
-        }
-        // Each default is below the node limit; the whole tool is not.
+        let exchange = f
+            .project(
+                stream,
+                json!([tool(
+                    "generic_budget",
+                    root(json!({"type":"string","default":vec![Value::Null; 4100]}))
+                )]),
+                None,
+            )
+            .await?;
+        exact(
+            exchange.parameters(0)?,
+            &selected_root(json!({"type":"STRING"})),
+            "default projection node budget omits oversized default",
+        )?;
+        // Each default is below the 4096-node default budget; the second exceeds the shared budget.
+        let half = json!(vec![Value::Null; 2300]);
         let schema = json!({"type":"object","properties":{
-            "a":{"type":"string","default":vec![Value::Null;2300]},
-            "b":{"type":"string","default":vec![Value::Null;2300]}
+            "a":{"type":"string","default":half},
+            "b":{"type":"string","default":half}
         },"additionalProperties":false});
         let exchange = f
             .project(stream, json!([tool("generic_shared_budget", schema)]), None)
             .await?;
         exact(
             exchange.parameters(0)?,
-            &json!({"type":"OBJECT","properties":{"a":{"type":"STRING"},"b":{"type":"STRING"}},"description":legacy_hint(json!({"additionalProperties":false}))}),
+            &json!({"type":"OBJECT","properties":{"a":{"type":"STRING","default":half},"b":{"type":"STRING"}}}),
             "shared whole-tool default budget",
         )?;
-        let value =
-            json!({"items":vec![Value::Null;32],"allOf":"ordinary data","default":{"type":false}});
+        let value = json!({
+            "items":vec![Value::Null;32],
+            "nested":deep_default,
+            "allOf":"ordinary data",
+            "default":{"type":false}
+        });
         let exchange = f
             .project(
                 stream,
@@ -2316,15 +2285,18 @@ async fn numeric_budgets(f: &mut Fixture) -> Result<()> {
 }
 
 async fn admission(f: &mut Fixture) -> Result<()> {
+    let mut too_deep = json!({"type":"string"});
+    for _ in 0..33 {
+        too_deep = json!({"properties":{"x":too_deep}});
+    }
     for stream in [false, true] {
         for schema in [
-            root(json!({"type":"string","minLength":-1})),
-            root(json!({"type":"string","minLength":1.5})),
-            root(json!({"type":"string","format":"unsupported-synthetic-format"})),
-            root(json!({"$ref":"https://example.invalid/never-retrieve"})),
-            json!({"type":"object","properties":{},"required":["missing"],"additionalProperties":false}),
-            root(json!({"type":"string","unknownSyntheticKeyword":true})),
-            root(json!({"type":"string","enum":7})),
+            json!(true),
+            json!([]),
+            json!("object"),
+            json!({"type":"string"}),
+            json!({"type":["string","integer"]}),
+            too_deep.clone(),
             root(json!({"type":"string","default":"x".repeat(256*1024)})),
         ] {
             let mut body = request(stream);
@@ -2332,17 +2304,17 @@ async fn admission(f: &mut Fixture) -> Result<()> {
             let exchange = f.exchange(body, json!([{"text":"unreachable"}])).await?;
             ensure!(
                 exchange.status == StatusCode::BAD_REQUEST && exchange.wire.is_none(),
-                "original schema admission weakened or deferred"
+                "root/bound schema admission weakened or deferred"
             );
         }
-        // none must not bypass original tool admission before clearing the pool.
+        // none must not bypass tool admission before clearing the pool.
         let mut body = request(stream);
-        body["tools"] = json!([tool("generic_invalid", root(json!({"unsupported":true})))]);
+        body["tools"] = json!([tool("generic_invalid", json!({"type":"string"}))]);
         body["tool_choice"] = json!({"type":"none"});
         let exchange = f.exchange(body, json!([{"text":"unreachable"}])).await?;
         ensure!(
             exchange.status == StatusCode::BAD_REQUEST && exchange.wire.is_none(),
-            "original admission-first ordering changed"
+            "admission-first ordering changed"
         );
     }
     Ok(())
@@ -2372,11 +2344,11 @@ async fn project_admission(f: &mut Fixture) -> Result<()> {
     let result = async {
         for stream in [false,true] {
             let mut body = request(stream);
-            body["tools"] = json!([tool("generic_invalid",root(json!({"unknownSyntheticKeyword":true})))]);
+            body["tools"] = json!([tool("generic_invalid",json!({"type":"string"}))]);
             let invalid = f.exchange(body,json!([{"text":"unreachable"}])).await?;
             ensure!(invalid.status == StatusCode::BAD_REQUEST && invalid.wire.is_none(),"admission before project resolution");
             let error: Value = serde_json::from_slice(&invalid.bytes)?;
-            ensure!(error["error"]["message"] == "unsupported schema keyword or reference","original admission error precedence");
+            ensure!(error["error"]["message"] == "tool input_schema root must be an object","admission error precedence");
             let missing = f.exchange(request(stream),json!([{"text":"unreachable"}])).await?;
             ensure!(missing.status == StatusCode::BAD_REQUEST && missing.wire.is_none(),"missing project must not send generation");
             let error: Value = serde_json::from_slice(&missing.bytes)?;
@@ -2422,8 +2394,8 @@ async fn continuation_control(f: &mut Fixture) -> Result<()> {
         let parts = json!([
             {"text":"Synthetic thought.","thought":true,"thoughtSignature":"synthetic-opaque-signature","syntheticUnknown":{"keep":true}},
             {"functionCall":{"name":"generic_empty","id":"synthetic-empty-id"}},
-            {"functionCall":{"name":"generic_path","args":{"value":"null"}}},
-            {"functionCall":{"name":native_alias,"id":"synthetic-alias-id","args":{"json":"{\"x\":\"y\"}"}}},
+            {"functionCall":{"name":"generic_path","args":{"value":null}}},
+            {"functionCall":{"name":native_alias,"id":"synthetic-alias-id","args":{"x":"y"}}},
             {"functionCall":{"name":"generic_selected","args":{"value":3}}}
         ]);
         let mut body = request(stream);
@@ -2447,8 +2419,8 @@ async fn continuation_control(f: &mut Fixture) -> Result<()> {
         ensure!(mapping.len() == 4, "V1 multiple tool mappings");
         for (index, (caller, paths, wrapper)) in [
             ("generic_empty", json!([]), Value::Null),
-            ("generic_path", json!(["/value"]), Value::Null),
-            (spaced, json!([]), json!("json")),
+            ("generic_path", json!([]), Value::Null),
+            (spaced, json!([]), Value::Null),
             ("generic_selected", json!([]), Value::Null),
         ]
         .into_iter()

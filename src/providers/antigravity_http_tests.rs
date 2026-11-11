@@ -388,10 +388,19 @@ async fn antigravity_property_names_http_preflight_never_refreshes_or_generates(
         0,
         "cap validation/counting must not refresh or generate with expired credentials"
     );
+    body["tools"][0]["input_schema"]["$defs"] = json!({"name":{"type":"string"}});
+    body["tools"][0]["input_schema"]["properties"]["metadata"]["propertyNames"] =
+        json!({"$ref":"#/$defs/name"});
+    let response = client()
+        .post(proxy.url.join("/v1/messages/count_tokens").unwrap())
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
     for stream in [false, true] {
         body["stream"] = json!(stream);
-        body["tools"][0]["input_schema"]["properties"]["metadata"]["propertyNames"] =
-            json!({"$ref":"#/$defs/name"});
+        body["tools"][0]["input_schema"] = json!({"type":"string"});
         for path in ["/v1/messages", "/v1/messages/count_tokens"] {
             let response = client()
                 .post(proxy.url.join(path).unwrap())
@@ -404,7 +413,7 @@ async fn antigravity_property_names_http_preflight_never_refreshes_or_generates(
             assert_eq!(
                 response.json::<Value>().await.unwrap(),
                 json!({"type":"error","error":{
-                    "type":"invalid_request_error","message":"unsupported schema keyword or reference"
+                    "type":"invalid_request_error","message":"tool input_schema root must be an object"
                 }})
             );
             assert_eq!(

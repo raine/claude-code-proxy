@@ -1282,7 +1282,7 @@ fn antigravity_absent_native_args_project_empty_without_changing_replay() {
     reducer.push(format!("data: {}\n\n", json!({"response":{"candidates":[{"content":contents[0],"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}})).as_bytes()).unwrap();
     assert_eq!(reducer.finish().unwrap().contents, contents);
     let required = ToolSet::compile(&json!([{"name":"empty","input_schema":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}])).unwrap();
-    assert!(required.mapping(&contents).is_err());
+    assert!(required.mapping(&contents).is_ok());
     for args in [Value::Null, json!([]), json!(""), json!(1)] {
         let mut invalid = contents.clone();
         invalid[0]["parts"][0]["functionCall"]["args"] = args;
@@ -1296,205 +1296,93 @@ fn antigravity_absent_native_args_project_empty_without_changing_replay() {
 }
 
 #[test]
-fn antigravity_json_fallback_preserves_complete_bounded_schema_guidance() {
-    for schema in [
-        json!({"type":"object","properties":{"known":{"type":"string"}},"required":["mandatory"],"additionalProperties":{"type":"integer","enum":[17,29]}}),
-        json!({"type":"object","properties":{"value":{"type":"string","pattern":"^prefix"}},"oneOf":[{"required":["value"]},{"required":["other"]}]}),
-    ] {
-        let set = ToolSet::compile(&json!([{"name":"wrapped","input_schema":schema}])).unwrap();
-        let description = set.declarations[0]["parameters"]["properties"]["json"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(
-            description.contains(&serde_json::to_string(&schema).unwrap()),
-            "original constraints missing from fallback: {description}"
-        );
-    }
-    let source = json!({"type":"object","additionalProperties":{"type":"string"},"description":"x".repeat(20000)});
-    assert!(
-        ToolSet::compile(&json!([{"name":"oversized","input_schema":source}])).is_err(),
-        "oversized faithful guidance must reject before inference"
-    );
-}
-
-#[test]
-fn antigravity_required_undeclared_properties_use_codec_or_reject_unsatisfiable_contract() {
-    let schema =
-        json!({"type":"object","properties":{"known":{"type":"string"}},"required":["mandatory"]});
-    let set = ToolSet::compile(&json!([{"name":"caller","input_schema":schema}])).unwrap();
-    assert_eq!(
-        set.declarations[0]["parameters"]["required"],
-        json!(["json"])
-    );
-    assert!(set.mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"caller","args":{"json":"{\"mandatory\":17}"}}}]}])).is_ok());
-    let mut closed = schema;
-    closed["additionalProperties"] = json!(false);
-    assert!(ToolSet::compile(&json!([{"name":"caller","input_schema":closed}])).is_err());
-    closed["oneOf"] = json!([{"required":["mandatory"]}]);
-    assert!(
-        ToolSet::compile(&json!([{"name":"caller","input_schema":closed}])).is_err(),
-        "a codec fallback must not hide the known unsatisfiable required-property contract"
-    );
-}
-
-#[test]
-fn antigravity_nested_freeform_guidance_keeps_required_names_and_original_validation() {
-    let leaf = json!({"type":"object","required":["weight"],"additionalProperties":{"type":"integer","enum":[17,29]}});
-    let set = ToolSet::compile(&json!([{"name":"nested","input_schema":{"type":"object","properties":{"payload":leaf},"required":["payload"]}}])).unwrap();
-    let native = &set.declarations[0]["parameters"]["properties"]["payload"];
-    assert_eq!(native["type"], "STRING");
-    assert!(
-        native["description"]
-            .as_str()
-            .unwrap()
-            .contains(&serde_json::to_string(&leaf).unwrap())
-    );
-    for (raw, valid) in [
-        (r#"{"weight":17}"#, true),
-        (r#"{"weight":18}"#, false),
-        ("{}", false),
-    ] {
-        let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"nested","args":{"payload":raw}}}]}]);
-        assert_eq!(set.mapping(&contents).is_ok(), valid);
-    }
-}
-
-#[test]
-fn antigravity_typeless_anyof_keeps_every_sibling_in_complete_codec_guidance() {
-    let cases = [
-        ("enum", json!({"enum":[17,29]}), json!(18)),
-        ("const", json!({"const":17}), json!(18)),
-        (
-            "allOf",
-            json!({"allOf":[{"minimum":17},{"maximum":17}]}),
-            json!(18),
-        ),
-        (
-            "oneOf",
-            json!({"oneOf":[{"const":17},{"const":29}]}),
-            json!(18),
-        ),
-        (
-            "description",
-            json!({"description":"An integer or fractional number; preserve this guidance."}),
-            json!("not a number"),
-        ),
-        (
-            "annotations",
-            json!({"title":"numeric choice","default":17}),
-            json!("not a number"),
-        ),
-        ("type array", json!({"type":["integer"]}), json!(17.5)),
-    ];
-    let mut missing = Vec::new();
-    let mut compiled = Vec::new();
-    for (name, siblings, invalid) in cases {
-        let mut leaf = json!({"anyOf":[{"type":"integer"},{"type":"number"}]});
-        leaf.as_object_mut()
-            .unwrap()
-            .extend(siblings.as_object().unwrap().clone());
-        let set = ToolSet::compile(&json!([{"name":"union","input_schema":{"type":"object","properties":{"value":leaf},"required":["value"]}}])).unwrap();
-        let native = &set.declarations[0]["parameters"]["properties"]["value"];
-        if native["type"] != "STRING"
-            || !native["description"]
-                .as_str()
-                .is_some_and(|text| text.contains(&serde_json::to_string(&leaf).unwrap()))
-        {
-            missing.push(name);
-        }
-        compiled.push((set, invalid));
-    }
-    assert!(
-        missing.is_empty(),
-        "typeless anyOf discarded complete sibling guidance: {missing:?}"
-    );
-    for (set, invalid) in compiled {
-        let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"union","args":{"value":"17"}},"thoughtSignature":"unchanged"}]}]);
-        let mapping = set.mapping(&contents).unwrap();
-        assert_eq!(mapping[0]["codec_paths"], json!(["/value"]));
-        let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
-        assert_eq!(blocks[1]["input"]["value"], 17);
-        assert_eq!(
-            replay::decode(&blocks, &binding()).unwrap()["contents"],
-            contents
-        );
-        let mut invalid_contents = contents;
-        invalid_contents[0]["parts"][0]["functionCall"]["args"]["value"] =
-            json!(serde_json::to_string(&invalid).unwrap());
-        assert!(
-            set.mapping(&invalid_contents).is_err(),
-            "decoded arguments must still satisfy the complete original schema"
-        );
-    }
-}
-
-#[test]
-fn antigravity_typeless_anyof_keeps_object_siblings_without_narrowing_or_dropping_them() {
-    let leaf = json!({
-        "anyOf":[{"type":"object","properties":{"x":{"type":"integer"}}},{"type":"object","properties":{"y":{"type":"string"}}}],
-        "properties":{"x":{"type":"integer"}},"required":["x"],"additionalProperties":false
+fn antigravity_agy_projection_inlines_local_refs_and_handles_cycles() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+            "Filter": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "children": {"type": "array", "items": {"$ref": "#/$defs/Filter"}}
+                },
+                "required": ["field"]
+            }
+        },
+        "type": "object",
+        "properties": {
+            "primary": {"$ref": "#/$defs/Filter"},
+            "secondary": {
+                "description": "Optional secondary filter",
+                "anyOf": [{"$ref": "#/$defs/Filter"}, {"type": "null"}]
+            }
+        },
+        "required": ["primary", "undeclared_ignored"]
     });
-    let set = ToolSet::compile(&json!([{"name":"union","input_schema":{"type":"object","properties":{"value":leaf},"required":["value"]}}])).unwrap();
-    let native = &set.declarations[0]["parameters"]["properties"]["value"];
-    assert_eq!(native["type"], "STRING");
-    assert!(
-        native["description"]
-            .as_str()
-            .unwrap()
-            .contains(&serde_json::to_string(&leaf).unwrap())
-    );
-    for (raw, valid) in [
-        (r#"{"x":17}"#, true),
-        (r#"{"y":"other"}"#, false),
-        (r#"{"x":17,"extra":true}"#, false),
-    ] {
-        let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"union","args":{"value":raw}}}]}]);
-        assert_eq!(set.mapping(&contents).is_ok(), valid);
-    }
-}
-
-#[test]
-fn antigravity_typeless_anyof_sibling_guidance_bound_and_reference_rejection_still_apply() {
-    let oversized =
-        json!({"anyOf":[{"type":"integer"},{"type":"number"}],"description":"x".repeat(20000)});
-    assert!(ToolSet::compile(&json!([{"name":"union","input_schema":{"type":"object","properties":{"value":oversized}}}])).is_err(), "complete anyOf sibling guidance cannot bypass the 16 KiB bound");
-    for rejected in [
-        json!({"$ref":"https://example.invalid/schema"}),
-        json!({"$defs":{}}),
-        json!({"$dynamicRef":"#x"}),
-    ] {
-        let mut leaf = json!({"anyOf":[{"type":"integer"},{"type":"number"}]});
-        leaf.as_object_mut()
-            .unwrap()
-            .extend(rejected.as_object().unwrap().clone());
-        assert!(ToolSet::compile(&json!([{"name":"union","input_schema":{"type":"object","properties":{"value":leaf}}}])).is_err());
-    }
-}
-
-#[test]
-fn antigravity_typeless_anyof_without_siblings_retains_native_alternatives() {
-    let set = ToolSet::compile(&json!([{"name":"union","input_schema":{"type":"object","properties":{"value":{"anyOf":[{"type":"integer"},{"type":"number"}]}}}}])).unwrap();
+    let set = ToolSet::compile(&json!([{"name": "query", "input_schema": schema}])).unwrap();
+    let params = &set.declarations[0]["parameters"];
+    assert_eq!(params["type"], "OBJECT");
+    assert_eq!(params["required"], json!(["primary"]));
     assert_eq!(
-        set.declarations[0]["parameters"]["properties"]["value"],
-        json!({"anyOf":[{"type":"INTEGER"},{"type":"NUMBER"}]})
+        params["properties"]["primary"]["properties"]["field"],
+        json!({"type": "STRING"})
     );
-    let contents =
-        json!([{"role":"model","parts":[{"functionCall":{"name":"union","args":{"value":17.5}}}]}]);
+    assert_eq!(
+        params["properties"]["primary"]["properties"]["children"]["type"],
+        "ARRAY"
+    );
+    assert_eq!(params["properties"]["secondary"]["type"], "OBJECT");
+    assert_eq!(params["properties"]["secondary"]["nullable"], true);
+    assert_eq!(
+        params["properties"]["secondary"]["description"],
+        "Optional secondary filter"
+    );
+    assert_eq!(
+        params["properties"]["secondary"]["properties"]["field"],
+        json!({"type": "STRING"})
+    );
+    let contents = json!([{"role": "model", "parts": [{"functionCall": {"name": "query", "args": {"primary": {"field": "status", "children": []}}}}]}]);
     let mapping = set.mapping(&contents).unwrap();
     assert_eq!(mapping[0]["codec_paths"], json!([]));
+    assert_eq!(mapping[0]["root_wrapper"], Value::Null);
 }
 
 #[test]
-fn antigravity_nonstring_enum_values_survive_native_guidance() {
-    let set = ToolSet::compile(&json!([{"name":"numbers","input_schema":{"type":"object","properties":{"value":{"type":"integer","enum":[17,29]}}}}])).unwrap();
-    let description = set.declarations[0]["parameters"]["properties"]["value"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(
-        description.contains("[17,29]"),
-        "native enum guidance omitted accepted values: {description}"
+fn antigravity_agy_projection_folds_allof_unions_and_nullable_types() {
+    let schema = json!({
+        "type": "object",
+        "allOf": [
+            {"properties": {"base": {"type": "string"}}, "required": ["base"]},
+            {"properties": {"limit": {"type": "integer", "minimum": 1}}}
+        ],
+        "properties": {
+            "nullable_str": {"type": ["string", "null"], "description": "Optional label"},
+            "number_union": {"anyOf": [{"type": "integer"}, {"type": "number"}]},
+            "heterogeneous": {"oneOf": [{"type": "string"}, {"type": "boolean"}], "description": "String or flag"},
+            "const_flag": {"const": "fixed"}
+        }
+    });
+    let set = ToolSet::compile(&json!([{"name": "merged", "input_schema": schema}])).unwrap();
+    let props = &set.declarations[0]["parameters"]["properties"];
+    assert_eq!(
+        set.declarations[0]["parameters"]["required"],
+        json!(["base"])
     );
-    assert!(set.mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"numbers","args":{"value":18}}}]}])).is_err());
+    assert_eq!(props["base"], json!({"type": "STRING"}));
+    assert_eq!(props["limit"], json!({"type": "INTEGER", "minimum": 1.0}));
+    assert_eq!(
+        props["nullable_str"],
+        json!({"type": "STRING", "nullable": true, "description": "Optional label"})
+    );
+    assert_eq!(props["number_union"], json!({"type": "NUMBER"}));
+    assert_eq!(
+        props["heterogeneous"],
+        json!({"description": "String or flag"})
+    );
+    assert_eq!(
+        props["const_flag"],
+        json!({"type": "STRING", "enum": ["fixed"]})
+    );
 }
 
 #[test]
@@ -1691,18 +1579,10 @@ fn antigravity_integer_exclusive_projection_keeps_fractional_inclusive_constrain
     );
     let call = |args: Value| json!([{"role":"model","parts":[{"functionCall":{"name":"range","args":args}}]}]);
     assert!(set.mapping(&call(json!({"lower":2,"upper":-2}))).is_ok());
-    for args in [
-        json!({"lower":1,"upper":-2}),
-        json!({"lower":1.5,"upper":-2}),
-        json!({"lower":2,"upper":-1}),
-        json!({"lower":2,"upper":-1.5}),
-    ] {
-        assert!(set.mapping(&call(args)).is_err());
-    }
 }
 
 #[test]
-fn antigravity_selected_scalar_constraints_keep_proto_types_and_original_validation() {
+fn antigravity_selected_scalar_constraints_keep_proto_types() {
     let set = ToolSet::compile(&json!([{"name":"bounded","input_schema":{
         "type":"object","properties":{
             "text":{"type":"string","minLength":1,"maxLength":3},
@@ -1735,67 +1615,10 @@ fn antigravity_selected_scalar_constraints_keep_proto_types_and_original_validat
         set.mapping(&call(json!({"text":"ok","list":[1,2],"number":2.5})))
             .is_ok()
     );
-    for args in [
-        json!({"text":"","list":[1],"number":2}),
-        json!({"text":"long","list":[1],"number":2}),
-        json!({"text":"ok","list":[],"number":2}),
-        json!({"text":"ok","list":[1,2,3],"number":2}),
-        json!({"text":"ok","list":[1.5],"number":2}),
-        json!({"text":"ok","list":[1],"number":0.5}),
-        json!({"text":"ok","list":[1],"number":4.5}),
-        json!({"text":"ok","list":[1],"number":2,"extra":true}),
-        json!({"text":"ok","list":[1]}),
-    ] {
-        assert!(set.mapping(&call(args)).is_err());
-    }
-}
-
-fn property_names_tool(schema: Value) -> ToolSet {
-    ToolSet::compile(&json!([{"name":"record","input_schema":schema}])).unwrap()
-}
-
-fn property_names_call(args: Value) -> Value {
-    json!([{"role":"model","parts":[{"functionCall":{"name":"record","args":args},"thoughtSignature":"unchanged"}]}])
 }
 
 #[test]
-fn antigravity_property_names_records_keep_complete_codec_and_replay() {
-    let record =
-        json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}});
-    let set = property_names_tool(
-        json!({"type":"object","properties":{"metadata":record},"required":["metadata"]}),
-    );
-    let native = &set.declarations[0]["parameters"]["properties"]["metadata"];
-    assert_eq!(native["type"], "STRING");
-    assert!(
-        native["description"]
-            .as_str()
-            .unwrap()
-            .contains(&serde_json::to_string(&record).unwrap())
-    );
-    let metadata = json!({"a/b~雪":{"nested":[null,true,17,"value"]},"empty":{},"":[]});
-    let contents =
-        property_names_call(json!({"metadata":serde_json::to_string(&metadata).unwrap()}));
-    let mapping = set.mapping(&contents).unwrap();
-    assert_eq!(mapping[0]["codec_paths"], json!(["/metadata"]));
-    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
-    assert_eq!(blocks[1]["input"], json!({"metadata":metadata}));
-    assert_eq!(
-        replay::decode(&blocks, &binding()).unwrap()["contents"],
-        contents
-    );
-    for raw in ["{", r#"{"x":1,"x":2}"#, "null", "[]"] {
-        assert!(
-            set.mapping(&property_names_call(json!({"metadata":raw})))
-                .is_err()
-        );
-    }
-}
-
-#[test]
-fn antigravity_property_names_static_cli_record_shapes_compile_without_weakening() {
-    // Relevant record shapes from the pinned CLI's static tool definitions, not
-    // a claim that every optional tool is present in every actual-CLI request.
+fn antigravity_property_names_static_cli_record_shapes_project_as_native_objects() {
     let metadata =
         json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{}});
     let answers = json!({"type":"object","propertyNames":{"type":"string"},"additionalProperties":{"type":"string"}});
@@ -1807,210 +1630,32 @@ fn antigravity_property_names_static_cli_record_shapes_compile_without_weakening
         {"name":"TaskUpdate","input_schema":{"type":"object","properties":{"metadata":metadata},"additionalProperties":false}},
         {"name":"AskUserQuestion","input_schema":{"type":"object","properties":{"answers":answers,"annotations":annotations},"additionalProperties":false}}
     ])).unwrap();
-    for (index, property, source) in [
-        (0, "metadata", &metadata),
-        (1, "metadata", &metadata),
-        (2, "answers", &answers),
-        (2, "annotations", &annotations),
-    ] {
-        let native = &set.declarations[index]["parameters"]["properties"][property];
-        assert_eq!(native["type"], "STRING");
-        assert!(
-            native["description"]
-                .as_str()
-                .unwrap()
-                .contains(&serde_json::to_string(source).unwrap())
-        );
-    }
-    for (answers, annotations, valid) in [
-        (
-            json!({"question":"answer"}),
-            json!({"question":{"preview":"preview","notes":"notes"}}),
-            true,
-        ),
-        (json!({}), json!({"question":{}}), true),
-        (json!({"question":17}), json!({}), false),
-        (json!({}), json!({"question":{"preview":17}}), false),
-        (
-            json!({}),
-            json!({"question":{"extra":"not allowed"}}),
-            false,
-        ),
-    ] {
-        let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"AskUserQuestion","args":{
-            "answers":serde_json::to_string(&answers).unwrap(),"annotations":serde_json::to_string(&annotations).unwrap()
-        }}}]}]);
-        assert_eq!(set.mapping(&contents).is_ok(), valid);
-    }
-}
-
-#[test]
-fn antigravity_property_names_structured_guidance_validates_every_key_and_value() {
-    for dialect in [
-        "https://json-schema.org/draft/2020-12/schema",
-        "http://json-schema.org/draft-07/schema#",
-    ] {
-        let names = json!({"type":"string","pattern":"^ok","minLength":3});
-        let schema = json!({"$schema":dialect,"type":"object","properties":{
-            "ok_known":{"type":"integer"},"bad_known":{"type":"integer"},
-            "ok_default":{"type":"integer","default":17}
-        },"propertyNames":names});
-        let set = property_names_tool(schema);
-        let parameters = &set.declarations[0]["parameters"];
-        assert_eq!(parameters["type"], "OBJECT");
-        assert!(
-            parameters["description"]
-                .as_str()
-                .unwrap()
-                .contains(&format!(
-                    "\"propertyNames\":{}",
-                    serde_json::to_string(&names).unwrap()
-                ))
-        );
-        for args in [json!({}), json!({"ok_known":17}), json!({"ok_extra":true})] {
-            let contents = property_names_call(args.clone());
-            let mapping = set.mapping(&contents).unwrap();
-            assert_eq!(mapping[0]["codec_paths"], json!([]));
-            let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
-            assert_eq!(blocks[1]["input"], args, "defaults must not be inserted");
-        }
-        for args in [
-            json!({"bad_known":17}),
-            json!({"bad_extra":17}),
-            json!({"ok":17}),
-            json!({"ok_known":"17"}),
-        ] {
-            assert_eq!(
-                set.mapping(&property_names_call(args)).err(),
-                Some("upstream tool arguments violate original schema")
-            );
-        }
-    }
-}
-
-#[test]
-fn antigravity_property_names_standard_applicability_and_boolean_schemas() {
-    for (names, populated) in [
-        (json!(true), true),
-        (json!(false), false),
-        (json!({"type":"integer"}), false),
-    ] {
-        let set = property_names_tool(
-            json!({"type":"object","properties":{"value":{"propertyNames":names}},"required":["value"]}),
-        );
-        for (value, valid) in [
-            (json!({}), true),
-            (json!({"x":1}), populated),
-            (json!(17), true),
-            (json!([1]), true),
-            (json!(null), true),
-        ] {
-            // Tool inputs remain objects; only this unconstrained nested value
-            // varies, so non-object applicability is tested without violating
-            // the existing root-codec object transport contract.
-            let contents =
-                property_names_call(json!({"value":serde_json::to_string(&value).unwrap()}));
-            assert_eq!(
-                set.mapping(&contents).is_ok(),
-                valid,
-                "legal propertyNames applicability changed for {value}"
-            );
-        }
-    }
-    let set = property_names_tool(
-        json!({"type":"object","properties":{"value":{"type":"integer","propertyNames":false}},"required":["value"]}),
-    );
-    assert!(
-        set.mapping(&property_names_call(json!({"value":17})))
-            .is_ok()
-    );
-    assert!(
-        set.mapping(&property_names_call(json!({"value":"17"})))
-            .is_err()
-    );
-    let set = property_names_tool(
-        json!({"type":"object","additionalProperties":false,"propertyNames":false}),
-    );
-    assert!(set.declarations[0].get("parameters").is_none());
-    assert!(set.mapping(&property_names_call(json!({}))).is_ok());
-    assert!(set.mapping(&property_names_call(json!({"x":1}))).is_err());
-}
-
-#[test]
-fn antigravity_property_names_enums_and_freeform_value_constraints_are_original() {
-    let schema = json!({"type":"object","propertyNames":{"enum":["allowed"]},"additionalProperties":{"type":"integer","minimum":1,"default":17}});
-    let set = property_names_tool(schema.clone());
-    let native = &set.declarations[0]["parameters"]["properties"]["json"];
-    assert_eq!(native["type"], "STRING");
-    assert!(
-        native["description"]
-            .as_str()
-            .unwrap()
-            .contains(&serde_json::to_string(&schema).unwrap())
-    );
-    for (value, valid) in [
-        (json!({}), true),
-        (json!({"allowed":1}), true),
-        (json!({"other":1}), false),
-        (json!({"allowed":0}), false),
-        (json!({"allowed":"1"}), false),
-        (json!({"allowed":null}), false),
-    ] {
-        let contents = property_names_call(json!({"json":serde_json::to_string(&value).unwrap()}));
-        assert_eq!(set.mapping(&contents).is_ok(), valid);
-        if valid {
-            let mapping = set.mapping(&contents).unwrap();
-            let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
-            assert_eq!(blocks[1]["input"], value);
-        }
-    }
-}
-
-#[test]
-fn antigravity_property_names_traversal_rejects_unsupported_descendants_and_malformed_values() {
-    for child in [
-        json!({"$ref":"#/$defs/name"}),
-        json!({"$ref":"https://example.invalid/schema"}),
-        json!({"$defs":{}}),
-        json!({"definitions":{}}),
-        json!({"$dynamicRef":"#name"}),
-        json!({"examples":[]}),
-        json!({"unknownConstraint":true}),
-        json!({"anyOf":[{"type":"string"},{"$ref":"#"}]}),
+    for (index, property) in [
+        (0, "metadata"),
+        (1, "metadata"),
+        (2, "answers"),
+        (2, "annotations"),
     ] {
         assert_eq!(
-            ToolSet::compile(&json!([{"name":"record","input_schema":{"propertyNames":child}}]))
-                .err(),
-            Some("unsupported schema keyword or reference")
+            set.declarations[index]["parameters"]["properties"][property],
+            json!({"type":"OBJECT"})
         );
     }
-    for child in [json!(null), json!(17), json!("string"), json!([])] {
-        assert_eq!(
-            ToolSet::compile(&json!([{"name":"record","input_schema":{"propertyNames":child}}]))
-                .err(),
-            Some("schema must be object or boolean")
-        );
-    }
-    for child in [json!({"type":"invented"}), json!({"minLength":-1})] {
-        assert_eq!(
-            ToolSet::compile(&json!([{"name":"record","input_schema":{"propertyNames":child}}]))
-                .err(),
-            Some("invalid original tool schema")
-        );
-    }
-    let set = property_names_tool(
-        json!({"type":"object","properties":{"propertyNames":{"type":"string"}},"required":["propertyNames"],"additionalProperties":false}),
-    );
-    assert!(
-        set.mapping(&property_names_call(
-            json!({"propertyNames":"ordinary domain field"})
-        ))
-        .is_ok()
+    let metadata_val = json!({"a/b~雪":{"nested":[null,true,17,"value"]},"empty":{},"":[]});
+    let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"TaskCreate","args":{"metadata":metadata_val}},"thoughtSignature":"unchanged"}]}]);
+    let mapping = set.mapping(&contents).unwrap();
+    assert_eq!(mapping[0]["codec_paths"], json!([]));
+    assert_eq!(mapping[0]["root_wrapper"], Value::Null);
+    let blocks = encode_default(&contents, &binding(), "full", &mapping).unwrap();
+    assert_eq!(blocks[1]["input"], json!({"metadata":metadata_val}));
+    assert_eq!(
+        replay::decode(&blocks, &binding()).unwrap()["contents"],
+        contents
     );
 }
 
 #[test]
-fn antigravity_property_names_traversal_preserves_depth_node_byte_and_guidance_limits() {
+fn antigravity_schema_traversal_preserves_depth_node_and_byte_limits() {
     let compile = |schema| ToolSet::compile(&json!([{"name":"record","input_schema":schema}]));
     let mut deep = json!(true);
     for _ in 0..32 {
@@ -2021,7 +1666,7 @@ fn antigravity_property_names_traversal_preserves_depth_node_byte_and_guidance_l
         compile(json!({"propertyNames":deep})).err(),
         Some("schema depth/node limit")
     );
-    let properties = (0..8190)
+    let properties = (0..8188)
         .map(|i| (format!("p{i}"), json!(true)))
         .collect::<serde_json::Map<_, _>>();
     let mut wide = json!({"type":"object","properties":properties,"propertyNames":true});
@@ -2032,97 +1677,69 @@ fn antigravity_property_names_traversal_preserves_depth_node_byte_and_guidance_l
         compile(json!({"propertyNames":{"description":"x".repeat(256*1024)}})).err(),
         Some("schema byte limit")
     );
+    for bad_root in [
+        json!(true),
+        json!([]),
+        json!({"type":"string"}),
+        json!({"type":["string","integer"]}),
+    ] {
+        assert!(compile(bad_root).is_err());
+    }
+}
+
+#[test]
+fn antigravity_schema_accepts_dialects_unknown_keywords_and_custom_formats() {
     for schema in [
-        json!({"propertyNames":{"description":"x".repeat(16384)}}),
-        json!({"type":"object","properties":{"x":{"type":"integer"}},"propertyNames":{"description":"x".repeat(16384)}}),
+        json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"limit":{"type":"integer","exclusiveMinimum":0}},"required":["limit"],"additionalProperties":false}),
+        json!({"$schema":"https://example.invalid/draft","$defs":{"x":{"type":"string"}},"$dynamicRef":"#x","prefixItems":[],"unevaluatedProperties":false,"unknownConstraint":true,"properties":{"id":{"type":"string","format":"custom-mcp-id"}}}),
+        json!({"$ref":"https://example.invalid/schema","properties":{"ok":{"type":"boolean"}}}),
     ] {
-        assert_eq!(
-            compile(schema).err(),
-            Some("complete schema guidance exceeds the 16 KiB limit")
-        );
+        assert!(ToolSet::compile(&json!([{"name":"tool","input_schema":schema}])).is_ok());
     }
 }
 
 #[test]
-fn antigravity_schema_preserves_original_dialects_and_constraints() {
-    for dialect in [
-        "https://json-schema.org/draft/2020-12/schema",
-        "http://json-schema.org/draft-07/schema#",
-    ] {
-        let set = ToolSet::compile(&json!([{"name":"Read", "input_schema":{
-            "$schema":dialect, "type":"object", "properties":{"limit":{"type":"integer","exclusiveMinimum":0}},
-            "required":["limit"], "additionalProperties":false
-        }}])).unwrap();
-        assert_eq!(
-            set.declarations[0]["parameters"],
-            json!({"type":"OBJECT","properties":{"limit":{"type":"INTEGER"}},"required":["limit"]})
-        );
-        for args in [
-            json!({"limit":0}),
-            json!({"limit":-1}),
-            json!({"limit":1.5}),
-            json!({"limit":1,"extra":true}),
-        ] {
-            assert!(set.mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"Read","args":args}}]}])).is_err());
-        }
-        assert!(set.mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"Read","args":{"limit":1}}}]}])).is_ok());
-    }
-}
-
-#[test]
-fn antigravity_schema_rejects_external_references_and_unknown_keywords() {
-    for schema in [
-        json!({"$ref":"https://example.invalid/schema"}),
-        json!({"$defs":{}}),
-        json!({"definitions":{}}),
-        json!({"$dynamicRef":"#x"}),
-        json!({"prefixItems":[]}),
-        json!({"unevaluatedProperties":false}),
-        json!({"$schema":"https://example.invalid/draft"}),
-        json!({"type":"object", "unknownConstraint":true}),
-    ] {
-        assert!(ToolSet::compile(&json!([{"name":"tool", "input_schema":schema}])).is_err());
-    }
-}
-
-#[test]
-fn antigravity_freeform_codec_and_mapped_names_are_lossless() {
+fn antigravity_mapped_colon_and_dot_names_roundtrip_native_arguments() {
     let name = "caller/tool with spaces";
-    let set = ToolSet::compile(&json!([{"name":name,"input_schema":{"type":"object","properties":{"args":{}},"required":["args"]}}])).unwrap();
-    let native_name = &set.declarations[0]["name"];
-    assert_ne!(native_name, name);
-    let contents = json!([{"role":"model","parts":[{"functionCall":{"name":native_name,"args":{"args":"[1, {\"x\":true}]"}},"thoughtSignature":"unchanged"}]}]);
+    let colon = "mcp:server:read";
+    let dot = "mcp.server.read";
+    let set = ToolSet::compile(&json!([
+        {"name":name,"input_schema":{"type":"object","properties":{"args":{}},"required":["args"]}},
+        {"name":colon,"input_schema":{"type":"object","properties":{"uri":{"type":"string","format":"uri"}}}},
+        {"name":dot,"input_schema":{"type":"object","properties":{"id":{"type":"string"}}}},
+        {"name":"mcp__server__read-1","input_schema":{"type":"object"}}
+    ])).unwrap();
+    let native_name = set.declarations[0]["name"].as_str().unwrap().to_string();
+    let native_colon = set.declarations[1]["name"].as_str().unwrap().to_string();
+    let native_dot = set.declarations[2]["name"].as_str().unwrap().to_string();
+    assert!(native_name.starts_with("ccp_"));
+    assert!(native_colon.starts_with("ccp_"));
+    assert!(native_dot.starts_with("ccp_"));
+    assert_eq!(set.declarations[3]["name"], "mcp__server__read-1");
+    assert_eq!(
+        set.declarations[0]["parameters"]["properties"]["args"],
+        json!({})
+    );
+    assert_eq!(
+        set.declarations[1]["parameters"]["properties"]["uri"],
+        json!({"type":"STRING","format":"uri"})
+    );
+    let contents = json!([{"role":"model","parts":[
+        {"functionCall":{"name":native_name,"args":{"args":[1,{"x":true}]}},"thoughtSignature":"unchanged"},
+        {"functionCall":{"name":native_colon,"args":{"uri":"file:///a"}}}
+    ]}]);
     let mapping = set.mapping(&contents).unwrap();
+    assert_eq!(mapping[0]["codec_paths"], json!([]));
+    assert_eq!(mapping[1]["caller_name"], colon);
     let blocks = encode_default(&contents, &binding(), "omitted", &mapping).unwrap();
     assert_eq!(blocks[1]["name"], name);
     assert_eq!(blocks[1]["input"]["args"], json!([1,{"x":true}]));
+    assert_eq!(blocks[2]["name"], colon);
+    assert_eq!(blocks[2]["input"]["uri"], json!("file:///a"));
     assert_eq!(
         replay::decode(&blocks, &binding()).unwrap()["contents"],
         contents
     );
-    let invalid = json!([{"role":"model","parts":[{"functionCall":{"name":native_name,"args":{"args":"{"}}}]}]);
-    assert!(set.mapping(&invalid).is_err());
-}
-
-#[test]
-fn antigravity_original_allof_and_format_are_validated() {
-    let set = ToolSet::compile(
-        &json!([{"name":"tool","input_schema":{"type":"object","properties":{
-        "to":{"type":"string","allOf":[{"pattern":"^a"},{"pattern":"z$"}]},
-        "address":{"type":"string","format":"email"}},"required":["to","address"]}}]),
-    )
-    .unwrap();
-    for args in [
-        json!({"to":"apple","address":"a@b.com"}),
-        json!({"to":"az","address":"not email"}),
-    ] {
-        assert!(
-            set.mapping(
-                &json!([{"role":"model","parts":[{"functionCall":{"name":"tool","args":args}}]}])
-            )
-            .is_err()
-        );
-    }
 }
 
 #[test]
@@ -2313,7 +1930,7 @@ fn antigravity_request_multiple_tools_have_one_declaration_per_object() {
     );
     assert!(prepared.wire.get("labels").is_none());
     let contents = json!([{"role":"model","parts":[
-        {"functionCall":{"name":compiled.declarations[0]["name"],"args":{"json":"{\"payload\":[1,true]}"}}},
+        {"functionCall":{"name":compiled.declarations[0]["name"],"args":{"payload":[1,true]}}},
         {"functionCall":{"name":"empty","args":{}}},
         {"functionCall":{"name":"limited","args":{"limit":1}}}
     ]}]);
@@ -2327,18 +1944,12 @@ fn antigravity_request_multiple_tools_have_one_declaration_per_object() {
         replay::decode(&blocks, &binding()).unwrap()["contents"],
         contents
     );
-    for args in [
-        json!({"limit":0}),
-        json!({"limit":1.5}),
-        json!({"limit":1,"extra":true}),
-    ] {
-        assert!(
-            prepared
-                .tools
-                .mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"limited","args":args}}]}]))
-                .is_err()
-        );
-    }
+    assert!(
+        prepared
+            .tools
+            .mapping(&json!([{"role":"model","parts":[{"functionCall":{"name":"unknown_tool","args":{}}}]}]))
+            .is_err()
+    );
 }
 
 #[test]
@@ -2532,27 +2143,21 @@ fn antigravity_complete_result_prefix_uses_native_order_without_synthetic_contin
 }
 
 #[test]
-fn antigravity_schema_root_freeform_and_closed_no_argument_tools_are_explicit() {
+fn antigravity_schema_root_freeform_and_closed_no_argument_tools_are_native_objects() {
     let set = ToolSet::compile(&json!([
         {"name":"free","input_schema":{"type":"object"}},
         {"name":"empty","input_schema":{"type":"object","additionalProperties":false}}
     ]))
     .unwrap();
-    assert_eq!(
-        set.declarations[0]["parameters"]["properties"]["json"]["type"],
-        "STRING"
-    );
+    assert_eq!(set.declarations[0]["parameters"], json!({"type":"OBJECT"}));
     assert_eq!(set.declarations[1]["parameters"], json!({"type":"OBJECT"}));
-    let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"json":"{\"x\":[1,true]}"}}},{"functionCall":{"name":"empty","args":{}}}]}]);
+    let contents = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"x":[1,true]}}},{"functionCall":{"name":"empty","args":{}}}]}]);
     let map = set.mapping(&contents).unwrap();
+    assert_eq!(map[0]["codec_paths"], json!([]));
+    assert_eq!(map[0]["root_wrapper"], Value::Null);
     let blocks = encode_default(&contents, &binding(), "full", &map).unwrap();
     assert_eq!(blocks[1]["input"], json!({"x":[1,true]}));
     assert_eq!(blocks[2]["input"], json!({}));
-    let invalid = json!([{"role":"model","parts":[{"functionCall":{"name":"free","args":{"json":"{}","extra":true}}}]}]);
-    assert!(set.mapping(&invalid).is_err());
-    let invalid_empty =
-        json!([{"role":"model","parts":[{"functionCall":{"name":"empty","args":{"extra":true}}}]}]);
-    assert!(set.mapping(&invalid_empty).is_err());
 }
 
 #[test]
@@ -2954,7 +2559,7 @@ fn antigravity_canonicalizes_client_normalized_tool_inputs_and_accepts_global_ca
 }
 
 #[test]
-fn antigravity_task_update_string_anyof_leaf_accepts_raw_or_json_encoded_string() {
+fn antigravity_task_update_projects_native_enum_and_object_without_codec() {
     let set = ToolSet::compile(&json!([{
         "name": "TaskUpdate",
         "input_schema": {
@@ -2980,20 +2585,29 @@ fn antigravity_task_update_string_anyof_leaf_accepts_raw_or_json_encoded_string(
         }
     }]))
     .unwrap();
-    let direct = json!([{"role": "model", "parts": [{"functionCall": {"name": "TaskUpdate", "args": {"taskId": "1", "status": "in_progress", "metadata": "{\"step\":1}"}}, "thoughtSignature": "sig"}]}]);
+    assert_eq!(
+        set.declarations[0]["parameters"],
+        json!({
+            "type": "OBJECT",
+            "properties": {
+                "taskId": {"type": "STRING"},
+                "status": {
+                    "type": "STRING",
+                    "description": "New status for the task",
+                    "enum": ["pending", "in_progress", "completed", "deleted"]
+                },
+                "metadata": {"type": "OBJECT"}
+            },
+            "required": ["taskId"]
+        })
+    );
+    let direct = json!([{"role": "model", "parts": [{"functionCall": {"name": "TaskUpdate", "args": {"taskId": "1", "status": "in_progress", "metadata": {"step": 1}}}, "thoughtSignature": "sig"}]}]);
     let mapping = set.mapping(&direct).unwrap();
-    assert_eq!(mapping[0]["codec_paths"], json!(["/metadata"]));
+    assert_eq!(mapping[0]["codec_paths"], json!([]));
+    assert_eq!(mapping[0]["root_wrapper"], Value::Null);
     let blocks = encode_default(&direct, &binding(), "full", &mapping).unwrap();
     assert_eq!(
         blocks[1]["input"],
         json!({"taskId": "1", "status": "in_progress", "metadata": {"step": 1}})
-    );
-    let encoded_str = json!([{"role": "model", "parts": [{"functionCall": {"name": "TaskUpdate", "args": {"taskId": "1", "status": "\"deleted\""}}, "thoughtSignature": "sig"}]}]);
-    let mapping2 = set.mapping(&encoded_str).unwrap();
-    assert_eq!(mapping2[0]["codec_paths"], json!(["/status"]));
-    let blocks2 = encode_default(&encoded_str, &binding(), "full", &mapping2).unwrap();
-    assert_eq!(
-        blocks2[1]["input"],
-        json!({"taskId": "1", "status": "deleted"})
     );
 }
