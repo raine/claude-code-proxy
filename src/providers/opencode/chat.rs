@@ -80,12 +80,19 @@ pub fn prepare_request(req: &MessagesRequest, model: &str) -> anyhow::Result<Cha
 
 fn build_messages(req: &MessagesRequest, model: &str) -> anyhow::Result<Vec<Value>> {
     let deepseek = model.to_ascii_lowercase().contains("deepseek");
-    let mut system = Vec::new();
+    let mut messages = Vec::new();
     if let Some(text) = flatten_system_text(req.extra.get("system")) {
-        system.push(text);
+        messages.push(json!({"role": "system", "content": text}));
     }
 
-    let mut messages = Vec::new();
+    // Claude Code appends a system message mid-conversation on most turns.
+    // Hoisting it into the leading system message rewrote the prompt's start
+    // on every request and voided the upstream prefix cache, so it stays at
+    // its own position as a user message: chat templates such as DeepSeek's
+    // gather every system message to the front, which would void it again.
+    // A reminder that lands between an assistant tool call and its results
+    // waits until those results are in place.
+    let mut pending_reminders = Vec::new();
     for message in &req.messages {
         let blocks = normalize_content(&message.content, json!({}));
         match message.role.as_str() {
@@ -99,7 +106,7 @@ fn build_messages(req: &MessagesRequest, model: &str) -> anyhow::Result<Vec<Valu
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !text.is_empty() {
-                    system.push(text);
+                    pending_reminders.push(reminder_message(&text));
                 }
             }
             "user" => push_user_messages(&mut messages, &blocks),
@@ -110,18 +117,31 @@ fn build_messages(req: &MessagesRequest, model: &str) -> anyhow::Result<Vec<Valu
             }
             other => anyhow::bail!("unexpected message role: {other}"),
         }
+        if !awaits_tool_results(messages.last()) {
+            messages.append(&mut pending_reminders);
+        }
     }
-
-    if !system.is_empty() {
-        messages.insert(
-            0,
-            json!({
-                "role": "system",
-                "content": system.join("\n\n"),
-            }),
-        );
-    }
+    messages.append(&mut pending_reminders);
     Ok(messages)
+}
+
+fn reminder_message(text: &str) -> Value {
+    let content = if text.trim_start().starts_with("<system-reminder>") {
+        text.to_string()
+    } else {
+        format!("<system-reminder>\n{text}\n</system-reminder>")
+    };
+    json!({"role": "user", "content": content})
+}
+
+fn awaits_tool_results(last: Option<&Value>) -> bool {
+    last.is_some_and(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+    })
 }
 
 fn push_user_messages(messages: &mut Vec<Value>, blocks: &[ContentBlock]) {
@@ -1419,6 +1439,79 @@ mod tests {
                 "type":"image_url",
                 "image_url":{"url":"data:image/png;base64,YWJj"}
             }])
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_messages_keep_the_upstream_prompt_append_only() {
+        let turn_one = json!([
+            {"role":"user","content":"start"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"call_1","name":"Read","input":{"file_path":"a"}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"a"}]},
+            {"role":"system","content":"first reminder"}
+        ]);
+        let mut turn_two = turn_one.as_array().unwrap().clone();
+        turn_two.extend([
+            json!({"role":"assistant","content":[{"type":"text","text":"done"}]}),
+            json!({"role":"user","content":"next"}),
+            json!({"role":"system","content":"second reminder"}),
+        ]);
+        let wire = |messages: Value| {
+            let req = request(json!({"system":"base", "messages":messages}));
+            serde_json::to_value(prepare_request(&req, "deepseek-v4.1-flash").unwrap()).unwrap()
+                ["messages"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        let first = wire(turn_one);
+        let second = wire(Value::Array(turn_two));
+        assert_eq!(first[0], json!({"role":"system","content":"base"}));
+        assert_eq!(second[..first.len()], first[..]);
+        assert_eq!(
+            first.last().unwrap(),
+            &json!({"role":"user","content":"<system-reminder>\nfirst reminder\n</system-reminder>"})
+        );
+        assert_eq!(
+            second
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reminder_between_a_tool_call_and_its_result_waits_for_the_result() {
+        let req = request(json!({
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_1","name":"Bash","input":{"command":"pwd"}}
+                ]},
+                {"role":"system","content":"<system-reminder>already tagged</system-reminder>"},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"/tmp"},
+                    {"type":"text","text":"and then"}
+                ]}
+            ]
+        }));
+        let wire = serde_json::to_value(prepare_request(&req, "glm-5.2").unwrap()).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["assistant", "tool", "user", "user"]
+        );
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["content"], "and then");
+        assert_eq!(
+            messages[3]["content"],
+            "<system-reminder>already tagged</system-reminder>"
         );
     }
 
