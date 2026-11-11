@@ -61,6 +61,8 @@ struct CodexConfig {
     pub request_compression: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
+    #[serde(rename = "emptyCompletion")]
+    pub empty_completion: Option<String>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
     #[serde(rename = "fullLane")]
@@ -366,6 +368,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if let Some(mode) = codex.empty_completion.as_deref() {
+                out.push(format!("codex.emptyCompletion: {mode}"));
             }
             if let Some(enabled) = codex.request_compression {
                 out.push(format!("codex.requestCompression: {enabled}"));
@@ -752,6 +757,32 @@ pub fn codex_server_compaction() -> bool {
     false
 }
 
+/// `end_turn` accepts a repeated empty Codex completion as a valid empty end_turn for any
+/// request, after one retry. The default, `retry`, accepts it only after resolved tool
+/// results and otherwise retries, then answers 503.
+pub fn codex_empty_completion_end_turn() -> bool {
+    fn parse(raw: &str) -> Option<bool> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "end_turn" | "end-turn" => Some(true),
+            "retry" => Some(false),
+            _ => None,
+        }
+    }
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(mode) = env
+        .get("CCP_CODEX_EMPTY_COMPLETION")
+        .and_then(|raw| parse(raw))
+    {
+        return mode;
+    }
+    let config_dir = paths::config_dir();
+    read_file_config(&config_dir)
+        .and_then(|file| file.codex)
+        .and_then(|codex| codex.empty_completion)
+        .and_then(|raw| parse(&raw))
+        .unwrap_or(false)
+}
+
 pub fn codex_responses_api() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
@@ -1077,6 +1108,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
             EnvGuard::unset("CCP_CODEX_REQUEST_COMPRESSION"),
             EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
+            EnvGuard::unset("CCP_CODEX_EMPTY_COMPLETION"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
             EnvGuard::unset("CCP_CODEX_FULL_LANE"),
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
@@ -1221,6 +1253,28 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
         assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[test]
+    fn codex_empty_completion_mode_reads_env_and_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(!codex_empty_completion_end_turn());
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"emptyCompletion":"end_turn"}}"#,
+        )
+        .unwrap();
+        assert!(codex_empty_completion_end_turn());
+        unsafe {
+            std::env::set_var("CCP_CODEX_EMPTY_COMPLETION", "retry");
+        }
+        assert!(!codex_empty_completion_end_turn());
+        unsafe {
+            std::env::set_var("CCP_CODEX_EMPTY_COMPLETION", "end_turn");
+        }
+        assert!(codex_empty_completion_end_turn());
     }
 
     #[test]

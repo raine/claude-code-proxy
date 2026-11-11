@@ -113,6 +113,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | Sets how long an HTTP-transport request waits for the Codex response headers. Values below `1000` are ignored. |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
 | `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |
+| `CCP_CODEX_EMPTY_COMPLETION` | `codex.emptyCompletion` | `retry` | `end_turn` turns a repeated empty Codex completion into an empty `end_turn` for any request, after one retry. `retry` does that only after resolved tool results and otherwise retries, then answers 503. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Enables parallel tool calls on the six [supported full-lane models](/providers/codex/#responses-lanes-and-parallel-tools). Luna and catalog-only models keep their default lane. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |
