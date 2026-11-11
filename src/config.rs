@@ -944,7 +944,7 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    if codex_request_compression() {
+    if codex_request_compression() && !codex_previous_response_id() {
         return CodexTransport::Http;
     }
     CodexTransport::Auto
@@ -1589,6 +1589,10 @@ mod tests {
         .unwrap();
         assert!(codex_request_compression());
         assert_eq!(codex_transport(), CodexTransport::Http);
+        {
+            let _prev_resp_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
         {
             let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
             assert_eq!(codex_transport(), CodexTransport::Auto);

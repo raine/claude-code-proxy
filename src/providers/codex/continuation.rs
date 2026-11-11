@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
 use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
-const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
 struct ContinuationState {
@@ -17,7 +17,6 @@ struct ContinuationState {
     socket_id: u64,
     prompt_signature: String,
     transcript: Vec<ResponsesInputItem>,
-    transcript_bytes: u64,
     updated_at: u64,
 }
 
@@ -30,7 +29,6 @@ struct OwnerState {
 #[derive(Default)]
 struct ContinuationRegistry {
     owners: HashMap<ConversationIdentity, OwnerState>,
-    total_transcript_bytes: u64,
 }
 
 static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
@@ -154,6 +152,60 @@ pub(crate) fn continuation_candidate_for_owner(
     continuation_candidate_inner(owner, body, enabled, "missing_identity")
 }
 
+/// Derives a conversation owner when `x-claude-code-agent-id` is absent
+/// (`ConversationIdentity::Main(session_id)`) by hashing `prompt_signature`
+/// (including leading developer envelope items for Responses Lite) plus the
+/// first user message in `body.input`. Explicit `ConversationIdentity::Agent`
+/// headers are preserved unchanged.
+pub(crate) fn resolve_continuation_owner(
+    owner: Option<&ConversationIdentity>,
+    body: &ResponsesRequest,
+) -> Option<ConversationIdentity> {
+    match owner {
+        Some(ConversationIdentity::Main(session_id)) => Some(ConversationIdentity::Agent(
+            session_id.clone(),
+            synthetic_subagent_key(body),
+        )),
+        Some(ConversationIdentity::Agent(session_id, agent_id)) => Some(
+            ConversationIdentity::Agent(session_id.clone(), agent_id.clone()),
+        ),
+        None => None,
+    }
+}
+
+pub(crate) fn synthetic_subagent_key(body: &ResponsesRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prompt_signature(body).as_bytes());
+    hasher.update(b"\0");
+    for item in body
+        .input
+        .iter()
+        .take_while(|item| is_developer_envelope_item(item))
+    {
+        let value = serde_json::to_value(item).unwrap_or_default();
+        hasher.update(stable_json(&value).as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"\0");
+    if let Some(first_user) = body
+        .input
+        .iter()
+        .find(|item| matches!(item, ResponsesInputItem::Message { role, .. } if role == "user"))
+    {
+        let value = serde_json::to_value(first_user).unwrap_or_default();
+        hasher.update(stable_json(&value).as_bytes());
+    }
+    format!("synthetic,{:x}", hasher.finalize())
+}
+
+fn is_developer_envelope_item(item: &ResponsesInputItem) -> bool {
+    match item {
+        ResponsesInputItem::AdditionalTools { .. } => true,
+        ResponsesInputItem::Message { role, .. } => role == "developer",
+        _ => false,
+    }
+}
+
 fn continuation_candidate_inner(
     owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
@@ -196,11 +248,6 @@ fn continuation_candidate_inner(
         let existing = registry.owners.remove(owner);
         let superseded_turn = existing.is_some();
         let state = existing.and_then(|owner| owner.continuation);
-        if let Some(state) = &state {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(state.transcript_bytes);
-        }
         registry.owners.insert(
             owner.clone(),
             OwnerState {
@@ -348,20 +395,11 @@ pub(crate) fn record_continuation_for_owner(
     let mut transcript: Vec<ResponsesInputItem> = request_body.input.clone();
     transcript.extend_from_slice(output_items);
 
-    let transcript_json = serde_json::to_string(&transcript).unwrap_or_default();
-    let transcript_bytes = transcript_json.len() as u64;
-
-    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
-        abort_continuation_inner(Some(owner), Some(turn_id));
-        return;
-    }
-
     let state = ContinuationState {
         response_id,
         socket_id,
         prompt_signature: prompt_signature(request_body),
         transcript,
-        transcript_bytes,
         updated_at: now_ms(),
     };
 
@@ -374,13 +412,8 @@ pub(crate) fn record_continuation_for_owner(
     };
     if owner_state.current_turn != turn_id {
         return;
-    }
-    if let Some(existing) = owner_state.continuation.replace(state) {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(existing.transcript_bytes);
-    }
-    registry.total_transcript_bytes += transcript_bytes;
+    };
+    owner_state.continuation = Some(state);
     evict_oldest(registry);
 }
 
@@ -406,12 +439,8 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
         .owners
         .get(owner)
         .is_some_and(|state| state.current_turn == turn_id)
-        && let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
     {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
+        registry.owners.remove(owner);
     }
 }
 
@@ -501,13 +530,7 @@ pub(crate) fn clear_continuation_for_owner(owner: Option<&ConversationIdentity>)
     let Some(registry) = guard.as_mut() else {
         return;
     };
-    if let Some(state) = registry.owners.remove(owner)
-        && let Some(continuation) = state.continuation
-    {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
-    }
+    registry.owners.remove(owner);
 }
 
 #[deprecated(note = "use the owner-aware test helper for typed conversation ownership")]
@@ -632,9 +655,7 @@ fn stable_json(value: &serde_json::Value) -> String {
 }
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
-    while registry.owners.len() > MAX_STATES
-        || registry.total_transcript_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
-    {
+    while registry.owners.len() > MAX_STATES {
         let owner = registry
             .owners
             .iter()
@@ -643,13 +664,7 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
         let Some(owner) = owner else {
             break;
         };
-        if let Some(state) = registry.owners.remove(&owner)
-            && let Some(continuation) = state.continuation
-        {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(continuation.transcript_bytes);
-        }
+        registry.owners.remove(&owner);
     }
 }
 
@@ -1195,5 +1210,85 @@ mod tests {
             &input("one"),
             &function_call("call_1", "Edit", "{\"a\":1}"),
         ));
+    }
+
+    #[test]
+    fn large_encrypted_reasoning_transcripts_keep_continuation() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("session-large-transcript");
+        let large_reasoning = ResponsesInputItem::Reasoning {
+            id: "rs_1".to_string(),
+            encrypted_content: "x".repeat(3_000_000),
+            summary: vec![],
+        };
+        let request = request_with_input(vec![input("one")], None);
+        record_with_output_items(
+            &owner,
+            &request,
+            "resp_large",
+            std::slice::from_ref(&large_reasoning),
+        );
+
+        assert!(has_continuation_for_owner_for_tests(&owner));
+        let next = request_with_input(vec![input("one"), large_reasoning, input("two")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &next, true);
+        assert_eq!(reservation.candidate().disabled_reason, None);
+        assert_eq!(
+            reservation.candidate().previous_response_id.as_deref(),
+            Some("resp_large")
+        );
+        assert_eq!(reservation.candidate().input_delta_count, 1);
+    }
+
+    #[test]
+    fn resolve_continuation_owner_derives_synthetic_key_when_agent_header_absent() {
+        let _registry_guard = lock_registry();
+        let main = main_owner("session-shared");
+        let explicit_agent = agent_owner("session-shared", "explicit-agent");
+
+        let main_turn1 = request_with_input(
+            vec![input("main task")],
+            Some(json!({"instructions": "You are the main coding agent."})),
+        );
+        let main_turn2 = request_with_input(
+            vec![input("main task"), input("follow up")],
+            Some(json!({"instructions": "You are the main coding agent."})),
+        );
+        let subagent_diff_first_user = request_with_input(
+            vec![input("subagent task")],
+            Some(json!({"instructions": "You are the main coding agent."})),
+        );
+        let subagent_diff_prompt = request_with_input(
+            vec![input("main task")],
+            Some(json!({"instructions": "You are a research subagent."})),
+        );
+
+        let main_owner_1 = resolve_continuation_owner(Some(&main), &main_turn1).unwrap();
+        let main_owner_2 = resolve_continuation_owner(Some(&main), &main_turn2).unwrap();
+        let sub_owner_user =
+            resolve_continuation_owner(Some(&main), &subagent_diff_first_user).unwrap();
+        let sub_owner_prompt =
+            resolve_continuation_owner(Some(&main), &subagent_diff_prompt).unwrap();
+        let explicit_resolved =
+            resolve_continuation_owner(Some(&explicit_agent), &main_turn1).unwrap();
+
+        assert_eq!(main_owner_1, main_owner_2);
+        assert_ne!(main_owner_1, sub_owner_user);
+        assert_ne!(main_owner_1, sub_owner_prompt);
+        assert_ne!(sub_owner_user, sub_owner_prompt);
+        assert_eq!(explicit_resolved, explicit_agent);
+        assert_eq!(resolve_continuation_owner(None, &main_turn1), None);
+
+        start_and_record(&main_owner_1, &main_turn1, "resp_main_1");
+        start_and_record(&sub_owner_user, &subagent_diff_first_user, "resp_sub_1");
+
+        let main_continued =
+            continuation_candidate_for_owner(Some(&main_owner_2), &main_turn2, true);
+        assert_eq!(
+            main_continued.candidate().previous_response_id.as_deref(),
+            Some("resp_main_1")
+        );
+        assert_eq!(main_continued.candidate().input_delta_count, 1);
+        assert!(has_continuation_for_owner_for_tests(&sub_owner_user));
     }
 }

@@ -2115,3 +2115,84 @@ async fn tool_turn_with_noncanonical_arguments_continues_with_delta() {
     assert_eq!(harness.upstream.snapshot().len(), 2);
     harness.shutdown().await;
 }
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagents_without_agent_header_derive_synthetic_keys_and_interleave_independently() {
+    let _environment_lock = env_lock();
+    let mut harness = TestHarness::start().await;
+    let case = unique("synthetic-subagent-key");
+    let session = tagged(&case, "session");
+    // Both main and subagent omit x-claude-code-agent-id (only x-claude-code-session-id).
+    let shared_headers = IdentityHeaders::main(&session);
+
+    let m1 = tagged(&case, "main-1");
+    let s1 = tagged(&case, "sub-1");
+    let m2 = tagged(&case, "main-2");
+    let s2 = tagged(&case, "sub-2");
+    let rm1 = tagged(&case, "reply-main-1");
+    let rs1 = tagged(&case, "reply-sub-1");
+    let resp_m1 = tagged(&case, "resp-main-1");
+    let resp_s1 = tagged(&case, "resp-sub-1");
+
+    // Start main turn 1 and subagent turn 1 concurrently under the same session header.
+    let main_req_1 = harness.start_request(
+        messages_body(false, vec![message("user", &m1)]),
+        shared_headers.clone(),
+    );
+    let sub_req_1 = harness.start_request(
+        messages_body(false, vec![message("user", &s1)]),
+        shared_headers.clone(),
+    );
+    let pending_one = harness.upstream.next_any_request(Some(&session)).await;
+    let pending_two = harness.upstream.next_any_request(Some(&session)).await;
+    let (m1_pending, s1_pending) = pending_pair(pending_one, pending_two, &m1, &s1);
+    assert_full_input(&m1_pending.captured, &[("user", &m1)]);
+    assert_full_input(&s1_pending.captured, &[("user", &s1)]);
+    assert_ne!(
+        m1_pending.captured.socket_ordinal,
+        s1_pending.captured.socket_ordinal
+    );
+
+    // Complete subagent first, then main, to verify completion order cannot supersede either.
+    let s1_capture = resolve_request(s1_pending, sub_req_1, &resp_s1, &rs1, false).await;
+    let m1_capture = resolve_request(m1_pending, main_req_1, &resp_m1, &rm1, false).await;
+
+    let main_second = harness
+        .round_trip(
+            messages_body(
+                false,
+                vec![
+                    message("user", &m1),
+                    message("assistant", &rm1),
+                    message("user", &m2),
+                ],
+            ),
+            shared_headers.clone(),
+            &m2,
+            &tagged(&case, "resp-main-2"),
+            &tagged(&case, "reply-main-2"),
+        )
+        .await;
+    let sub_second = harness
+        .round_trip(
+            messages_body(
+                false,
+                vec![
+                    message("user", &s1),
+                    message("assistant", &rs1),
+                    message("user", &s2),
+                ],
+            ),
+            shared_headers,
+            &s2,
+            &tagged(&case, "resp-sub-2"),
+            &tagged(&case, "reply-sub-2"),
+        )
+        .await;
+
+    assert_delta_input(&main_second, &resp_m1, m1_capture.socket_ordinal, &m2);
+    assert_delta_input(&sub_second, &resp_s1, s1_capture.socket_ordinal, &s2);
+    assert_eq!(harness.upstream.snapshot().len(), 4);
+    harness.shutdown().await;
+}
