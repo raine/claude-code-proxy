@@ -51,6 +51,11 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Manage experimental native Antigravity authentication (available while disabled)
+    Antigravity {
+        #[command(subcommand)]
+        command: AntigravityGroup,
+    },
     /// Manage Codex authentication
     Codex {
         #[command(subcommand)]
@@ -71,6 +76,33 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AntigravityGroup {
+    Auth {
+        #[command(subcommand)]
+        command: AntigravityAuth,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AntigravityAuth {
+    Login {
+        /// Experimental Unix terminal paste-back with visible, sensitive input;
+        /// requires a known width of at least 10 columns and hosted-redirect client registration.
+        /// Long input shows its end and character count; changing terminal width cancels.
+        /// Copy the code displayed by the browser page. Cancel on browser errors
+        /// (including redirect_uri_mismatch) or no displayed code; no automatic fallback.
+        #[arg(long)]
+        manual: bool,
+    },
+    Device,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Logout,
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,6 +217,27 @@ fn main() -> Result<()> {
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
             Ok(())
+        }
+        Commands::Antigravity {
+            command: AntigravityGroup::Auth { command },
+        } => {
+            let handlers = claude_code_proxy::providers::antigravity::cli_handlers();
+            match command {
+                AntigravityAuth::Login { manual: false } => handlers.login(),
+                AntigravityAuth::Login { manual: true } => {
+                    claude_code_proxy::providers::antigravity::login_manual()
+                }
+                AntigravityAuth::Device => handlers.device(),
+                AntigravityAuth::Logout => handlers.logout(),
+                AntigravityAuth::Status { json: true } => {
+                    println!(
+                        "{}",
+                        claude_code_proxy::providers::antigravity::status_json()
+                    );
+                    Ok(())
+                }
+                AntigravityAuth::Status { json: false } => handlers.status(),
+            }
         }
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
@@ -328,7 +381,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["codex", "kimi", "grok", "opencode", "cursor", "antigravity"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };
@@ -409,6 +462,27 @@ mod tests {
     #[test]
     fn non_tty_stdout_selects_plain_mode() {
         assert_eq!(select_serve_mode(false, false), ServeMode::Plain);
+    }
+
+    #[test]
+    fn antigravity_manual_login_is_an_explicit_provider_only_option() {
+        let manual = Cli::try_parse_from([
+            "claude-code-proxy",
+            "antigravity",
+            "auth",
+            "login",
+            "--manual",
+        ]);
+        assert!(manual.is_ok(), "manual login must be a supported opt-in");
+        assert!(
+            Cli::try_parse_from(["claude-code-proxy", "antigravity", "auth", "login",]).is_ok()
+        );
+        for provider in ["codex", "kimi", "cursor", "grok"] {
+            assert!(
+                Cli::try_parse_from(["claude-code-proxy", provider, "auth", "login", "--manual",])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

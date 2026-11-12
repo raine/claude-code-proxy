@@ -31,7 +31,7 @@ pub struct TrafficCaptureOptions {
 }
 
 pub fn traffic_capture_enabled() -> bool {
-    traffic_capture_enabled_for_env(&std::env::vars().collect())
+    traffic_capture_enabled_for_env(&crate::environment::legacy_vars().collect())
 }
 
 pub fn traffic_capture_enabled_for_env(env: &std::collections::HashMap<String, String>) -> bool {
@@ -362,7 +362,12 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
             let mut out = Map::new();
             for (key, value) in map {
                 let normalized = key.to_lowercase();
-                if normalized == "image_url" {
+                if matches!(
+                    normalized.as_str(),
+                    "thoughtsignature" | "thought_signature"
+                ) {
+                    out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "image_url" {
                     // Grok/OpenAI `input_image` parts carry data URLs; never
                     // persist the payload in traffic captures.
                     out.insert(key.clone(), redact_traffic_value(value));
@@ -419,6 +424,9 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                 .map(|value| redact_traffic_with_depth(value, depth + 1))
                 .collect(),
         ),
+        Value::String(text) if text.contains("ccp:antigravity:") => {
+            Value::String(format!("[redacted len={}]", text.len()))
+        }
         Value::String(text) if is_data_url(text) => {
             Value::String(format!("[redacted data-url len={}]", text.len()))
         }
@@ -480,6 +488,47 @@ fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_traffic_and_sse_redact_native_replay_and_oauth_secrets() {
+        let value = serde_json::json!({
+            "contents": [{"parts": [{"thoughtSignature": "native-secret"}]}],
+            "signature": "ccp:antigravity:v1:opaque-secret",
+            "message": "upstream echoed ccp:antigravity:v1:embedded-secret",
+            "nested": {"code": "code-secret", "code_verifier": "verifier-secret", "refresh_token": "refresh-secret"},
+            "safe": "retained", "foreign": {"signature": "anthropic-foreign"}
+        });
+        let rendered = redact_traffic(&value).to_string();
+        for secret in [
+            "native-secret",
+            "opaque-secret",
+            "embedded-secret",
+            "code-secret",
+            "verifier-secret",
+            "refresh-secret",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}");
+        }
+        assert!(rendered.contains("retained"));
+        assert!(rendered.contains("anthropic-foreign"));
+        let directory = tempfile::tempdir().unwrap();
+        let capture = test_capture(directory.path().join("traffic"));
+        let mut stream = capture.stream_capture();
+        stream.upstream_event(None, &value);
+        stream.downstream_event("content_block_delta", value);
+        stream.finish(&capture, serde_json::json!({"ok":true}));
+        let sse = std::fs::read_dir(capture.root())
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension().and_then(|s| s.to_str()) == Some("sse"))
+                    .then(|| std::fs::read_to_string(path).unwrap())
+            })
+            .collect::<String>();
+        assert!(!sse.is_empty());
+        assert!(!sse.contains("native-secret"));
+        assert!(!sse.contains("opaque-secret"));
+    }
 
     #[test]
     fn redact_traffic_strips_input_image_data_urls() {

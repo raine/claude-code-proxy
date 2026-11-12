@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 anyhow = "1.0"
 thiserror = "2.0"
 axum = { version = "0.8", features = ["macros", "multipart"] }
@@ -35,10 +35,12 @@ once_cell = "1.20"
 regex-lite = "0.1"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
-hyper-util = { version = "0.1", features = ["client-proxy"] }
+hyper = { version = "1.10.1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "tokio"] }
 url = "2"
 prost = "0.13"
 flate2 = "1.0"
@@ -47,7 +49,11 @@ crossterm = "0.28"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 tiktoken-rs = { version = "0.12", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.186"
+
 [dev-dependencies]
+hyper = { version = "1.10.1", default-features = false, features = ["server", "http1", "http2"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.14"
 assert_cmd = "2"

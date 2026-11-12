@@ -27,6 +27,11 @@ pub enum AuthCommand {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn supported_models(&self) -> Vec<String>;
+    /// Optional safe local metadata for this serving instance. Implementations
+    /// must not perform network requests, refresh credentials, or write state.
+    fn local_capability(&self) -> Option<serde_json::Value> {
+        None
+    }
     fn cli(&self) -> &'static dyn CliHandlers;
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
@@ -41,6 +46,12 @@ pub trait Provider: Send + Sync {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
+
+    /// After ingress is quiescent, await owned credential maintenance. This
+    /// hook must never start or continue model generation.
+    async fn finish_maintenance(&self) -> Result<()> {
+        Ok(())
+    }
 
     async fn generate_anthropic_stream(
         &self,
