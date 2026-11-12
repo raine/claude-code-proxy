@@ -251,24 +251,40 @@ impl AntigravityProvider {
                 tokio::select! {
                     biased;
                     result = work.as_mut() => {
-                        let bytes = match result.and_then(|message| transport::sse(&message)) {
-                            Ok(bytes) => bytes,
+                        match result.and_then(|message| transport::sse(&message)) {
+                            Ok(bytes) => Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(bytes)),
+                                None,
+                            )),
                             Err(error) => {
-                                shared.fail(format!("Antigravity: {error}"));
-                                format!(
-                                    "event: error\ndata: {}\n\n",
-                                    json!({"type":"error","error":{"type":"api_error","message":format!("Antigravity: {error}")}})
-                                )
-                                .into_bytes()
+                                let message = format!("Antigravity: {error}");
+                                shared.fail(message.clone());
+                                if matches!(
+                                    error,
+                                    "native stream transport failed"
+                                        | "native stream idle timeout"
+                                        | "native turn deadline exceeded"
+                                ) {
+                                    Some((
+                                        Err(std::io::Error::new(
+                                            std::io::ErrorKind::ConnectionReset,
+                                            message,
+                                        )),
+                                        None,
+                                    ))
+                                } else {
+                                    let bytes = format!(
+                                        "event: error\ndata: {}\n\n",
+                                        json!({"type":"error","error":{"type":"api_error","message":message}})
+                                    )
+                                    .into_bytes();
+                                    Some((Ok(bytes::Bytes::from(bytes)), None))
+                                }
                             }
-                        };
-                        Some((
-                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(bytes)),
-                            None,
-                        ))
+                        }
                     }
                     _ = heartbeat.tick() => Some((
-                        Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b": ping\n\n")),
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": ping\n\n")),
                         Some((work, heartbeat, shared)),
                     )),
                 }

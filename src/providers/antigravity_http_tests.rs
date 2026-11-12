@@ -2581,3 +2581,61 @@ async fn antigravity_downstream_sse_heartbeats_bridge_long_buffered_turns() {
     assert!(frames[2].contains("after deep thought"));
     assert!(frames[2].contains("event: message_stop"));
 }
+
+#[tokio::test]
+async fn antigravity_mid_stream_transport_drop_aborts_downstream_body_for_retry() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}", upstream.local_addr().unwrap())).unwrap();
+    let (headers_observed_tx, headers_observed_rx) = tokio::sync::oneshot::channel();
+    let native_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_request(&mut socket).await;
+        // Advertise Content-Length: 4096, write partial frame, then drop TCP socket mid-body.
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\n\r\ndata: {\"response\":",
+            )
+            .await
+            .unwrap();
+        headers_observed_rx.await.unwrap();
+        drop(socket);
+    });
+
+    let directory = tempfile::tempdir().unwrap();
+    let monitor = MonitorHandle::new(10);
+    let registry = Registry::from_providers(
+        AliasProvider::Codex,
+        [Arc::new(provider(directory.path(), &url).await) as Arc<dyn Provider>],
+    );
+    let app = app_with_features(
+        Arc::new(registry),
+        Some(monitor.clone()),
+        AppFeatures {
+            responses_api: true,
+            ..AppFeatures::default()
+        },
+    );
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(request(true).to_string()))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    headers_observed_tx.send(()).unwrap();
+    let result = response.into_body().collect().await;
+    native_task.await.unwrap();
+    assert!(
+        result.is_err(),
+        "expected truncated native HTTP body to abort downstream body with io::Error"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let snapshot = monitor.snapshot();
+    assert!(snapshot.active.is_empty());
+    assert_eq!(snapshot.recent.len(), 1);
+    assert_eq!(snapshot.recent[0].status, RequestStatus::Failed);
+}
