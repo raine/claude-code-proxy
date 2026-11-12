@@ -320,7 +320,7 @@ impl PtyChild {
                 Err(e) => panic!("PTY read: {e}"),
             }
         }
-        assert!(self.output.len() < 256 * 1024, "unbounded terminal output");
+        assert!(self.output.len() < 512 * 1024, "unbounded terminal output");
     }
     fn tty_text(&self) -> String {
         String::from_utf8_lossy(&self.output).into_owned()
@@ -475,14 +475,52 @@ fn fill_output(terminal: &File) {
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
         .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
         .unwrap();
-    for _ in 0..256 {
-        match filler.write(&[b'!'; 1024]) {
-            Ok(n) => assert!(n > 0),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-            other => panic!("PTY fill failed: {other:?}"),
+    let mut total = 0usize;
+    let limit = 384 * 1024;
+    loop {
+        while total < limit {
+            match filler.write(&[b'!'; 1024]) {
+                Ok(n) => {
+                    assert!(n > 0);
+                    total += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                other => panic!("PTY fill failed: {other:?}"),
+            }
+        }
+        while total < limit {
+            match filler.write(&[b'!'; 1]) {
+                Ok(n) => {
+                    assert!(n > 0);
+                    total += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                other => panic!("PTY byte fill failed: {other:?}"),
+            }
+        }
+        assert!(
+            total < limit,
+            "fixture did not reach actual output backpressure"
+        );
+        // Linux PTY slave writes first fill tty_port flip buffers before an
+        // async workqueue (flush_to_ldisc) drains up to N_TTY_BUF_SIZE into
+        // read_buf and re-asserts POLLOUT. Refill across a quiet poll window
+        // so both buffers are genuinely saturated before returning.
+        let mut pfd = libc::pollfd {
+            fd: filler.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 30) };
+        assert!(
+            ready >= 0,
+            "PTY poll failed: {}",
+            io::Error::last_os_error()
+        );
+        if ready == 0 || (pfd.revents & libc::POLLOUT) == 0 {
+            return;
         }
     }
-    panic!("fixture did not reach actual output backpressure");
 }
 
 #[test]
