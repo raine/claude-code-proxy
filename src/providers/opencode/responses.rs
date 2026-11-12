@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::io;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -68,9 +68,9 @@ pub fn stream_body(
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
-            .next_output()
+            .next_item()
             .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
+            .map(|item| (item.map(Bytes::from), state))
     });
     Body::from_stream(stream)
 }
@@ -95,7 +95,12 @@ impl<S> ResponsesStreamState<S>
 where
     S: futures_util::Stream<Item = Result<Bytes, OpenCodeError>> + Unpin,
 {
+    #[cfg(test)]
     async fn next_output(&mut self) -> Option<Vec<u8>> {
+        self.next_item().await.and_then(Result::ok)
+    }
+
+    async fn next_item(&mut self) -> Option<Result<Vec<u8>, io::Error>> {
         if self.terminal {
             return None;
         }
@@ -107,24 +112,31 @@ where
         loop {
             let chunk = match self.upstream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
+                Some(Err(err)) => {
+                    if !self.translator.has_non_thinking_output()
+                        && self.pending_completion.is_none()
+                    {
+                        return Some(Err(self.abort_transport(&err.message)));
+                    }
+                    return Some(Ok(self.fail_at("transport", "upstream_stream")));
+                }
                 None => {
                     if self.decoder.finish().is_err() {
-                        return Some(self.fail_at("decoder", "incomplete_stream"));
+                        return Some(Ok(self.fail_at("decoder", "incomplete_stream")));
                     }
                     let Some(completion) = self.pending_completion.take() else {
-                        return Some(self.fail_at("decoder", "incomplete_stream"));
+                        return Some(Ok(self.fail_at("decoder", "incomplete_stream")));
                     };
                     let output = match self.translator.accept(&completion, self.traffic.as_deref())
                     {
                         Ok(output) => output,
-                        Err(_) => return Some(self.fail_at("translation", "invalid_event")),
+                        Err(_) => return Some(Ok(self.fail_at("translation", "invalid_event"))),
                     };
                     self.terminal = true;
                     self.record_progress(&output);
                     self.capture_downstream(&output);
                     self.finish_capture(true);
-                    return (!output.is_empty()).then_some(output);
+                    return (!output.is_empty()).then_some(Ok(output));
                 }
             };
 
@@ -138,14 +150,14 @@ where
 
             let events = match self.decoder.push(&chunk) {
                 Ok(events) => events,
-                Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
+                Err(_) => return Some(Ok(self.fail_at("decoder", "malformed_sse"))),
             };
             let mut output = Vec::new();
             for event in events {
                 let data = event.data.trim();
                 if data == "[DONE]" {
                     if self.pending_completion.is_none() || self.done_seen {
-                        return Some(self.fail_at("protocol", "premature_done"));
+                        return Some(Ok(self.fail_at("protocol", "premature_done")));
                     }
                     self.done_seen = true;
                     if let Some(capture) = self.stream_capture.as_mut() {
@@ -156,7 +168,7 @@ where
                 }
                 let value: serde_json::Value = match serde_json::from_str(data) {
                     Ok(value) => value,
-                    Err(_) => return Some(self.fail_at("json", "malformed_event")),
+                    Err(_) => return Some(Ok(self.fail_at("json", "malformed_event"))),
                 };
                 if let Some(capture) = self.stream_capture.as_mut() {
                     capture.upstream_event(event.event.as_deref(), &value);
@@ -166,7 +178,7 @@ where
                     if event_type == Some("ping") {
                         continue;
                     }
-                    return Some(self.fail_at("protocol", "event_after_completion"));
+                    return Some(Ok(self.fail_at("protocol", "event_after_completion")));
                 }
                 if matches!(
                     event_type,
@@ -178,16 +190,36 @@ where
                 }
                 let translated = match self.translator.accept(&value, self.traffic.as_deref()) {
                     Ok(translated) => translated,
-                    Err(_) => return Some(self.fail_at("translation", "invalid_event")),
+                    Err(_) => return Some(Ok(self.fail_at("translation", "invalid_event"))),
                 };
                 output.extend(translated);
             }
             if !output.is_empty() {
                 self.record_progress(&output);
                 self.capture_downstream(&output);
-                return Some(output);
+                return Some(Ok(output));
             }
         }
+    }
+
+    fn abort_transport(&mut self, message: &str) -> io::Error {
+        self.terminal = true;
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.malformed("transport", "upstream_stream");
+        }
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_json(
+                "060-opencode-responses-stream-error",
+                &serde_json::json!({
+                    "stage": "transport",
+                    "kind": "upstream_stream",
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+        self.finish_capture(false);
+        io::Error::new(io::ErrorKind::ConnectionReset, message.to_string())
     }
 
     fn record_progress(&self, output: &[u8]) {

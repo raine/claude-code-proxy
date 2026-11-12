@@ -3,7 +3,7 @@ pub mod client;
 pub mod count_tokens;
 pub mod translate;
 
-use std::convert::Infallible;
+use std::io;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -288,9 +288,9 @@ where
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
-            .next_output()
+            .next_item()
             .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
+            .map(|item| (item.map(Bytes::from), state))
     });
     (
         [
@@ -321,7 +321,7 @@ impl<S> GrokStreamState<S>
 where
     S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin,
 {
-    async fn next_output(&mut self) -> Option<Vec<u8>> {
+    async fn next_item(&mut self) -> Option<Result<Vec<u8>, io::Error>> {
         if self.terminal {
             return None;
         }
@@ -332,10 +332,15 @@ where
         loop {
             let chunk = match self.upstream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
+                Some(Err(err)) => {
+                    if !self.translator.has_non_thinking_output() {
+                        return Some(Err(self.abort_transport(&err.message)));
+                    }
+                    return Some(Ok(self.fail_at("transport", "upstream_stream")));
+                }
                 None => {
                     if self.decoder.finish().is_err() || !self.reducer.finished() {
-                        return Some(self.fail_at("decoder", "incomplete_stream"));
+                        return Some(Ok(self.fail_at("decoder", "incomplete_stream")));
                     }
                     self.terminal = true;
                     self.finish_capture(true);
@@ -354,7 +359,7 @@ where
             }
             let events = match self.decoder.push(&chunk) {
                 Ok(events) => events,
-                Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
+                Err(_) => return Some(Ok(self.fail_at("decoder", "malformed_sse"))),
             };
             let mut out = Vec::new();
             for event in events {
@@ -364,7 +369,7 @@ where
                         if let Some(capture) = self.stream_capture.as_mut() {
                             capture.malformed("json", "malformed_event");
                         }
-                        return Some(self.fail_at("json", "malformed_event"));
+                        return Some(Ok(self.fail_at("json", "malformed_event")));
                     }
                 };
                 if let Some(capture) = self.stream_capture.as_mut() {
@@ -372,7 +377,7 @@ where
                 }
                 let reduced = match self.reducer.push(value) {
                     Ok(events) => events,
-                    Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
+                    Err(_) => return Some(Ok(self.fail_at("reducer", "invalid_event"))),
                 };
                 let usage = reduced.iter().find_map(|event| match event {
                     translate::reducer::ReducerEvent::Finish {
@@ -384,7 +389,7 @@ where
                 });
                 match self.translator.render(reduced) {
                     Ok(bytes) => out.extend(bytes),
-                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
+                    Err(_) => return Some(Ok(self.fail_at("render", "invalid_event"))),
                 }
                 if let Some((input_tokens, output_tokens)) = usage
                     && let Some(monitor) = self.monitor.as_ref()
@@ -395,14 +400,41 @@ where
                     self.terminal = true;
                     self.capture_downstream(&out);
                     self.finish_capture(true);
-                    return if out.is_empty() { None } else { Some(out) };
+                    return if out.is_empty() { None } else { Some(Ok(out)) };
                 }
             }
             if !out.is_empty() {
                 self.capture_downstream(&out);
-                return Some(out);
+                return Some(Ok(out));
             }
         }
+    }
+
+    fn abort_transport(&mut self, message: &str) -> io::Error {
+        self.terminal = true;
+        let mut fields = serde_json::Map::new();
+        fields.insert("reqId".into(), serde_json::json!(self.req_id));
+        fields.insert("stage".into(), serde_json::json!("transport"));
+        fields.insert("kind".into(), serde_json::json!("upstream_stream"));
+        fields.insert("bytes".into(), serde_json::json!(self.bytes));
+        fields.insert("chunks".into(), serde_json::json!(self.chunks));
+        crate::logging::create_logger("grok").warn("grok_stream_failed", Some(fields));
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.malformed("transport", "upstream_stream");
+        }
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_json(
+                "060-grok-stream-error",
+                &serde_json::json!({
+                    "stage": "transport",
+                    "kind": "upstream_stream",
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+        self.finish_capture(false);
+        io::Error::new(io::ErrorKind::ConnectionReset, message.to_string())
     }
 
     fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
@@ -1034,5 +1066,55 @@ mod tests {
         }
         assert!(captured.contains("[redacted len=6]"));
         assert!(!captured.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn streaming_transport_error_aborts_before_text_and_emits_sse_error_after_text() {
+        // Thinking-only followed by upstream transport error -> body aborts with io::Error.
+        let thinking_then_err = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking...\"}\n\n",
+            )),
+            Err(client::GrokError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "Grok upstream stream failed".into(),
+            }),
+        ]);
+        let response = stream_body(
+            thinking_then_err,
+            "msg_think".into(),
+            "grok-4.5".into(),
+            0,
+            None,
+            "req_think".into(),
+            None,
+        );
+        assert!(response.into_body().collect().await.is_err());
+
+        // Text delta followed by upstream transport error -> preserves event: error + clean EOF.
+        let text_then_err = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n",
+            )),
+            Err(client::GrokError {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after: None,
+                message: "Grok upstream stream failed".into(),
+            }),
+        ]);
+        let response = stream_body(
+            text_then_err,
+            "msg_text".into(),
+            "grok-4.5".into(),
+            0,
+            None,
+            "req_text".into(),
+            None,
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let sse = String::from_utf8_lossy(&bytes);
+        assert!(sse.contains("visible"));
+        assert!(sse.contains("event: error"));
     }
 }

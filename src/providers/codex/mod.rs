@@ -1331,6 +1331,22 @@ fn remaining_live_stream_response(
                             let error_message = failure
                                 .as_ref()
                                 .map_or(message.as_str(), |failure| failure.message.as_str());
+                            if !translator.has_non_thinking_output()
+                                && retryable_mid_thinking_event_failure(&payload, failure.as_ref())
+                            {
+                                log_mid_thinking_stream_abort(
+                                    &ctx.req_id,
+                                    &request_body.model,
+                                    error_message,
+                                );
+                                let _ = tx
+                                    .send(Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionReset,
+                                        error_message.to_string(),
+                                    )))
+                                    .await;
+                                return;
+                            }
                             let chunk = translator.error_chunk(
                                 error_message,
                                 error_type,
@@ -1382,6 +1398,19 @@ fn remaining_live_stream_response(
                             return;
                         }
                     }
+                    if !translator.has_non_thinking_output()
+                        && retryable_mid_thinking_codex_error(&err)
+                    {
+                        let reason = codex_error_message(&err);
+                        log_mid_thinking_stream_abort(&ctx.req_id, &request_body.model, reason);
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                reason.to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
                         codex_error_message(&err),
@@ -1408,11 +1437,18 @@ fn remaining_live_stream_response(
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
             return;
         }
-        let chunk = translator.error_chunk(
-            "Upstream event stream closed before terminal Codex response event",
-            "api_error",
-            ctx.traffic.as_deref(),
-        );
+        let reason = "Upstream event stream closed before terminal Codex response event";
+        if !translator.has_non_thinking_output() {
+            log_mid_thinking_stream_abort(&ctx.req_id, &request_body.model, reason);
+            let _ = tx
+                .send(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    reason,
+                )))
+                .await;
+            return;
+        }
+        let chunk = translator.error_chunk(reason, "api_error", ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
@@ -1561,6 +1597,45 @@ fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationReserv
     true
 }
 
+fn log_mid_thinking_stream_abort(req_id: &str, model: &str, reason: &str) {
+    create_logger("codex").warn(
+        "codex_thinking_stream_aborted_for_retry",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(req_id)),
+            ("model".to_string(), serde_json::json!(model)),
+            ("reason".to_string(), serde_json::json!(reason)),
+        ])),
+    );
+}
+
+fn retryable_mid_thinking_codex_error(err: &client::CodexError) -> bool {
+    if err.usage_limit.is_some() {
+        return false;
+    }
+    if matches!(
+        err.detail.as_deref(),
+        Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL)
+            | Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
+    ) {
+        return true;
+    }
+    matches!(err.status, 500 | 502 | 503 | 504 | 529)
+        || (err.status == 0 && retryable_live_message(codex_error_message(err)))
+}
+
+fn retryable_mid_thinking_event_failure(
+    payload: &serde_json::Value,
+    failure: Option<&events::CodexEventFailure>,
+) -> bool {
+    if events::usage_limit_from_event(payload).is_some() {
+        return false;
+    }
+    matches!(
+        failure.map(|failure| failure.kind),
+        Some(events::CodexFailureKind::Transient | events::CodexFailureKind::Overloaded)
+    )
+}
+
 fn retryable_live_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
@@ -1569,8 +1644,17 @@ fn retryable_live_message(message: &str) -> bool {
         "you can retry your request",
         "temporarily unavailable",
         "timed out",
+        "idle timeout",
+        "keepalive error",
+        "transport error",
         "connection closed",
+        "peer closed connection",
+        "close_notify",
+        "unexpected eof",
+        "unexpected-eof",
         "connection reset",
+        "econnreset",
+        "etimedout",
         "broken pipe",
         "epipe",
     ]
@@ -3354,5 +3438,177 @@ mod tests {
             Vec::new()
         ));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[test]
+    fn live_start_tls_close_notify_unexpected_eof_is_retryable() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket stream error: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof".to_string(),
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+        assert!(retryable_live_start_codex_error(&err));
+        assert!(retryable_mid_thinking_codex_error(&err));
+    }
+
+    #[tokio::test]
+    async fn live_stream_aborts_body_on_mid_thinking_transport_drop_but_preserves_sse_error_after_text_or_policy()
+     {
+        use http_body_util::BodyExt as _;
+
+        // 1. Mid-thinking TLS close_notify drop -> downstream HTTP body aborts with Err(io::Error).
+        {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            tx.send(Ok(serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "delta": "Inspecting files..."
+            })))
+            .await
+            .unwrap();
+            tx.send(Err(client::CodexError {
+                status: 0,
+                message: "WebSocket stream error: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof".to_string(),
+                detail: None,
+                retry_after: None,
+                usage_limit: None,
+                origin: client::CodexErrorOrigin::WebSocket,
+            }))
+            .await
+            .unwrap();
+            drop(tx);
+
+            let continuation = ContinuationReservation::for_owner_turn(None, None);
+            let response = match live_stream_response_once(
+                rx,
+                "msg_thinking_abort".to_string(),
+                "claude-opus-4-8",
+                ctx,
+                continuation,
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                false,
+            )
+            .await
+            {
+                LiveStreamStart::Response(response) => response,
+                LiveStreamStart::Retry { error, .. } => {
+                    panic!("expected Response after thinking delta, got Retry: {error}")
+                }
+            };
+            let result = response.into_body().collect().await;
+            assert!(
+                result.is_err(),
+                "expected mid-thinking transport drop to abort body with io::Error"
+            );
+        }
+
+        // 2. Post-text TLS close_notify drop -> preserves event: error + clean EOF so visible text isn't duplicated.
+        {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            tx.send(Ok(serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "Hello world"
+            })))
+            .await
+            .unwrap();
+            tx.send(Err(client::CodexError {
+                status: 0,
+                message: "WebSocket stream error: IO error: peer closed connection without sending TLS close_notify".to_string(),
+                detail: None,
+                retry_after: None,
+                usage_limit: None,
+                origin: client::CodexErrorOrigin::WebSocket,
+            }))
+            .await
+            .unwrap();
+            drop(tx);
+
+            let continuation = ContinuationReservation::for_owner_turn(None, None);
+            let response = match live_stream_response_once(
+                rx,
+                "msg_text_error".to_string(),
+                "claude-opus-4-8",
+                ctx,
+                continuation,
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                false,
+            )
+            .await
+            {
+                LiveStreamStart::Response(response) => response,
+                LiveStreamStart::Retry { error, .. } => {
+                    panic!("expected Response after text delta, got Retry: {error}")
+                }
+            };
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let sse = String::from_utf8_lossy(&bytes);
+            assert!(sse.contains("Hello world"));
+            assert!(sse.contains("event: error"));
+        }
+
+        // 3. Permanent policy block during thinking -> preserves event: error + clean EOF (do NOT retry deterministic error).
+        {
+            let (tx, rx, ctx, request_body) = empty_terminal_fixture();
+            tx.send(Ok(serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "delta": "Thinking..."
+            })))
+            .await
+            .unwrap();
+            tx.send(Ok(serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "code": "cyber_policy_violation",
+                        "message": "blocked by policy"
+                    }
+                }
+            })))
+            .await
+            .unwrap();
+            drop(tx);
+
+            let continuation = ContinuationReservation::for_owner_turn(None, None);
+            let response = match live_stream_response_once(
+                rx,
+                "msg_policy_error".to_string(),
+                "claude-opus-4-8",
+                ctx,
+                continuation,
+                request_body,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                false,
+            )
+            .await
+            {
+                LiveStreamStart::Response(response) => response,
+                LiveStreamStart::Retry { error, .. } => {
+                    panic!("expected Response after thinking delta, got Retry: {error}")
+                }
+            };
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let sse = String::from_utf8_lossy(&bytes);
+            assert!(sse.contains("event: error"));
+        }
     }
 }

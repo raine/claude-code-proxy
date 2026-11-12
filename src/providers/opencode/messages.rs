@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::io;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -41,6 +41,7 @@ pub fn stream_body(
     let state = MessagesStreamState {
         upstream: upstream.into_stream(),
         decoder: SseDecoder::default(),
+        non_thinking_emitted: false,
         terminal: false,
         error_sent: false,
         monitor,
@@ -51,10 +52,7 @@ pub fn stream_body(
         traffic,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
-        state
-            .next_output()
-            .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(bytes), state))
+        state.next_item().await.map(|item| (item, state))
     });
     Body::from_stream(stream)
 }
@@ -62,6 +60,7 @@ pub fn stream_body(
 struct MessagesStreamState<S> {
     upstream: S,
     decoder: SseDecoder,
+    non_thinking_emitted: bool,
     terminal: bool,
     error_sent: bool,
     monitor: Option<MonitorHandle>,
@@ -76,7 +75,12 @@ impl<S> MessagesStreamState<S>
 where
     S: futures_util::Stream<Item = Result<Bytes, OpenCodeError>> + Unpin,
 {
+    #[cfg(test)]
     async fn next_output(&mut self) -> Option<Bytes> {
+        self.next_item().await.and_then(Result::ok)
+    }
+
+    async fn next_item(&mut self) -> Option<Result<Bytes, io::Error>> {
         if self.terminal {
             return None;
         }
@@ -87,12 +91,17 @@ where
 
         let chunk = match self.upstream.next().await {
             Some(Ok(chunk)) => chunk,
-            Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
+            Some(Err(err)) => {
+                if !self.non_thinking_emitted {
+                    return Some(Err(self.abort_transport(&err.message)));
+                }
+                return Some(Ok(self.fail_at("transport", "upstream_stream")));
+            }
             None => {
                 if self.decoder.finish().is_err() {
-                    return Some(self.fail_at("decoder", "incomplete_stream"));
+                    return Some(Ok(self.fail_at("decoder", "incomplete_stream")));
                 }
-                return Some(self.fail_at("protocol", "missing_message_stop"));
+                return Some(Ok(self.fail_at("protocol", "missing_message_stop")));
             }
         };
         if self.bytes == 0
@@ -105,18 +114,18 @@ where
 
         let events = match self.decoder.push(&chunk) {
             Ok(events) => events,
-            Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
+            Err(_) => return Some(Ok(self.fail_at("decoder", "malformed_sse"))),
         };
         let mut input_tokens = None;
         let mut output_tokens = None;
         let mut terminal = false;
         for event in events {
             if terminal {
-                return Some(self.fail_at("protocol", "event_after_message_stop"));
+                return Some(Ok(self.fail_at("protocol", "event_after_message_stop")));
             }
             let value: serde_json::Value = match serde_json::from_str(&event.data) {
                 Ok(value) => value,
-                Err(_) => return Some(self.fail_at("json", "malformed_event")),
+                Err(_) => return Some(Ok(self.fail_at("json", "malformed_event"))),
             };
             if let Some(capture) = self.stream_capture.as_mut() {
                 capture.upstream_event(event.event.as_deref(), &value);
@@ -135,7 +144,32 @@ where
                 .or(output_tokens);
             let kind = value.get("type").and_then(serde_json::Value::as_str);
             if event.event.as_deref() == Some("error") || kind == Some("error") {
-                return Some(self.fail_at("upstream", "error_event"));
+                return Some(Ok(self.fail_at("upstream", "error_event")));
+            }
+            if kind == Some("content_block_start")
+                && value
+                    .pointer("/content_block/type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|block_type| {
+                        !matches!(block_type, "thinking" | "redacted_thinking")
+                    })
+            {
+                self.non_thinking_emitted = true;
+            }
+            if kind == Some("content_block_delta")
+                && value
+                    .pointer("/delta/type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|delta_type| {
+                        !matches!(delta_type, "thinking_delta" | "signature_delta")
+                    })
+            {
+                self.non_thinking_emitted = true;
+            }
+            if matches!(kind, Some("message_delta" | "message_stop"))
+                || event.event.as_deref() == Some("message_stop")
+            {
+                self.non_thinking_emitted = true;
             }
             if event.event.as_deref() == Some("message_stop") || kind == Some("message_stop") {
                 terminal = true;
@@ -152,12 +186,32 @@ where
         }
         if terminal {
             if self.decoder.finish().is_err() {
-                return Some(self.fail_at("decoder", "trailing_incomplete_frame"));
+                return Some(Ok(self.fail_at("decoder", "trailing_incomplete_frame")));
             }
             self.terminal = true;
             self.finish_capture(true);
         }
-        Some(chunk)
+        Some(Ok(chunk))
+    }
+
+    fn abort_transport(&mut self, message: &str) -> io::Error {
+        self.terminal = true;
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.malformed("transport", "upstream_stream");
+        }
+        if let Some(traffic) = self.traffic.as_ref() {
+            traffic.write_json(
+                "060-opencode-messages-stream-error",
+                &serde_json::json!({
+                    "stage": "transport",
+                    "kind": "upstream_stream",
+                    "bytes": self.bytes,
+                    "chunks": self.chunks,
+                }),
+            );
+        }
+        self.finish_capture(false);
+        io::Error::new(io::ErrorKind::ConnectionReset, message.to_string())
     }
 
     fn fail_at(&mut self, stage: &str, kind: &str) -> Bytes {
@@ -267,6 +321,7 @@ mod tests {
         let mut state = MessagesStreamState {
             upstream,
             decoder: SseDecoder::default(),
+            non_thinking_emitted: false,
             terminal: false,
             error_sent: false,
             monitor: None,
@@ -297,6 +352,7 @@ mod tests {
         let mut state = MessagesStreamState {
             upstream,
             decoder: SseDecoder::default(),
+            non_thinking_emitted: false,
             terminal: false,
             error_sent: false,
             monitor: None,
