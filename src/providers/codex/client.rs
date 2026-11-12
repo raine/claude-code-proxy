@@ -3046,6 +3046,10 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
         || message.contains("transport error")
         || message.contains("connection reset")
         || message.contains("connection closed")
+        || message.contains("peer closed connection")
+        || message.contains("close_notify")
+        || message.contains("unexpected eof")
+        || message.contains("unexpected-eof")
         || message.contains("timed out")
         || message.contains("econnreset")
         || message.contains("etimedout")
@@ -3060,6 +3064,10 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     let msg = err.to_string().to_lowercase();
     msg.contains("connection reset")
         || msg.contains("connection closed")
+        || msg.contains("peer closed connection")
+        || msg.contains("close_notify")
+        || msg.contains("unexpected eof")
+        || msg.contains("unexpected-eof")
         || msg.contains("econnreset")
         || msg.contains("etimedout")
         || msg.contains("epipe")
@@ -5690,6 +5698,20 @@ mod tests {
         assert!(!should_retry_without_continuation(&idle, Some(&append)));
         assert!(!should_retry_without_continuation(&timeout, Some(&initial)));
         assert!(!should_retry_without_continuation(&timeout, None));
+    }
+
+    #[test]
+    fn statusless_tls_close_notify_unexpected_eof_is_retryable() {
+        let err = CodexError {
+            status: 0,
+            message: "WebSocket stream error: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof".to_string(),
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        assert!(is_retryable_transport_error(&err));
+        assert!(super::super::events::retryable_message(&err.message));
     }
 
     #[tokio::test]

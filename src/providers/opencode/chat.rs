@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::io;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -1017,6 +1017,16 @@ impl LiveStreamTranslator {
     pub fn is_finished(&self) -> bool {
         self.state.finished
     }
+
+    pub fn has_non_thinking_output(&self) -> bool {
+        self.state.finished
+            || self.state.pending_stop.is_some()
+            || self
+                .state
+                .blocks
+                .iter()
+                .any(|block| !matches!(block.kind, BlockKind::Thinking { .. }))
+    }
 }
 
 fn validate_post_done_metadata(data: &str) -> anyhow::Result<()> {
@@ -1081,9 +1091,9 @@ pub fn stream_body(
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
-            .next_output()
+            .next_item()
             .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
+            .map(|item| (item.map(Bytes::from), state))
     });
     Body::from_stream(stream)
 }
@@ -1106,7 +1116,12 @@ impl<S> OpenCodeChatStreamState<S>
 where
     S: futures_util::Stream<Item = Result<Bytes, OpenCodeError>> + Unpin,
 {
+    #[cfg(test)]
     async fn next_output(&mut self) -> Option<Vec<u8>> {
+        self.next_item().await.and_then(Result::ok)
+    }
+
+    async fn next_item(&mut self) -> Option<Result<Vec<u8>, io::Error>> {
         if self.terminal {
             return None;
         }
@@ -1117,19 +1132,24 @@ where
         loop {
             let chunk = match self.upstream.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
+                Some(Err(err)) => {
+                    if !self.translator.has_non_thinking_output() {
+                        return Some(Err(self.abort_transport(&err.message)));
+                    }
+                    return Some(Ok(self.fail_at("transport", "upstream_stream")));
+                }
                 None => {
                     let output = match self.translator.finish() {
                         Ok(output) => output,
-                        Err(_) => return Some(self.fail_at("decoder", "incomplete_stream")),
+                        Err(_) => return Some(Ok(self.fail_at("decoder", "incomplete_stream"))),
                     };
                     if self.capture_decoder.finish().is_err() {
-                        return Some(self.fail_at("capture", "incomplete_stream"));
+                        return Some(Ok(self.fail_at("capture", "incomplete_stream")));
                     }
                     self.terminal = true;
                     self.capture_downstream(&output);
                     self.finish_capture(true);
-                    return (!output.is_empty()).then_some(output);
+                    return (!output.is_empty()).then_some(Ok(output));
                 }
             };
             if self.bytes == 0
@@ -1143,7 +1163,7 @@ where
 
             let output = match self.translator.push(&chunk) {
                 Ok(output) => output,
-                Err(_) => return Some(self.fail_at("translation", "invalid_event")),
+                Err(_) => return Some(Ok(self.fail_at("translation", "invalid_event"))),
             };
             if !output.is_empty() {
                 let (input_tokens, output_tokens) = usage_from_anthropic_sse(&output);
@@ -1160,16 +1180,25 @@ where
             }
             if self.translator.is_finished() {
                 if self.translator.finish().is_err() || self.capture_decoder.finish().is_err() {
-                    return Some(self.fail_at("decoder", "trailing_incomplete_frame"));
+                    return Some(Ok(self.fail_at("decoder", "trailing_incomplete_frame")));
                 }
                 self.terminal = true;
                 self.finish_capture(true);
-                return (!output.is_empty()).then_some(output);
+                return (!output.is_empty()).then_some(Ok(output));
             }
             if !output.is_empty() {
-                return Some(output);
+                return Some(Ok(output));
             }
         }
+    }
+
+    fn abort_transport(&mut self, message: &str) -> io::Error {
+        self.terminal = true;
+        if let Some(capture) = self.stream_capture.as_mut() {
+            capture.malformed("transport", "upstream_stream");
+        }
+        self.finish_capture(false);
+        io::Error::new(io::ErrorKind::ConnectionReset, message.to_string())
     }
 
     fn capture_upstream(&mut self, bytes: &[u8]) {
