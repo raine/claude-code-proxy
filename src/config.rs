@@ -39,6 +39,8 @@ struct FileConfig {
     pub alias_provider: Option<String>,
     #[serde(rename = "autoReviewModel")]
     pub auto_review_model: Option<String>,
+    #[serde(default, rename = "modelOverrides")]
+    pub model_overrides: HashMap<String, String>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -871,6 +873,17 @@ pub fn codex_reasoning_summary() -> Option<String> {
         return Some(summary);
     }
     None
+}
+
+/// Exact Claude ID aliases to Codex targets; unknown targets are rejected by
+/// the provider allowlist. Do not recursively resolve user mappings.
+pub fn model_override(model: &str) -> Option<String> {
+    if !model.starts_with("claude-") {
+        return None;
+    }
+    read_file_config(&paths::config_dir())?
+        .model_overrides
+        .remove(model)
 }
 
 pub fn codex_model() -> Option<String> {

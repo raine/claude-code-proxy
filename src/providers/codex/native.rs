@@ -148,6 +148,14 @@ fn shape_native_request(body: &mut Value, full_lane: bool) -> Result<NativeResol
 }
 
 fn resolve_native_model(requested: &str) -> (String, Option<ServiceTier>) {
+    let normalized = crate::registry::normalize_incoming_model(requested);
+    let requested = normalized.as_str();
+    if let Some(target) = config::model_override(requested) {
+        return match split_tier_suffix(&target) {
+            Some((base, tier)) => (base.to_string(), Some(tier)),
+            None => (target, None),
+        };
+    }
     let (requested, service_tier) = match split_tier_suffix(requested) {
         Some((base, tier)) => (base, Some(tier)),
         None => (requested, None),

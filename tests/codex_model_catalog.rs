@@ -105,19 +105,22 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
-    let mut proxy = Proxy(
-        command(&dir)
-            .args(["serve", "--no-monitor", "--port", &port.to_string()])
-            .env(
-                "CCP_CODEX_BASE_URL",
-                format!("http://{upstream_addr}/responses"),
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let spawn_proxy = || {
+        Proxy(
+            command(&dir)
+                .args(["serve", "--no-monitor", "--port", &port.to_string()])
+                .env(
+                    "CCP_CODEX_BASE_URL",
+                    format!("http://{upstream_addr}/responses"),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut proxy = spawn_proxy();
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -214,6 +217,84 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
         assert_eq!(body["service_tier"], "priority");
         assert!(headers.contains_key("x-openai-internal-codex-responses-lite"));
         assert!(body.get("client_metadata").is_some());
+    }
+    // Exact Claude overrides select Codex despite Kimi routing and the global
+    // model setting, and retain the target tier/lane across all API adapters.
+    std::fs::write(
+        dir.path().join("config.json"),
+        json!({"aliasProvider":"kimi", "codex":{"model":"gpt-5.4"},
+        "modelOverrides":{
+            "claude-fable-5-2":"gpt-6-astra-ultrafast",
+            "claude-future-test":"gpt-test-future-fast",
+            "claude-opus-5-5":"gpt-6.1-sol",
+            "claude-sonnet-5-5":"gpt-6.1-terra",
+            "claude-haiku-5-5":"gpt-6-luna",
+            "claude-invalid":"gpt-nonexistent",
+            "claude-empty":"",
+            "claude-chain":"claude-fable-5-2"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    // aliasProvider is loaded at startup, so restart after changing it.
+    proxy.0.kill().unwrap();
+    proxy.0.wait().unwrap();
+    proxy = spawn_proxy();
+    let mut ready = false;
+    for _ in 0..150 {
+        assert!(proxy.0.try_wait().unwrap().is_none(), "proxy exited");
+        if client.get(format!("{url}/healthz")).send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "proxy did not restart");
+    for (requested, target, tier) in [
+        ("claude-fable-5-2[1m]", "gpt-6-astra", Some("ultrafast")),
+        ("claude-future-test", "gpt-test-future", Some("priority")),
+        ("claude-opus-5-5", "gpt-6.1-sol", None),
+        ("claude-sonnet-5-5", "gpt-6.1-terra", None),
+        ("claude-haiku-5-5", "gpt-6-luna", None),
+    ] {
+        for route in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
+            let mut request = if route == "/v1/responses" {
+                json!({"model":requested,"input":"synthetic"})
+            } else {
+                json!({"model":requested,"max_tokens":64,"messages":[{"role":"user","content":"synthetic"}]})
+            };
+            if route == "/v1/chat/completions" {
+                request.as_object_mut().unwrap().remove("max_tokens");
+            }
+            let response = client
+                .post(format!("{url}{route}"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            assert!(status.is_success(), "{requested} {route}: {status} {text}");
+            let (headers, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(body["model"], target);
+            assert_eq!(body.get("service_tier").and_then(Value::as_str), tier);
+            assert!(headers.contains_key("x-openai-internal-codex-responses-lite"));
+        }
+    }
+    for model in [
+        "claude-invalid",
+        "claude-empty",
+        "claude-chain",
+        "claude-unknown",
+    ] {
+        let response = client.post(format!("{url}/v1/messages"))
+            .json(&json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":"synthetic"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 400, "{model}");
+        assert!(rx.try_recv().is_err(), "invalid model reached upstream");
     }
     for full_lane in [false, true] {
         std::fs::write(

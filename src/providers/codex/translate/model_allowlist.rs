@@ -39,6 +39,7 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("claude-opus-5-5", "gpt-6-sol"),
     ("fable", "gpt-6-sol"),
     ("claude-fable-5", "gpt-6-sol"),
+    ("claude-fable-5-2", "gpt-6-astra"),
 ];
 
 #[derive(Debug, Clone)]
@@ -140,6 +141,9 @@ pub fn resolve_model_request_with_config_override(
     model: &str,
     apply_config_override: bool,
 ) -> ResolvedModel {
+    if let Some(target) = config::model_override(model) {
+        return resolve_tier_model_alias(&target);
+    }
     let override_model = apply_config_override.then(config::codex_model).flatten();
     resolve_with_model_override(model, override_model.as_deref())
 }
@@ -256,6 +260,17 @@ pub fn is_valid_model_for_codex(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_52_and_unknown_models() {
+        assert_eq!(
+            resolve_with_model_override("claude-fable-5-2", None).model,
+            "gpt-6-astra"
+        );
+        assert!(is_valid_model_for_codex("claude-fable-5-2"));
+        let unknown = resolve_with_model_override("claude-unknown", None);
+        assert!(assert_allowed_model(&unknown.model).is_err());
+    }
 
     #[test]
     fn haiku_resolves_to_luna() {

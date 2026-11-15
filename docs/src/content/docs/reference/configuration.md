@@ -162,3 +162,30 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 `CCP_USER_AGENT` is the fallback when a Codex or Kimi provider-specific user-agent is absent. Prefer `CCP_CODEX_USER_AGENT` or `CCP_KIMI_USER_AGENT` in durable configuration.
 
 Endpoint and client identity overrides can break provider compatibility. Use defaults unless a controlled integration or focused diagnostic requires an override.
+
+## Claude model overrides
+
+Map exact Claude model IDs to Codex model IDs in `config.json`:
+
+```json
+{
+  "modelOverrides": {
+    "claude-fable-5-2": "gpt-6-astra",
+    "claude-opus-5-5": "gpt-6.1-sol",
+    "claude-sonnet-5-5": "gpt-6.1-terra",
+    "claude-haiku-5-5": "gpt-6-luna"
+  }
+}
+```
+
+Keys must start with `claude-` and match exactly after the existing `[1m]`
+normalization. Explicit mappings route to Codex even with Kimi alias/session
+routing, and take precedence over `codex.model` / `CCP_CODEX_MODEL`.
+Unmapped requests retain existing behavior. Fable 5.2 defaults to GPT-6 Astra
+when routed to Codex. Mappings also apply to Chat Completions and native Responses.
+Targets must be registered Codex IDs (built-in or API-supported local Codex
+catalog entries); supported `-fast` / `-ultrafast` suffixes work as usual.
+Mappings are not recursive. Empty or unsupported targets return HTTP 400;
+unknown unmapped IDs remain rejected. Non-Claude keys are ignored.
+New Claude IDs need only a configuration entry. Backend account access is still
+required; recognizing an ID locally does not grant access to that model.

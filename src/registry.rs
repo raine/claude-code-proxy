@@ -24,6 +24,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-opus-5-5",
     "fable",
     "claude-fable-5",
+    "claude-fable-5-2",
 ];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
@@ -183,6 +184,9 @@ impl Registry {
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
+        if crate::config::model_override(&normalized).is_some() {
+            return self.handlers.get("codex").cloned();
+        }
         if is_anthropic_alias(&normalized) {
             let target = session_affinity.unwrap_or(&self.alias_provider);
             return self.handlers.get(target.as_str()).cloned();
