@@ -259,6 +259,30 @@ fn strip_claude_code_system_header(mut text: &str) -> Option<&str> {
     }
 }
 
+// Reword only the complete known built-in preamble, preserving its security
+// requirements. Unknown revisions and application instructions pass through.
+fn neutral_claude_code_preamble(text: &str) -> Cow<'_, str> {
+    const INTRO: &str =
+        "You are an interactive agent that helps users with software engineering tasks.";
+    const SECURITY: &str = "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.";
+    const NEUTRAL: &str = "Help users interactively with software-engineering work.\n\nFor cybersecurity tasks, support authorized testing, defensive security, capture-the-flag challenges, and education. Decline requests involving destructive techniques, denial-of-service attacks, mass targeting, supply-chain compromise, or detection evasion for malicious purposes. Assistance with dual-use security tools, including command-and-control frameworks, credential testing, and exploit development, requires clear authorization context, such as a penetration-testing engagement, a capture-the-flag competition, security research, or a defensive use case.";
+    let Some(after_intro) = text.strip_prefix(INTRO) else {
+        return Cow::Borrowed(text);
+    };
+    for separator in ["\n\n", "\r\n\r\n"] {
+        let Some(tail) = after_intro
+            .strip_prefix(separator)
+            .and_then(|rest| rest.strip_prefix(SECURITY))
+        else {
+            continue;
+        };
+        if tail.is_empty() || tail.starts_with("\n\n") || tail.starts_with("\r\n\r\n") {
+            return Cow::Owned(format!("{}{tail}", NEUTRAL.replace("\n\n", separator)));
+        }
+    }
+    Cow::Borrowed(text)
+}
+
 fn sanitize_system_parts(parts: Vec<Value>) -> Vec<Value> {
     let filtered: Vec<Value> = parts
         .into_iter()
@@ -267,16 +291,15 @@ fn sanitize_system_parts(parts: Vec<Value>) -> Vec<Value> {
             strip_claude_code_system_header(text).map(|cleaned| json!({"text": cleaned}))
         })
         .collect();
-    if filtered.len() > 1 {
-        let joined = filtered
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        vec![json!({"text": joined})]
-    } else {
-        filtered
+    if filtered.is_empty() {
+        return filtered;
     }
+    let joined = filtered
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    vec![json!({"text": neutral_claude_code_preamble(&joined)})]
 }
 
 fn text_parts(value: &Value) -> Result<Vec<Value>> {

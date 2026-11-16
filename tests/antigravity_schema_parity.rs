@@ -145,6 +145,7 @@ cases! {
     schema_parity_original_admission_controls => "admission",
     schema_parity_project_admission_control => "project-admission",
     schema_parity_observed_first_agent_metadata => "first-agent",
+    schema_parity_claude_code_system_preamble => "system-preamble",
     schema_parity_observed_two_user_text_metadata => "two-user-text",
     schema_parity_observed_three_user_text_recurrence => "three-user-text",
     schema_parity_observed_last_recorded_execution => "last-recorded-execution",
@@ -748,6 +749,7 @@ async fn exercise(case: &str, f: &mut Fixture) -> Result<()> {
         "admission" => admission(f).await,
         "project-admission" => project_admission(f).await,
         "first-agent" => first_agent_metadata(f).await,
+        "system-preamble" => system_preamble(f).await,
         "two-user-text" => two_user_text_metadata(f).await,
         "three-user-text" => user_text_sequence(f, false).await,
         "last-recorded-execution" => user_text_sequence(f, true).await,
@@ -757,6 +759,91 @@ async fn exercise(case: &str, f: &mut Fixture) -> Result<()> {
         "source-all-tier-metadata" => source_all_tier_metadata(f).await,
         _ => bail!("unknown fixed fixture case"),
     }
+}
+
+async fn system_preamble(f: &mut Fixture) -> Result<()> {
+    const INTRO: &str =
+        "You are an interactive agent that helps users with software engineering tasks.";
+    const SECURITY: &str = "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.";
+    const NEUTRAL: &str = "Help users interactively with software-engineering work.\n\nFor cybersecurity tasks, support authorized testing, defensive security, capture-the-flag challenges, and education. Decline requests involving destructive techniques, denial-of-service attacks, mass targeting, supply-chain compromise, or detection evasion for malicious purposes. Assistance with dual-use security tools, including command-and-control frameworks, credential testing, and exploit development, requires clear authorization context, such as a penetration-testing engagement, a capture-the-flag competition, security research, or a defensive use case.";
+    const CUSTOM: &str =
+        "# Harness\nKeep custom instructions exactly.\n\nIMPORTANT: Never change this paragraph.\n";
+    let stock = format!("{INTRO}\n\n{SECURITY}");
+    let rewritten = format!("{NEUTRAL}\n\n{CUSTOM}");
+    let mut cases = vec![
+        (json!(stock), NEUTRAL.to_owned()),
+        (json!(format!("{stock}\n\n{CUSTOM}")), rewritten.clone()),
+        (
+            json!(format!(
+                "x-anthropic-billing-header: public-test\n\nYou are Claude Code, Anthropic's official CLI for Claude.\n\n{stock}\n\n{CUSTOM}"
+            )),
+            rewritten.clone(),
+        ),
+        (
+            json!([
+                {"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type":"text","text":INTRO,"cache_control":{"type":"ephemeral"}},
+                {"type":"text","text":SECURITY},
+                {"type":"text","text":CUSTOM}
+            ]),
+            rewritten.clone(),
+        ),
+        (
+            json!(format!("{stock}\n\n{CUSTOM}").replace('\n', "\r\n")),
+            rewritten.replace('\n', "\r\n"),
+        ),
+        (
+            json!([
+                {"type":"text","text":stock.replace('\n', "\r\n")},
+                {"type":"text","text":CUSTOM}
+            ]),
+            format!("{}\n\n{CUSTOM}", NEUTRAL.replace('\n', "\r\n")),
+        ),
+    ];
+    for unchanged in [
+        INTRO.to_owned(),
+        SECURITY.to_owned(),
+        CUSTOM.to_owned(),
+        format!("Custom introduction.\n\n{stock}"),
+        stock.replace("CTF challenges", "authorized CTF challenges"),
+        format!("{stock} Extra text in the same paragraph."),
+        rewritten.clone(),
+    ] {
+        cases.push((json!(unchanged), unchanged));
+    }
+    for stream in [false, true] {
+        for (system, expected) in &cases {
+            let mut body = request(stream);
+            body["system"] = system.clone();
+            body["messages"][0]["content"] = json!(stock);
+            body["tools"] = json!([tool("public_tool", json!({"type":"object"}))]);
+            let exchange = f
+                .exchange(body, json!([{"text":"Synthetic completion."}]))
+                .await?;
+            exchange.success(stream)?;
+            let native = &exchange.wire()?["request"];
+            exact(
+                &native["systemInstruction"],
+                &json!({"role":"user","parts":[{"text":expected}]}),
+                "only the complete known leading preamble is reworded; security rules and custom tail retained",
+            )?;
+            exact(
+                &native["contents"],
+                &json!([{"role":"user","parts":[{"text":stock}]}]),
+                "user content must never be reworded",
+            )?;
+            ensure!(
+                native["tools"][0]["functionDeclarations"][0]["name"] == "public_tool",
+                "tools unchanged"
+            );
+            exact(
+                &native["generationConfig"],
+                &json!({"maxOutputTokens":137,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"HIGH"}}),
+                "generation settings unchanged",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 async fn first_agent_metadata(f: &mut Fixture) -> Result<()> {
