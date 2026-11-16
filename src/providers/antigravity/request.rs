@@ -266,7 +266,9 @@ fn neutral_claude_code_preamble(text: &str) -> Cow<'_, str> {
         "You are an interactive agent that helps users with software engineering tasks.";
     const SECURITY: &str = "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.";
     const NEUTRAL: &str = "Help users interactively with software-engineering work.\n\nFor cybersecurity tasks, support authorized testing, defensive security, capture-the-flag challenges, and education. Decline requests involving destructive techniques, denial-of-service attacks, mass targeting, supply-chain compromise, or detection evasion for malicious purposes. Assistance with dual-use security tools, including command-and-control frameworks, credential testing, and exploit development, requires clear authorization context, such as a penetration-testing engagement, a capture-the-flag competition, security research, or a defensive use case.";
-    let Some(after_intro) = text.strip_prefix(INTRO) else {
+    let trimmed = text.trim_start_matches([' ', '\t', '\r', '\n']);
+    let prefix = &text[..text.len() - trimmed.len()];
+    let Some(after_intro) = trimmed.strip_prefix(INTRO) else {
         return Cow::Borrowed(text);
     };
     for separator in ["\n\n", "\r\n\r\n"] {
@@ -277,7 +279,10 @@ fn neutral_claude_code_preamble(text: &str) -> Cow<'_, str> {
             continue;
         };
         if tail.is_empty() || tail.starts_with("\n\n") || tail.starts_with("\r\n\r\n") {
-            return Cow::Owned(format!("{}{tail}", NEUTRAL.replace("\n\n", separator)));
+            return Cow::Owned(format!(
+                "{prefix}{}{tail}",
+                NEUTRAL.replace("\n\n", separator)
+            ));
         }
     }
     Cow::Borrowed(text)

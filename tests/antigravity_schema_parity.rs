@@ -146,6 +146,7 @@ cases! {
     schema_parity_project_admission_control => "project-admission",
     schema_parity_observed_first_agent_metadata => "first-agent",
     schema_parity_claude_code_system_preamble => "system-preamble",
+    schema_parity_claude_code_preamble_leading_whitespace => "system-preamble-leading",
     schema_parity_observed_two_user_text_metadata => "two-user-text",
     schema_parity_observed_three_user_text_recurrence => "three-user-text",
     schema_parity_observed_last_recorded_execution => "last-recorded-execution",
@@ -749,7 +750,8 @@ async fn exercise(case: &str, f: &mut Fixture) -> Result<()> {
         "admission" => admission(f).await,
         "project-admission" => project_admission(f).await,
         "first-agent" => first_agent_metadata(f).await,
-        "system-preamble" => system_preamble(f).await,
+        "system-preamble" => system_preamble(f, false).await,
+        "system-preamble-leading" => system_preamble(f, true).await,
         "two-user-text" => two_user_text_metadata(f).await,
         "three-user-text" => user_text_sequence(f, false).await,
         "last-recorded-execution" => user_text_sequence(f, true).await,
@@ -761,7 +763,7 @@ async fn exercise(case: &str, f: &mut Fixture) -> Result<()> {
     }
 }
 
-async fn system_preamble(f: &mut Fixture) -> Result<()> {
+async fn system_preamble(f: &mut Fixture, leading_whitespace: bool) -> Result<()> {
     const INTRO: &str =
         "You are an interactive agent that helps users with software engineering tasks.";
     const SECURITY: &str = "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.";
@@ -811,9 +813,62 @@ async fn system_preamble(f: &mut Fixture) -> Result<()> {
     ] {
         cases.push((json!(unchanged), unchanged));
     }
+    if leading_whitespace {
+        // The stock lean prompt starts with LF; other ASCII prefixes are defensive cases.
+        for prefix in ["\n", "\r\n", " \t\r\n", "\n\n"] {
+            cases.push((
+                json!(format!("{prefix}{stock}\n\n{CUSTOM}")),
+                format!("{prefix}{rewritten}"),
+            ));
+            cases.push((
+                json!(format!("{prefix}{rewritten}")),
+                format!("{prefix}{rewritten}"),
+            ));
+        }
+        cases.push((
+            json!([
+                {"type":"text","text":"x-anthropic-billing-header: public-test"},
+                {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type":"text","text":format!("\n{stock}\n\n{CUSTOM}"),"cache_control":{"type":"ephemeral"}}
+            ]),
+            format!("\n{rewritten}"),
+        ));
+        cases.push((
+            json!(format!("x-anthropic-billing-header: public-test\n\nYou are Claude Code, Anthropic's official CLI for Claude.\n\n\n{stock}\n\n{CUSTOM}")),
+            format!("\n{rewritten}"),
+        ));
+        cases.push((
+            json!([{"type":"text","text":" \t\r\n"},{"type":"text","text":stock}]),
+            format!(" \t\r\n\n\n{NEUTRAL}"),
+        ));
+        cases.push((
+            json!(format!("\n{}", stock.replace('\n', "\r\n"))),
+            format!("\n{}", NEUTRAL.replace('\n', "\r\n")),
+        ));
+        for unchanged in [
+            String::new(),
+            " \t\r\n".to_owned(),
+            format!("\n{INTRO}"),
+            format!("\n{INTRO}\n\n{stock}"),
+            format!("\nCustom introduction.\n\n{stock}"),
+            format!(
+                "\n{}",
+                stock.replace("CTF challenges", "authorized CTF challenges")
+            ),
+        ] {
+            cases.push((json!(unchanged), unchanged));
+        }
+        for prefix in ["\u{000b}", "\u{000c}", "\u{00a0}", "\u{feff}", "\u{2003}"] {
+            let unchanged = format!("{prefix}{stock}");
+            cases.push((json!(unchanged), unchanged));
+        }
+    }
     for stream in [false, true] {
         for (system, expected) in &cases {
             let mut body = request(stream);
+            if leading_whitespace {
+                body["model"] = json!("antigravity/gemini-4-carbon-medium");
+            }
             body["system"] = system.clone();
             body["messages"][0]["content"] = json!(stock);
             body["tools"] = json!([tool("public_tool", json!({"type":"object"}))]);
@@ -838,10 +893,33 @@ async fn system_preamble(f: &mut Fixture) -> Result<()> {
             );
             exact(
                 &native["generationConfig"],
-                &json!({"maxOutputTokens":137,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"HIGH"}}),
+                &json!({"maxOutputTokens":137,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":if leading_whitespace { "MEDIUM" } else { "HIGH" }}}),
                 "generation settings unchanged",
             )?;
         }
+    }
+    if leading_whitespace {
+        let mut counts = Vec::new();
+        for system in [format!("\n{stock}\n\n{CUSTOM}"), format!("\n{rewritten}")] {
+            let mut body = request(false);
+            body["model"] = json!("antigravity/gemini-4-carbon-medium");
+            body["system"] = json!(system);
+            let response = f
+                .provider
+                .handle_count_tokens(serde_json::from_value(body)?, context())
+                .await;
+            ensure!(
+                response.status() == StatusCode::OK,
+                "leading-preamble local count"
+            );
+            let bytes = to_bytes(response.into_body(), BODY_LIMIT).await?;
+            counts.push(serde_json::from_slice::<Value>(&bytes)?["input_tokens"].clone());
+        }
+        exact(
+            &counts[0],
+            &counts[1],
+            "count and generation use the same normalized preamble",
+        )?;
     }
     Ok(())
 }
