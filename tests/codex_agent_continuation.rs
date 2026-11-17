@@ -80,6 +80,7 @@ fn configure_environment(config_dir: &Path, upstream_url: &str) -> Vec<EnvGuard>
         "all_proxy",
         "REQUEST_METHOD",
         "CCP_AUTO_REVIEW_MODEL",
+        "CCP_AUTO_REVIEW_EFFORT",
         "CCP_CODEX_MODEL",
         "CCP_CODEX_SERVICE_TIER",
         "CCP_CODEX_EFFORT",
@@ -1441,6 +1442,11 @@ async fn malformed_identity_sandwich_is_stateless_and_preserves_main() {
 async fn auto_review_with_agent_headers_is_stateless() {
     let _environment_lock = env_lock();
     let mut harness = TestHarness::start().await;
+    std::fs::write(
+        harness._config_dir.path().join("config.json"),
+        r#"{"autoReviewEffort":"medium","codex":{"effort":"high"}}"#,
+    )
+    .unwrap();
     let case = unique("auto-review");
     let session = tagged(&case, "session");
     let headers = IdentityHeaders::agent(&session, &tagged(&case, "agent-a"), None);
@@ -1471,6 +1477,7 @@ async fn auto_review_with_agent_headers_is_stateless() {
                     "text": review_system
                 }],
                 "messages": [{"role": "user", "content": review}],
+                "output_config": {"effort": "low", "format": {"type": "json_object"}},
                 "tools": []
             }),
             headers.clone(),
@@ -1502,6 +1509,10 @@ async fn auto_review_with_agent_headers_is_stateless() {
         &[("developer", review_system), ("user", &review)],
     );
     assert_eq!(classifier.body["model"], "gpt-6-luna");
+    assert_eq!(classifier.body["reasoning"]["effort"], "medium");
+    assert_eq!(classifier.body["text"]["format"]["type"], "json_object");
+    assert_eq!(first.body["reasoning"]["effort"], "high");
+    assert_eq!(second.body["reasoning"]["effort"], "high");
     assert_eq!(first.socket_ordinal, 1);
     assert_eq!(classifier.socket_ordinal, 2);
     assert_delta_input(&second, &a_response, first.socket_ordinal, &a2);
