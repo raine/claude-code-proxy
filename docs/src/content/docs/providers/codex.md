@@ -28,6 +28,10 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
+`gpt-6.2-sol` and `gpt-6.2-astra` are built-in models, including their `-fast`
+variants. They use Responses Lite; the `fullLane` setting does not switch them
+to the full lane.
+
 The proxy also reads the Codex CLI's optional `$CODEX_HOME/models_cache.json`
 (default `~/.codex/models_cache.json`) to recognize additional models. Listed
 entries marked `supported_in_api: true` appear in discovery; hidden entries
