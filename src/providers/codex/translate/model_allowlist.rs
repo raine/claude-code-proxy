@@ -23,6 +23,8 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -207,6 +209,8 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-sol"
             | "gpt-6.1-sol"
             | "gpt-6.1-terra"
+            | "gpt-6.2-sol"
+            | "gpt-6.2-astra"
     ) || (!ALLOWED_MODELS.contains(&model)
         && catalog_model(model)
             .is_some_and(|entry| entry.supported_in_api && entry.use_responses_lite))
@@ -224,6 +228,8 @@ pub fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool 
                 | "gpt-6-sol"
                 | "gpt-6.1-sol"
                 | "gpt-6.1-terra"
+                | "gpt-6.2-sol"
+                | "gpt-6.2-astra"
         )
     {
         return false;
@@ -272,6 +278,8 @@ mod tests {
             "gpt-6-sol",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
         ] {
             assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
             assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
