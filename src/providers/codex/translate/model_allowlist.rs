@@ -23,6 +23,8 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -207,6 +209,8 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-sol"
             | "gpt-6.1-sol"
             | "gpt-6.1-terra"
+            | "gpt-6.2-astra"
+            | "gpt-6.2-sol"
     ) || (!ALLOWED_MODELS.contains(&model)
         && catalog_model(model)
             .is_some_and(|entry| entry.supported_in_api && entry.use_responses_lite))
@@ -264,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn full_lane_covers_all_lite_models_except_luna() {
+    fn full_lane_covers_known_full_lane_models() {
         for model in [
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -276,7 +280,12 @@ mod tests {
             assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
             assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
         }
-        for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+        ] {
             assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
             assert!(uses_responses_lite_with_full_lane(model, true), "{model}");
         }
@@ -331,8 +340,14 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_sol_fast_adds_priority() {
-        for model in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"] {
+    fn gpt_6_fast_adds_priority() {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
+        ] {
             let r = resolve_model_request(&format!("{model}-fast"));
             assert_eq!(r.model, model);
             assert_eq!(r.service_tier, Some(ServiceTier::Priority));
@@ -345,6 +360,8 @@ mod tests {
         assert!(uses_responses_lite("gpt-6-luna"));
         assert!(uses_responses_lite("gpt-6.1-sol"));
         assert!(uses_responses_lite("gpt-6.1-terra"));
+        assert!(uses_responses_lite("gpt-6.2-astra"));
+        assert!(uses_responses_lite("gpt-6.2-sol"));
     }
 
     #[test]
@@ -508,6 +525,8 @@ mod tests {
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
         assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+        assert!(assert_allowed_model("gpt-6.2-astra").is_ok());
+        assert!(assert_allowed_model("gpt-6.2-sol").is_ok());
     }
 
     #[test]
