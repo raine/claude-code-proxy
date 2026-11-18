@@ -2611,3 +2611,229 @@ fn antigravity_task_update_projects_native_enum_and_object_without_codec() {
         json!({"taskId": "1", "status": "in_progress", "metadata": {"step": 1}})
     );
 }
+
+#[test]
+fn antigravity_codex_cross_provider_model_switch_and_prefix_binding_isolation() {
+    use super::antigravity::request::{self, CountInputs, ServingScope};
+    use crate::providers::codex::translate::reasoning_signature::{
+        ReasoningReplay, encode_reasoning_signature,
+    };
+
+    let codex_sig = encode_reasoning_signature(&ReasoningReplay {
+        id: "rs_0c8806abcdef".into(),
+        encrypted_content: "gAAAAABsynthetic_codex_encrypted_reasoning".into(),
+    })
+    .unwrap();
+
+    // 1. Codex multi-thinking turn (with leading empty signature + signed second block + tool loop) -> Antigravity
+    let codex_to_agy = json!({
+        "model": "antigravity/gemini-4-argon-low",
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "inspect cluster"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "step 1", "signature": ""},
+                {"type": "thinking", "thinking": "step 2", "signature": codex_sig},
+                {"type": "text", "text": "Checking files"},
+                {"type": "tool_use", "id": "call_codex_1", "name": "Read", "input": {"file_path": "/tmp/a"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_codex_1", "content": "contents-a"},
+                {"type": "text", "text": "now summarize with antigravity"}
+            ]}
+        ]
+    });
+    let codex_req: crate::anthropic::schema::MessagesRequest =
+        serde_json::from_value(codex_to_agy).unwrap();
+    let prepared = prepare(&codex_req, &binding()).unwrap();
+    assert!(
+        prepared.wire["request"]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<prior_conversation_transcript>")
+    );
+    let local_scope = ServingScope {
+        profile_id: "profile".into(),
+        project_id: "project".into(),
+    };
+    assert!(
+        request::estimate(
+            &codex_req,
+            CountInputs {
+                serving_scope: None,
+                configured_project: Some("project"),
+            }
+        )
+        .is_ok()
+    );
+    assert!(
+        request::estimate(
+            &codex_req,
+            CountInputs {
+                serving_scope: Some(&local_scope),
+                configured_project: Some("project"),
+            }
+        )
+        .is_ok()
+    );
+
+    // 2. Antigravity A -> Codex (with thinking) -> Antigravity A
+    let lineage = default_lineage();
+    let agy_turn_a = encode_turn(
+        &json!([{"role": "model", "parts": [{"text": "agy first answer"}]}]),
+        &binding(),
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let a_codex_a: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+        "model": "antigravity/gemini-4-argon-low",
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": agy_turn_a},
+            {"role": "user", "content": "q2 on codex"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "codex reasoning", "signature": codex_sig},
+                {"type": "text", "text": "codex answer"}
+            ]},
+            {"role": "user", "content": "q3 back on agy A"}
+        ]
+    }))
+    .unwrap();
+    assert!(prepare(&a_codex_a, &binding()).is_ok());
+    assert!(
+        request::estimate(
+            &a_codex_a,
+            CountInputs {
+                serving_scope: None,
+                configured_project: Some("project"),
+            }
+        )
+        .is_ok()
+    );
+
+    // 3. Mixed/tampered Codex + foreign thinking blocks fail closed
+    let tampered_mixed: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+        "model": "antigravity/gemini-4-argon-low",
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "ok", "signature": codex_sig},
+                {"type": "thinking", "thinking": "bad", "signature": "foreign"},
+                {"type": "text", "text": "ans"}
+            ]},
+            {"role": "user", "content": "q2"}
+        ]
+    }))
+    .unwrap();
+    assert!(prepare(&tampered_mixed, &binding()).is_err());
+    assert!(
+        request::estimate(
+            &tampered_mixed,
+            CountInputs {
+                serving_scope: None,
+                configured_project: Some("project"),
+            }
+        )
+        .is_err()
+    );
+
+    // 4. Foreign profile_id or project_id fails closed across tier switches AND intervening Codex turns
+    let mut foreign_profile_binding = binding();
+    foreign_profile_binding.profile_id = "other-profile".into();
+    let foreign_prof_turn = encode_turn(
+        &json!([{"role": "model", "parts": [{"text": "foreign profile answer"}]}]),
+        &foreign_profile_binding,
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+
+    for switched_messages in [
+        json!([
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": foreign_prof_turn},
+            {"role": "user", "content": "switch tier"}
+        ]),
+        json!([
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": foreign_prof_turn},
+            {"role": "user", "content": "codex turn"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "codex", "signature": codex_sig},
+                {"type": "text", "text": "codex reply"}
+            ]},
+            {"role": "user", "content": "smuggle attempt"}
+        ]),
+    ] {
+        let req: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+            "model": "antigravity/gemini-4-argon-high",
+            "max_tokens": 256,
+            "messages": switched_messages
+        }))
+        .unwrap();
+        let mut high_binding = binding();
+        high_binding.native_model = "gemini-4-argon-high".into();
+        assert!(
+            prepare(&req, &high_binding).is_err(),
+            "foreign profile_id must fail closed even on tier switch or intervening Codex turn"
+        );
+        assert!(
+            request::estimate(
+                &req,
+                CountInputs {
+                    serving_scope: Some(&local_scope),
+                    configured_project: Some("project"),
+                }
+            )
+            .is_err()
+        );
+    }
+
+    let mut foreign_project_binding = binding();
+    foreign_project_binding.project_id = "other-project".into();
+    let foreign_proj_turn = encode_turn(
+        &json!([{"role": "model", "parts": [{"text": "foreign project answer"}]}]),
+        &foreign_project_binding,
+        &lineage,
+        0,
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    let foreign_proj_req: crate::anthropic::schema::MessagesRequest =
+        serde_json::from_value(json!({
+            "model": "antigravity/gemini-4-argon-high",
+            "max_tokens": 256,
+            "messages": [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": foreign_proj_turn},
+                {"role": "user", "content": "codex turn"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "codex", "signature": codex_sig},
+                    {"type": "text", "text": "codex reply"}
+                ]},
+                {"role": "user", "content": "smuggle attempt"}
+            ]
+        }))
+        .unwrap();
+    let mut high_binding = binding();
+    high_binding.native_model = "gemini-4-argon-high".into();
+    assert!(prepare(&foreign_proj_req, &high_binding).is_err());
+    assert!(
+        request::estimate(
+            &foreign_proj_req,
+            CountInputs {
+                serving_scope: None,
+                configured_project: Some("project"),
+            }
+        )
+        .is_err()
+    );
+}

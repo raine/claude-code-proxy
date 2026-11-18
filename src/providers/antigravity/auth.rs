@@ -360,8 +360,9 @@ impl Auth {
             .await
             .map_err(|_| "OAuth token exchange transport failed")?;
         let token = bounded_json(response).await?;
+        let profile_id = profile_id_from_token(&token, client_id, &self.config.token_url)?;
         let mut credential = Credential {
-            profile_id: uuid::Uuid::new_v4().to_string(),
+            profile_id,
             project_id: self.config.project.clone(),
             access_token: String::new(),
             refresh_token: None,
@@ -403,7 +404,7 @@ pub(crate) fn authorization_url(
     state: &str,
     verifier: &str,
 ) -> url::Url {
-    let scopes = [
+    let google_scopes = [
         "cloud-platform",
         "userinfo.email",
         "userinfo.profile",
@@ -412,6 +413,7 @@ pub(crate) fn authorization_url(
     ]
     .map(|s| format!("https://www.googleapis.com/auth/{s}"))
     .join(" ");
+    let scopes = format!("openid {google_scopes}");
     let mut url = config.authorization_url.clone();
     url.query_pairs_mut().extend_pairs([
         ("client_id", client_id),
@@ -568,6 +570,92 @@ pub(super) fn update_tokens(credential: &mut Credential, value: &Value) -> Resul
         credential.refresh_token = Some(replay::nonempty(refresh)?.to_string());
     }
     credential.validate()
+}
+
+pub(crate) fn profile_id_from_token(
+    token: &Value,
+    client_id: &str,
+    token_url: &url::Url,
+) -> Result<String> {
+    let raw_jwt = match token.get("id_token") {
+        None | Some(Value::Null) => return Ok(uuid::Uuid::new_v4().to_string()),
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => return Err("invalid OAuth id_token"),
+    };
+    if raw_jwt.is_empty() || raw_jwt.len() > 16384 {
+        return Err("invalid OAuth id_token");
+    }
+    let mut parts = raw_jwt.split('.');
+    let (Some(header_b64), Some(payload_b64), Some(signature_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("invalid OAuth id_token");
+    };
+    if header_b64.is_empty() || payload_b64.is_empty() || signature_b64.is_empty() {
+        return Err("invalid OAuth id_token");
+    }
+    let header_raw = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|_| "invalid OAuth id_token")?;
+    let payload_raw = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|_| "invalid OAuth id_token")?;
+    let header = replay::parse_json(&header_raw, 16384).map_err(|_| "invalid OAuth id_token")?;
+    let payload = replay::parse_json(&payload_raw, 16384).map_err(|_| "invalid OAuth id_token")?;
+    let alg = replay::nonempty(&header["alg"]).map_err(|_| "invalid OAuth id_token")?;
+    let is_google_token_host = token_url.host_str() == Some("oauth2.googleapis.com");
+    if alg.eq_ignore_ascii_case("none") || (is_google_token_host && alg != "RS256") {
+        return Err("invalid OAuth id_token");
+    }
+    let raw_iss = replay::nonempty(&payload["iss"]).map_err(|_| "invalid OAuth id_token issuer")?;
+    if raw_iss.len() > 1024 {
+        return Err("invalid OAuth id_token issuer");
+    }
+    let canonical_iss = if raw_iss == "accounts.google.com" {
+        "https://accounts.google.com"
+    } else {
+        raw_iss
+    };
+    if is_google_token_host && canonical_iss != "https://accounts.google.com" {
+        return Err("invalid OAuth id_token issuer");
+    }
+    let multi_aud = match payload.get("aud") {
+        Some(Value::String(aud)) if aud == client_id => false,
+        Some(Value::Array(items)) if !items.is_empty() && items.len() <= 32 => {
+            let mut matched = false;
+            for item in items {
+                let value =
+                    replay::nonempty(item).map_err(|_| "invalid OAuth id_token audience")?;
+                if value.len() > 4096 {
+                    return Err("invalid OAuth id_token audience");
+                }
+                if value == client_id {
+                    matched = true;
+                }
+            }
+            if !matched {
+                return Err("invalid OAuth id_token audience");
+            }
+            items.len() > 1
+        }
+        _ => return Err("invalid OAuth id_token audience"),
+    };
+    match payload.get("azp") {
+        None | Some(Value::Null) if !multi_aud => {}
+        Some(Value::String(azp)) if azp == client_id => {}
+        _ => return Err("invalid OAuth id_token authorized party"),
+    }
+    let sub = replay::nonempty(&payload["sub"]).map_err(|_| "invalid OAuth id_token subject")?;
+    if sub.len() > 255 {
+        return Err("invalid OAuth id_token subject");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"ccp:antigravity:profile:v1:");
+    hasher.update((canonical_iss.len() as u64).to_be_bytes());
+    hasher.update(canonical_iss.as_bytes());
+    hasher.update((sub.len() as u64).to_be_bytes());
+    hasher.update(sub.as_bytes());
+    Ok(format!("profile-{:x}", hasher.finalize()))
 }
 
 pub(crate) fn project_id(value: &Value) -> Result<String> {

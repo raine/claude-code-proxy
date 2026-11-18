@@ -585,41 +585,97 @@ pub(crate) fn canonicalize_tool_inputs(blocks: &mut Value) {
     }
 }
 
-/// Returns true when `blocks` carries a valid Antigravity envelope from a
-/// different `native_model` (mid-session `/model` switch between Antigravity
-/// models/tiers) or from an older envelope version (`v2`), so `request::prepare`
-/// can include it in `prefix_messages` instead of failing `decode_history`.
-pub(crate) fn is_prior_carrier_turn(blocks: &Value, current_native_model: &str) -> bool {
-    let Some(first) = blocks
-        .as_array()
-        .and_then(|b| b.first())
-        .filter(|b| b["type"] == "thinking")
-    else {
+pub(crate) fn is_codex_carrier_signature(signature: &str) -> bool {
+    crate::providers::codex::translate::reasoning_signature::is_valid_reasoning_signature(signature)
+}
+
+pub(crate) fn is_codex_carrier_turn(blocks: &Value) -> bool {
+    let Some(items) = blocks.as_array().filter(|b| !b.is_empty()) else {
         return false;
     };
-    let Some(signature) = first["signature"].as_str() else {
-        return false;
-    };
-    let (encoded, is_old_version) = if let Some(enc) = signature.strip_prefix(PREFIX) {
-        (enc, false)
-    } else if let Some(enc) = signature.strip_prefix("ccp:antigravity:v2:") {
-        (enc, true)
-    } else {
-        return false;
-    };
-    if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
+    if items[0]["type"] != "thinking" {
         return false;
     }
-    let Ok(raw) = URL_SAFE_NO_PAD.decode(encoded) else {
+    let mut saw_codex = false;
+    for block in items.iter().filter(|b| b["type"] == "thinking") {
+        match block.get("signature") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(sig)) if sig.is_empty() => {}
+            Some(Value::String(sig)) if is_codex_carrier_signature(sig) => {
+                saw_codex = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_codex
+}
+
+fn decode_antigravity_carrier_scope(
+    signature: &str,
+    binding: &Binding,
+) -> Result<(&'static str, String)> {
+    let (encoded, version_tag) = if let Some(enc) = signature.strip_prefix(PREFIX) {
+        (enc, "v1")
+    } else if let Some(enc) = signature.strip_prefix("ccp:antigravity:v2:") {
+        (enc, "v2")
+    } else {
+        return Err("missing/foreign carrier");
+    };
+    if encoded.is_empty() || encoded.len() > MAX_ENCODED || encoded.len() * 3 / 4 > MAX_DECODED {
+        return Err("carrier byte limit");
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "malformed carrier")?;
+    let envelope = parse_json(&raw, MAX_DECODED)?;
+    let turn_model = nonempty(&envelope["native_model"])?.to_owned();
+    if version_tag == "v1"
+        && !super::request::MODELS.contains(&format!("antigravity/{turn_model}").as_str())
+    {
+        return Err("unsupported Antigravity model or replay scope");
+    }
+    if binding.profile_id.is_empty()
+        || binding.project_id.is_empty()
+        || envelope["profile_id"].as_str() != Some(binding.profile_id.as_str())
+        || envelope["project_id"].as_str() != Some(binding.project_id.as_str())
+    {
+        return Err("model/profile/project binding mismatch; start a fresh session");
+    }
+    Ok((version_tag, turn_model))
+}
+
+pub(crate) fn validate_prefix_thinking_block(block: &Value, binding: &Binding) -> Result<()> {
+    match block.get("signature") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(sig)) if sig.is_empty() || is_codex_carrier_signature(sig) => Ok(()),
+        Some(Value::String(sig)) => decode_antigravity_carrier_scope(sig, binding).map(|_| ()),
+        Some(_) => Err("missing/foreign carrier"),
+    }
+}
+
+/// Returns true when `blocks` carries a valid Codex reasoning carrier or a valid
+/// Antigravity envelope under the same `(profile_id, project_id)` from a different
+/// `native_model` (or older `v2`), so `request::prepare` can include it in
+/// `prefix_messages` instead of failing `decode_history`.
+pub(crate) fn is_prior_carrier_turn(blocks: &Value, binding: &Binding) -> bool {
+    if is_codex_carrier_turn(blocks) {
+        return true;
+    }
+    let Some(items) = blocks.as_array().filter(|b| !b.is_empty()) else {
         return false;
     };
-    let Ok(envelope) = parse_json(&raw, MAX_DECODED) else {
+    if items[0]["type"] != "thinking"
+        || items.iter().filter(|b| b["type"] == "thinking").count() != 1
+    {
+        return false;
+    }
+    let Some(signature) = items[0]["signature"].as_str() else {
         return false;
     };
-    let Ok(turn_model) = nonempty(&envelope["native_model"]) else {
+    let Ok((version_tag, turn_model)) = decode_antigravity_carrier_scope(signature, binding) else {
         return false;
     };
-    is_old_version || turn_model != current_native_model
+    version_tag == "v2" || turn_model != binding.native_model
 }
 
 /// Extract only an UNTRUSTED scope claim for local estimation when no serving

@@ -639,11 +639,11 @@ fn has_polluted_prefix_artefact(content: &Value) -> bool {
     })
 }
 
-fn is_prior_or_unsigned_assistant(content: &Value, native_model: &str) -> bool {
+fn is_prior_or_unsigned_assistant(content: &Value, binding: &Binding) -> bool {
     content
         .get(0)
         .is_none_or(|block| block["type"] != "thinking")
-        || replay::is_prior_carrier_turn(content, native_model)
+        || replay::is_prior_carrier_turn(content, binding)
         || has_polluted_prefix_artefact(content)
 }
 
@@ -734,6 +734,7 @@ pub(crate) fn estimate(body: &MessagesRequest, inputs: CountInputs<'_>) -> Resul
                 && m.content
                     .get(0)
                     .is_some_and(|block| block["type"] == "thinking")
+                && !replay::is_codex_carrier_turn(&m.content)
         }) {
             replay::claimed_binding(&turn.content, native_model, inputs.configured_project)?
         } else {
@@ -797,10 +798,7 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
     let system = sanitize_system_parts(system);
     let start_idx = messages
         .iter()
-        .rposition(|m| {
-            m.role == "assistant"
-                && is_prior_or_unsigned_assistant(&m.content, &binding.native_model)
-        })
+        .rposition(|m| m.role == "assistant" && is_prior_or_unsigned_assistant(&m.content, binding))
         .filter(|&last_unsigned| {
             let prefix = &messages[..=last_unsigned];
             let last_has_carrier = messages[last_unsigned]
@@ -809,8 +807,7 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                 .is_some_and(|block| block["type"] == "thinking");
             let no_current_thinking = last_has_carrier
                 || prefix.iter().all(|m| {
-                    m.role != "assistant"
-                        || is_prior_or_unsigned_assistant(&m.content, &binding.native_model)
+                    m.role != "assistant" || is_prior_or_unsigned_assistant(&m.content, binding)
                 });
             let non_system: Vec<_> = prefix.iter().filter(|m| m.role != "system").collect();
             let starts_with_user = non_system.first().is_some_and(|m| m.role == "user");
@@ -900,7 +897,7 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                     .ok_or("invalid assistant content")?;
                 for block in blocks {
                     match block["type"].as_str() {
-                        Some("thinking") => {}
+                        Some("thinking") => replay::validate_prefix_thinking_block(block, binding)?,
                         Some("text") => {
                             let text = block["text"].as_str().ok_or("invalid display text")?;
                             if !text.is_empty() {

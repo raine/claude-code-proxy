@@ -57,6 +57,29 @@ pub fn encode_reasoning_signature(replay: &ReasoningReplay) -> Option<String> {
     Some(format!("{PREFIX}{encoded_id}:{}", replay.encrypted_content))
 }
 
+pub fn is_valid_reasoning_signature(signature: &str) -> bool {
+    let Some(payload) = signature.strip_prefix(PREFIX) else {
+        return false;
+    };
+    if payload.is_empty() || payload.len() > max_payload_len() {
+        return false;
+    }
+    let Some((encoded_id, encrypted_content)) = payload.split_once(':') else {
+        return false;
+    };
+    if encoded_id.is_empty()
+        || encoded_id.len() > encoded_id_len_limit()
+        || encrypted_content.is_empty()
+        || encrypted_content.len() > MAX_ENCRYPTED_CONTENT_BYTES
+    {
+        return false;
+    }
+    let Ok(id) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded_id) else {
+        return false;
+    };
+    !id.is_empty() && id.len() <= MAX_ID_BYTES && std::str::from_utf8(&id).is_ok()
+}
+
 pub fn decode_reasoning_signature(signature: &str) -> Option<ReasoningReplay> {
     let payload = signature.strip_prefix(PREFIX)?;
     if payload.is_empty() || payload.len() > max_payload_len() {
@@ -108,6 +131,7 @@ mod tests {
         let signature = encode_reasoning_signature(&replay).unwrap();
         assert!(signature.starts_with(PREFIX));
         assert!(signature.ends_with(":gAAAAopaque"));
+        assert!(is_valid_reasoning_signature(&signature));
         assert_eq!(decode_reasoning_signature(&signature), Some(replay));
     }
 
@@ -141,5 +165,11 @@ mod tests {
             "A".repeat(MAX_ENCRYPTED_CONTENT_BYTES + 1)
         );
         assert_eq!(decode_reasoning_signature(&signature), None);
+        assert!(!is_valid_reasoning_signature(&signature));
+        assert!(!is_valid_reasoning_signature("anthropic-signature"));
+        assert!(!is_valid_reasoning_signature("ccp:codex:v1:not-base64"));
+        assert!(!is_valid_reasoning_signature("ccp:codex:v1::opaque"));
+        assert!(!is_valid_reasoning_signature("ccp:codex:v1:cnNfMQ:"));
+        assert!(!is_valid_reasoning_signature("ccp:codex:v1:////:opaque"));
     }
 }

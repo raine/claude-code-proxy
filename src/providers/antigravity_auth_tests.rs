@@ -1267,3 +1267,297 @@ async fn antigravity_status_never_refreshes_or_exposes_private_values() {
     }
     assert_eq!(state.count.load(Ordering::SeqCst), 0);
 }
+
+fn synthetic_jwt(header: &Value, payload: &Value, signature_segment: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).unwrap());
+    let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+    format!("{h}.{p}.{signature_segment}")
+}
+
+#[tokio::test]
+async fn antigravity_oidc_relogin_preserves_profile_and_native_continuation_while_fencing_foreign_sub()
+ {
+    let url = auth::authorization_url(
+        &Config::default(),
+        "public-client",
+        "http://127.0.0.1:1234/oauth/callback",
+        "state",
+        "verifier",
+    );
+    let query = url
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    let scopes: Vec<&str> = query["scope"].split(' ').collect();
+    assert_eq!(scopes[0], "openid");
+    assert!(scopes.contains(&"https://www.googleapis.com/auth/userinfo.profile"));
+
+    let current_id_token = Arc::new(std::sync::Mutex::new(synthetic_jwt(
+        &json!({"alg": "RS256", "typ": "JWT"}),
+        &json!({
+            "iss": "https://accounts.google.com",
+            "sub": "110248495921238986420",
+            "aud": "public-client",
+            "azp": "public-client"
+        }),
+        "synthetic-rsa-sig",
+    )));
+    let token_holder = current_id_token.clone();
+    let wire_captures = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let wire_sink = wire_captures.clone();
+
+    let server = Server::start(
+        Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let id_token = token_holder.lock().unwrap().clone();
+                    async move {
+                        Json(json!({
+                            "access_token": "oidc-access",
+                            "refresh_token": "oidc-refresh",
+                            "expires_in": 3600,
+                            "token_type": "Bearer",
+                            "id_token": id_token
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1internal:streamGenerateContent",
+                post(move |Json(body): Json<Value>| {
+                    let wire_sink = wire_sink.clone();
+                    async move {
+                        wire_sink.lock().unwrap().push(body);
+                        (
+                            [("content-type", "text/event-stream")],
+                            format!(
+                                "data: {}\n\n",
+                                json!({
+                                    "response": {
+                                        "candidates": [{
+                                            "content": {
+                                                "role": "model",
+                                                "parts": [
+                                                    {"thought": true, "text": "native thought", "thoughtSignature": "native-sig"},
+                                                    {"text": "native answer"}
+                                                ]
+                                            },
+                                            "finishReason": "STOP"
+                                        }],
+                                        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+                                    }
+                                })
+                            ),
+                        )
+                    }
+                }),
+            ),
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path().join("auth.json"));
+    let auth = Auth::new(
+        Config {
+            enabled: true,
+            base_url: server.url.clone(),
+            token_url: server.url.join("/token").unwrap(),
+            client_id: Some("public-client".into()),
+            project: Some("project-1".into()),
+            ..Config::default()
+        },
+        store.clone(),
+    )
+    .unwrap();
+
+    // First login
+    auth.login_manual_with_completion(|_, _| async { Ok("4/0code-one".into()) })
+        .await
+        .unwrap();
+    let first_cred = store.load().unwrap().unwrap();
+    let first_epoch = store
+        .lock(Duration::from_secs(1))
+        .await
+        .unwrap()
+        .epoch()
+        .unwrap();
+    assert!(first_cred.profile_id.starts_with("profile-"));
+    assert_eq!(first_cred.profile_id.len(), 72);
+    assert!(!first_cred.profile_id.contains("110248495921238986420"));
+
+    let registry = crate::registry::Registry::from_providers(
+        crate::config::AliasProvider::Codex,
+        [
+            Arc::new(super::antigravity::AntigravityProvider::with_auth(auth))
+                as Arc<dyn crate::provider::Provider>,
+        ],
+    );
+    let proxy = Server::start(crate::server::app_with_features(
+        Arc::new(registry),
+        None,
+        crate::server::AppFeatures::default(),
+    ))
+    .await;
+
+    // Turn 1 before re-login
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let turn1_resp = client
+        .post(proxy.url.join("/v1/messages").unwrap())
+        .json(&json!({
+            "model": "antigravity/gemini-4-carbon-medium",
+            "max_tokens": 256,
+            "stream": false,
+            "messages": [{"role": "user", "content": "turn 1"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turn1_resp.status(), 200);
+    let turn1_msg: Value = turn1_resp.json().await.unwrap();
+
+    // Re-login with SAME Google sub (using Google's alternate "accounts.google.com" issuer and multi-aud + azp)
+    *current_id_token.lock().unwrap() = synthetic_jwt(
+        &json!({"alg": "RS256"}),
+        &json!({
+            "iss": "accounts.google.com",
+            "sub": "110248495921238986420",
+            "aud": ["public-client", "secondary-aud"],
+            "azp": "public-client"
+        }),
+        "synthetic-rsa-sig-2",
+    );
+    let login_auth = Auth::new(
+        Config {
+            enabled: true,
+            base_url: server.url.clone(),
+            token_url: server.url.join("/token").unwrap(),
+            client_id: Some("public-client".into()),
+            project: Some("project-1".into()),
+            ..Config::default()
+        },
+        store.clone(),
+    )
+    .unwrap();
+    login_auth
+        .login_manual_with_completion(|_, _| async { Ok("4/0code-two".into()) })
+        .await
+        .unwrap();
+    let second_cred = store.load().unwrap().unwrap();
+    let second_epoch = store
+        .lock(Duration::from_secs(1))
+        .await
+        .unwrap()
+        .epoch()
+        .unwrap();
+    assert_ne!(
+        first_epoch, second_epoch,
+        "auth.lock epoch must still advance on re-login"
+    );
+    assert_eq!(
+        second_cred.profile_id, first_cred.profile_id,
+        "same Google OIDC subject must derive identical pseudonymous profile_id"
+    );
+
+    // Turn 2 on SAME model continues natively without 400 or flattening!
+    let mut history = json!({
+        "model": "antigravity/gemini-4-carbon-medium",
+        "max_tokens": 256,
+        "stream": false,
+        "messages": [
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": turn1_msg["content"]},
+            {"role": "user", "content": "turn 2 after relogin"}
+        ]
+    });
+    let turn2_resp = client
+        .post(proxy.url.join("/v1/messages").unwrap())
+        .json(&history)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turn2_resp.status(), 200);
+    let turn2_wire = wire_captures.lock().unwrap().last().unwrap().clone();
+    assert_eq!(turn2_wire["request"]["labels"]["last_step_index"], "2");
+    assert!(
+        !turn2_wire["request"]["contents"]
+            .to_string()
+            .contains("<prior_conversation_transcript>"),
+        "same-account re-login must preserve true native continuation without flattening"
+    );
+
+    // Login 3 with DIFFERENT Google sub fences prior session with 400
+    *current_id_token.lock().unwrap() = synthetic_jwt(
+        &json!({"alg": "RS256"}),
+        &json!({
+            "iss": "https://accounts.google.com",
+            "sub": "999999999999999999999",
+            "aud": "public-client"
+        }),
+        "synthetic-rsa-sig-3",
+    );
+    login_auth
+        .login_manual_with_completion(|_, _| async { Ok("4/0code-three".into()) })
+        .await
+        .unwrap();
+    let third_cred = store.load().unwrap().unwrap();
+    assert_ne!(third_cred.profile_id, first_cred.profile_id);
+
+    history["messages"][2]["content"] = json!("turn 3 under foreign account");
+    let rejected = client
+        .post(proxy.url.join("/v1/messages").unwrap())
+        .json(&history)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 400);
+    let err_json: Value = rejected.json().await.unwrap();
+    assert!(
+        err_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("model/profile/project binding mismatch")
+    );
+    assert_eq!(wire_captures.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn antigravity_oidc_invalid_id_tokens_fail_closed_without_leaking_claims() {
+    let google_token_url: url::Url = "https://oauth2.googleapis.com/token".parse().unwrap();
+    let valid_google = json!({
+        "id_token": synthetic_jwt(
+            &json!({"alg": "RS256"}),
+            &json!({
+                "iss": "https://accounts.google.com",
+                "sub": "secret-subject-123",
+                "aud": "public-client-xyz"
+            }),
+            "sig"
+        )
+    });
+    let derived =
+        auth::profile_id_from_token(&valid_google, "public-client-xyz", &google_token_url).unwrap();
+    assert!(derived.starts_with("profile-"));
+    assert!(!derived.contains("secret-subject-123"));
+
+    let invalid_cases = vec![
+        json!({"id_token": 12345}),
+        json!({"id_token": {"sub": "secret-subject-123"}}),
+        json!({"id_token": "not-a-jwt"}),
+        json!({"id_token": "a.b."}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "none"}), &json!({"iss": "https://accounts.google.com", "sub": "secret-subject-123", "aud": "public-client-xyz"}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "HS256"}), &json!({"iss": "https://accounts.google.com", "sub": "secret-subject-123", "aud": "public-client-xyz"}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "RS256"}), &json!({"iss": "https://evil.example.com", "sub": "secret-subject-123", "aud": "public-client-xyz"}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "RS256"}), &json!({"iss": "https://accounts.google.com", "sub": "secret-subject-123", "aud": "wrong-client"}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "RS256"}), &json!({"iss": "https://accounts.google.com", "sub": "secret-subject-123", "aud": ["public-client-xyz", "second-aud"]}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "RS256"}), &json!({"iss": "https://accounts.google.com", "sub": "secret-subject-123", "aud": "public-client-xyz", "azp": "wrong-azp"}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "RS256"}), &json!({"iss": "https://accounts.google.com", "sub": "", "aud": "public-client-xyz"}), "sig")}),
+        json!({"id_token": synthetic_jwt(&json!({"alg": "RS256"}), &json!({"iss": "https://accounts.google.com", "sub": "s".repeat(256), "aud": "public-client-xyz"}), "sig")}),
+    ];
+    for case in invalid_cases {
+        let err = auth::profile_id_from_token(&case, "public-client-xyz", &google_token_url)
+            .expect_err("invalid id_token must fail closed");
+        assert!(!err.contains("secret-subject-123"));
+        assert!(!err.contains("public-client-xyz"));
+    }
+}
