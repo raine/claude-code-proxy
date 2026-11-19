@@ -236,7 +236,7 @@ There are no automatic generation retries or endpoint/account fallback.
 | Native response contents / parts / calls | 512 / 4096 / 128 |
 | Logical assistant projection / blocks | 8 MiB semantic bytes / 4097; cumulative bounds checked before growth |
 | Original-schema codec guidance | 16 KiB per complete description; no essential-constraint truncation |
-| Incoming messages / prepared native history contents | 512 / 1024 |
+| Incoming messages / checkpoints / prepared native history contents | Bounded by 64 MiB HTTP request body (`MAX_ANTHROPIC_REQUEST_BYTES`); no fixed count cap |
 | Caller tools / source schema bytes / schema nodes / schema depth | 128 / 256 KiB per schema / 8192 / 32 |
 | Raw codec JSON / decoded argument bytes | 1 MiB each |
 | Codec paths per call / path bytes / root-key bytes | 64 / 1024 / 256 |

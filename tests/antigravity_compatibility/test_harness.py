@@ -50,6 +50,14 @@ class HarnessTests(unittest.TestCase):
         blocks = first_assistant_turn(messages)
         self.assertEqual([b["type"] for b in blocks], ["text", "tool_use"])
 
+    def test_assistant_turns_supports_conversations_over_512_messages(self):
+        messages = []
+        for idx in range(300):
+            messages.append({"role": "user", "content": f"u{idx}"})
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": f"a{idx}"}]})
+        self.assertEqual(len(messages), 600)
+        self.assertEqual(len(assistant_turns(messages)), 300)
+
     def test_wire_observations_do_not_invent_omitted_fields(self):
         fields = wire_fields({"model": "antigravity/gemini-4-argon-low[1m]", "stream": True,
                               "output_config": {"effort": "high"}})

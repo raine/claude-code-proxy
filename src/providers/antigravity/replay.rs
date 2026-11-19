@@ -11,7 +11,7 @@ use std::collections::HashSet;
 pub(crate) type Result<T> = std::result::Result<T, &'static str>;
 pub const PREFIX: &str = "ccp:antigravity:v1:";
 pub(crate) const BACKEND_SESSION: &str = "-3750763034362895579";
-pub(crate) const MAX_CHECKPOINTS: u64 = 512;
+pub(crate) const MAX_SAFE_CHECKPOINT_INDEX: u64 = (1 << 53) - 1;
 pub const MAX_DECODED: usize = 8 * 1024 * 1024;
 pub const MAX_ENCODED: usize = 12 * 1024 * 1024;
 pub const MAX_ARGUMENT: usize = 1024 * 1024;
@@ -777,8 +777,8 @@ pub(crate) struct State {
 impl State {
     pub(crate) fn validate(&self) -> Result<()> {
         self.lineage.validate()?;
-        if self.native_checkpoint_index >= MAX_CHECKPOINTS {
-            return Err("checkpoint limit");
+        if self.native_checkpoint_index > MAX_SAFE_CHECKPOINT_INDEX {
+            return Err("step overflow");
         }
         let execution = &self.user_execution;
         uuid_v4(&execution.active_id)?;
@@ -971,10 +971,7 @@ pub(crate) fn decode(blocks: &Value, binding: &Binding) -> Result<Value> {
 }
 
 pub(crate) fn decode_history(turns: &Value, binding: &Binding) -> Result<Vec<Value>> {
-    let turns = turns
-        .as_array()
-        .filter(|t| t.len() <= MAX_CHECKPOINTS as usize)
-        .ok_or("history limit/type")?;
+    let turns = turns.as_array().ok_or("history must be an array")?;
     let mut result = Vec::new();
     let mut previous: Option<(State, String)> = None;
     let mut executions = HashSet::new();

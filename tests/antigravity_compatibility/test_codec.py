@@ -295,6 +295,9 @@ class FinalV1Tests(unittest.TestCase):
         with self.assertRaisesRegex(ReplayError, "local ID"):
             decode_history([first, first], BINDING)
         self.assertEqual(decode_history([first, project_turn(native_fixture(), BINDING, session_id="17")], BINDING)["session_id"], "17")
+        long_turns = [project_turn([{"role": "model", "parts": [{"text": f"t{i}"}]}], BINDING, session_id="17")
+                      for i in range(520)]
+        self.assertEqual(len(decode_history(long_turns, BINDING)["turns"]), 520)
 
     def test_malformed_leaf_json_fails_before_projection(self):
         for raw in ("bad json", "NaN", "1e309", "{\"x\":1,\"x\":2}", "9007199254740992", 123):

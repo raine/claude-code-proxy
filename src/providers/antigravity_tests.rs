@@ -406,7 +406,40 @@ fn antigravity_two_user_text_checkpoint_progress_and_history_consistency() {
             "full",
             &json!([])
         )
-        .is_err()
+        .is_ok()
+    );
+    let max_safe = replay::State {
+        lineage: lineage.clone(),
+        native_checkpoint_index: (1_u64 << 53) - 1,
+        user_execution: replay::UserExecution {
+            active_id: execution_id(1),
+            prior_recorded_id: Some(execution_id(0)),
+        },
+    };
+    assert!(
+        replay::encode(
+            &second_contents,
+            &binding(),
+            &max_safe,
+            "end_turn",
+            "full",
+            &json!([])
+        )
+        .is_ok()
+    );
+    let mut overflow = max_safe;
+    overflow.native_checkpoint_index = 1_u64 << 53;
+    assert_eq!(
+        replay::encode(
+            &second_contents,
+            &binding(),
+            &overflow,
+            "end_turn",
+            "full",
+            &json!([])
+        )
+        .err(),
+        Some("step overflow")
     );
     for history in [
         json!([second]),
@@ -2836,4 +2869,240 @@ fn antigravity_codex_cross_provider_model_switch_and_prefix_binding_isolation() 
         )
         .is_err()
     );
+}
+
+#[test]
+fn antigravity_supports_long_multi_turn_conversations_beyond_former_count_caps() {
+    use super::antigravity::request::{self, CountInputs, ServingScope};
+
+    let lineage = default_lineage();
+    let scope = ServingScope {
+        profile_id: "profile".into(),
+        project_id: "project".into(),
+    };
+
+    // 1. Active continuation exceeding all three former caps simultaneously:
+    //    - 520 native assistant checkpoints (>= former 512 MAX_CHECKPOINTS)
+    //    - > 1,100 raw Anthropic messages (> former 512 message count cap, including
+    //      unmerged streaming assistant block fragments as emitted by Claude Code)
+    //    - 1,041 native `contents` items (> former 1024 native history content cap)
+    let mut messages = vec![json!({"role": "user", "content": "start long agentic run"})];
+    for idx in 0..519_u64 {
+        let local_id = format!("toolu_loop_{idx}");
+        let native_call = json!([{
+            "role": "model",
+            "parts": [
+                {"text": "step", "thought": true},
+                {"functionCall": {"name": "bash", "id": format!("call_{idx}"), "args": {"cmd": "true"}}}
+            ]
+        }]);
+        let recipes = json!([{"local_id": local_id, "caller_name": "bash"}]);
+        let mapping = replay::mapping(&native_call, Some(&recipes)).unwrap();
+        let state = replay::State {
+            lineage: lineage.clone(),
+            native_checkpoint_index: idx,
+            user_execution: replay::UserExecution {
+                active_id: execution_id(0),
+                prior_recorded_id: None,
+            },
+        };
+        let blocks = replay::encode(
+            &native_call,
+            &binding(),
+            &state,
+            "tool_use",
+            "full",
+            &mapping,
+        )
+        .unwrap();
+        let arr = blocks.as_array().unwrap();
+        if idx % 5 == 0 {
+            // Mirror Claude Code streaming transcript splits across adjacent assistant messages.
+            messages.push(json!({"role": "assistant", "content": [arr[0].clone()]}));
+            messages.push(json!({"role": "assistant", "content": arr[1..].to_vec()}));
+        } else {
+            messages.push(json!({"role": "assistant", "content": blocks}));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": local_id, "content": "ok"},
+                {"type": "text", "text": "<system-reminder>tokens ok</system-reminder>"}
+            ]
+        }));
+    }
+    let final_state = replay::State {
+        lineage: lineage.clone(),
+        native_checkpoint_index: 519,
+        user_execution: replay::UserExecution {
+            active_id: execution_id(0),
+            prior_recorded_id: None,
+        },
+    };
+    let final_assistant = replay::encode(
+        &json!([{"role": "model", "parts": [{"text": "completed 519 tool calls"}]}]),
+        &binding(),
+        &final_state,
+        "end_turn",
+        "full",
+        &json!([]),
+    )
+    .unwrap();
+    messages.push(json!({"role": "assistant", "content": final_assistant}));
+    messages.push(json!({"role": "user", "content": "follow-up after 520 checkpoints"}));
+    assert!(messages.len() > 1100);
+
+    let body: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+        "model": "antigravity/gemini-4-argon-low",
+        "max_tokens": 1024,
+        "tools": [{
+            "name": "bash",
+            "input_schema": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"]
+            }
+        }],
+        "messages": messages
+    }))
+    .unwrap();
+
+    let estimated = request::estimate(
+        &body,
+        CountInputs {
+            serving_scope: Some(&scope),
+            configured_project: Some("project"),
+        },
+    )
+    .expect("estimate must succeed past 512 messages / 512 checkpoints / 1024 contents");
+    assert!(estimated > 0);
+
+    let mut prepared_collision = prepare(&body, &binding())
+        .expect("prepare must succeed past 512 messages / 512 checkpoints / 1024 contents");
+    assert_eq!(
+        prepared_collision
+            .finalize_metadata(1_700_000_000_000, || execution_id(0))
+            .err(),
+        Some("USER execution UUID collision"),
+        "HashSet execution_ids must still reject reused active_id"
+    );
+
+    let mut prepared = prepare(&body, &binding()).unwrap();
+    let native_contents = prepared.wire["request"]["contents"].as_array().unwrap();
+    // 1 initial user + 519 * (model call + model functionResponse + user reminder merged? No:
+    // model call, then model functionResponse, then user reminder text, then next model call...)
+    assert!(
+        native_contents.len() > 1024,
+        "expected > 1024 native contents, got {}",
+        native_contents.len()
+    );
+    prepared
+        .finalize_metadata(1_700_000_000_000, || execution_id(1))
+        .expect("finalize_metadata must succeed at checkpoint 520");
+    assert_eq!(
+        prepared.wire["request"]["labels"]["last_step_index"],
+        json!("1040")
+    );
+    assert_eq!(
+        prepared.wire["request"]["labels"]["last_execution_id"],
+        json!(execution_id(0))
+    );
+    assert!(
+        prepared.wire["requestId"]
+            .as_str()
+            .unwrap()
+            .ends_with("/1041")
+    );
+
+    // 2. Prefix-folded cross-tier session + fragmented active tool loop > 512 messages
+    //    (matching the real Claude Code `/model` switch + long tool-loop transcript shape).
+    let mut high_binding = binding();
+    high_binding.native_model = "gemini-4-argon-high".into();
+    let prior_lineage = replay::Lineage::new(
+        "55555555-5555-4555-8555-555555555555".into(),
+        "66666666-6666-4666-8666-666666666666".into(),
+    )
+    .unwrap();
+    let mut mixed_messages = Vec::new();
+    for idx in 0..40_u64 {
+        mixed_messages.push(json!({"role": "user", "content": format!("prior q{idx}")}));
+        let prior_turn = encode_turn(
+            &json!([{"role": "model", "parts": [{"text": format!("prior a{idx}")}]}]),
+            &high_binding,
+            &prior_lineage,
+            idx,
+            "full",
+            &json!([]),
+        )
+        .unwrap();
+        mixed_messages.push(json!({"role": "assistant", "content": prior_turn}));
+    }
+    mixed_messages.push(json!({"role": "user", "content": "switched to low tier"}));
+    for idx in 0..160_u64 {
+        let local_id = format!("toolu_mixed_{idx}");
+        let native_call = json!([{
+            "role": "model",
+            "parts": [
+                {"text": "t", "thought": true},
+                {"functionCall": {"name": "bash", "id": format!("mcall_{idx}"), "args": {"cmd": "pwd"}}}
+            ]
+        }]);
+        let recipes = json!([{"local_id": local_id, "caller_name": "bash"}]);
+        let mapping = replay::mapping(&native_call, Some(&recipes)).unwrap();
+        let state = replay::State {
+            lineage: lineage.clone(),
+            native_checkpoint_index: idx,
+            user_execution: replay::UserExecution {
+                active_id: execution_id(10),
+                prior_recorded_id: None,
+            },
+        };
+        let blocks = replay::encode(
+            &native_call,
+            &binding(),
+            &state,
+            "tool_use",
+            "full",
+            &mapping,
+        )
+        .unwrap();
+        let arr = blocks.as_array().unwrap();
+        mixed_messages.push(json!({"role": "assistant", "content": [arr[0].clone()]}));
+        mixed_messages.push(json!({"role": "assistant", "content": arr[1..].to_vec()}));
+        mixed_messages.push(json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": local_id, "content": "/work"}]
+        }));
+    }
+    assert!(mixed_messages.len() > 560);
+    let mixed_body: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+        "model": "antigravity/gemini-4-argon-low",
+        "max_tokens": 1024,
+        "tools": [{
+            "name": "bash",
+            "input_schema": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}}
+            }
+        }],
+        "messages": mixed_messages
+    }))
+    .unwrap();
+    let mixed_prepared = prepare(&mixed_body, &binding())
+        .expect("prefix-folded + fragmented active tool loop > 512 messages must succeed");
+    assert!(
+        mixed_prepared.wire["request"]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<prior_conversation_transcript>\n")
+    );
+
+    // 3. Empty messages array must still fail closed.
+    let empty_body: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+        "model": "antigravity/gemini-4-argon-low",
+        "max_tokens": 256,
+        "messages": []
+    }))
+    .unwrap();
+    assert!(prepare(&empty_body, &binding()).is_err());
 }

@@ -98,7 +98,7 @@ pub(crate) enum Metadata {
     Continuation {
         state: replay::State,
         new_user_execution: bool,
-        execution_ids: Vec<String>,
+        execution_ids: HashSet<String>,
     },
     Ready(replay::State),
 }
@@ -679,8 +679,8 @@ fn observed_continuation(
     state.native_checkpoint_index = state
         .native_checkpoint_index
         .checked_add(1)
-        .filter(|n| *n < replay::MAX_CHECKPOINTS)
-        .ok_or("checkpoint limit")?;
+        .filter(|n| *n <= replay::MAX_SAFE_CHECKPOINT_INDEX)
+        .ok_or("step overflow")?;
     if new_user_execution {
         state.user_execution.prior_recorded_id = state
             .recorded_after(nonempty(&last["checkpoint_stop_reason"])?)?
@@ -771,8 +771,8 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
         return Err("max_tokens must be between 1 and 65536");
     }
     let display = options(body)?.to_owned();
-    if body.messages.is_empty() || body.messages.len() > 512 {
-        return Err("message count limit");
+    if body.messages.is_empty() {
+        return Err("messages must not be empty");
     }
     let messages = logical_messages(&body.messages)?;
     let mut tools = ToolSet::compile(body.extra.get("tools").unwrap_or(&json!([])))?;
@@ -825,8 +825,9 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
     for turn in &mut turns {
         replay::canonicalize_tool_inputs(turn);
     }
-    let envelopes = replay::decode_history(&json!(turns), binding)?;
-    let metadata = if turns.is_empty() {
+    let has_turns = !turns.is_empty();
+    let envelopes = replay::decode_history(&Value::Array(turns), binding)?;
+    let metadata = if !has_turns {
         let input = active_messages
             .iter()
             .filter(|m| m.role != "system")
@@ -967,15 +968,8 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
             }
             let native = envelope["contents"].as_array().unwrap();
             if binding.native_model.starts_with("claude-") {
-                let coalesced = coalesce_claude_native_turn(native);
-                if contents.len().saturating_add(coalesced.len()) > 1024 {
-                    return Err("native history content limit");
-                }
-                contents.extend(coalesced);
+                contents.extend(coalesce_claude_native_turn(native));
             } else {
-                if contents.len().saturating_add(native.len()) > 1024 {
-                    return Err("native history content limit");
-                }
                 contents.extend(native.iter().cloned());
             }
         } else if message.role == "user" {
@@ -1070,9 +1064,6 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                 return Err("incomplete tool result batch");
             }
             if !pending.is_empty() {
-                if contents.len() >= 1024 {
-                    return Err("native history content limit");
-                }
                 let mut parts = Vec::new();
                 for (entry, call) in pending.drain(..) {
                     let mut response = json!({"name":call["name"],"response":results.remove(entry["local_id"].as_str().unwrap()).unwrap()});
@@ -1093,9 +1084,6 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
                         .unwrap()
                         .extend(text);
                 } else {
-                    if contents.len() >= 1024 {
-                        return Err("native history content limit");
-                    }
                     contents.push(json!({"role":"user","parts":text}));
                 }
             }
@@ -1106,9 +1094,6 @@ pub(crate) fn prepare(body: &MessagesRequest, binding: &Binding) -> Result<Prepa
     }
     if contents.is_empty() || last_role != "user" || !pending.is_empty() {
         return Err("request needs a final user turn with complete tool results");
-    }
-    if contents.len() > 1024 {
-        return Err("native history content limit");
     }
     let mut request = json!({"contents":contents,"sessionId":session,
         "generationConfig":{"maxOutputTokens":cap,"thinkingConfig":{"includeThoughts":true,"thinkingLevel":tier}}});

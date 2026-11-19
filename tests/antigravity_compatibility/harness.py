@@ -88,7 +88,7 @@ def wire_fields(body):
 def assistant_turns(messages):
     # Boundaries come from the original sequence: removing a real system message
     # must not manufacture adjacency. Ordinary user text is never system input.
-    if not isinstance(messages, list) or len(messages) > 512:
+    if not isinstance(messages, list):
         raise ReplayError("message count/type limit")
     turns, current = [], []
     for message in messages:

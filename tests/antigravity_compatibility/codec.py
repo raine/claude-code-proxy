@@ -398,7 +398,7 @@ def decode_turn(blocks, binding, max_encoded=MAX_ENCODED, max_decoded=MAX_DECODE
 
 
 def decode_history(turns, binding):
-    if not isinstance(turns, list) or len(turns) > MAX_CONTENTS:
+    if not isinstance(turns, list):
         raise ReplayError("history turn limit/type")
     envelopes, session_id, local_ids = [], None, set()
     for blocks in turns:
