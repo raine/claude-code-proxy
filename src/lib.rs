@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+mod environment;
 pub mod logging;
 pub mod monitor;
 pub mod openai_compat;
