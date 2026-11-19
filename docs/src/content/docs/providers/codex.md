@@ -26,7 +26,7 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 ## Models and fast mode
 
-Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
+Select GPT-6.2 with `ANTHROPIC_MODEL=gpt-6.2-sol` or `ANTHROPIC_MODEL=gpt-6.2-astra`. Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
 The proxy also reads the Codex CLI's optional `$CODEX_HOME/models_cache.json`
 (default `~/.codex/models_cache.json`) to recognize additional models. Listed
@@ -44,7 +44,7 @@ Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.
 
-Append `-ultrafast` to a model that offers the ultrafast tier to request `service_tier: "ultrafast"`. `gpt-6-astra` and `gpt-6.1-sol` offer it today, so `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast` are the ultrafast IDs.
+Append `-ultrafast` to a model that offers the ultrafast tier to request `service_tier: "ultrafast"`. The supported base models are `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.2-astra`, and `gpt-6.2-sol`.
 
 On `/v1/messages`, `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence over either suffix. A forced `ultrafast` applies to models that offer it, and the proxy requests `priority` for the others. The OpenAI-compatible routes use only the suffix or, on `/v1/responses`, the request's own `service_tier`.
 
@@ -78,8 +78,9 @@ The gpt-5.6 and gpt-6 families use Responses Lite by default. Lite requires
 `parallel_tool_calls: false`, so function tools run serially. Set
 `codex.fullLane: true` or `CCP_CODEX_FULL_LANE=1` to use the full Responses lane
 for `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`,
-and `gpt-6.1-terra`. This permits parallel calls; the model still decides whether to batch tools, and explicit
-client restrictions on parallel tools remain effective.
+`gpt-6.1-terra`, `gpt-6.2-astra`, and `gpt-6.2-sol`. This permits parallel calls.
+The model decides whether to batch tools and respects explicit client
+restrictions on parallel calls.
 
 This is not a universal lane override: catalog-only models keep the lane
 specified in the local Codex model cache. Luna models stay on Lite.

@@ -1756,6 +1756,16 @@ async fn models_endpoint_lists_supported_models() {
     assert!(ids.contains(&"gpt-6.1-terra-fast"));
     assert!(ids.contains(&"gpt-6-astra-ultrafast"));
     assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
+    for id in [
+        "gpt-6.2-astra",
+        "gpt-6.2-astra-fast",
+        "gpt-6.2-astra-ultrafast",
+        "gpt-6.2-sol",
+        "gpt-6.2-sol-fast",
+        "gpt-6.2-sol-ultrafast",
+    ] {
+        assert!(ids.contains(&id), "{id}");
+    }
     assert!(!ids.contains(&"gpt-6-sol-ultrafast"));
     assert!(ids.contains(&"grok-4.6"));
     for entry in data {

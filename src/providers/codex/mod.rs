@@ -2504,8 +2504,35 @@ mod tests {
     }
 
     #[test]
-    fn terra_translation_preserves_model_and_tier_across_lanes() {
-        for requested in ["gpt-6.1-terra", "gpt-6.1-terra-fast"] {
+    fn translation_preserves_model_and_tier_across_lanes() {
+        for (requested, model, tier) in [
+            ("gpt-6.1-terra", "gpt-6.1-terra", None),
+            (
+                "gpt-6.1-terra-fast",
+                "gpt-6.1-terra",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                "gpt-6.2-astra-fast",
+                "gpt-6.2-astra",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                "gpt-6.2-sol-fast",
+                "gpt-6.2-sol",
+                Some(ServiceTier::Priority),
+            ),
+            (
+                "gpt-6.2-astra-ultrafast",
+                "gpt-6.2-astra",
+                Some(ServiceTier::Ultrafast),
+            ),
+            (
+                "gpt-6.2-sol-ultrafast",
+                "gpt-6.2-sol",
+                Some(ServiceTier::Ultrafast),
+            ),
+        ] {
             for hosted_search in [false, true] {
                 let tools = if hosted_search {
                     serde_json::json!([{"type":"web_search_20250305", "name":"web_search"}])
@@ -2526,14 +2553,9 @@ mod tests {
                     },
                 )
                 .unwrap();
-                assert_eq!(translated.model, "gpt-6.1-terra");
+                assert_eq!(translated.model, model, "{requested}");
                 assert_eq!(translated.client_metadata.is_some(), !hosted_search);
-                assert_eq!(
-                    translated.service_tier,
-                    requested
-                        .ends_with("-fast")
-                        .then_some(ServiceTier::Priority)
-                );
+                assert_eq!(translated.service_tier, tier, "{requested}");
             }
         }
     }
