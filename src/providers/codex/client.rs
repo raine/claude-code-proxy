@@ -687,6 +687,25 @@ fn test_websocket_http_client() -> reqwest::Client {
         .expect("failed to create test WebSocket HTTP client")
 }
 
+struct ByteCountWriter(usize);
+
+impl std::io::Write for ByteCountWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len(body: &ResponsesRequest) -> Option<usize> {
+    let mut writer = ByteCountWriter(0);
+    serde_json::to_writer(&mut writer, body).ok()?;
+    Some(writer.0)
+}
+
 pub struct CodexHttpClient {
     client: reqwest::Client,
     native_client: reqwest::Client,
@@ -698,6 +717,9 @@ pub struct CodexHttpClient {
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
     request_compression: bool,
+    auto_websocket_max_bytes: usize,
+    #[cfg(test)]
+    request_compression_override: Option<bool>,
 }
 
 impl Default for CodexHttpClient {
@@ -724,6 +746,9 @@ impl CodexHttpClient {
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             request_compression: config::codex_request_compression(),
+            auto_websocket_max_bytes: config::codex_auto_websocket_max_bytes(),
+            #[cfg(test)]
+            request_compression_override: None,
         }
     }
 
@@ -747,6 +772,9 @@ impl CodexHttpClient {
             header_timeout_ms: config::codex_header_timeout_ms(),
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             request_compression: config::codex_request_compression(),
+            auto_websocket_max_bytes: config::codex_auto_websocket_max_bytes(),
+            #[cfg(test)]
+            request_compression_override: None,
         }
     }
 
@@ -768,17 +796,63 @@ impl CodexHttpClient {
             header_timeout_ms,
             body_idle_timeout_ms,
             request_compression: false,
+            auto_websocket_max_bytes: config::CODEX_DEFAULT_AUTO_WEBSOCKET_MAX_BYTES,
+            request_compression_override: Some(false),
         }
     }
 
     #[cfg(test)]
     pub fn with_request_compression(mut self, enabled: bool) -> Self {
         self.request_compression = enabled;
+        self.request_compression_override = Some(enabled);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_auto_websocket_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.auto_websocket_max_bytes = if max_bytes == 0 {
+            usize::MAX
+        } else {
+            max_bytes
+        };
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_auto_http_fallback_enabled(mut self, enabled: bool) -> Self {
+        self.auto_http_fallback_enabled = enabled;
         self
     }
 
     fn should_compress_request_body(&self) -> bool {
+        #[cfg(test)]
+        if let Some(enabled) = self.request_compression_override {
+            return enabled;
+        }
         self.request_compression || config::codex_request_compression()
+    }
+
+    fn should_prefer_http_for_oversized_full_context(
+        &self,
+        serialized_len: usize,
+        has_previous_response_id: bool,
+    ) -> bool {
+        self.auto_http_fallback_enabled
+            && self.should_compress_request_body()
+            && !has_previous_response_id
+            && serialized_len > self.auto_websocket_max_bytes
+    }
+
+    fn reset_websocket_pool_if_needed(
+        &self,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) {
+        let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
+        if should_reset_websocket_pool(continuation)
+            && let Some(owner) = websocket_pool_owner(continuation)
+        {
+            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, turn_id);
+        }
     }
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
@@ -1304,11 +1378,27 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        let has_previous_response_id = continuation
+            .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
+            .is_some();
+        if serialized_json_len(body).is_some_and(|len| {
+            self.should_prefer_http_for_oversized_full_context(len, has_previous_response_id)
+        }) {
+            self.reset_websocket_pool_if_needed(continuation);
+            return self.stream_codex_http_events_for_owner(body, ctx).await;
+        }
+        let auto_prefer_http_on_oversized_retry =
+            self.auto_http_fallback_enabled && self.should_compress_request_body();
         let mut websocket = self
-            .stream_codex_websocket_events_for_owner(body, ctx, continuation)
+            .stream_codex_websocket_events_for_owner_with_policy(
+                body,
+                ctx,
+                continuation,
+                auto_prefer_http_on_oversized_retry,
+            )
             .await?;
         match websocket.recv().await {
-            Some(Err(err)) if should_fallback_to_http(&err) => {
+            Some(Err(err)) if self.auto_http_fallback_enabled && should_fallback_to_http(&err) => {
                 self.stream_codex_http_events_for_owner(body, ctx).await
             }
             Some(item) => {
@@ -1679,6 +1769,7 @@ impl CodexHttpClient {
         }
 
         let mut active_continuation = continuation.cloned();
+        let mut allow_oversized_http_bypass = true;
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
         loop {
@@ -1722,66 +1813,100 @@ impl CodexHttpClient {
                     .await
                 }
                 CodexTransport::Auto => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
-                    let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(
-                        body,
-                        active_continuation
-                            .as_ref()
-                            .map(super::continuation::ContinuationReservation::candidate),
-                    );
-
-                    // Try WebSocket first
-                    let ws_result = super::websocket::codex_websocket_request(
-                        &self.websocket_client,
-                        &self.websocket_proxy_config,
-                        &self.base_url,
-                        &ws_headers,
-                        &ws_body,
-                        ctx,
-                        ctx.traffic.as_deref(),
-                        super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                        super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
-                        active_continuation.as_ref(),
-                    )
-                    .await;
-
-                    match ws_result {
-                        Ok(response) => Ok(response),
-                        Err(err)
-                            if should_retry_without_continuation(
-                                &err,
-                                active_continuation.as_ref(),
-                            ) =>
-                        {
-                            // Drop stale continuation state before considering a
-                            // replacement transport or connection.
-                            Err(err)
-                        }
-                        Err(err)
-                            if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
-                        {
-                            // Fall back to HTTP only if WebSocket failed before sending
-                            let body_json =
-                                serde_json::to_string(body).map_err(|e| CodexError {
-                                    status: 500,
-                                    message: "Failed to serialize request".to_string(),
-                                    detail: Some(e.to_string()),
-                                    retry_after: None,
-                                    usage_limit: None,
-                                    origin: CodexErrorOrigin::Http,
-                                })?;
-                            self.attempt_post_http(
-                                &auth,
-                                &body_json,
-                                ctx,
-                                body.client_metadata.is_some(),
+                    let has_previous_response_id = active_continuation
+                        .as_ref()
+                        .and_then(|reservation| {
+                            reservation.candidate().previous_response_id.as_deref()
+                        })
+                        .is_some();
+                    if allow_oversized_http_bypass
+                        && serialized_json_len(body).is_some_and(|len| {
+                            self.should_prefer_http_for_oversized_full_context(
+                                len,
+                                has_previous_response_id,
                             )
-                            .await
-                            .map(|response| OwnerAwareCodexResponse::new(response, None))
+                        })
+                    {
+                        invalidate_live_continuation_pool(active_continuation.as_ref());
+                        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
+                            status: 500,
+                            message: "Failed to serialize request".to_string(),
+                            detail: Some(e.to_string()),
+                            retry_after: None,
+                            usage_limit: None,
+                            origin: CodexErrorOrigin::Http,
+                        })?;
+                        self.attempt_post_http(
+                            &auth,
+                            &body_json,
+                            ctx,
+                            body.client_metadata.is_some(),
+                        )
+                        .await
+                        .map(|response| OwnerAwareCodexResponse::new(response, None))
+                    } else {
+                        let ws_headers =
+                            build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                        let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
+                        let ws_body = build_websocket_request(
+                            body,
+                            active_continuation
+                                .as_ref()
+                                .map(super::continuation::ContinuationReservation::candidate),
+                        );
+
+                        // Try WebSocket first
+                        let ws_result = super::websocket::codex_websocket_request(
+                            &self.websocket_client,
+                            &self.websocket_proxy_config,
+                            &self.base_url,
+                            &ws_headers,
+                            &ws_body,
+                            ctx,
+                            ctx.traffic.as_deref(),
+                            super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
+                            super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                            active_continuation.as_ref(),
+                        )
+                        .await;
+
+                        match ws_result {
+                            Ok(response) => Ok(response),
+                            Err(err)
+                                if should_retry_without_continuation(
+                                    &err,
+                                    active_continuation.as_ref(),
+                                ) =>
+                            {
+                                // Drop stale continuation state before considering a
+                                // replacement transport or connection.
+                                Err(err)
+                            }
+                            Err(err)
+                                if self.auto_http_fallback_enabled
+                                    && should_fallback_to_http(&err) =>
+                            {
+                                // Fall back to HTTP only if WebSocket failed before sending
+                                let body_json =
+                                    serde_json::to_string(body).map_err(|e| CodexError {
+                                        status: 500,
+                                        message: "Failed to serialize request".to_string(),
+                                        detail: Some(e.to_string()),
+                                        retry_after: None,
+                                        usage_limit: None,
+                                        origin: CodexErrorOrigin::Http,
+                                    })?;
+                                self.attempt_post_http(
+                                    &auth,
+                                    &body_json,
+                                    ctx,
+                                    body.client_metadata.is_some(),
+                                )
+                                .await
+                                .map(|response| OwnerAwareCodexResponse::new(response, None))
+                            }
+                            Err(err) => Err(err),
                         }
-                        Err(err) => Err(err),
                     }
                 }
             };
@@ -1792,6 +1917,7 @@ impl CodexHttpClient {
                     Ok(new_auth) => {
                         auth = new_auth;
                         invalidate_live_continuation_pool(active_continuation.as_ref());
+                        allow_oversized_http_bypass = true;
                         active_continuation =
                             full_context_continuation(active_continuation.as_ref());
                         continue;
@@ -1850,6 +1976,7 @@ impl CodexHttpClient {
                         &failure.message,
                     );
                     transport_failures += 1;
+                    allow_oversized_http_bypass = false;
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     sleep(delay.wait_ms).await;
                     continue;
@@ -1985,6 +2112,8 @@ impl CodexHttpClient {
                 Err(err)
                     if should_retry_without_continuation(&err, active_continuation.as_ref()) =>
                 {
+                    allow_oversized_http_bypass = err.detail.as_deref()
+                        == Some(super::websocket::WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL);
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     continue;
                 }
@@ -2044,6 +2173,17 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.stream_codex_websocket_events_for_owner_with_policy(body, ctx, continuation, false)
+            .await
+    }
+
+    async fn stream_codex_websocket_events_for_owner_with_policy(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        auto_prefer_http_on_oversized_retry: bool,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -2053,12 +2193,7 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Auth,
         })?;
 
-        let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
-        if should_reset_websocket_pool(continuation)
-            && let Some(owner) = websocket_pool_owner(continuation)
-        {
-            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, turn_id);
-        }
+        self.reset_websocket_pool_if_needed(continuation);
 
         let client = self.clone();
         let body = body.clone();
@@ -2073,6 +2208,7 @@ impl CodexHttpClient {
                     ctx,
                     continuation,
                     auth,
+                    auto_prefer_http_on_oversized_retry,
                     tx,
                     socket_id_publisher,
                 )
@@ -2089,6 +2225,7 @@ impl CodexHttpClient {
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationReservation>,
         mut auth: StoredAuth,
+        auto_prefer_http_on_oversized_retry: bool,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) {
@@ -2174,6 +2311,24 @@ impl CodexHttpClient {
                         continuation = full_context_continuation(continuation.as_ref());
                         continuation_retry_available = false;
                         continue 'attempt;
+                    }
+                    Err(err)
+                        if continuation_retry_available
+                            && auto_prefer_http_on_oversized_retry
+                            && err.detail.as_deref()
+                                == Some(
+                                    super::websocket::WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL,
+                                )
+                            && serialized_json_len(&body)
+                                .is_some_and(|len| len > self.auto_websocket_max_bytes) =>
+                    {
+                        if tx.send(Err(err)).await.is_err() {
+                            abort_abandoned_live_continuation(
+                                continuation.as_ref(),
+                                &socket_id_publisher,
+                            );
+                        }
+                        return;
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
                         socket_id_publisher.mark_full_context_retry();
@@ -5770,5 +5925,401 @@ mod tests {
                 .as_u64()
                 .is_some_and(|n| n > 0)
         );
+    }
+
+    #[tokio::test]
+    async fn auto_transport_oversized_full_context_routes_directly_to_compressed_http() {
+        use std::io::Read;
+
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let raw_request = read_http_request(&mut stream).await;
+                let header_end = raw_request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                let headers =
+                    String::from_utf8_lossy(&raw_request[..header_end]).to_ascii_lowercase();
+                assert!(
+                    !headers.contains("upgrade: websocket"),
+                    "oversized full-context request #{idx} must bypass WebSocket"
+                );
+                assert!(
+                    headers.contains("content-encoding: gzip\r\n"),
+                    "expected gzip header, got: {headers}"
+                );
+                let mut decoded = String::new();
+                flate2::read::GzDecoder::new(&raw_request[header_end + 4..])
+                    .read_to_string(&mut decoded)
+                    .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+                assert!(parsed.get("previous_response_id").is_none());
+
+                let response_body = format!(
+                    "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_oversized_{idx}\"}}}}\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(response_body.as_bytes()).await.unwrap();
+            }
+        });
+
+        let client = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(true)
+                .with_auto_websocket_max_bytes(512),
+        );
+        let large_text = "x".repeat(2048);
+        let request = buffered_request_with_texts(&[&large_text]);
+
+        let owner = ConversationIdentity::Main("auto-oversized-full".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        let continuation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let mut events = client
+            .stream_codex_auto_events_for_owner(&request, &http_test_context(), Some(&continuation))
+            .await
+            .unwrap();
+        let mut terminal = None;
+        while let Some(item) = events.recv().await {
+            let value = item.unwrap();
+            if value.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
+                terminal = Some(value);
+                break;
+            }
+        }
+        assert_eq!(terminal.unwrap()["response"]["id"], "resp_oversized_0");
+        assert_eq!(events.socket_id(), None);
+        super::super::continuation::abort_continuation_for_owner(&continuation);
+
+        let response = client
+            .post_codex_with_transport(
+                &request,
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.transport, ActualTransport::Http);
+        server.await.unwrap();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn auto_transport_oversized_delta_with_previous_response_id_stays_on_websocket() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+
+        let owner = ConversationIdentity::Main("auto-oversized-delta".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        let big = "a".repeat(900);
+        let req1 = buffered_request_with_texts(&[&big]);
+        let req2 = buffered_request_with_texts(&[&big, "short delta"]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let first = next_websocket_json(&mut ws).await;
+            assert!(first.get("previous_response_id").is_none());
+            send_completed_websocket_response(&mut ws, "resp_turn_1").await;
+
+            let second = next_websocket_json(&mut ws).await;
+            assert_eq!(second["previous_response_id"], "resp_turn_1");
+            assert_eq!(second["input"].as_array().unwrap().len(), 1);
+            send_completed_websocket_response(&mut ws, "resp_turn_2").await;
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "continuation delta must not fall back to HTTP"
+            );
+        });
+
+        let turn1_client = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(true)
+                .with_auto_websocket_max_bytes(2_048),
+        );
+        let c1 =
+            super::super::continuation::continuation_candidate_for_owner(Some(&owner), &req1, true);
+        let mut s1 = turn1_client
+            .stream_codex_auto_events_for_owner(&req1, &http_test_context(), Some(&c1))
+            .await
+            .unwrap();
+        assert_eq!(
+            s1.recv().await.unwrap().unwrap()["response"]["id"],
+            "resp_turn_1"
+        );
+        super::super::continuation::record_continuation_for_owner(
+            &c1,
+            &req1,
+            Some("resp_turn_1"),
+            s1.socket_id(),
+            &[],
+        );
+
+        let turn2_client = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(true)
+                .with_auto_websocket_max_bytes(512),
+        );
+        let c2 =
+            super::super::continuation::continuation_candidate_for_owner(Some(&owner), &req2, true);
+        assert_eq!(
+            c2.candidate().previous_response_id.as_deref(),
+            Some("resp_turn_1")
+        );
+        let mut s2 = turn2_client
+            .stream_codex_auto_events_for_owner(&req2, &http_test_context(), Some(&c2))
+            .await
+            .unwrap();
+        assert_eq!(
+            s2.recv().await.unwrap().unwrap()["response"]["id"],
+            "resp_turn_2"
+        );
+        super::super::continuation::abort_continuation_for_owner(&c2);
+        server.await.unwrap();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn auto_transport_oversized_stays_on_websocket_when_compression_or_fallback_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // 1: compression disabled -> WebSocket
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_websocket_json(&mut ws).await;
+            send_completed_websocket_response(&mut ws, "resp_ws_nocomp").await;
+
+            // 2: fallback disabled -> WebSocket even with compression=true
+            let (socket2, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(socket2).await.unwrap();
+            let _ = next_websocket_json(&mut ws2).await;
+            send_completed_websocket_response(&mut ws2, "resp_ws_nofb").await;
+
+            // 3: fallback disabled + WS 400 handshake error in live stream -> returns error, no HTTP fallback
+            let (mut raw_socket, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut raw_socket).await;
+            raw_socket
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "must not fall back to HTTP when auto_http_fallback_enabled is false"
+            );
+        });
+
+        let big = "y".repeat(2048);
+        let request = buffered_request_with_texts(&[&big]);
+
+        let c_nocomp = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(false)
+                .with_auto_websocket_max_bytes(512),
+        );
+        let mut s1 = c_nocomp
+            .stream_codex_auto_events_for_owner(&request, &http_test_context(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s1.recv().await.unwrap().unwrap()["response"]["id"],
+            "resp_ws_nocomp"
+        );
+
+        let c_nofb = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(true)
+                .with_auto_websocket_max_bytes(512)
+                .with_auto_http_fallback_enabled(false),
+        );
+        let mut s2 = c_nofb
+            .stream_codex_auto_events_for_owner(&request, &http_test_context(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s2.recv().await.unwrap().unwrap()["response"]["id"],
+            "resp_ws_nofb"
+        );
+
+        let small = buffered_request_with_texts(&["hi"]);
+        let err = match c_nofb
+            .stream_codex_auto_events_for_owner(&small, &http_test_context(), None)
+            .await
+        {
+            Ok(mut stream) => stream.recv().await.unwrap().unwrap_err(),
+            Err(err) => err,
+        };
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_transport_dead_pool_oversized_full_context_redirects_to_http_presend() {
+        use std::io::Read;
+
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+
+        let owner = ConversationIdentity::Main("auto-dead-pool-redirect".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        let big_first = "z".repeat(1200);
+        let req1 = buffered_request_with_texts(&[&big_first]);
+        let req2 = buffered_request_with_texts(&[&big_first, "follow-up"]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ws_closed_tx, ws_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            // Turn 1 accepts WS, completes, then drops WS so pooled socket goes dead.
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_websocket_json(&mut ws).await;
+            send_completed_websocket_response(&mut ws, "resp_pool_1").await;
+            let _ = ws.close(None).await;
+            drop(ws);
+            let _ = ws_closed_tx.send(());
+
+            // Turn 2 & Turn 3 (streaming & buffered) must redirect directly to gzipped HTTP without WS dial!
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let raw_request = read_http_request(&mut stream).await;
+                let header_end = raw_request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap();
+                let headers =
+                    String::from_utf8_lossy(&raw_request[..header_end]).to_ascii_lowercase();
+                assert!(
+                    !headers.contains("upgrade: websocket"),
+                    "dead-pool oversized redirect #{idx} must go straight to HTTP"
+                );
+                assert!(headers.contains("content-encoding: gzip\r\n"));
+                let mut decoded = String::new();
+                flate2::read::GzDecoder::new(&raw_request[header_end + 4..])
+                    .read_to_string(&mut decoded)
+                    .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+                assert!(parsed.get("previous_response_id").is_none());
+                assert_eq!(parsed["input"].as_array().unwrap().len(), 2);
+
+                let response_body = format!(
+                    "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_http_redirect_{idx}\"}}}}\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(response_body.as_bytes()).await.unwrap();
+            }
+        });
+
+        let c1_client = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(true)
+                .with_auto_websocket_max_bytes(4_096),
+        );
+        let c1 =
+            super::super::continuation::continuation_candidate_for_owner(Some(&owner), &req1, true);
+        let mut s1 = c1_client
+            .stream_codex_auto_events_for_owner(&req1, &http_test_context(), Some(&c1))
+            .await
+            .unwrap();
+        assert_eq!(
+            s1.recv().await.unwrap().unwrap()["response"]["id"],
+            "resp_pool_1"
+        );
+        super::super::continuation::record_continuation_for_owner(
+            &c1,
+            &req1,
+            Some("resp_pool_1"),
+            s1.socket_id(),
+            &[],
+        );
+        ws_closed_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let c2_client = Arc::new(
+            authenticated_http_test_client(format!("http://{addr}/responses"))
+                .with_request_compression(true)
+                .with_auto_websocket_max_bytes(800),
+        );
+        let c2 =
+            super::super::continuation::continuation_candidate_for_owner(Some(&owner), &req2, true);
+        assert_eq!(
+            c2.candidate().previous_response_id.as_deref(),
+            Some("resp_pool_1")
+        );
+        let mut s2 = c2_client
+            .stream_codex_auto_events_for_owner(&req2, &http_test_context(), Some(&c2))
+            .await
+            .unwrap();
+        let mut terminal = None;
+        while let Some(item) = s2.recv().await {
+            let value = item.unwrap();
+            if value.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
+                terminal = Some(value);
+                break;
+            }
+        }
+        assert_eq!(terminal.unwrap()["response"]["id"], "resp_http_redirect_0");
+        assert_eq!(s2.socket_id(), None);
+        super::super::continuation::abort_continuation_for_owner(&c2);
+
+        let buffered_res =
+            super::super::continuation::continuation_candidate_for_owner(Some(&owner), &req1, true);
+        let buffered_cont = super::super::continuation::ContinuationReservation::new(
+            super::super::continuation::ContinuationCandidate {
+                turn_id: buffered_res.turn_id(),
+                previous_response_id: Some("resp_missing_pool".to_string()),
+                input_delta: Some(vec![req2.input.last().unwrap().clone()]),
+                input_delta_count: 1,
+                disabled_reason: None,
+            },
+            Some(owner.clone()),
+            Some(u64::MAX),
+        );
+        let response = c2_client
+            .post_codex_with_transport(
+                &req2,
+                &http_test_context(),
+                Some(&buffered_cont),
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.transport, ActualTransport::Http);
+        super::super::continuation::abort_continuation_for_owner(&buffered_cont);
+        server.await.unwrap();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
     }
 }

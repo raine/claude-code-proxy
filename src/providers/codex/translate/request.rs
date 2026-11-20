@@ -357,6 +357,68 @@ pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
         })
 }
 
+const CLAUDE_FORK_AWAY_SUMMARY_MARKER: &str =
+    "The user stepped away and is coming back. Recap in under 40 words";
+const CLAUDE_FORK_PROMPT_SUGGESTION_MARKER: &str =
+    "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]";
+const CLAUDE_FORK_AGENT_SUMMARY_MARKER: &str =
+    "Describe your most recent action in 3-5 words using present tense (-ing).";
+const CLAUDE_FORK_RENAME_MARKER: &str = "Generate a short kebab-case name (2-4 words) that captures the main topic of this conversation.";
+const CLAUDE_FORK_SIDE_QUESTION_MARKER: &str =
+    "This is a one-off response - there will be no follow-up turns";
+const CLAUDE_FORK_EXTRACT_MEMORIES_MARKER: &str =
+    "You are now acting as the memory extraction subagent.";
+const CLAUDE_FORK_AUTO_DREAM_MARKER: &str = "# Dream: Memory Consolidation";
+
+const CLAUDE_EPHEMERAL_FORK_MARKERS: &[(&str, &str)] = &[
+    (CLAUDE_FORK_AWAY_SUMMARY_MARKER, "fork:away_summary"),
+    (
+        CLAUDE_FORK_PROMPT_SUGGESTION_MARKER,
+        "fork:prompt_suggestion",
+    ),
+    (CLAUDE_FORK_AGENT_SUMMARY_MARKER, "fork:agent_summary"),
+    (CLAUDE_FORK_RENAME_MARKER, "fork:rename"),
+    (CLAUDE_FORK_SIDE_QUESTION_MARKER, "fork:side_question"),
+    (CLAUDE_FORK_EXTRACT_MEMORIES_MARKER, "fork:extract_memories"),
+    (CLAUDE_FORK_AUTO_DREAM_MARKER, "fork:auto_dream"),
+];
+
+fn match_claude_ephemeral_fork_text(text: &str) -> Option<&'static str> {
+    CLAUDE_EPHEMERAL_FORK_MARKERS
+        .iter()
+        .find(|(marker, _)| text.contains(marker))
+        .map(|(_, label)| *label)
+}
+
+fn claude_ephemeral_fork_in_content(content: &Value) -> Option<&'static str> {
+    match content {
+        Value::String(text) => match_claude_ephemeral_fork_text(text),
+        Value::Array(blocks) => blocks.iter().rev().find_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+                .and_then(match_claude_ephemeral_fork_text)
+        }),
+        _ => None,
+    }
+}
+
+/// Identifies Claude Code background/ephemeral forks (`away_summary`,
+/// `prompt_suggestion`, `agent_summary`, `rename`, `side_question` `/btw`,
+/// `extract_memories`, `auto_dream`) so they can be isolated from the main
+/// session's continuation and compaction state.
+pub(crate) fn claude_ephemeral_fork_label(request: &MessagesRequest) -> Option<&'static str> {
+    if is_compact_messages_request(request) {
+        return None;
+    }
+    request
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .find_map(|message| claude_ephemeral_fork_in_content(&message.content))
+}
+
 /// Reasoning-effort cap applied to compaction requests, or None when the
 /// fast path is disabled. Summarization is extraction, not problem solving:
 /// native Claude Code compacts without extended thinking, so burning
@@ -2688,5 +2750,110 @@ mod tests {
             out.input.get(reasoning_index + 1),
             Some(ResponsesInputItem::Message { role, .. }) if role == "assistant"
         ));
+    }
+
+    #[test]
+    fn claude_ephemeral_fork_label_matches_all_seven_claude_code_forks() {
+        let cases = [
+            (
+                "away_summary",
+                json!(
+                    "The user stepped away and is coming back. Recap in under 40 words what we were working on."
+                ),
+                "fork:away_summary",
+            ),
+            (
+                "prompt_suggestion",
+                json!([{"type": "text", "text": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"}]),
+                "fork:prompt_suggestion",
+            ),
+            (
+                "agent_summary",
+                json!("Describe your most recent action in 3-5 words using present tense (-ing)."),
+                "fork:agent_summary",
+            ),
+            (
+                "rename",
+                json!(
+                    "Generate a short kebab-case name (2-4 words) that captures the main topic of this conversation."
+                ),
+                "fork:rename",
+            ),
+            (
+                "side_question_inside_system_reminder",
+                json!([
+                    {"type": "text", "text": "<system-reminder>\nThis is a one-off response - there will be no follow-up turns\n</system-reminder>\nWhat port does it use?"}
+                ]),
+                "fork:side_question",
+            ),
+            (
+                "extract_memories",
+                json!(
+                    "You are now acting as the memory extraction subagent. Update durable notes."
+                ),
+                "fork:extract_memories",
+            ),
+            (
+                "auto_dream",
+                json!("# Dream: Memory Consolidation\n\nSynthesize recent session logs."),
+                "fork:auto_dream",
+            ),
+        ];
+
+        for (label, content, expected) in cases {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-6.1-sol",
+                "messages": [
+                    {"role": "user", "content": "main turn"},
+                    {"role": "assistant", "content": "main reply"},
+                    {"role": "user", "content": content}
+                ],
+                "system": "You are Claude Code."
+            }))
+            .unwrap();
+            assert_eq!(
+                claude_ephemeral_fork_label(&req),
+                Some(expected),
+                "fork case {label} failed"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_ephemeral_fork_label_ignores_compact_assistant_and_regular_turns() {
+        let compact: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6.1-sol",
+            "messages": [
+                {"role": "user", "content": "# Dream: Memory Consolidation"},
+                {
+                    "role": "user",
+                    "content": concat!(
+                        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n",
+                        "Your task is to create a detailed summary of the conversation so far."
+                    )
+                }
+            ],
+            "system": "You are a helpful AI assistant tasked with summarizing conversations."
+        }))
+        .unwrap();
+        assert_eq!(claude_ephemeral_fork_label(&compact), None);
+
+        let assistant_only: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6.1-sol",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "# Dream: Memory Consolidation"},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(claude_ephemeral_fork_label(&assistant_only), None);
+
+        let normal: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "fix the bug in websocket.rs"}]
+        }))
+        .unwrap();
+        assert_eq!(claude_ephemeral_fork_label(&normal), None);
     }
 }
