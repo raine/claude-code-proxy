@@ -1716,7 +1716,9 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
             {"role":"user","content":[
                 {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
                 {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
-            ]}
+            ]},
+            {"role":"system","content":"Hook success"},
+            {"role":"system","content":"Concise output style"}
         ]
     }))
     .await;

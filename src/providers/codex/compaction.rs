@@ -277,8 +277,11 @@ fn split_input_envelope(
 
 fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<ResponsesInputItem> {
     let mut input = input.to_vec();
+    let boundary = input.iter().rposition(|item| {
+        !matches!(item, ResponsesInputItem::Message { role, .. } if matches!(role.as_str(), "developer" | "system"))
+    });
     let remove_empty_message = if let Some(ResponsesInputItem::Message { role, content }) =
-        input.last_mut()
+        boundary.and_then(|index| input.get_mut(index))
         && role == "user"
     {
         content.retain(|part| {
@@ -293,7 +296,7 @@ fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<Responses
         false
     };
     if remove_empty_message {
-        input.pop();
+        input.remove(boundary.expect("a user message was found"));
     }
     input
 }
@@ -591,6 +594,41 @@ mod tests {
         let attempt = begin_compaction(session_id, "gpt-5.6-sol");
         assert!(store_compaction(session_id, attempt, native_history));
         attempt
+    }
+
+    #[test]
+    fn instruction_removal_respects_trailing_roles() {
+        let instruction = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour task is to create a detailed summary of the conversation so far".into(),
+            }],
+        };
+        let hook = ResponsesInputItem::Message {
+            role: "developer".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "Hook success".into(),
+            }],
+        };
+        let assistant = ResponsesInputItem::Message {
+            role: "assistant".into(),
+            content: vec![],
+        };
+        let cleaned =
+            without_compaction_instruction(&[instruction.clone(), hook.clone(), hook.clone()]);
+        assert_eq!(cleaned.len(), 2);
+        assert!(
+            !serde_json::to_string(&cleaned)
+                .unwrap()
+                .contains("CRITICAL")
+        );
+        let blocked = without_compaction_instruction(&[instruction, assistant, hook]);
+        assert_eq!(blocked.len(), 3);
+        assert!(
+            serde_json::to_string(&blocked)
+                .unwrap()
+                .contains("CRITICAL")
+        );
     }
 
     #[test]
