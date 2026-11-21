@@ -2522,16 +2522,8 @@ mod tests {
                 "gpt-6.2-sol",
                 Some(ServiceTier::Priority),
             ),
-            (
-                "gpt-6.2-astra-ultrafast",
-                "gpt-6.2-astra",
-                Some(ServiceTier::Ultrafast),
-            ),
-            (
-                "gpt-6.2-sol-ultrafast",
-                "gpt-6.2-sol",
-                Some(ServiceTier::Ultrafast),
-            ),
+            ("gpt-6.2-astra", "gpt-6.2-astra", None),
+            ("gpt-6.2-sol", "gpt-6.2-sol", None),
         ] {
             for hosted_search in [false, true] {
                 let tools = if hosted_search {

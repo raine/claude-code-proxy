@@ -85,8 +85,7 @@ pub fn allowed_models_display() -> String {
 
 /// Models that offer the `ultrafast` service tier in Codex.
 /// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
-pub const ULTRAFAST_MODELS: &[&str] =
-    &["gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"];
+pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
 
 const FAST_SUFFIX: &str = "-fast";
 const ULTRAFAST_SUFFIX: &str = "-ultrafast";

@@ -376,8 +376,6 @@ mod tests {
             "gpt-6-astra-ultrafast",
             "gpt-6-astra-ultrafast[1m]",
             "gpt-6.1-sol-ultrafast",
-            "gpt-6.2-astra-ultrafast",
-            "gpt-6.2-sol-ultrafast[1m]",
         ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
