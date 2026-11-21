@@ -72,6 +72,8 @@ pub enum PumpOutcome {
     Replay,
     /// The turn ended.
     Ended,
+    /// Upstream transport/idle stream failed before any non-thinking block was emitted.
+    Aborted(String),
     Failed(String),
 }
 
@@ -367,6 +369,12 @@ pub async fn pump_live_bridge(
                 return PumpOutcome::Ended;
             }
             LiveEvent::Error(error) => {
+                if !framer.has_non_thinking_output()
+                    && (error.starts_with("read body:")
+                        || error == "Cursor upstream went quiet with the run open")
+                {
+                    return PumpOutcome::Aborted(error);
+                }
                 framer.finalize();
                 sink(&framer.take_output());
                 sink(&format_sse_error(&error));

@@ -189,17 +189,16 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         || lower.contains("context window")
         || lower.contains("context length exceeded");
 
+    let policy_violation = code.is_some_and(|c| {
+        matches!(c, "cyber_policy" | "invalid_prompt" | "bio_policy")
+            || c.ends_with("_policy")
+            || c.ends_with("_policy_violation")
+    });
     let kind = if context_window
+        || policy_violation
         || matches!(
             code,
-            Some(
-                "context_length_exceeded"
-                    | "insufficient_quota"
-                    | "usage_not_included"
-                    | "cyber_policy"
-                    | "invalid_prompt"
-                    | "bio_policy"
-            )
+            Some("context_length_exceeded" | "insufficient_quota" | "usage_not_included")
         ) {
         CodexFailureKind::Permanent
     } else if matches!(code, Some("server_is_overloaded" | "slow_down")) {
@@ -235,7 +234,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         413
     } else {
         explicit_status.unwrap_or(match code {
-            Some("cyber_policy" | "invalid_prompt" | "bio_policy") => 400,
+            _ if policy_violation => 400,
             Some("insufficient_quota") => 429,
             Some("usage_not_included") => 403,
             _ => match kind {
@@ -549,7 +548,7 @@ fn scalar_string_value(value: &Value) -> Option<String> {
     }
 }
 
-fn retryable_message(message: &str) -> bool {
+pub(super) fn retryable_message(message: &str) -> bool {
     [
         "server error",
         "internal server error",
@@ -570,7 +569,10 @@ fn retryable_message(message: &str) -> bool {
         "etimedout",
         "und_err_socket",
         "fetch failed",
+        "peer closed connection",
+        "close_notify",
         "unexpected eof",
+        "unexpected-eof",
     ]
     .iter()
     .any(|needle| message.contains(needle))

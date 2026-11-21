@@ -98,6 +98,7 @@ pub struct StreamTranslator {
     model: String,
     started: bool,
     finished: bool,
+    non_thinking_emitted: bool,
     search_blocks: GrokSearchBlocks,
     // Seeds Claude Code's live usage counter until the provider returns
     // authoritative usage in the terminal message_delta.
@@ -163,6 +164,7 @@ impl StreamTranslator {
             model,
             started: false,
             finished: false,
+            non_thinking_emitted: false,
             search_blocks,
             estimated_input_tokens: 0,
         }
@@ -171,6 +173,10 @@ impl StreamTranslator {
     pub fn with_estimated_input_tokens(mut self, estimated_input_tokens: u64) -> Self {
         self.estimated_input_tokens = estimated_input_tokens;
         self
+    }
+
+    pub fn has_non_thinking_output(&self) -> bool {
+        self.non_thinking_emitted
     }
 
     pub fn render(&mut self, events: Vec<ReducerEvent>) -> anyhow::Result<Vec<u8>> {
@@ -195,6 +201,17 @@ impl StreamTranslator {
                     "message_start",
                     serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":self.estimated_input_tokens,"output_tokens":0}}}),
                 );
+            }
+            if matches!(
+                event,
+                ReducerEvent::TextStart(_)
+                    | ReducerEvent::TextDelta(_, _)
+                    | ReducerEvent::ToolStart(_, _, _)
+                    | ReducerEvent::ToolDelta(_, _)
+                    | ReducerEvent::HostedSearch { .. }
+                    | ReducerEvent::Finish { .. }
+            ) {
+                self.non_thinking_emitted = true;
             }
             if matches!(event, ReducerEvent::Finish { .. }) {
                 self.finished = true;

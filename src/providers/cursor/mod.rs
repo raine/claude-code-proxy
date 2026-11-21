@@ -383,7 +383,7 @@ fn live_sse_response(
     model: &str,
     ctx: &RequestContext,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
     let message_id = message_id.to_string();
     let model = model.to_string();
     let monitor = ctx.monitor.clone();
@@ -400,11 +400,11 @@ fn live_sse_response(
         }
 
         let outcome = match send_failed {
-            true => PumpOutcome::Failed("Cursor run already closed".to_string()),
+            true => PumpOutcome::Aborted("Cursor run already closed".to_string()),
             false => {
                 pump_live_bridge(&mut bridge, &message_id, &model, &mut |chunk| {
                     sse.extend_from_slice(chunk);
-                    let _ = tx.send(Bytes::copy_from_slice(chunk));
+                    let _ = tx.send(Ok(Bytes::copy_from_slice(chunk)));
                 })
                 .await
             }
@@ -414,6 +414,13 @@ fn live_sse_response(
             PumpOutcome::Tool(pending) => {
                 bridge.pending = Some(pending);
                 BridgeRegistry::insert(bridge);
+            }
+            PumpOutcome::Aborted(error) => {
+                drop(bridge);
+                let _ = tx.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    error,
+                )));
             }
             // Nothing left to resume: the run is dropped, which closes its
             // stream upstream.
@@ -434,9 +441,7 @@ fn live_sse_response(
     });
 
     let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv()
-            .await
-            .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), rx))
+        rx.recv().await.map(|item| (item, rx))
     }));
     let headers = [
         (http::header::CONTENT_TYPE, "text/event-stream"),
@@ -454,7 +459,10 @@ fn finish_buffered_run(bridge: LiveBridge, outcome: PumpOutcome) {
             bridge.pending = Some(pending);
             BridgeRegistry::insert(bridge);
         }
-        PumpOutcome::Replay | PumpOutcome::Ended | PumpOutcome::Failed(_) => drop(bridge),
+        PumpOutcome::Replay
+        | PumpOutcome::Ended
+        | PumpOutcome::Aborted(_)
+        | PumpOutcome::Failed(_) => drop(bridge),
     }
 }
 
@@ -478,6 +486,9 @@ async fn pump_buffered(
         sse.extend_from_slice(chunk)
     })
     .await;
+    if let PumpOutcome::Aborted(ref error) = outcome {
+        sse.extend_from_slice(&self::sse::format_sse_error(error));
+    }
     (sse, outcome)
 }
 

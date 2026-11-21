@@ -68,6 +68,7 @@ pub struct LiveStreamTranslator {
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
     semantic_output_started: bool,
+    non_thinking_output_emitted: bool,
     // Seeds Claude Code's live subagent counter until the provider returns
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
@@ -103,6 +104,7 @@ impl LiveStreamTranslator {
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
             semantic_output_started: false,
+            non_thinking_output_emitted: false,
             estimated_input_tokens,
             incomplete_response_policy: IncompleteResponsePolicy::Error,
             finished: false,
@@ -202,6 +204,10 @@ impl LiveStreamTranslator {
 
     pub fn has_semantic_output(&self) -> bool {
         self.semantic_output_started
+    }
+
+    pub fn has_non_thinking_output(&self) -> bool {
+        self.non_thinking_output_emitted
     }
 
     pub fn ping_chunk(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
@@ -343,6 +349,7 @@ impl LiveStreamTranslator {
                     },
                 );
                 if !deferred {
+                    self.non_thinking_output_emitted = true;
                     self.ensure_message_start(traffic, out);
                     self.emit(
                         traffic,
@@ -359,6 +366,7 @@ impl LiveStreamTranslator {
             "function_call" => {
                 self.close_thinking(traffic, out);
                 self.saw_tool_use = true;
+                self.non_thinking_output_emitted = true;
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
                 let call_id = item
@@ -493,6 +501,7 @@ impl LiveStreamTranslator {
                 },
             );
             if !deferred {
+                self.non_thinking_output_emitted = true;
                 self.ensure_message_start(traffic, out);
                 self.emit(
                     traffic,
@@ -520,6 +529,7 @@ impl LiveStreamTranslator {
             return;
         }
         let index = *index;
+        self.non_thinking_output_emitted = true;
         self.emit(
             traffic,
             out,
@@ -583,6 +593,7 @@ impl LiveStreamTranslator {
             *emitted_args = true;
             let index = *index;
             self.semantic_output_started = true;
+            self.non_thinking_output_emitted = true;
             self.emit(
                 traffic,
                 out,
@@ -601,6 +612,7 @@ impl LiveStreamTranslator {
         if let Some((index, repaired)) = repaired_read {
             self.blocks_by_output_index.remove(&output_index);
             self.semantic_output_started = true;
+            self.non_thinking_output_emitted = true;
             self.emit(
                 traffic,
                 out,
@@ -714,6 +726,7 @@ impl LiveStreamTranslator {
                 if *deferred {
                     self.deferred_text.push((*index, std::mem::take(text)));
                 } else {
+                    self.non_thinking_output_emitted = true;
                     self.emit(
                         traffic,
                         out,
@@ -736,6 +749,7 @@ impl LiveStreamTranslator {
                 ..
             } => {
                 self.semantic_output_started = true;
+                self.non_thinking_output_emitted = true;
                 if let Some(final_args) = payload
                     .get("item")
                     .and_then(|item| item.get("arguments"))
@@ -808,6 +822,7 @@ impl LiveStreamTranslator {
     fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         let searches = std::mem::take(&mut self.web_searches);
         for search in searches {
+            self.non_thinking_output_emitted = true;
             self.ensure_message_start(traffic, out);
             self.emit(
                 traffic,
@@ -877,6 +892,7 @@ impl LiveStreamTranslator {
         }
 
         for (index, text) in std::mem::take(&mut self.deferred_text) {
+            self.non_thinking_output_emitted = true;
             self.emit(
                 traffic,
                 out,
@@ -942,6 +958,7 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
+        self.non_thinking_output_emitted = true;
         let mapped = map_codex_usage_to_anthropic(&usage, Some(self.web_search_requests));
         self.emit(
             traffic,

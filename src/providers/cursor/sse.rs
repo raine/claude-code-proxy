@@ -107,6 +107,7 @@ pub struct CursorSseFramer<'a> {
     started: bool,
     thinking_open: bool,
     text_open: bool,
+    non_thinking_emitted: bool,
     next_index: i32,
     thinking_index: i32,
     text_index: i32,
@@ -129,6 +130,7 @@ impl<'a> CursorSseFramer<'a> {
             started: false,
             thinking_open: false,
             text_open: false,
+            non_thinking_emitted: false,
             next_index: 0,
             thinking_index: -1,
             text_index: -1,
@@ -144,6 +146,10 @@ impl<'a> CursorSseFramer<'a> {
     /// event. State (open blocks, indices, usage) survives the drain.
     pub fn take_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.output)
+    }
+
+    pub fn has_non_thinking_output(&self) -> bool {
+        self.non_thinking_emitted
     }
 
     pub fn ensure_start(&mut self) {
@@ -202,6 +208,7 @@ impl<'a> CursorSseFramer<'a> {
         }
         self.ensure_start();
         self.text_open = true;
+        self.non_thinking_emitted = true;
         self.text_index = self.next_index;
         self.next_index += 1;
 
@@ -320,6 +327,7 @@ impl<'a> CursorSseFramer<'a> {
     /// Emit a tool_use pause: content block + message_delta with
     /// stop_reason="tool_use" + message_stop.
     pub fn emit_tool_pause(&mut self, tool_use_id: &str, tool_name: &str, partial_json: &str) {
+        self.non_thinking_emitted = true;
         self.close_open_blocks();
         self.ensure_start();
         let index = self.next_content_block_index();
@@ -362,6 +370,7 @@ impl<'a> CursorSseFramer<'a> {
         if self.finalized {
             return;
         }
+        self.non_thinking_emitted = true;
         self.ensure_start();
         self.close_open_blocks();
 
