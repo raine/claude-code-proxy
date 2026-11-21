@@ -69,7 +69,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
 | `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
-| `CCP_AUTO_REVIEW_EFFORT` | `autoReviewEffort` | — | Уровень рассуждения классификатора Auto Mode: `low`, `medium`, `high`, `xhigh` или `max`. |
+| `CCP_AUTO_REVIEW_EFFORT` | `autoReviewEffort` | — | Sets the Auto Mode classifier's reasoning effort to `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
 | `CCP_TRAFFIC_LOG` | none | `false` | Enables full request captures for `1`, `true`, or `yes`. |
@@ -79,7 +79,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 
 Auto-review routing resolves the classifier's requested model first, not the main conversation's model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`; Grok and other providers do not establish alias affinity. Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
 
-Настройка `autoReviewEffort` действует независимо от `autoReviewModel`. Для запросов классификатора она имеет приоритет над `output_config.effort` и, в Codex, над `CCP_CODEX_EFFORT` / `codex.effort`. Допустимое значение переменной `CCP_AUTO_REVIEW_EFFORT` имеет приоритет над файлом. Пустые и недопустимые значения игнорируются; без настройки сохраняется обычный выбор уровня рассуждения. Доступные уровни зависят от модели и провайдера; например, у Cursor уровень задаётся вариантом модели.
+Classifier effort is independent of model selection. A valid `CCP_AUTO_REVIEW_EFFORT` takes precedence over `autoReviewEffort` in the config file. Either overrides the classifier's `output_config.effort` and, on Codex, the global `CCP_CODEX_EFFORT` or `codex.effort`. Empty or invalid values are ignored. If neither setting is valid, normal effort selection applies. Supported levels depend on the provider and model; Cursor, for example, selects effort through its model variant.
 
 ## Outbound proxies
 
