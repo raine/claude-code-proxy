@@ -1068,7 +1068,19 @@ pub(super) fn start_codex_websocket_events(
             idle_timeout_ms,
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
-        if let Err(error) = guard.send(Message::Text(body_json)).await {
+        let send_result = tokio::select! {
+            biased;
+            _ = tx.closed() => {
+                drop(guard);
+                if let Some(owner) = pool_owner {
+                    pool_remove_entry(owner, &entry);
+                }
+                socket_id_publisher.publish(None);
+                return;
+            }
+            result = guard.send(Message::Text(body_json)) => result,
+        };
+        if let Err(error) = send_result {
             drop(guard);
             if let Some(owner) = pool_owner {
                 pool_remove_entry(owner, &entry);
@@ -1165,9 +1177,26 @@ fn continuation_socket_missing_error() -> CodexError {
 }
 
 fn missing_terminal_error() -> CodexError {
+    missing_terminal_error_with_close(None)
+}
+
+fn missing_terminal_error_with_close(
+    close_frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> CodexError {
+    let mut message =
+        "WebSocket connection closed before terminal Codex response event".to_string();
+    if let Some(frame) = close_frame {
+        let code: u16 = frame.code.into();
+        let reason = frame.reason.trim();
+        if reason.is_empty() {
+            message.push_str(&format!(" (code {code})"));
+        } else {
+            message.push_str(&format!(" (code {code}: {reason})"));
+        }
+    }
     CodexError {
         status: 0,
-        message: "WebSocket connection closed before terminal Codex response event".to_string(),
+        message,
         detail: Some(WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
@@ -2182,9 +2211,12 @@ where
                 // Raw frame passthrough - continue
                 continue;
             }
-            Some(Ok(Message::Close(_))) => {
+            Some(Ok(Message::Close(frame))) => {
                 // Connection closed - invalidate pool
                 invalidate_pool_owner(pool_owner, pool_entry);
+                if frame.is_some() {
+                    return Err(missing_terminal_error_with_close(frame.as_ref()));
+                }
                 break;
             }
             Some(Err(e)) => {
@@ -2362,7 +2394,11 @@ where
                 let _ = ws.send(Message::Pong(data)).await;
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-            Some(Ok(Message::Close(_))) | None => {
+            Some(Ok(Message::Close(frame))) => {
+                terminal_item = Some(Err(missing_terminal_error_with_close(frame.as_ref())));
+                break;
+            }
+            None => {
                 terminal_item = Some(Err(missing_terminal_error()));
                 break;
             }
@@ -4334,5 +4370,172 @@ mod tests {
                 GENERIC_HANDSHAKE_ERROR_DETAIL
             );
         }
+    }
+
+    #[tokio::test]
+    async fn close_frame_before_terminal_includes_code_and_reason_in_error() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let server_task = tokio::spawn(async move {
+            server
+                .close(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "going away".into(),
+                }))
+                .await
+                .unwrap();
+        });
+        let err = match collect_ws_events(&mut client, 1_000, None, None, None).await {
+            Ok(_) => panic!("expected missing terminal error"),
+            Err(err) => err,
+        };
+        server_task.await.unwrap();
+        assert!(
+            err.message
+                .starts_with("WebSocket connection closed before terminal Codex response event"),
+            "unexpected prefix: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("1001"),
+            "missing code: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("going away"),
+            "missing reason: {}",
+            err.message
+        );
+        assert_eq!(
+            err.detail.as_deref(),
+            Some(WEBSOCKET_MISSING_TERMINAL_DETAIL)
+        );
+
+        let (stream_client_io, stream_server_io) = tokio::io::duplex(4096);
+        let mut stream_client =
+            WebSocketStream::from_raw_socket(stream_client_io, Role::Client, None).await;
+        let mut stream_server =
+            WebSocketStream::from_raw_socket(stream_server_io, Role::Server, None).await;
+        let stream_server_task = tokio::spawn(async move {
+            stream_server
+                .close(Some(CloseFrame {
+                    code: CloseCode::Protocol,
+                    reason: "bad frame".into(),
+                }))
+                .await
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let (reusable, terminal) = stream_ws_events(&mut stream_client, 1_000, None, &tx).await;
+        stream_server_task.await.unwrap();
+        assert!(!reusable);
+        assert!(rx.try_recv().is_err());
+        let stream_err = terminal
+            .expect("expected terminal close error")
+            .unwrap_err();
+        assert!(
+            stream_err
+                .message
+                .starts_with("WebSocket connection closed before terminal Codex response event"),
+            "unexpected stream prefix: {}",
+            stream_err.message
+        );
+        assert!(stream_err.message.contains("1002"));
+        assert!(stream_err.message.contains("bad frame"));
+        assert_eq!(
+            stream_err.detail.as_deref(),
+            Some(WEBSOCKET_MISSING_TERMINAL_DETAIL)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_receiver_during_websocket_send_closes_upstream_socket() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let owner = main_owner("send-abort-session");
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        let reservation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &continuation_request(),
+            true,
+        );
+        let cleanup_reservation = reservation.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            drop(ws);
+        });
+
+        let ws_client = test_websocket_client();
+        let ws = connect_with_timeout(
+            &ws_client,
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/"),
+            &HeaderMap::new(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let entry = Arc::new(PoolEntry::new(ws));
+        let guard = entry.ws.clone().lock_owned().await;
+        {
+            let mut pool = WS_POOL.lock().unwrap();
+            pool.insert(owner.clone(), entry.clone());
+        }
+
+        let ready = ReadyWebSocket {
+            ws_url: format!("ws://{addr}/"),
+            guard,
+            entry: entry.clone(),
+            used_pooled: false,
+            reservation: Some(reservation),
+            traffic: None,
+            idle_timeout_ms: 5_000,
+        };
+        let huge_payload = "x".repeat(32 * 1024 * 1024);
+        let stream = start_codex_websocket_events(
+            ready,
+            &serde_json::json!({"big": true}),
+            format!(r#"{{"payload":"{huge_payload}"}}"#),
+            &HeaderMap::new(),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(stream);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let unlocked = entry.ws.try_lock().is_ok();
+            let evicted = !WS_POOL.lock().unwrap().contains_key(&owner);
+            if unlocked && evicted {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dropping receiver did not cancel guard.send and release pool/socket (unlocked={unlocked}, evicted={evicted})"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = release_tx.send(());
+        server_task.await.unwrap();
+        super::super::continuation::abort_continuation_for_owner(&cleanup_reservation);
     }
 }

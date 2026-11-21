@@ -40,7 +40,8 @@ use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::compaction::{
     CompactionAttempt, CompactionError, abort_compaction_attempt, activate_compaction,
-    apply_compaction_replay, begin_compaction, request_compaction, store_compaction,
+    apply_compaction_replay, begin_compaction, peek_compaction_replay, request_compaction,
+    store_compaction,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
@@ -55,7 +56,8 @@ use self::translate::model_allowlist::{
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, claude_ephemeral_fork_label, has_hosted_web_search,
+    is_compact_messages_request, translate_request,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
@@ -87,6 +89,18 @@ impl CodexProvider {
         Self {
             client: Arc::new(CodexHttpClient::new()),
         }
+    }
+}
+
+fn fork_isolated_conversation_identity(
+    conversation_identity: Option<ConversationIdentity>,
+    fork_label: Option<&str>,
+) -> Option<ConversationIdentity> {
+    match (conversation_identity, fork_label) {
+        (Some(ConversationIdentity::Main(session_id)), Some(label)) => {
+            Some(ConversationIdentity::Agent(session_id, label.to_string()))
+        }
+        (identity, _) => identity,
     }
 }
 
@@ -218,6 +232,11 @@ impl CodexProvider {
         };
 
         let compact_boundary = is_compact_messages_request(&body);
+        let fork_label = (!compact_boundary)
+            .then(|| claude_ephemeral_fork_label(&body))
+            .flatten();
+        let conversation_identity =
+            fork_isolated_conversation_identity(conversation_identity, fork_label);
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
         if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
@@ -277,6 +296,10 @@ impl CodexProvider {
                         Some(&error.to_string()),
                     );
                 }
+            }
+        } else if server_compaction_enabled && !compact_boundary && fork_label.is_some() {
+            if let Some(replayed) = peek_compaction_replay(ctx.session_id.as_deref(), &translated) {
+                translated = replayed;
             }
         } else if server_compaction_enabled
             && !compact_boundary
@@ -876,7 +899,7 @@ async fn live_stream_response(
                     empty_completion_attempts = 0;
                 }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
+                if full_context_retry_attempted && is_missing_previous_response_error(&error) {
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
@@ -3368,5 +3391,311 @@ mod tests {
             Vec::new()
         ));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn live_stream_retries_missing_terminal_after_full_context_retry_while_short_circuiting_missing_origin()
+     {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        crate::retry::set_zero_retry_delay_for_tests(true);
+        struct ResetRetryDelay;
+        impl Drop for ResetRetryDelay {
+            fn drop(&mut self) {
+                crate::retry::set_zero_retry_delay_for_tests(false);
+            }
+        }
+        let _retry_guard = ResetRetryDelay;
+
+        // Case 1: establish pooled Turn 1 -> Turn 2 delta -> previous_response_not_found -> internal full-context retry -> WS closes before terminal -> outer retry succeeds.
+        {
+            let session_id = "live-full-context-terminal-retry";
+            let owner = ConversationIdentity::Main(session_id.to_string());
+            continuation::clear_continuation_for_owner(Some(&owner));
+            websocket::invalidate_codex_websocket_pool_owner(&owner);
+            let req1 = live_test_request("one");
+            let mut req2 = live_test_request("one");
+            req2.input
+                .push(translate::request::ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: vec![translate::request::ResponsesContentPart::InputText {
+                        text: "two".to_string(),
+                    }],
+                });
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                // Socket 1: Turn 1 succeeds and pools socket; Turn 2 delta arrives on same socket and gets previous_response_not_found.
+                let (s1, _) = listener.accept().await.unwrap();
+                let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+                let req_turn1 = next_live_websocket_request(&mut ws1).await;
+                assert!(req_turn1.get("previous_response_id").is_none());
+                emit_live_event(
+                    &mut ws1,
+                    &serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_stale",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "turn1"}]
+                            }]
+                        }
+                    }),
+                )
+                .await;
+
+                let req_delta = next_live_websocket_request(&mut ws1).await;
+                assert_eq!(req_delta["previous_response_id"], "resp_stale");
+                emit_live_event(
+                    &mut ws1,
+                    &serde_json::json!({
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "status": 400,
+                                "code": "previous_response_not_found",
+                                "message": "previous response missing"
+                            }
+                        }
+                    }),
+                )
+                .await;
+
+                // Socket 2: in-socket full-context retry arrives, then close without terminal event.
+                let (s2, _) = listener.accept().await.unwrap();
+                let mut ws2 = tokio_tungstenite::accept_async(s2).await.unwrap();
+                let req_full = next_live_websocket_request(&mut ws2).await;
+                assert!(req_full.get("previous_response_id").is_none());
+                ws2.close(None).await.unwrap();
+                drop(ws2);
+
+                // Socket 3: outer retry in live_stream_response must succeed!
+                let (s3, _) = listener.accept().await.unwrap();
+                let mut ws3 = tokio_tungstenite::accept_async(s3).await.unwrap();
+                let req_retry = next_live_websocket_request(&mut ws3).await;
+                assert!(req_retry.get("previous_response_id").is_none());
+                for event in [
+                    serde_json::json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"type": "message", "id": "msg_ok"}
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "ok"
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {"type": "message"}
+                    }),
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_recovered",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "ok"}]
+                            }]
+                        }
+                    }),
+                ] {
+                    emit_live_event(&mut ws3, &event).await;
+                }
+            });
+
+            let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+            let c1 = continuation_candidate_for_owner(Some(&owner), &req1, true);
+            let mut turn1 = client
+                .stream_codex_websocket_events_for_owner(
+                    &req1,
+                    &live_test_context(session_id),
+                    Some(&c1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                turn1.recv().await.unwrap().unwrap()["type"],
+                "response.completed"
+            );
+            record_continuation_for_owner(&c1, &req1, Some("resp_stale"), turn1.socket_id(), &[]);
+
+            let c2 = continuation_candidate_for_owner(Some(&owner), &req2, true);
+            let model = req2.model.clone();
+            let response = live_stream_response(
+                client,
+                "message".to_string(),
+                &model,
+                live_test_context(session_id),
+                req2,
+                c2,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            server.await.unwrap();
+            continuation::clear_continuation_for_owner(Some(&owner));
+            websocket::invalidate_codex_websocket_pool_owner(&owner);
+        }
+
+        // Case 2: establish pooled Turn 1 -> Turn 2 delta -> previous_response_not_found -> internal full-context retry -> ALSO previous_response_not_found -> immediate bailout.
+        {
+            let session_id = "live-full-context-missing-short-circuit";
+            let owner = ConversationIdentity::Main(session_id.to_string());
+            continuation::clear_continuation_for_owner(Some(&owner));
+            websocket::invalidate_codex_websocket_pool_owner(&owner);
+            let req1 = live_test_request("one");
+            let mut req2 = live_test_request("one");
+            req2.input
+                .push(translate::request::ResponsesInputItem::Message {
+                    role: "user".to_string(),
+                    content: vec![translate::request::ResponsesContentPart::InputText {
+                        text: "two".to_string(),
+                    }],
+                });
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (s1, _) = listener.accept().await.unwrap();
+                let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+                let _ = next_live_websocket_request(&mut ws1).await;
+                emit_live_event(
+                    &mut ws1,
+                    &serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_stale_2",
+                            "status": "completed",
+                            "output": []
+                        }
+                    }),
+                )
+                .await;
+
+                let req_delta = next_live_websocket_request(&mut ws1).await;
+                assert_eq!(req_delta["previous_response_id"], "resp_stale_2");
+                emit_live_event(
+                    &mut ws1,
+                    &serde_json::json!({
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "status": 400,
+                                "code": "previous_response_not_found",
+                                "message": "still missing 1"
+                            }
+                        }
+                    }),
+                )
+                .await;
+
+                let (s2, _) = listener.accept().await.unwrap();
+                let mut ws2 = tokio_tungstenite::accept_async(s2).await.unwrap();
+                let _ = next_live_websocket_request(&mut ws2).await;
+                emit_live_event(
+                    &mut ws2,
+                    &serde_json::json!({
+                        "type": "response.failed",
+                        "response": {
+                            "status": "failed",
+                            "error": {
+                                "status": 400,
+                                "code": "previous_response_not_found",
+                                "message": "still missing 2"
+                            }
+                        }
+                    }),
+                )
+                .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "second previous_response_not_found must short-circuit without outer retry"
+                );
+            });
+
+            let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+            let c1 = continuation_candidate_for_owner(Some(&owner), &req1, true);
+            let mut turn1 = client
+                .stream_codex_websocket_events_for_owner(
+                    &req1,
+                    &live_test_context(session_id),
+                    Some(&c1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                turn1.recv().await.unwrap().unwrap()["type"],
+                "response.completed"
+            );
+            record_continuation_for_owner(&c1, &req1, Some("resp_stale_2"), turn1.socket_id(), &[]);
+
+            let c2 = continuation_candidate_for_owner(Some(&owner), &req2, true);
+            let model = req2.model.clone();
+            let response = live_stream_response(
+                client,
+                "message".to_string(),
+                &model,
+                live_test_context(session_id),
+                req2,
+                c2,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            server.await.unwrap();
+            continuation::clear_continuation_for_owner(Some(&owner));
+            websocket::invalidate_codex_websocket_pool_owner(&owner);
+        }
+    }
+
+    #[test]
+    fn fork_isolated_conversation_identity_isolates_only_main_forks() {
+        let main = Some(ConversationIdentity::Main("sess-1".to_string()));
+        assert_eq!(
+            fork_isolated_conversation_identity(main.clone(), Some("fork:away_summary")),
+            Some(ConversationIdentity::Agent(
+                "sess-1".to_string(),
+                "fork:away_summary".to_string()
+            ))
+        );
+        assert_eq!(
+            fork_isolated_conversation_identity(main, None),
+            Some(ConversationIdentity::Main("sess-1".to_string()))
+        );
+
+        let subagent = Some(ConversationIdentity::Agent(
+            "sess-1".to_string(),
+            "subagent-7".to_string(),
+        ));
+        assert_eq!(
+            fork_isolated_conversation_identity(subagent.clone(), Some("fork:side_question")),
+            subagent
+        );
+        assert_eq!(
+            fork_isolated_conversation_identity(None, Some("fork:rename")),
+            None
+        );
     }
 }

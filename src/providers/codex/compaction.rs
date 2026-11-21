@@ -182,42 +182,38 @@ pub fn activate_compaction(
     registry.states.contains_key(session_id)
 }
 
-pub fn apply_compaction_replay(
-    session_id: Option<&str>,
+enum ReplayMatchOutcome {
+    Matched(Box<ResponsesRequest>),
+    NoMatchKeepState,
+    MismatchInvalidateState,
+}
+
+fn match_anchored_compaction_replay(
+    state: &CompactionState,
     request: &ResponsesRequest,
-) -> Option<CompactionReplay> {
-    let session_id = session_id?;
-    let now = now_ms();
-    let mut guard = REGISTRY.lock().unwrap();
-    let registry = guard.as_mut()?;
-    evict_states(registry, now);
-    let state = registry.states.get_mut(session_id)?;
+) -> ReplayMatchOutcome {
     if !matches!(state.phase, CompactionPhase::Anchored { .. }) {
-        return None;
+        return ReplayMatchOutcome::NoMatchKeepState;
     }
     if state.model != request.model {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
+        return ReplayMatchOutcome::MismatchInvalidateState;
     }
     let CompactionPhase::Anchored { portable_summary } = &state.phase else {
-        return None;
+        return ReplayMatchOutcome::NoMatchKeepState;
     };
 
     let (envelope, conversation) = split_input_envelope(&request.input);
-    let summary_item = conversation.first()?;
+    let Some(summary_item) = conversation.first() else {
+        return ReplayMatchOutcome::NoMatchKeepState;
+    };
     let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
+        return ReplayMatchOutcome::MismatchInvalidateState;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
+        return ReplayMatchOutcome::MismatchInvalidateState;
     }
     if conversation.len() == 1 {
-        return None;
+        return ReplayMatchOutcome::NoMatchKeepState;
     }
 
     let mut replay = request.clone();
@@ -228,15 +224,55 @@ pub fn apply_compaction_replay(
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return None;
+        return ReplayMatchOutcome::MismatchInvalidateState;
     }
-    state.updated_at = now;
-    Some(CompactionReplay {
-        request: replay,
-        attempt: state.attempt,
-    })
+    ReplayMatchOutcome::Matched(Box::new(replay))
+}
+
+pub fn apply_compaction_replay(
+    session_id: Option<&str>,
+    request: &ResponsesRequest,
+) -> Option<CompactionReplay> {
+    let session_id = session_id?;
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let registry = guard.as_mut()?;
+    evict_states(registry, now);
+    let state = registry.states.get_mut(session_id)?;
+    match match_anchored_compaction_replay(state, request) {
+        ReplayMatchOutcome::Matched(replay) => {
+            state.updated_at = now;
+            Some(CompactionReplay {
+                request: *replay,
+                attempt: state.attempt,
+            })
+        }
+        ReplayMatchOutcome::NoMatchKeepState => None,
+        ReplayMatchOutcome::MismatchInvalidateState => {
+            registry.states.remove(session_id);
+            update_total_bytes(registry);
+            None
+        }
+    }
+}
+
+/// Non-mutating read of the session's anchored compaction history for
+/// ephemeral background forks. Mismatches return `None` without invalidating
+/// or touching the main session's compaction anchor.
+pub fn peek_compaction_replay(
+    session_id: Option<&str>,
+    request: &ResponsesRequest,
+) -> Option<ResponsesRequest> {
+    let session_id = session_id?;
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let registry = guard.as_mut()?;
+    evict_states(registry, now);
+    let state = registry.states.get(session_id)?;
+    match match_anchored_compaction_replay(state, request) {
+        ReplayMatchOutcome::Matched(replay) => Some(*replay),
+        ReplayMatchOutcome::NoMatchKeepState | ReplayMatchOutcome::MismatchInvalidateState => None,
+    }
 }
 
 pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<CompactionAttempt>) {
@@ -1011,5 +1047,55 @@ mod tests {
         };
         assert!(text.len() <= RETAINED_MESSAGE_TOKEN_BUDGET as usize * 4);
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn peek_compaction_replay_is_non_mutating_on_mismatch_and_match() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let attempt = stored_compaction(
+            "peek-session",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque".to_string(),
+            }],
+        );
+        assert!(activate_compaction(
+            Some("peek-session"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+
+        let mut wrong_model = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"fork question"}]}
+        ]));
+        wrong_model.model = "gpt-5.4".to_string();
+        assert!(peek_compaction_replay(Some("peek-session"), &wrong_model).is_none());
+
+        let mismatch_text = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"unrelated"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"fork question"}]}
+        ]));
+        assert!(peek_compaction_replay(Some("peek-session"), &mismatch_text).is_none());
+
+        let matching_fork = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"fork question"}]}
+        ]));
+        let peeked = peek_compaction_replay(Some("peek-session"), &matching_fork)
+            .expect("matching fork should still read anchored compaction history");
+        assert!(matches!(
+            peeked.input.first(),
+            Some(ResponsesInputItem::Compaction { encrypted_content }) if encrypted_content == "opaque"
+        ));
+
+        let main_next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"main follow-up"}]}
+        ]));
+        let main_replay = apply_compaction_replay(Some("peek-session"), &main_next)
+            .expect("mismatched peeks and matching fork peek must leave anchor intact");
+        assert_eq!(main_replay.attempt, attempt);
     }
 }
