@@ -167,6 +167,8 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
             true,
             Some("ultrafast"),
         ),
+        ("gpt-6.2-astra", "gpt-6.2-astra", true, None),
+        ("gpt-6.2-sol-fast", "gpt-6.2-sol", true, Some("priority")),
     ] {
         let response = client
             .post(format!("{url}/v1/responses"))
