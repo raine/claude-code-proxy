@@ -1447,6 +1447,12 @@ async fn auto_review_with_agent_headers_is_stateless() {
         r#"{"autoReviewEffort":"medium","codex":{"effort":"high"}}"#,
     )
     .unwrap();
+    let schema = json!({
+        "type": "object",
+        "properties": {"allow": {"type": "boolean"}},
+        "required": ["allow"],
+        "additionalProperties": false
+    });
     let case = unique("auto-review");
     let session = tagged(&case, "session");
     let headers = IdentityHeaders::agent(&session, &tagged(&case, "agent-a"), None);
@@ -1477,7 +1483,10 @@ async fn auto_review_with_agent_headers_is_stateless() {
                     "text": review_system
                 }],
                 "messages": [{"role": "user", "content": review}],
-                "output_config": {"effort": "low", "format": {"type": "json_object"}},
+                "output_config": {
+                    "effort": "low",
+                    "format": {"type": "json_schema", "name": "decision", "schema": schema}
+                },
                 "tools": []
             }),
             headers.clone(),
@@ -1510,7 +1519,10 @@ async fn auto_review_with_agent_headers_is_stateless() {
     );
     assert_eq!(classifier.body["model"], "gpt-6-luna");
     assert_eq!(classifier.body["reasoning"]["effort"], "medium");
-    assert_eq!(classifier.body["text"]["format"]["type"], "json_object");
+    assert_eq!(
+        classifier.body["text"]["format"],
+        json!({"type": "json_schema", "name": "decision", "schema": schema, "strict": true})
+    );
     assert_eq!(first.body["reasoning"]["effort"], "high");
     assert_eq!(second.body["reasoning"]["effort"], "high");
     assert_eq!(first.socket_ordinal, 1);
