@@ -3,6 +3,22 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.49 (2026-11-21)
+
+- Codex users can select `gpt-6.2-astra` and `gpt-6.2-sol`, including their
+  `-fast` variants, without a local model catalog.
+  ([#215](https://github.com/raine/claude-code-proxy/pull/215))
+- Codex compaction now works when a Claude Code hook or output style adds a
+  system message after the user's compaction instruction.
+  ([#204](https://github.com/raine/claude-code-proxy/issues/204),
+  [#205](https://github.com/raine/claude-code-proxy/pull/205))
+- Set `CCP_AUTO_REVIEW_EFFORT` or `autoReviewEffort` to change the Auto Mode
+  classifier's reasoning effort without changing ordinary requests.
+  ([#212](https://github.com/raine/claude-code-proxy/pull/212))
+- Set `CCP_CODEX_REQUEST_COMPRESSION=1` to gzip outgoing Codex HTTP requests.
+  Enabling compression selects HTTP unless you explicitly choose a transport.
+  ([#202](https://github.com/raine/claude-code-proxy/pull/202))
+
 ## v0.1.48 (2026-11-01)
 
 - Codex users can select GPT-6.1 Terra with `gpt-6.1-terra` or its
