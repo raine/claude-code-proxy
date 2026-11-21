@@ -15,6 +15,7 @@ These settings configure the proxy process. Claude Code client settings such as 
   "port": 18765,
   "aliasProvider": "codex",
   "autoReviewModel": "gpt-5.6-terra",
+  "autoReviewEffort": "medium",
   "codex": {
     "originator": "claude-code-proxy",
     "userAgent": "claude-code-proxy/0.1.24",
@@ -68,6 +69,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
 | `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
+| `CCP_AUTO_REVIEW_EFFORT` | `autoReviewEffort` | — | Sets the Auto Mode classifier's reasoning effort to `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
 | `CCP_TRAFFIC_LOG` | none | `false` | Enables full request captures for `1`, `true`, or `yes`. |
@@ -76,6 +78,8 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
 Auto-review routing resolves the classifier's requested model first, not the main conversation's model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`; Grok and other providers do not establish alias affinity. Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
+
+Classifier effort is independent of model selection. A valid `CCP_AUTO_REVIEW_EFFORT` takes precedence over `autoReviewEffort` in the config file. Either overrides the classifier's `output_config.effort` and, on Codex, the global `CCP_CODEX_EFFORT` or `codex.effort`. Empty or invalid values are ignored. If neither setting is valid, normal effort selection applies. Supported levels depend on the provider and model; Cursor, for example, selects effort through its model variant.
 
 ## Outbound proxies
 

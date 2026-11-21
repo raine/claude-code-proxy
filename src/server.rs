@@ -107,6 +107,27 @@ fn apply_auto_review_model(
     Some(route)
 }
 
+fn apply_auto_review_effort(
+    body: &mut crate::anthropic::schema::MessagesRequest,
+    count_tokens: bool,
+    configured_effort: impl FnOnce() -> Option<String>,
+) {
+    if count_tokens || !is_claude_auto_review_request(body) {
+        return;
+    }
+    let Some(effort) = configured_effort() else {
+        return;
+    };
+    let output_config = body.extra.entry("output_config").or_insert(Value::Null);
+    if output_config.is_null() {
+        *output_config = Value::Object(Map::new());
+    }
+    if let Some(output_config) = output_config.as_object_mut() {
+        output_config.insert("effort".to_string(), Value::String(effort));
+        body.bypass_provider_effort_override = true;
+    }
+}
+
 pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
@@ -1718,6 +1739,7 @@ async fn dispatch_request(
     };
 
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    apply_auto_review_effort(&mut body, count_tokens, crate::config::auto_review_effort);
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(
@@ -2318,7 +2340,10 @@ mod request_id_header_tests {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
+    use super::{
+        CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX, apply_auto_review_effort, apply_auto_review_model,
+        headers_to_record, is_claude_auto_review_request,
+    };
     use crate::anthropic::schema::MessagesRequest;
     use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
     use http::{HeaderMap, HeaderValue};
@@ -2363,6 +2388,57 @@ mod auto_review_tests {
             false,
             json!([{"name": "Bash"}]),
         )));
+    }
+
+    #[test]
+    fn classifier_effort_preserves_output_format_without_a_model_override() {
+        let mut body = request(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX, false, json!([]));
+        body.model = Some("grok-4.5".to_string());
+        assert!(apply_auto_review_model(&mut body, false, None, "grok").is_none());
+        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        body.extra.insert(
+            "output_config".to_string(),
+            json!({"effort": "low", "format": format}),
+        );
+        apply_auto_review_effort(&mut body, false, || Some("high".to_string()));
+        assert_eq!(body.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(
+            body.extra["output_config"],
+            json!({"effort": "high", "format": format})
+        );
+        assert!(body.bypass_provider_effort_override);
+    }
+
+    #[test]
+    fn classifier_effort_does_not_change_other_requests_or_unconfigured_reviews() {
+        for (mut body, count_tokens) in [
+            (request("An ordinary request", false, json!([])), false),
+            (
+                request(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX, true, json!([])),
+                false,
+            ),
+            (
+                request(
+                    CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX,
+                    false,
+                    json!([{"name": "Bash"}]),
+                ),
+                false,
+            ),
+            (
+                request(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX, false, json!([])),
+                true,
+            ),
+        ] {
+            apply_auto_review_effort(&mut body, count_tokens, || panic!("not a review message"));
+            assert!(!body.extra.contains_key("output_config"));
+            assert!(!body.bypass_provider_effort_override);
+        }
+
+        let mut body = request(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX, false, json!([]));
+        apply_auto_review_effort(&mut body, false, || None);
+        assert!(!body.extra.contains_key("output_config"));
+        assert!(!body.bypass_provider_effort_override);
     }
 
     #[test]

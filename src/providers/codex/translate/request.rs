@@ -589,7 +589,7 @@ fn translate_request_inner(
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = if apply_codex_config {
+    let mut resolved_effort = if apply_codex_config && !req.bypass_provider_effort_override {
         resolve_effort(codex_effort)?
     } else {
         codex_effort

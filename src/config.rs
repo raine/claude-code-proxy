@@ -39,6 +39,8 @@ struct FileConfig {
     pub alias_provider: Option<String>,
     #[serde(rename = "autoReviewModel")]
     pub auto_review_model: Option<String>,
+    #[serde(rename = "autoReviewEffort")]
+    pub auto_review_effort: Option<serde_json::Value>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -325,6 +327,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     {
         out.push("CCP_AUTO_REVIEW_MODEL (env)".to_string());
     }
+    if env
+        .get("CCP_AUTO_REVIEW_EFFORT")
+        .is_some_and(|raw| valid_auto_review_effort(raw))
+    {
+        out.push("CCP_AUTO_REVIEW_EFFORT (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
             out.push(format!("bindAddress: {bind_address}"));
@@ -340,6 +348,14 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             .is_some_and(|model| !model.is_empty())
         {
             out.push("autoReviewModel (config)".to_string());
+        }
+        if file_cfg
+            .auto_review_effort
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(valid_auto_review_effort)
+        {
+            out.push("autoReviewEffort (config)".to_string());
         }
         if let Some(log) = file_cfg.log {
             if let Some(v) = log.verbose {
@@ -900,6 +916,23 @@ pub fn auto_review_model() -> Option<String> {
         .filter(|model| !model.is_empty())
 }
 
+pub fn auto_review_effort() -> Option<String> {
+    std::env::var("CCP_AUTO_REVIEW_EFFORT")
+        .ok()
+        .filter(|raw| valid_auto_review_effort(raw))
+        .or_else(|| {
+            let value = read_file_config(&paths::config_dir())?.auto_review_effort?;
+            value
+                .as_str()
+                .filter(|raw| valid_auto_review_effort(raw))
+                .map(str::to_owned)
+        })
+}
+
+fn valid_auto_review_effort(effort: &str) -> bool {
+    matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
+}
+
 // ---------------------------------------------------------------------------
 // Codex transport config
 // ---------------------------------------------------------------------------
@@ -1084,6 +1117,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+            EnvGuard::unset("CCP_AUTO_REVIEW_EFFORT"),
             EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
@@ -1548,6 +1582,30 @@ mod tests {
             let _model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "");
             assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
         }
+    }
+
+    #[test]
+    fn auto_review_effort_reads_top_level_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let path = config.path().join("config.json");
+        assert_eq!(auto_review_effort(), None);
+
+        std::fs::write(&path, r#"{"autoReviewEffort":"medium"}"#).unwrap();
+        assert_eq!(auto_review_effort().as_deref(), Some("medium"));
+        for (raw, expected) in [("high", "high"), ("", "medium"), ("off", "medium")] {
+            let _effort_env = EnvGuard::set("CCP_AUTO_REVIEW_EFFORT", raw);
+            assert_eq!(auto_review_effort().as_deref(), Some(expected));
+        }
+
+        std::fs::write(
+            &path,
+            r#"{"autoReviewEffort":42,"autoReviewModel":"grok-4.5"}"#,
+        )
+        .unwrap();
+        assert_eq!(auto_review_effort(), None);
+        assert_eq!(auto_review_model().as_deref(), Some("grok-4.5"));
     }
 
     #[test]
