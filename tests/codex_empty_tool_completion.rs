@@ -148,6 +148,8 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
             for case in [
                 "success",
                 "whitespace",
+                "tokens_reminder",
+                "trailing_tokens_reminder_user",
                 "text",
                 "hook",
                 "system",
@@ -166,6 +168,10 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
                     vec![json!({"type":"tool_result","tool_use_id":"a","content":"sent"})];
                 match case {
                     "whitespace" => results.push(json!({"type":"text","text":" \n\t"})),
+                    "tokens_reminder" => results.push(json!({
+                        "type":"text",
+                        "text":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"
+                    })),
                     "text" => results.push(json!({"type":"text","text":"please continue"})),
                     "hook" => results.push(json!({"type":"text","text":"<system-reminder>PostToolUse hook: continue</system-reminder>"})),
                     "unmatched" => results[0]["tool_use_id"] = json!("unknown"),
@@ -181,6 +187,12 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
                     json!({"role":"assistant","content":calls}),
                     json!({"role":"user","content":results}),
                 ];
+                if case == "trailing_tokens_reminder_user" {
+                    messages.push(json!({
+                        "role":"user",
+                        "content":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"
+                    }));
+                }
                 if case == "system" {
                     messages.push(json!({"role":"system","content":"PostToolUse hook: continue"}));
                 }
@@ -206,7 +218,13 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
                     assert_eq!(attempts, 1, "{context}");
                 } else {
                     assert!(status.is_success(), "{context}");
-                    let eligible = matches!(case, "success" | "whitespace");
+                    let eligible = matches!(
+                        case,
+                        "success"
+                            | "whitespace"
+                            | "tokens_reminder"
+                            | "trailing_tokens_reminder_user"
+                    );
                     assert_eq!(attempts, if eligible { 2 } else { 3 }, "{context}");
                     assert_eq!(body.contains("recovered"), !eligible, "{context}");
                     if stream {
@@ -224,4 +242,212 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
         }
         upstream_task.abort();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_process_stateful_auto_empty_tool_completion_with_tokens_reminder() {
+    let captured_requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let recorded = captured_requests.clone();
+    let upstream_task = tokio::spawn(async move {
+        let mut seq = 0_usize;
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let mut socket = accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    match message {
+                        Message::Text(text) => {
+                            let req: Value = serde_json::from_str(&text).unwrap();
+                            let idx = {
+                                let mut guard = recorded.lock().unwrap();
+                                guard.push(req);
+                                guard.len()
+                            };
+                            let events = match idx {
+                                1 => vec![
+                                    json!({
+                                        "type":"response.output_item.added",
+                                        "output_index":0,
+                                        "item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"reply","arguments":"{}"}
+                                    }),
+                                    json!({
+                                        "type":"response.output_item.done",
+                                        "output_index":0,
+                                        "item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"reply","arguments":"{}"}
+                                    }),
+                                    json!({
+                                        "type":"response.completed",
+                                        "response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}
+                                    }),
+                                ],
+                                2 | 3 => vec![json!({
+                                    "type":"response.completed",
+                                    "response":{"id":format!("resp_{idx}"),"status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":0}}
+                                })],
+                                _ => vec![
+                                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_next"}}),
+                                    json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"next ok"}),
+                                    json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_next"}}),
+                                    json!({
+                                        "type":"response.completed",
+                                        "response":{"id":format!("resp_{idx}"),"status":"completed","output":[],"usage":{"input_tokens":15,"output_tokens":2}}
+                                    }),
+                                ],
+                            };
+                            for event in events {
+                                if socket.send(Message::Text(event.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Message::Ping(payload) => {
+                            let _ = socket.send(Message::Pong(payload)).await;
+                        }
+                        Message::Close(_) => return,
+                        _ => {}
+                    }
+                }
+            });
+            seq += 1;
+            let _ = seq;
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("codex")).unwrap();
+    std::fs::write(
+        dir.path().join("codex/auth.json"),
+        json!({
+            "access":"synthetic-access","refresh":"synthetic-refresh",
+            "expires":4_102_444_800_000_i64,"account_id":"synthetic-account"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+    command
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .args(["serve", "--port", &port.to_string(), "--no-monitor"])
+        .env("CCP_CONFIG_DIR", dir.path())
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("CCP_CODEX_TRANSPORT", "auto")
+        .env("CCP_CODEX_BASE_URL", format!("http://{upstream}"))
+        .env("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1")
+        .env("CCP_CODEX_SERVER_COMPACTION", "1")
+        .env("CCP_ALIAS_PROVIDER", "codex")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _proxy = Child(command.spawn().unwrap());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut ready = false;
+    for _ in 0..100 {
+        if client.get(format!("{base}/healthz")).send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "proxy did not start");
+
+    let session_id = "stateful-empty-tool-session";
+    let tools = json!([{"name":"reply","input_schema":{"type":"object","properties":{}}}]);
+
+    // Turn 1: triggers tool_use call_1
+    let r1 = client
+        .post(format!("{base}/v1/messages"))
+        .header("x-claude-code-session-id", session_id)
+        .json(&json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":true,
+            "messages":[{"role":"user","content":"ping"}],
+            "tools":tools
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r1.status().is_success());
+    let b1 = r1.text().await.unwrap();
+    assert!(b1.contains("\"stop_reason\":\"tool_use\""), "{b1}");
+
+    // Turn 2: resolved tool_result + total_tokens_reminder -> 1 delta + 1 full-context retry -> 200 empty end_turn
+    let r2 = client
+        .post(format!("{base}/v1/messages"))
+        .header("x-claude-code-session-id", session_id)
+        .json(&json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":true,
+            "messages":[
+                {"role":"user","content":"ping"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"reply","input":{}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"sent"},
+                    {"type":"text","text":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"}
+                ]}
+            ],
+            "tools":tools
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let b2 = r2.text().await.unwrap();
+    assert!(b2.contains("event: message_start"), "{b2}");
+    assert!(b2.contains("\"stop_reason\":\"end_turn\""), "{b2}");
+    assert_eq!(b2.matches("event: message_stop").count(), 1, "{b2}");
+
+    // Turn 3: follow-up turn continues cleanly on same session
+    let r3 = client
+        .post(format!("{base}/v1/messages"))
+        .header("x-claude-code-session-id", session_id)
+        .json(&json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":true,
+            "messages":[
+                {"role":"user","content":"ping"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"reply","input":{}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"sent"},
+                    {"type":"text","text":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"}
+                ]},
+                {"role":"user","content":"next"}
+            ],
+            "tools":tools
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), 200);
+    let b3 = r3.text().await.unwrap();
+    assert!(b3.contains("next ok"), "{b3}");
+
+    let reqs = captured_requests.lock().unwrap();
+    assert_eq!(reqs.len(), 4, "expected 1 + 2 + 1 upstream turns: {reqs:?}");
+    assert_eq!(
+        reqs[1].get("previous_response_id").and_then(Value::as_str),
+        Some("resp_1")
+    );
+    assert!(
+        reqs[2].get("previous_response_id").is_none(),
+        "retry must send full context: {}",
+        reqs[2]
+    );
+    assert_eq!(
+        reqs[3].get("previous_response_id").and_then(Value::as_str),
+        Some("resp_3")
+    );
+
+    upstream_task.abort();
 }
