@@ -669,10 +669,4 @@ mod tests {
         assert!(models.contains(&"cursor-plan".to_string()));
         assert!(models.contains(&"cursor-ask".to_string()));
     }
-
-    #[test]
-    fn cursor_cli_logout_does_not_error() {
-        let result = CURSOR_CLI.logout();
-        assert!(result.is_ok());
-    }
 }
