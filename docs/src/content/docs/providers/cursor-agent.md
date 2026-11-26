@@ -58,7 +58,9 @@ When the OpenAI routes are enabled, Cursor models work with both `POST /v1/chat/
 
 ## Session continuation
 
-The proxy maps `x-claude-code-session-id` to a Cursor conversation ID in memory. Request metadata can resume a known Cursor chat through `cursor_chat_id`, `cursorChatId`, `cursor_resume`, or `cursorResume`. A proxy restart clears the in-memory mapping.
+For tool-bridged requests, the proxy keeps the Cursor conversation of each Claude Code session, model, system prompt and tool set in memory: the conversation ID, the last checkpoint and the agent-store blobs. When the next request extends the transcript that conversation saw, the run sends the checkpoint back with only the new messages, so Cursor's prompt cache reuses the earlier turns instead of writing the whole context again. A changed transcript (an edit, a compaction) or tool list starts a new conversation with the full prompt. Conversations idle for 30 minutes are dropped, and a proxy restart clears them all. Set `CCP_CURSOR_CONTINUATION=off` to send the full transcript on every request.
+
+Each run logs `cursor_turn_usage` with Cursor's own input, output, cache-read and cache-write token counts and whether it continued a conversation.
 
 Metadata can also choose a mode per request:
 
