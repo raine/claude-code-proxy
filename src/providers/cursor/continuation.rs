@@ -186,16 +186,17 @@ fn log_resume(resume: &Resume, reason: &str, body: &MessagesRequest) {
 /// The request cut down to what the server has not seen.
 ///
 /// The stored run saw `messages[..prefix_len]` and wrote the reply Claude Code
-/// stored as `messages[prefix_len]`. Everything after it must be user turns
-/// (tool results or a new prompt); anything else means the transcript moved on
-/// without this conversation.
+/// stored as `messages[prefix_len]`. Everything after it must come from the
+/// client side: tool results, a new prompt, and the `system` messages Claude
+/// Code appends after a user turn (hooks, output styles). Another assistant
+/// message means the transcript moved on without this conversation.
 fn delta_request(segment: &Segment, body: &MessagesRequest) -> Option<MessagesRequest> {
     let messages = &body.messages;
     let reply = messages.get(segment.prefix_len)?;
     let delta = &messages[segment.prefix_len + 1..];
     if reply.role != "assistant"
         || delta.is_empty()
-        || delta.iter().any(|message| message.role != "user")
+        || delta.iter().any(|message| message.role == "assistant")
         || prefix_hash(&messages[..segment.prefix_len]) != segment.prefix_hash
     {
         return None;
@@ -306,6 +307,28 @@ mod tests {
     }
 
     #[test]
+    fn delta_carries_the_system_messages_claude_code_appends() {
+        let first = request(serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "system", "content": [{"type": "text", "text": "style reminder",
+                "cache_control": {"type": "ephemeral"}}]}
+        ]));
+        let segment = Segment::for_request("session-system", &first);
+        let second = request(serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "system", "content": "style reminder"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "system", "content": "style reminder"}
+        ]));
+
+        let delta = delta_request(&segment, &second).expect("continues");
+
+        let roles: Vec<&str> = delta.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "system"]);
+    }
+
+    #[test]
     fn delta_rejects_an_edited_history() {
         let segment = Segment::for_request("session-edited", &first_turn());
         let edited = request(serde_json::json!([
@@ -315,6 +338,20 @@ mod tests {
         ]));
 
         assert!(delta_request(&segment, &edited).is_none());
+    }
+
+    #[test]
+    fn delta_rejects_a_second_assistant_reply() {
+        let segment = Segment::for_request("session-two-replies", &first_turn());
+        let moved_on = request(serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "an answer this conversation never gave"},
+            {"role": "user", "content": "third question"}
+        ]));
+
+        assert!(delta_request(&segment, &moved_on).is_none());
     }
 
     #[test]
