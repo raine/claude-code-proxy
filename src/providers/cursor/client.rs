@@ -9,6 +9,7 @@ use crate::providers::cursor::connect::{
     ConnectFrame, ConnectFrameDecoder, FLAG_END, FLAG_GZIP, encode_connect_frame,
     parse_connect_error,
 };
+use crate::providers::cursor::continuation::{RunState, SharedRunState};
 use crate::providers::cursor::model::CursorModelResolution;
 use crate::providers::cursor::proto;
 use crate::providers::cursor::request::CursorSelectedImage;
@@ -52,9 +53,15 @@ pub struct LiveRun {
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
     pub events: mpsc::Receiver<LiveEvent>,
     writer: tokio::task::JoinHandle<()>,
+    state: SharedRunState,
 }
 
 impl LiveRun {
+    /// The conversation state as of the latest frame the reader handled.
+    pub fn snapshot(&self) -> RunState {
+        self.state.lock().unwrap().clone()
+    }
+
     /// Write one client message on the open request body.
     pub async fn send(&self, message: &proto::AgentClientMessage) -> Result<(), CursorError> {
         self.tx
@@ -82,6 +89,7 @@ impl LiveRun {
             tx,
             events,
             writer: tokio::spawn(async {}),
+            state: RunState::new_shared(),
         }
     }
 
@@ -92,6 +100,7 @@ impl LiveRun {
             tx,
             events,
             writer: tokio::spawn(async {}),
+            state: RunState::new_shared(),
         }
     }
 }
@@ -153,14 +162,19 @@ impl CursorHttpClient {
     /// The returned handle owns the write side of the request body, so the
     /// caller can answer exec requests on the same stream, and a reader task
     /// that decodes response frames incrementally into `LiveRun::events`.
+    ///
+    /// `state` carries the conversation: a fresh one starts a new conversation,
+    /// a stored one continues it. The reader keeps it current as the server
+    /// writes blobs and checkpoints.
     pub async fn start_run(
         &self,
         token: &str,
         prompt: &str,
         model: &str,
         images: &[CursorSelectedImage],
+        state: SharedRunState,
     ) -> Result<LiveRun, CursorError> {
-        let transport = self.open_run(token, prompt, model, images).await?;
+        let transport = self.open_run(token, prompt, model, images, &state).await?;
         let status = transport.response.status().as_u16();
         let headers = transport.response.headers().clone();
 
@@ -181,11 +195,10 @@ impl CursorHttpClient {
 
         let (event_tx, event_rx) = mpsc::channel::<LiveEvent>(64);
         let kv_tx = transport.tx.clone();
+        let reader_state = std::sync::Arc::clone(&state);
         tokio::spawn(async move {
             let mut stream = transport.response.bytes_stream();
             let mut decoder = ConnectFrameDecoder::new();
-            let mut blobs: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-                std::collections::HashMap::new();
             loop {
                 let next = tokio::time::timeout(RUN_IDLE_TIMEOUT, stream.next()).await;
                 let chunk = match next {
@@ -231,14 +244,20 @@ impl CursorHttpClient {
                         let _ = event_tx.send(event).await;
                         return;
                     }
-                    match decode_frame_payload(&frame) {
-                        Ok(message) => {
+                    match decode_frame_with_payload(&frame) {
+                        Ok((message, payload)) => {
+                            if message.conversation_checkpoint_update.is_some()
+                                && let Some(checkpoint) = length_delimited_field(&payload, 3)
+                            {
+                                reader_state.lock().unwrap().checkpoint = Some(checkpoint.to_vec());
+                            }
                             // The agent store is answered here rather than by
                             // the pump: a blob the server is waiting on must
                             // land even while the turn is paused on a tool.
-                            if let Some(kv) = message.kv_server_message.as_ref()
-                                && let Some(reply) = kv_reply(kv, &mut blobs)
-                            {
+                            let reply = message.kv_server_message.as_ref().and_then(|kv| {
+                                kv_reply(kv, &mut reader_state.lock().unwrap().blobs)
+                            });
+                            if let Some(reply) = reply {
                                 if kv_tx
                                     .send(Ok(encode_connect_frame(reply.encode_to_vec(), 0)))
                                     .await
@@ -268,6 +287,7 @@ impl CursorHttpClient {
             tx: transport.tx,
             events: event_rx,
             writer: transport.writer,
+            state,
         })
     }
 
@@ -278,12 +298,23 @@ impl CursorHttpClient {
         prompt: &str,
         model: &str,
         images: &[CursorSelectedImage],
+        state: &SharedRunState,
     ) -> Result<RunTransport, CursorError> {
         let resolved = super::model::resolve_cursor_model(model)
             .map_err(|e| CursorError::internal(format!("model resolution: {e}")))?;
 
         let request_id = uuid::Uuid::new_v4().to_string();
-        let frames = build_run_frames(prompt, &resolved, images, &request_id);
+        let frames = {
+            let state = state.lock().unwrap();
+            build_run_frames(
+                prompt,
+                &resolved,
+                images,
+                &request_id,
+                &state.conversation_id,
+                state.checkpoint.as_deref(),
+            )
+        };
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
         let writer_tx = tx.clone();
         let writer = tokio::spawn(async move {
@@ -357,7 +388,9 @@ impl CursorHttpClient {
         model: &str,
         images: &[CursorSelectedImage],
     ) -> Result<CursorUpstreamResponse, CursorError> {
-        let transport = self.open_run(token, prompt, model, images).await?;
+        let transport = self
+            .open_run(token, prompt, model, images, &RunState::new_shared())
+            .await?;
         let sender = transport.writer;
         let status = transport.response.status().as_u16();
         let headers = transport.response.headers().clone();
@@ -495,13 +528,19 @@ fn selected_context(images: &[CursorSelectedImage]) -> Option<Vec<u8>> {
     Some(context)
 }
 
+/// The opening frames of a run.
+///
+/// `checkpoint` is the `ConversationStateStructure` the server sent last in
+/// this conversation; with it the server rebuilds the earlier turns from the
+/// agent store, and `prompt` only has to carry what is new.
 fn build_run_frames(
     prompt: &str,
     resolved: &CursorModelResolution,
     images: &[CursorSelectedImage],
     request_id: &str,
+    conversation_id: &str,
+    checkpoint: Option<&[u8]>,
 ) -> Vec<Bytes> {
-    let conversation_id = uuid::Uuid::new_v4().to_string();
     let mut user_message = field_string(1, prompt);
     user_message.extend(field_string(2, request_id));
     if let Some(context) = selected_context(images) {
@@ -512,15 +551,15 @@ fn build_run_frames(
     user_message.extend(field_varint(4, mode_value(resolved)));
 
     let action = field_bytes(1, &field_bytes(1, &user_message));
-    let mut request = field_bytes(1, &[]);
+    let mut request = field_bytes(1, checkpoint.unwrap_or_default());
     request.extend(field_bytes(2, &action));
     request.extend(field_bytes(4, &[]));
-    request.extend(field_string(5, &conversation_id));
+    request.extend(field_string(5, conversation_id));
     request.extend(field_bytes(9, &model_message(resolved)));
     request.extend(field_varint(12, 0));
     request.extend(field_bytes(14, &field_string(1, "default")));
     request.extend(field_bytes(14, &model_message(resolved)));
-    request.extend(field_string(16, &conversation_id));
+    request.extend(field_string(16, conversation_id));
     let first = encode_connect_frame(field_bytes(1, &request), 0);
 
     let environment = request_context_env().encode_to_vec();
@@ -666,6 +705,14 @@ pub fn decode_upstream_frames(body: &[u8]) -> Result<Vec<ConnectFrame>, CursorEr
 pub fn decode_frame_payload(
     frame: &ConnectFrame,
 ) -> Result<proto::AgentServerMessage, CursorError> {
+    decode_frame_with_payload(frame).map(|(message, _)| message)
+}
+
+/// Decode a frame and keep its decompressed payload: prost drops the fields
+/// this crate does not model, and a checkpoint goes back byte for byte.
+fn decode_frame_with_payload(
+    frame: &ConnectFrame,
+) -> Result<(proto::AgentServerMessage, Vec<u8>), CursorError> {
     let payload = if frame.flags & FLAG_GZIP != 0 {
         super::connect::decode_gzip_frame(&frame.payload)
             .map_err(|e| CursorError::internal(format!("gzip decompress: {e}")))?
@@ -673,8 +720,48 @@ pub fn decode_frame_payload(
         frame.payload.to_vec()
     };
 
-    proto::AgentServerMessage::decode(&payload[..])
-        .map_err(|e| CursorError::internal(format!("prost decode: {e}")))
+    let message = proto::AgentServerMessage::decode(&payload[..])
+        .map_err(|e| CursorError::internal(format!("prost decode: {e}")))?;
+    Ok((message, payload))
+}
+
+/// The raw bytes of the last top-level length-delimited field `tag`.
+fn length_delimited_field(buf: &[u8], tag: u64) -> Option<&[u8]> {
+    fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *buf.get(*pos)?;
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    let mut pos = 0;
+    let mut found = None;
+    while pos < buf.len() {
+        let key = varint(buf, &mut pos)?;
+        match key & 7 {
+            0 => {
+                varint(buf, &mut pos)?;
+            }
+            1 => pos += 8,
+            2 => {
+                let len = usize::try_from(varint(buf, &mut pos)?).ok()?;
+                let end = pos.checked_add(len).filter(|end| *end <= buf.len())?;
+                if key >> 3 == tag {
+                    found = Some(&buf[pos..end]);
+                }
+                pos = end;
+            }
+            5 => pos += 4,
+            _ => return None,
+        }
+    }
+    (pos == buf.len()).then_some(found).flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -726,6 +813,60 @@ impl std::fmt::Display for CursorError {
 }
 
 impl std::error::Error for CursorError {}
+
+#[cfg(test)]
+mod continuation_frame_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_field_is_returned_byte_for_byte() {
+        // A checkpoint with a field prost does not model (tag 8, the turns).
+        let mut checkpoint = field_bytes(8, b"turn-blob-id");
+        checkpoint.extend(field_bytes(5, &field_varint(1, 1200)));
+        let mut payload = field_varint(9, 7);
+        payload.extend(field_bytes(3, &checkpoint));
+
+        assert_eq!(
+            length_delimited_field(&payload, 3),
+            Some(checkpoint.as_slice())
+        );
+    }
+
+    #[test]
+    fn truncated_payload_yields_no_field() {
+        let payload = field_bytes(3, b"checkpoint");
+
+        assert_eq!(
+            length_delimited_field(&payload[..payload.len() - 1], 3),
+            None
+        );
+    }
+
+    #[test]
+    fn run_request_carries_the_stored_checkpoint_and_conversation_id() {
+        let resolved =
+            crate::providers::cursor::model::resolve_cursor_model("cursor:gpt-5.5").unwrap();
+
+        let checkpoint = field_bytes(8, b"turn-blob-id");
+
+        let frames = build_run_frames(
+            "new turn",
+            &resolved,
+            &[],
+            "req-1",
+            "conv-1",
+            Some(&checkpoint),
+        );
+
+        let request = length_delimited_field(&frames[0][5..], 1).unwrap();
+        assert_eq!(
+            length_delimited_field(request, 1),
+            Some(checkpoint.as_slice())
+        );
+        assert_eq!(length_delimited_field(request, 5), Some(&b"conv-1"[..]));
+        assert_eq!(length_delimited_field(request, 16), Some(&b"conv-1"[..]));
+    }
+}
 
 #[cfg(test)]
 mod model_message_tests {

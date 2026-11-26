@@ -1357,6 +1357,374 @@ async fn live_run_still_answers_plain_turns() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conversation continuation
+// ---------------------------------------------------------------------------
+
+/// A new user turn continues the Cursor conversation: the run carries the last
+/// checkpoint and conversation id, the prompt holds only the new message, and
+/// the server reads the earlier turn back from the agent store.
+#[tokio::test]
+async fn next_turn_continues_the_cursor_conversation() {
+    let _guard = ENV_LOCK.lock().await;
+    let (addr, records) = spawn_conversation_mock("first answer").await;
+    set_mock_env(addr);
+
+    let provider = claude_code_proxy::providers::cursor::CursorProvider::new();
+    let first = collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "first question"}
+        ])),
+        "continue-next-turn",
+    )
+    .await;
+    let second = collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"}
+        ])),
+        "continue-next-turn",
+    )
+    .await;
+
+    assert!(first.contains("first answer"), "{first}");
+    assert!(second.contains("second answer"), "{second}");
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert!(records[0].conversation_state.is_empty());
+    assert_eq!(records[1].conversation_state, checkpoint_bytes());
+    assert_eq!(records[1].conversation_id, records[0].conversation_id);
+    assert!(records[1].prompt.contains("second question"));
+    assert!(!records[1].prompt.contains("first question"));
+    assert_eq!(records[1].blob_reply.as_deref(), Some(&b"turn-1"[..]));
+    clear_mock_env();
+}
+
+/// A tool call recovered from the text channel ends the response early; the
+/// run still finishes its turn in the background, and the request carrying the
+/// tool result continues the conversation with that result alone.
+#[tokio::test]
+async fn tool_result_after_a_text_tool_call_continues_the_conversation() {
+    let _guard = ENV_LOCK.lock().await;
+    let (addr, records) =
+        spawn_conversation_mock(r#"<tool_use name="Glob">{"pattern":"*.rs"}</tool_use>"#).await;
+    set_mock_env(addr);
+
+    let provider = claude_code_proxy::providers::cursor::CursorProvider::new();
+    let first = collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "list the rust files"}
+        ])),
+        "continue-text-tool",
+    )
+    .await;
+    let tool_use_id = parse_sse_events(&first)
+        .iter()
+        .find_map(|(name, data)| {
+            (name == "content_block_start" && data["content_block"]["name"] == "Glob")
+                .then(|| data["content_block"]["id"].as_str().unwrap().to_string())
+        })
+        .expect("turn 1 asks for Glob");
+    let second = collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "list the rust files"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tool_use_id, "name": "Glob",
+                 "input": {"pattern": "*.rs"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_use_id, "content": "main.rs"}
+            ]}
+        ])),
+        "continue-text-tool",
+    )
+    .await;
+
+    assert!(second.contains("second answer"), "{second}");
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].conversation_state, checkpoint_bytes());
+    assert_eq!(records[1].conversation_id, records[0].conversation_id);
+    assert!(records[1].prompt.contains("main.rs"));
+    assert!(!records[1].prompt.contains("list the rust files"));
+    clear_mock_env();
+}
+
+/// A transcript that no longer matches what the conversation saw (an edit, a
+/// compaction) starts a new conversation with the whole transcript.
+#[tokio::test]
+async fn changed_history_starts_a_new_conversation() {
+    let _guard = ENV_LOCK.lock().await;
+    let (addr, records) = spawn_conversation_mock("first answer").await;
+    set_mock_env(addr);
+
+    let provider = claude_code_proxy::providers::cursor::CursorProvider::new();
+    collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "first question"}
+        ])),
+        "continue-changed",
+    )
+    .await;
+    collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "summary of the earlier work"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"}
+        ])),
+        "continue-changed",
+    )
+    .await;
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert!(records[1].conversation_state.is_empty());
+    assert_ne!(records[1].conversation_id, records[0].conversation_id);
+    assert!(records[1].prompt.contains("summary of the earlier work"));
+    clear_mock_env();
+}
+
+/// What one mock `Run` received.
+#[derive(Default, Clone, Debug)]
+struct RunRecord {
+    conversation_state: Vec<u8>,
+    conversation_id: String,
+    prompt: String,
+    blob_reply: Option<Vec<u8>>,
+}
+
+fn conversation_request(messages: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "model": "cursor:gpt-5.5",
+        "stream": true,
+        "system": "be brief",
+        "tools": [
+            {"name": "Read", "description": "read", "input_schema": {"type": "object"}},
+            {"name": "Glob", "description": "glob", "input_schema": {"type": "object"}}
+        ],
+        "messages": messages
+    })
+}
+
+fn set_mock_env(addr: std::net::SocketAddr) {
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", format!("http://{addr}"));
+        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "proxy-token");
+    }
+}
+
+fn clear_mock_env() {
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
+    }
+}
+
+/// A Cursor upstream that keeps one conversation.
+///
+/// The first run stores a blob, replies with `first_reply` and sends a
+/// checkpoint that refers to the blob. Every later run asks for the blob back
+/// before it answers "second answer".
+async fn spawn_conversation_mock(
+    first_reply: &'static str,
+) -> (std::net::SocketAddr, Arc<Mutex<Vec<RunRecord>>>) {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::post;
+    use claude_code_proxy::providers::cursor::connect::{
+        ConnectFrameDecoder, encode_connect_frame,
+    };
+    use claude_code_proxy::providers::cursor::proto::*;
+    use futures_util::StreamExt;
+    use prost::Message;
+
+    let records: Arc<Mutex<Vec<RunRecord>>> = Arc::default();
+    let app = {
+        let records = Arc::clone(&records);
+        Router::new().route(
+            "/agent.v1.AgentService/Run",
+            post(move |body: Body| async move {
+                let run = {
+                    let mut records = records.lock().unwrap();
+                    records.push(RunRecord::default());
+                    records.len() - 1
+                };
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let records = Arc::clone(&records);
+
+                tokio::spawn(async move {
+                    let mut decoder = ConnectFrameDecoder::new();
+                    let mut stream = body.into_data_stream();
+                    let mut started = false;
+                    while let Some(Ok(chunk)) = stream.next().await {
+                        let Ok(frames) = decoder.push(&chunk) else {
+                            break;
+                        };
+                        for frame in frames {
+                            if !started {
+                                started = true;
+                                let request = raw_field(&frame.payload, 1).unwrap_or_default();
+                                let prompt = [2, 1, 1, 1]
+                                    .iter()
+                                    .try_fold(request.clone(), |buf, tag| raw_field(&buf, *tag))
+                                    .unwrap_or_default();
+                                {
+                                    let mut records = records.lock().unwrap();
+                                    records[run].conversation_state =
+                                        raw_field(&request, 1).unwrap_or_default();
+                                    records[run].conversation_id = String::from_utf8(
+                                        raw_field(&request, 5).unwrap_or_default(),
+                                    )
+                                    .unwrap();
+                                    records[run].prompt = String::from_utf8(prompt).unwrap();
+                                }
+                                if run == 0 {
+                                    let _ = tx.send(Ok(kv_frame(
+                                        1,
+                                        kv_server_message::Message::SetBlobArgs(SetBlobArgs {
+                                            blob_id: b"blob-1".to_vec(),
+                                            blob_data: b"turn-1".to_vec(),
+                                        }),
+                                    )));
+                                    let _ = tx.send(Ok(text_frame(first_reply)));
+                                    let _ = tx.send(Ok(encode_connect_frame(
+                                        length_delimited(3, &checkpoint_bytes()),
+                                        0,
+                                    )));
+                                    let _ = tx.send(Ok(usage_frame(30, 5)));
+                                    let _ = tx.send(Ok(encode_connect_frame(b"", 2)));
+                                } else {
+                                    let _ = tx.send(Ok(kv_frame(
+                                        2,
+                                        kv_server_message::Message::GetBlobArgs(GetBlobArgs {
+                                            blob_id: b"blob-1".to_vec(),
+                                        }),
+                                    )));
+                                }
+                                continue;
+                            }
+                            let Ok(message) = AgentClientMessage::decode(frame.payload.clone())
+                            else {
+                                continue;
+                            };
+                            if let Some(KvClientMessage {
+                                message: Some(kv_client_message::Message::GetBlobResult(result)),
+                                ..
+                            }) = message.kv_client_message
+                            {
+                                records.lock().unwrap()[run].blob_reply = result.blob_data;
+                                let _ = tx.send(Ok(text_frame("second answer")));
+                                let _ = tx.send(Ok(usage_frame(40, 5)));
+                                let _ = tx.send(Ok(encode_connect_frame(b"", 2)));
+                            }
+                        }
+                    }
+                });
+
+                let body =
+                    Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+                        rx.recv()
+                            .await
+                            .map(|item: Result<bytes::Bytes, std::io::Error>| (item, rx))
+                    }));
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/connect+proto",
+                    )],
+                    body,
+                )
+            }),
+        )
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, records)
+}
+
+/// A checkpoint as the server sends it: the turns (tag 8, a blob id the crate
+/// does not model) and the token counter (tag 5).
+fn checkpoint_bytes() -> Vec<u8> {
+    let mut checkpoint = length_delimited(8, b"blob-1");
+    checkpoint.extend(length_delimited(5, &[0x08, 0xb0, 0x09]));
+    checkpoint
+}
+
+fn kv_frame(
+    id: u32,
+    message: claude_code_proxy::providers::cursor::proto::kv_server_message::Message,
+) -> bytes::Bytes {
+    use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
+    use claude_code_proxy::providers::cursor::proto::*;
+    use prost::Message;
+
+    let message = AgentServerMessage {
+        kv_server_message: Some(KvServerMessage {
+            id,
+            message: Some(message),
+        }),
+        ..Default::default()
+    };
+    encode_connect_frame(message.encode_to_vec(), 0)
+}
+
+/// A length-delimited protobuf field; the payloads here stay under 128 bytes.
+fn length_delimited(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![(tag << 3) | 2, value.len() as u8];
+    out.extend_from_slice(value);
+    out
+}
+
+/// The last top-level length-delimited field `tag` of a protobuf message.
+fn raw_field(buf: &[u8], tag: u64) -> Option<Vec<u8>> {
+    fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let byte = *buf.get(*pos)?;
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    let mut pos = 0;
+    let mut found = None;
+    while pos < buf.len() {
+        let key = varint(buf, &mut pos)?;
+        match key & 7 {
+            0 => {
+                varint(buf, &mut pos)?;
+            }
+            1 => pos += 8,
+            2 => {
+                let len = varint(buf, &mut pos)? as usize;
+                let end = pos + len;
+                if key >> 3 == tag {
+                    found = Some(buf.get(pos..end)?.to_vec());
+                }
+                pos = end;
+            }
+            5 => pos += 4,
+            _ => return None,
+        }
+    }
+    found
+}
+
 /// Call the provider the way the proxy does and collect the whole SSE body.
 async fn collect_sse(
     provider: &claude_code_proxy::providers::cursor::CursorProvider,

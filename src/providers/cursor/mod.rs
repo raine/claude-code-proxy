@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod connect;
+pub mod continuation;
 pub mod model;
 pub mod proto;
 pub mod request;
@@ -30,13 +31,18 @@ use crate::providers::cursor::auth::{
     run_cursor_login,
 };
 use crate::providers::cursor::client::CursorHttpClient;
+use crate::providers::cursor::continuation::{Resume, RunState, Segment};
 use crate::providers::cursor::model::resolve_cursor_model;
 use crate::providers::cursor::request::render_cursor_prompt;
 use crate::providers::cursor::response::{CursorDecodeError, decode_cursor_upstream};
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, LiveBridge, PumpOutcome, advertised_tool_names, can_bridge_cursor_native_tools,
-    exec_result_messages, find_tool_result, pump_live_bridge,
+    drain_to_turn_end, exec_result_messages, find_tool_result, pump_live_bridge,
 };
+
+/// How long a run stopped on a text-channel tool call may take to finish its
+/// turn. The agent was told to stop after the call, so this is a safety net.
+const REPLAY_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -97,6 +103,9 @@ impl Provider for CursorProvider {
                 Some(preamble) => {
                     let mut bridge = bridge;
                     bridge.input_floor = response::estimate_request_input_tokens(&body);
+                    if bridge.segment.is_some() {
+                        bridge.segment = Some(Segment::for_request(&session_id, &body));
+                    }
                     return live_sse_response(bridge, preamble, &message_id, model, &ctx);
                 }
                 // No result for the pending exec: the caller moved on. The
@@ -148,10 +157,30 @@ impl Provider for CursorProvider {
             && can_bridge_cursor_native_tools(&body, Some(&session_id))
         {
             let allowed = advertised_tool_names(&body);
-            return match client.start_run(&token, &prompt, model, &images).await {
+            let keep = crate::config::cursor_continuation();
+            let segment = keep.then(|| Segment::for_request(&session_id, &body));
+            let resume = match keep {
+                true => continuation::resume(&session_id, &body).await,
+                false => Resume::Fresh,
+            };
+            let (prompt, images, state, continued) = match resume {
+                Resume::Continue { state, delta } => (
+                    render_cursor_prompt(&delta),
+                    request::cursor_selected_images(&delta),
+                    state,
+                    true,
+                ),
+                Resume::Fresh => (prompt, images, RunState::new_shared(), false),
+            };
+            return match client
+                .start_run(&token, &prompt, model, &images, state)
+                .await
+            {
                 Ok(run) => {
                     let mut bridge = LiveBridge::new(session_id, run, allowed);
-                    bridge.input_floor = (prompt.len() / 4).max(1) as u64;
+                    bridge.input_floor = response::estimate_request_input_tokens(&body);
+                    bridge.segment = segment;
+                    bridge.continued = continued;
                     live_sse_response(bridge, Vec::new(), &message_id, model, &ctx)
                 }
                 Err(error) => map_cursor_error_to_response(&error),
@@ -243,7 +272,7 @@ impl Provider for CursorProvider {
             if let Some(preamble) = resume_payload(&bridge, &body) {
                 let (bytes, outcome) =
                     pump_buffered(&mut bridge, preamble, &message_id, &requested).await;
-                finish_buffered_run(bridge, outcome);
+                settle_run(bridge, outcome);
                 return Ok(Generation {
                     body: GenerationBody::BufferedSse(bytes.into()),
                     resolved_model: resolved.model_id,
@@ -298,13 +327,19 @@ impl Provider for CursorProvider {
         {
             let allowed = advertised_tool_names(&body);
             let run = client
-                .start_run(&auth.access_token, &prompt, &requested, &images)
+                .start_run(
+                    &auth.access_token,
+                    &prompt,
+                    &requested,
+                    &images,
+                    RunState::new_shared(),
+                )
                 .await
                 .map_err(cursor_provider_error)?;
             let mut bridge = LiveBridge::new(session_id, run, allowed);
             let (bytes, outcome) =
                 pump_buffered(&mut bridge, Vec::new(), &message_id, &requested).await;
-            finish_buffered_run(bridge, outcome);
+            settle_run(bridge, outcome);
             if let Some(traffic) = ctx.traffic.as_ref() {
                 traffic.write_bytes("050-anthropic-intermediate.sse", &bytes);
             }
@@ -410,15 +445,7 @@ fn live_sse_response(
             }
         };
 
-        match outcome {
-            PumpOutcome::Tool(pending) => {
-                bridge.pending = Some(pending);
-                BridgeRegistry::insert(bridge);
-            }
-            // Nothing left to resume: the run is dropped, which closes its
-            // stream upstream.
-            PumpOutcome::Replay | PumpOutcome::Ended | PumpOutcome::Failed(_) => drop(bridge),
-        }
+        settle_run(bridge, outcome);
 
         if let Some(monitor) = monitor {
             let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse);
@@ -446,15 +473,32 @@ fn live_sse_response(
     (headers, body).into_response()
 }
 
-/// Keep or drop a run the buffered pump stopped on.
-fn finish_buffered_run(bridge: LiveBridge, outcome: PumpOutcome) {
-    match outcome {
-        PumpOutcome::Tool(pending) => {
-            let mut bridge = bridge;
+/// Settle a run the pump stopped on.
+///
+/// A run waiting on a tool result is parked for the next request. A finished
+/// turn keeps its conversation for the next request when the run has a
+/// segment; a run stopped on a text-channel tool call first reads its turn to
+/// the end in the background, and the next request waits for that. Anything
+/// else is dropped, which closes its stream upstream.
+fn settle_run(mut bridge: LiveBridge, outcome: PumpOutcome) {
+    match (outcome, bridge.segment.take()) {
+        (PumpOutcome::Tool(pending), segment) => {
             bridge.pending = Some(pending);
+            bridge.segment = segment;
             BridgeRegistry::insert(bridge);
         }
-        PumpOutcome::Replay | PumpOutcome::Ended | PumpOutcome::Failed(_) => drop(bridge),
+        (PumpOutcome::Ended, Some(segment)) => {
+            continuation::reserve(segment).complete(bridge.run.snapshot());
+        }
+        (PumpOutcome::Replay, Some(segment)) => {
+            let pending = continuation::reserve(segment);
+            tokio::spawn(async move {
+                if drain_to_turn_end(&mut bridge, REPLAY_DRAIN_LIMIT).await {
+                    pending.complete(bridge.run.snapshot());
+                }
+            });
+        }
+        (PumpOutcome::Replay | PumpOutcome::Ended | PumpOutcome::Failed(_), _) => drop(bridge),
     }
 }
 

@@ -95,7 +95,7 @@ pub fn cursor_selected_images(req: &MessagesRequest) -> Vec<CursorSelectedImage>
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn render_system(req: &MessagesRequest) -> Option<String> {
+pub(crate) fn render_system(req: &MessagesRequest) -> Option<String> {
     let system_value = req.extra.get("system")?;
     let text = match system_value {
         serde_json::Value::String(s) => s.clone(),
@@ -124,7 +124,9 @@ fn render_system(req: &MessagesRequest) -> Option<String> {
     Some(text)
 }
 
-fn render_message_content(message: &crate::anthropic::schema::Message) -> Option<String> {
+pub(crate) fn render_message_content(
+    message: &crate::anthropic::schema::Message,
+) -> Option<String> {
     let blocks = message_blocks(message);
     let rendered: Vec<String> = blocks.iter().filter_map(render_block).collect();
     if rendered.is_empty() {
