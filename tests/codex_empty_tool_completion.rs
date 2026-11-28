@@ -112,10 +112,21 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
             .local_addr()
             .unwrap()
             .port();
+        let log_path = dir.path().join("proxy.log");
+        let log = std::fs::File::create(&log_path).unwrap();
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+        command.env_clear();
+        // Isolate credentials/config without removing the Windows runtime's
+        // environment (notably SystemRoot, needed by system DLLs and services).
+        for name in ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         command
-            .env_clear()
             .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("CODEX_HOME", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
             .args(["serve", "--port", &port.to_string(), "--no-monitor"])
             .env("CCP_CONFIG_DIR", dir.path())
@@ -126,24 +137,42 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
             .env("CCP_CODEX_SERVER_COMPACTION", "0")
             .env("CCP_ALIAS_PROVIDER", "codex")
             .env("NO_PROXY", "127.0.0.1,localhost")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _proxy = Child(command.spawn().unwrap());
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        let mut proxy = Child(command.spawn().unwrap());
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap();
         let base = format!("http://127.0.0.1:{port}");
-        let mut ready = false;
-        for _ in 0..100 {
-            if client.get(format!("{base}/healthz")).send().await.is_ok() {
-                ready = true;
-                break;
+        let ready = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let status = proxy.0.try_wait().unwrap();
+                assert!(
+                    status.is_none(),
+                    "{transport} proxy exited during startup: {status:?}\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                );
+                if let Ok(response) = client
+                    .get(format!("{base}/healthz"))
+                    .timeout(Duration::from_millis(500))
+                    .send()
+                    .await
+                    && response.status().is_success()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "proxy did not start");
+        })
+        .await;
+        assert!(
+            ready.is_ok(),
+            "{transport} proxy did not start within 15 seconds\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        );
         for stream in [false, true] {
             for case in [
                 "success",
