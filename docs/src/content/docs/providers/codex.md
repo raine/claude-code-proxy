@@ -118,6 +118,8 @@ WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `
 
 An absent, malformed, or ambiguous identity does not reject the HTTP request; that request proceeds without continuation or WebSocket reuse. If the originating socket is missing, dead, or has been replaced, the proxy retries once with the full translated input and without the stale response ID. Continuation and connection state is held only in memory and is lost when the proxy restarts.
 
+Claude Code background requests that share the Main session ID, such as prompt suggestions, away summaries, session renames, `/btw` side questions, and memory extraction, are recognized by their final user message and get their own continuation and WebSocket. They can read the session's native compaction history but never replace or invalidate it, so they do not break the Main conversation's continuation.
+
 Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership.
 
 ## Server compaction

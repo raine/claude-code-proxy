@@ -114,6 +114,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_SERVICE_TIER` | `codex.serviceTier` | unset | Forces `fast`, `priority`, `ultrafast`, or `flex` on `/v1/messages` requests. Fast is sent as `priority`. Ultrafast is sent as `priority` to models that do not offer it. |
 | `CCP_CODEX_BASE_URL` | `codex.baseUrl` | ChatGPT Codex Responses URL | Changes the Codex endpoint. |
 | `CCP_CODEX_TRANSPORT` | `codex.transport` | `auto` | Selects `websocket`, `http`, or `auto`. `auto` falls back to HTTP SSE only when WebSocket setup fails before a request is sent. |
+| `CCP_CODEX_REQUEST_COMPRESSION` | `codex.requestCompression` | `false` | Gzips HTTP request bodies for `1`, `true`, `yes`, or `on`. When no transport is set, enabling it also selects `http`. |
 | `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | Sets how long an HTTP-transport request waits for the Codex response headers. Values below `1000` are ignored. |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
 | `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |

@@ -671,3 +671,269 @@ async fn codex_explicit_transport_preserves_fallback_and_replay_policy() {
         check_transport_policy(config_dir.path(), Some("auto"), true, stream).await;
     }
 }
+
+#[tokio::test]
+async fn preheader_downstream_tcp_drop_closes_stalled_upstream_websocket() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _zero_retry = ZeroRetryDelayGuard::new();
+    clear_codex_websocket_pool_for_tests();
+
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let (ws_accepted_tx, ws_accepted_rx) = oneshot::channel();
+    let (ws_closed_tx, ws_closed_rx) = oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let (socket, _) = origin.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        // Wait for the full request frame, then hold without sending response headers.
+        while let Some(Ok(frame)) = ws.next().await {
+            if matches!(frame, Message::Text(_)) {
+                let _ = ws_accepted_tx.send(());
+                break;
+            }
+        }
+        while let Some(Ok(_)) = ws.next().await {}
+        let _ = ws_closed_tx.send(());
+    });
+
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    let mut guards = clear_proxy_environment();
+    guards.extend(configure_codex(
+        config_dir.path(),
+        &format!("http://{origin_addr}/responses"),
+    ));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(claude_code_proxy::server::serve_listener(
+        proxy_listener,
+        None,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut downstream = TcpStream::connect(proxy_addr).await.unwrap();
+    let body = json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role": "user", "content": "stalled preheader test"}]
+    })
+    .to_string();
+    let http_req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: {proxy_addr}\r\nContent-Type: application/json\r\nX-Claude-Code-Session-Id: preheader-tcp-drop\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    downstream.write_all(http_req.as_bytes()).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), ws_accepted_rx)
+        .await
+        .expect("proxy did not forward request to upstream WebSocket")
+        .unwrap();
+
+    // Downstream disconnects BEFORE proxy writes any HTTP response headers!
+    drop(downstream);
+
+    tokio::time::timeout(Duration::from_secs(2), ws_closed_rx)
+        .await
+        .expect(
+            "dropping downstream TCP connection pre-header must close stalled upstream WebSocket",
+        )
+        .unwrap();
+
+    let _ = shutdown_tx.send(());
+    let _ = server_task.await;
+    origin_task.await.unwrap();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[tokio::test]
+async fn claude_ephemeral_forks_isolate_continuation_and_preserve_compaction_anchor() {
+    use claude_code_proxy::providers::codex::compaction::{
+        activate_compaction, begin_compaction, store_compaction,
+    };
+    use claude_code_proxy::providers::codex::translate::request::{
+        ResponsesContentPart, ResponsesInputItem,
+    };
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _zero_retry = ZeroRetryDelayGuard::new();
+    clear_codex_websocket_pool_for_tests();
+
+    let session_id = "e2e-fork-isolation-session-20261120";
+    let summary_text =
+        "SUMMARY_ANCHOR: detailed summary of prior session state preserved across forks.";
+
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = origin.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        async fn next_ws_json(
+            ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+        ) -> serde_json::Value {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Ping(payload) => ws.send(Message::Pong(payload)).await.unwrap(),
+                    Message::Text(text) => return serde_json::from_str(&text).unwrap(),
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }
+
+        // Socket 1: Main turn 1 + Main turn 2 (must reuse socket and keep previous_response_id!).
+        let (s1, _) = origin.accept().await.unwrap();
+        let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+        let r1 = next_ws_json(&mut ws1).await;
+        assert!(r1.get("previous_response_id").is_none());
+        let r1_input = r1["input"].as_array().unwrap();
+        assert!(
+            r1_input
+                .iter()
+                .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("compaction")),
+            "expected replayed compaction item in main turn 1 input: {r1}"
+        );
+        for event in [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_m1"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"main reply 1"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_main_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+        ] {
+            ws1.send(Message::Text(event.to_string())).await.unwrap();
+        }
+
+        // Socket 2: Ephemeral /btw fork fails with 400. Must NOT carry resp_main_1!
+        let (s2, _) = origin.accept().await.unwrap();
+        let mut ws2 = tokio_tungstenite::accept_async(s2).await.unwrap();
+        let r_fork = next_ws_json(&mut ws2).await;
+        assert!(
+            r_fork.get("previous_response_id").is_none(),
+            "ephemeral fork must not inherit main previous_response_id: {r_fork}"
+        );
+        ws2.send(Message::Text(
+            serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"status": 400, "code": "invalid_request", "message": "aborted fork"}
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // Main turn 2 still arrives on pooled ws1 with previous_response_id == resp_main_1!
+        let r2 = next_ws_json(&mut ws1).await;
+        assert_eq!(r2["previous_response_id"], "resp_main_1");
+        assert_eq!(r2["input"].as_array().unwrap().len(), 1);
+        for event in [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_m2"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"main reply 2"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_main_2","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+        ] {
+            ws1.send(Message::Text(event.to_string())).await.unwrap();
+        }
+    });
+
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    let mut guards = clear_proxy_environment();
+    guards.extend(configure_codex(
+        config_dir.path(),
+        &format!("http://{origin_addr}/responses"),
+    ));
+    guards.push(EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1"));
+    guards.push(EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1"));
+
+    let compact_attempt = begin_compaction(session_id, "gpt-5.6-sol");
+    assert!(store_compaction(
+        session_id,
+        compact_attempt,
+        vec![ResponsesInputItem::Compaction {
+            encrypted_content: "opaque-anchor".to_string(),
+        }],
+    ));
+    assert!(activate_compaction(
+        Some(session_id),
+        Some(compact_attempt),
+        "gpt-5.6-sol",
+        &[ResponsesInputItem::Message {
+            role: "assistant".to_string(),
+            content: vec![ResponsesContentPart::OutputText {
+                text: summary_text.to_string(),
+            }],
+        }],
+    ));
+
+    let proxy_app = app(Arc::new(Registry::with_default_alias()));
+    let post = |app: axum::Router, payload: serde_json::Value| async move {
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", session_id)
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+
+    // Main turn 1
+    let r1 = post(
+        proxy_app.clone(),
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": summary_text},
+                {"role": "user", "content": "turn 1"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    // Ephemeral /btw fork with mismatched message text & 400 failure must NOT disturb Main continuation or CompactionState!
+    let r_fork = post(
+        proxy_app.clone(),
+        json!({
+            "model": "gpt-5.4",
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "different prefix"},
+                {"role": "user", "content": "<system-reminder>\nThis is a one-off response - there will be no follow-up turns\n</system-reminder>\nWhat port?"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(r_fork.status(), StatusCode::BAD_REQUEST);
+
+    // Main turn 2 still reuses pooled WS + previous_response_id AND compaction anchor!
+    let r2 = post(
+        proxy_app.clone(),
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": summary_text},
+                {"role": "user", "content": "turn 1"},
+                {"role": "assistant", "content": "main reply 1"},
+                {"role": "user", "content": "turn 2"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    origin_task.await.unwrap();
+    clear_codex_websocket_pool_for_tests();
+}
