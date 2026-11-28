@@ -27,8 +27,8 @@ Starts the local HTTP proxy and blocks until shutdown.
 | --- | --- |
 | `--port <PORT>` | Overrides `PORT`, `config.json`, and the default for this invocation. |
 | `--no-monitor` | Uses plain output even when stdout is a terminal. |
-| `--codex-profile <NAME>` | Pins the Codex account for this process; overrides profile environment and saved defaults. |
-| `--anthropic-profile <NAME>` | Pins the Anthropic API-key account for this process. |
+| `--codex-profile <NAME>` | Selects the startup Codex account; overrides profile environment and saved defaults. |
+| `--anthropic-profile <NAME>` | Selects the startup Anthropic API-key account. |
 
 The bind address comes from `CCP_BIND_ADDRESS` or `bindAddress`. Interactive stdout opens the monitor unless `--no-monitor` is present. Non-terminal stdout uses plain mode.
 
@@ -40,7 +40,7 @@ Plain mode continues collecting monitor history and supports separate dashboards
 claude-code-proxy monitor [--url <URL>]
 ```
 
-Attach a read-only dashboard to a running proxy. The default URL is `http://127.0.0.1:<configured-port>`. No provider login is needed in the dashboard process. `q` and `Ctrl-C` detach without stopping the proxy; multiple dashboards are supported. After a connection failure, the dashboard retains its last snapshot and retries. The proxy accepts monitor reads only from loopback peers; use an SSH port forward for another machine.
+Attach a dashboard to a running proxy. It reads status and supports confirmed runtime account switching from Accounts (`a`, then `Enter`). The default URL is `http://127.0.0.1:<configured-port>`. No provider login is needed in the dashboard process. `q` and `Ctrl-C` detach without stopping the proxy; multiple dashboards are supported. After a connection failure, the dashboard retains its last snapshot and retries. The proxy accepts monitor reads only from loopback peers; use an SSH port forward for another machine.
 
 ## `demo`
 
@@ -101,7 +101,7 @@ claude-code-proxy codex profile use NAME
 claude-code-proxy codex profile remove NAME --yes
 ```
 
-The profile-management commands also accept `anthropic` instead of `codex`. Anthropic login reads a key from environment variables or piped stdin, never a command-line key argument. `profile use` affects new proxy processes only; current processes keep their account. See [Account profiles](/using/account-profiles/) for precedence, default compatibility, storage, removal, and refresh-token limitations.
+The profile-management commands also accept `anthropic` instead of `codex`. Anthropic login reads a key from environment variables or piped stdin, never a command-line key argument. `profile use` affects new proxy processes only. To switch a running proxy, open Accounts in the monitor (`a`), choose a profile, press `Enter`, then confirm with `y`; active requests must finish first. See [Account profiles](/using/account-profiles/) for precedence, default compatibility, storage, removal, and refresh-token limitations.
 
 ## Development commands
 

@@ -190,7 +190,7 @@ pub async fn serve_listener(
     );
     let refresh = async {
         if let Some(monitor) = &monitor {
-            monitor.refresh_profiles().await;
+            tokio::join!(monitor.refresh_profiles(), monitor.refresh_account_limits());
         } else {
             std::future::pending::<()>().await;
         }
@@ -260,40 +260,14 @@ pub fn app_with_features(
     monitor: Option<MonitorHandle>,
     features: AppFeatures,
 ) -> Router {
-    let native_responses = features
-        .responses_api
-        .then(|| Arc::new(CodexNativeBackend::new()));
-    let chat_completions = features
-        .responses_api
-        .then(|| Arc::new(ChatCompletionsBackend::new()));
-    let images = if features.images_api {
-        match CodexImagesBackend::new() {
-            Ok(backend) => Some(Arc::new(backend)),
-            Err(error) => {
-                create_logger("server").warn(
-                    "codex images backend disabled by invalid configuration",
-                    Some(Map::from_iter([("error".to_string(), json!(error))])),
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let transcriptions = features
-        .transcriptions_api
-        .then(|| Arc::new(CodexTranscriptionBackend::new()));
     let state = Arc::new(AppState {
-        registry,
-        monitor,
-        native_responses,
-        chat_completions,
-        images,
-        transcriptions,
+        current: std::sync::RwLock::new(Arc::new(build_backends(registry, monitor, features))),
+        features,
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/monitor", get(handler_monitor))
+        .route("/monitor/accounts/switch", post(handler_switch_account))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -323,11 +297,60 @@ pub fn app_with_features(
     } else {
         router
     };
-    router.fallback(fallback_handler).with_state(state)
+    router
+        .fallback(fallback_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            inference_lifetime,
+        ))
+        .with_state(state)
+}
+
+fn build_backends(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    features: AppFeatures,
+) -> BackendState {
+    let native_responses = features
+        .responses_api
+        .then(|| Arc::new(CodexNativeBackend::new()));
+    let chat_completions = features
+        .responses_api
+        .then(|| Arc::new(ChatCompletionsBackend::new()));
+    let images = if features.images_api {
+        match CodexImagesBackend::new() {
+            Ok(backend) => Some(Arc::new(backend)),
+            Err(error) => {
+                create_logger("server").warn(
+                    "codex images backend disabled by invalid configuration",
+                    Some(Map::from_iter([("error".to_string(), json!(error))])),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let transcriptions = features
+        .transcriptions_api
+        .then(|| Arc::new(CodexTranscriptionBackend::new()));
+    BackendState {
+        registry,
+        monitor,
+        native_responses,
+        chat_completions,
+        images,
+        transcriptions,
+    }
+}
+
+struct AppState {
+    current: std::sync::RwLock<Arc<BackendState>>,
+    features: AppFeatures,
 }
 
 #[derive(Clone)]
-struct AppState {
+struct BackendState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
     native_responses: Option<Arc<CodexNativeBackend>>,
@@ -336,10 +359,189 @@ struct AppState {
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
 }
 
+// One process-wide drain gate also covers Codex producer tasks that can outlive
+// a disconnected response body. No generations overlap during a switch.
+static SWITCH_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static ACTIVE_WORK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) struct RuntimeWorkGuard;
+impl Drop for RuntimeWorkGuard {
+    fn drop(&mut self) {
+        ACTIVE_WORK.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// Producer tasks must acquire this BEFORE spawning, while their parent request
+// is still counted. Never acquire it for persistent idle websocket actors.
+pub(crate) fn runtime_work_guard() -> RuntimeWorkGuard {
+    ACTIVE_WORK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    RuntimeWorkGuard
+}
+
+fn begin_inference() -> Option<RuntimeWorkGuard> {
+    let _gate = SWITCH_GATE.try_read().ok()?;
+    Some(runtime_work_guard())
+}
+
+async fn inference_lifetime(
+    State(_state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if !req.uri().path().starts_with("/v1/") {
+        return next.run(req).await;
+    }
+    let Some(guard) = begin_inference() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "account_switch_busy",
+            "Account switch in progress; retry after it completes",
+        );
+    };
+    let response = next.run(req).await;
+    let (parts, body) = response.into_parts();
+    let stream = futures_util::stream::unfold((body, guard), |(mut body, guard)| async move {
+        body.frame().await.map(|frame| (frame, (body, guard)))
+    });
+    Response::from_parts(parts, Body::new(StreamBody::new(stream)))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwitchAccount {
+    provider: String,
+    name: String,
+}
+
+async fn handler_switch_account(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> Response {
+    let mut response = switch_account_request(state, req).await;
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn switch_account_request(state: Arc<AppState>, req: Request<Body>) -> Response {
+    let local = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|peer| peer.0.ip().to_canonical().is_loopback());
+    if !local
+        || req.headers().contains_key(http::header::ORIGIN)
+        || req
+            .headers()
+            .get("x-proxy-account-switch")
+            .and_then(|v| v.to_str().ok())
+            != Some("1")
+    {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Account switching requires a local non-browser client and X-Proxy-Account-Switch: 1",
+        );
+    }
+    if !req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Account switch requires application/json",
+        );
+    }
+    let bytes = match axum::body::to_bytes(req.into_body(), 4096).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Invalid account switch request",
+            );
+        }
+    };
+    let selection: SwitchAccount = match serde_json::from_slice(&bytes) {
+        Ok(selection) => selection,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Invalid account switch request",
+            );
+        }
+    };
+    switch_account(&state, selection)
+}
+
+fn switch_account(state: &AppState, request: SwitchAccount) -> Response {
+    let Ok(_gate) = SWITCH_GATE.try_write() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "account_switch_busy",
+            "Account switch already in progress",
+        );
+    };
+    if ACTIVE_WORK.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        return json_error(
+            StatusCode::CONFLICT,
+            "account_switch_busy",
+            "Inference requests are active; retry after all requests and streams finish",
+        );
+    }
+    let selected = match crate::account_profiles::candidate(&request.provider, &request.name) {
+        Ok(selected) => selected,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_account_profile",
+                "Profile selection or local credentials are invalid",
+            );
+        }
+    };
+    let previous = state.current.read().unwrap().clone();
+    let next = crate::account_profiles::construct_with(&selected, || {
+        build_backends(
+            Arc::new(previous.registry.rebuild()),
+            previous.monitor.clone(),
+            state.features,
+        )
+    });
+    // Do not silently lose an enabled backend if reconstruction fails.
+    if previous.images.is_some() && next.images.is_none() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_account_profile",
+            "Cannot rebuild account backends",
+        );
+    }
+    crate::providers::codex::clear_runtime_caches();
+    *state.current.write().unwrap() = Arc::new(next);
+    crate::account_profiles::commit(selected);
+    (
+        [(http::header::CACHE_CONTROL, "no-store")],
+        Json(json!({"provider": request.provider, "name": request.name})),
+    )
+        .into_response()
+}
+
 async fn handler_monitor(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
 ) -> Response {
+    let state = state.current.read().unwrap().clone();
     let Some(axum::Extension(axum::extract::ConnectInfo(peer))) = peer else {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -388,6 +590,7 @@ async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
+    let state = state.current.read().unwrap().clone();
     let mut data: Vec<Value> = state
         .registry
         .all_supported_models()
@@ -415,14 +618,17 @@ async fn handler_models(
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let state = state.current.read().unwrap().clone();
     dispatch_request(state, req, false).await
 }
 
 async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let state = state.current.read().unwrap().clone();
     dispatch_request(state, req, true).await
 }
 
 async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let state = state.current.read().unwrap().clone();
     let started_at = Instant::now();
     let log = create_logger("server");
     let req_id = Uuid::new_v4().to_string();
@@ -638,15 +844,17 @@ async fn handler_image_generation(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Response {
+    let state = state.current.read().unwrap().clone();
     dispatch_image_request(state, req, ImageOperation::Generation).await
 }
 
 async fn handler_image_edit(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let state = state.current.read().unwrap().clone();
     dispatch_image_request(state, req, ImageOperation::Edit).await
 }
 
 async fn dispatch_image_request(
-    state: Arc<AppState>,
+    state: Arc<BackendState>,
     req: Request<Body>,
     operation: ImageOperation,
 ) -> Response {
@@ -894,6 +1102,7 @@ async fn multipart_text(
 }
 
 async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let state = state.current.read().unwrap().clone();
     let started_at = Instant::now();
     let log = create_logger("server");
     let req_id = Uuid::new_v4().to_string();
@@ -1121,6 +1330,7 @@ async fn handler_chat_completions(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Response {
+    let state = state.current.read().unwrap().clone();
     let started_at = Instant::now();
     let log = create_logger("server");
     let req_id = Uuid::new_v4().to_string();
@@ -1442,7 +1652,7 @@ fn log_native_request_completed(
 }
 
 async fn dispatch_request(
-    state: Arc<AppState>,
+    state: Arc<BackendState>,
     req: Request<Body>,
     count_tokens: bool,
 ) -> Response {
@@ -2284,6 +2494,49 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _unused(session_state: Option<&SessionState>) {
     let _ = session_state;
+}
+
+#[cfg(test)]
+mod account_switch_security_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn switching_rejects_missing_remote_and_browser_peers() {
+        let router = app_with_features(
+            Arc::new(Registry::with_default_alias()),
+            None,
+            AppFeatures::default(),
+        );
+        for (peer, header, origin) in [
+            (None, true, false),
+            (Some("192.0.2.1:1234"), true, false),
+            (Some("[::ffff:192.0.2.1]:1234"), true, false),
+            (Some("127.0.0.1:1234"), false, false),
+            (Some("127.0.0.1:1234"), true, true),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/monitor/accounts/switch")
+                .header("content-type", "application/json");
+            if header {
+                request = request.header("x-proxy-account-switch", "1");
+            }
+            if origin {
+                request = request.header("origin", "null");
+            }
+            let mut request = request
+                .body(Body::from(r#"{"provider":"anthropic","name":"default"}"#))
+                .unwrap();
+            if let Some(peer) = peer {
+                request.extensions_mut().insert(axum::extract::ConnectInfo(
+                    peer.parse::<std::net::SocketAddr>().unwrap(),
+                ));
+            }
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
 }
 
 #[cfg(test)]

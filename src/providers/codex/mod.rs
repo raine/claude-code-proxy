@@ -68,6 +68,12 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // Provider
 // ---------------------------------------------------------------------------
 
+pub(crate) fn clear_runtime_caches() {
+    websocket::clear_codex_websocket_pool();
+    continuation::clear_all_continuations();
+    compaction::clear_all_compactions();
+}
+
 pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
 }
@@ -1266,7 +1272,9 @@ fn remaining_live_stream_response(
     compaction: LiveStreamCompaction,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let runtime_work = crate::server::runtime_work_guard();
     tokio::spawn(async move {
+        let _runtime_work = runtime_work;
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
                 ctx.session_id.as_deref(),

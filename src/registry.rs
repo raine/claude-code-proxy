@@ -102,6 +102,10 @@ impl Registry {
         }
     }
 
+    pub(crate) fn rebuild(&self) -> Self {
+        Self::new(self.alias_provider.clone())
+    }
+
     pub fn with_default_alias() -> Self {
         Self::new(crate::config::alias_provider())
     }

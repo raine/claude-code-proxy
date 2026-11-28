@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+pub mod account_limits;
+pub mod account_switch;
 mod mock;
 pub mod remote;
 pub mod snapshot;
@@ -245,6 +247,7 @@ pub struct MonitorState {
     pub started_at: SystemTime,
     pub uptime: Duration,
     pub accounts: Vec<crate::account_profiles::ProfileStatus>,
+    pub account_limits: Vec<account_limits::AccountLimit>,
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
@@ -297,6 +300,7 @@ struct MonitorStore {
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
     accounts: Vec<crate::account_profiles::ProfileStatus>,
+    account_limits: Vec<account_limits::AccountLimit>,
 }
 
 #[derive(Debug)]
@@ -340,6 +344,7 @@ impl MonitorHandle {
                 session_output_buckets: HashMap::new(),
                 recent_limit,
                 accounts: Vec::new(),
+                account_limits: Vec::new(),
             })),
         }
     }
@@ -359,6 +364,19 @@ impl MonitorHandle {
         }
     }
 
+    /// Read-only quota polling is separate from local metadata and inference.
+    /// The collector throttles upstream reads and retains explicitly stale data.
+    pub async fn refresh_account_limits(&self) {
+        let mut collector = account_limits::AccountLimitsCollector::new();
+        loop {
+            let limits = collector.refresh().await;
+            if let Ok(mut store) = self.store.lock() {
+                store.account_limits = limits;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     pub fn publish(&self, event: MonitorEvent) {
         if let Ok(mut store) = self.store.lock() {
             store.apply(event);
@@ -372,6 +390,7 @@ impl MonitorHandle {
                 started_at: SystemTime::now(),
                 uptime: Duration::ZERO,
                 accounts: Vec::new(),
+                account_limits: Vec::new(),
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
@@ -949,6 +968,7 @@ impl MonitorStore {
             started_at: self.started_at,
             uptime: self.started_instant.elapsed(),
             accounts: self.accounts.clone(),
+            account_limits: self.account_limits.clone(),
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),

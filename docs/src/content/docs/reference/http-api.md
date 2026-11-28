@@ -25,7 +25,24 @@ Read-only dashboard snapshot, available when monitor collection is enabled. The 
 
 The JSON envelope contains `version: 1` and a `snapshot` with the proxy start time, sessions, active requests and recent requests. It includes the monitor's display metadata, timing, token usage and computed throughput. It does not include credentials or request/response bodies. Process-local monotonic clocks remain in the service; snapshots contain elapsed durations instead.
 
-The `monitor` CLI polls this endpoint. There is no corresponding mutation or shutdown endpoint. Attaching or disconnecting a viewer does not change proxy lifetime or request accounting.
+The `snapshot.account_limits` array contains safe per-login Codex usage metadata: `provider`, profile `name`, `status`, `updated_at_ms`, and optional `five_hour` / `seven_day` objects with `used_percent` and `reset_at_ms`. Timestamps are Unix milliseconds. Missing windows are `null`; failed polls may retain stale windows with an explicit status. The service polls the read-only upstream usage endpoint approximately every 60 seconds without generating tokens or refreshing credentials. Older services may omit this field.
+
+The `monitor` CLI polls this endpoint. There is no shutdown endpoint. Attaching or disconnecting a viewer does not change proxy lifetime or request accounting.
+
+## `POST /monitor/accounts/switch`
+
+Explicit runtime account selection, shared by the integrated and attached monitors. Only actual loopback peers may call this route. It requires `Content-Type: application/json` and `X-Proxy-Account-Switch: 1`; requests with an `Origin` header are rejected. The custom header is an anti-CSRF measure, not authentication. Do not expose this route through an unauthenticated reverse proxy that makes remote clients appear local.
+
+```sh
+curl http://127.0.0.1:18765/monitor/accounts/switch \
+  -H 'Content-Type: application/json' \
+  -H 'X-Proxy-Account-Switch: 1' \
+  -d '{"provider":"codex","name":"work"}'
+```
+
+Supports `codex` and `anthropic`, including the implicit `default` profile. Success returns `{"provider":"codex","name":"work"}`. The switch affects all sessions for that provider and leaves saved defaults unchanged. HTTP 409 means inference work is still active; wait and retry. Invalid or missing local credentials are rejected without changing the current account. This does not validate credentials upstream. There is no automatic account rotation. Codex transport and conversation caches are reset on switching.
+
+A timeout does not prove that the action failed: inspect the monitor's selected profile before retrying. Responses contain no credentials and must not be cached.
 
 ## `POST /v1/messages`
 

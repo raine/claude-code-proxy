@@ -551,6 +551,11 @@ fn evict_states(registry: &mut CompactionRegistry, now: u64) {
 }
 
 pub fn clear_all_compactions_for_tests() {
+    clear_all_compactions();
+}
+
+/// Clear account-scoped state only after inference and producers have drained.
+pub(crate) fn clear_all_compactions() {
     *REGISTRY.lock().unwrap() = None;
 }
 

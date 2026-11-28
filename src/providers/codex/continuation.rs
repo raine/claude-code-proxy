@@ -525,6 +525,11 @@ pub(crate) fn has_continuation_for_owner_for_tests(owner: &ConversationIdentity)
 }
 
 pub fn clear_all_continuations_for_tests() {
+    clear_all_continuations();
+}
+
+/// Clear account-scoped state only after inference and producers have drained.
+pub(crate) fn clear_all_continuations() {
     let mut guard = REGISTRY.lock().unwrap();
     *guard = None;
 }

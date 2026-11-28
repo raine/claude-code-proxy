@@ -358,6 +358,11 @@ fn now_ms() -> u64 {
 }
 
 pub fn clear_codex_websocket_pool_for_tests() {
+    clear_codex_websocket_pool();
+}
+
+/// Clear account-scoped state only after inference and producers have drained.
+pub(crate) fn clear_codex_websocket_pool() {
     let mut guard = WS_POOL.lock().unwrap();
     guard.clear();
 }
@@ -1057,7 +1062,9 @@ pub(super) fn start_codex_websocket_events(
     }
     let (tx, rx) = mpsc::channel(64);
     let (receiver, socket_id_publisher) = CodexWebSocketEventStream::pending(rx);
+    let runtime_work = crate::server::runtime_work_guard();
     tokio::spawn(async move {
+        let _runtime_work = runtime_work;
         let ReadyWebSocket {
             ws_url: _,
             mut guard,

@@ -1,9 +1,9 @@
 ---
 title: Account profiles
-description: Save and manually select multiple Codex OAuth accounts and Anthropic API keys without changing an active proxy's account.
+description: Save multiple Codex OAuth accounts and Anthropic API keys, and switch a running proxy from the monitor.
 ---
 
-Codex and Anthropic support named account profiles. Each proxy process selects **one account per provider at startup**. There is no round-robin, quota-based switching, or automatic account failover.
+Codex and Anthropic support named account profiles. Each proxy process uses **one account per provider at a time**. The monitor can switch that account without restarting. There is no round-robin, quota-based switching, or automatic account failover.
 
 ## Codex accounts
 
@@ -58,7 +58,9 @@ Selection precedence:
 claude-code-proxy serve --codex-profile work --anthropic-profile personal
 ```
 
-Selection is pinned for the running process. `profile use` affects **future processes only**; restart the proxy to change accounts. All sessions on that proxy use its selected account per provider. To use different accounts concurrently, run separate proxies on separate ports and select a different profile for each; do not share a rotating Codex OAuth profile across those processes.
+These settings choose the startup account. `profile use` affects **future processes only**. To change the running proxy, open Accounts (`a`), select a profile, press `Enter`, and confirm with `y`. The switch applies to **all sessions** using that provider and does not change the saved default. It is rejected while inference requests or streams are active; wait for them to finish and retry. Missing or locally invalid credentials leave the current account unchanged. No live authentication or paid validation request is made.
+
+Switching rebuilds the provider clients and resets Codex WebSocket, continuation, and compaction state so the new account cannot reuse the old account's connection or response IDs. To use different accounts concurrently, run separate proxies on separate ports and select a different profile for each; do not share a rotating Codex OAuth profile across those processes.
 
 To restore existing behavior:
 
@@ -71,7 +73,9 @@ Unset any profile environment override or pass `--profile default` / the corresp
 
 ## Monitor UI
 
-Press `a` in the proxy monitor (built-in or separately attached) to open Accounts. It lists every profile with local credential status, Codex expiry, `[selected]` for the running process, and `[saved-default]` for future processes. Scroll with arrows/`j`/`k`, page keys, or `Home`/`End`; `a`/`Esc` closes it. Metadata refreshes about every five seconds without making provider requests or displaying secrets. These are local statuses, not quota or live API-key validation.
+Press `a` in the proxy monitor (built-in or separately attached) to open Accounts. It lists every profile with local credential status, Codex expiry, `[selected]` for the running process, and `[saved-default]` for future processes. Scroll with arrows/`j`/`k`, page keys, or `Home`/`End`; `Enter` requests a switch, `y` confirms, and `n`/`Esc` cancels. Outside confirmation, `a`/`Esc` closes Accounts. Metadata refreshes about every five seconds without making provider requests or displaying secrets. These are local statuses, not quota or live API-key validation.
+
+Attached monitors use the same loopback-only control endpoint as the integrated monitor. Older services report that runtime switching is unsupported. Demo mode cannot switch real accounts. A disconnected monitor cannot submit a switch. If a control request times out, check `[selected]` after reconnecting before retrying; closing the dashboard does not undo a submitted switch.
 
 ## Storage and removal
 

@@ -33,6 +33,7 @@ use tokio::sync::oneshot;
 use crate::{
     monitor::{
         MockMonitor, MonitorHandle, SESSION_TOKEN_BUCKET_SECS,
+        account_switch::{AccountChoice, AccountSwitchControl},
         snapshot::{
             ActiveSnapshot, CompletedSnapshot, MonitorSnapshot, SessionSnapshot, SnapshotUpdate,
         },
@@ -148,6 +149,7 @@ fn run_monitor_loop(
         focus: FocusPane::Sessions,
         selected: 0,
         recent_selected: 0,
+        limits_selected: 0,
         tick: 0,
         phase: MonitorPhase::Running,
         shutdown: config.shutdown,
@@ -172,16 +174,32 @@ fn run_monitor_events(
     mut snapshot: impl FnMut() -> SnapshotUpdate,
     app: &mut MonitorApp,
 ) -> Result<MonitorExit, anyhow::Error> {
+    let mut account_switch = AccountSwitchUi::default();
     loop {
+        if let Some(result) = account_switch.control.poll() {
+            account_switch.notice = Some(match result {
+                Ok(()) => {
+                    "Account switched. Selection will refresh shortly; saved default unchanged."
+                        .to_owned()
+                }
+                Err(error) => error,
+            });
+        }
         let update = snapshot();
         let state = update.snapshot();
         app.clamp_selection(state.sessions.len(), state.recent.len());
+        app.limits_selected = app
+            .limits_selected
+            .min(state.account_limits.len().saturating_sub(1));
         if let Some(selected) = &mut app.accounts_selected {
             *selected = (*selected).min(state.accounts.len().saturating_sub(1));
         }
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| {
             render(frame, app, state);
+            if app.accounts_selected.is_some() {
+                account_switch.render(frame);
+            }
             if let Some(error) = update.connection_error() {
                 let area = frame.area();
                 let banner = Rect::new(
@@ -224,6 +242,20 @@ fn run_monitor_events(
                         app.cancel_shutdown_confirmation()
                     }
                     _ if app.phase == MonitorPhase::ConfirmingShutdown => {}
+                    KeyCode::Char('y') if account_switch.confirm.is_some() => {
+                        if update.connection_error().is_some() {
+                            account_switch.confirm = None;
+                            account_switch.notice =
+                                Some("Cannot switch while monitor is disconnected.".to_owned());
+                        } else {
+                            account_switch.submit(&app.listen_url);
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc if account_switch.confirm.is_some() => {
+                        account_switch.confirm = None;
+                        account_switch.notice = Some("Switch cancelled.".to_owned());
+                    }
+                    _ if account_switch.confirm.is_some() => {}
                     KeyCode::Char('q') => app.request_shutdown_confirmation(),
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
@@ -252,9 +284,42 @@ fn run_monitor_events(
                     KeyCode::End if app.accounts_selected.is_some() => {
                         app.accounts_selected = Some(state.accounts.len().saturating_sub(1));
                     }
-                    KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Enter
+                    KeyCode::Enter if app.accounts_selected.is_some() => {
+                        if update.connection_error().is_some() {
+                            account_switch.notice =
+                                Some("Cannot switch while monitor is disconnected.".to_owned());
+                        } else if app.listen_url.starts_with("mock:") {
+                            account_switch.notice =
+                                Some("Account switching is unavailable in demo mode.".to_owned());
+                        } else if let Some(profile) = app
+                            .accounts_selected
+                            .and_then(|index| state.accounts.get(index))
+                        {
+                            account_switch.select(profile);
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Left | KeyCode::Right
                         if app.accounts_selected.is_some() => {}
                     KeyCode::Tab => app.focus = app.focus.next(),
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown
+                        if app.focus == FocusPane::Limits =>
+                    {
+                        let step = if key.code == KeyCode::PageDown { 10 } else { 1 };
+                        app.limits_selected = app
+                            .limits_selected
+                            .saturating_add(step)
+                            .min(state.account_limits.len().saturating_sub(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp
+                        if app.focus == FocusPane::Limits =>
+                    {
+                        let step = if key.code == KeyCode::PageUp { 10 } else { 1 };
+                        app.limits_selected = app.limits_selected.saturating_sub(step);
+                    }
+                    KeyCode::Home if app.focus == FocusPane::Limits => app.limits_selected = 0,
+                    KeyCode::End if app.focus == FocusPane::Limits => {
+                        app.limits_selected = state.account_limits.len().saturating_sub(1);
+                    }
                     KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
                     KeyCode::Char('j') => {
                         app.move_down(state.sessions.len(), state.recent.len(), false)
@@ -296,17 +361,77 @@ fn run_monitor_events(
     }
 }
 
+#[derive(Default)]
+struct AccountSwitchUi {
+    control: AccountSwitchControl,
+    confirm: Option<AccountChoice>,
+    notice: Option<String>,
+}
+
+impl AccountSwitchUi {
+    fn select(&mut self, profile: &crate::account_profiles::ProfileStatus) {
+        if self.control.is_pending() {
+            return;
+        }
+        if profile.selected {
+            self.notice = Some("This account is already selected.".to_owned());
+            return;
+        }
+        self.confirm = Some(AccountChoice {
+            provider: profile.provider.clone(),
+            name: profile.name.clone(),
+        });
+        self.notice = None;
+    }
+
+    fn submit(&mut self, base: &str) {
+        if let Some(choice) = self.confirm.take() {
+            self.notice = Some(format!("Switching to {}...", choice.label()));
+            self.control.start(base.to_owned(), choice);
+        }
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame<'_>) {
+        let text = if let Some(choice) = &self.confirm {
+            format!(
+                "Switch ALL sessions for {} to {}? y = confirm, n / Esc = cancel. Saved default unchanged.",
+                choice.provider, choice.name
+            )
+        } else if let Some(notice) = &self.notice {
+            notice.clone()
+        } else {
+            "Enter = switch selected account (confirmation required). Active requests must finish first.".to_owned()
+        };
+        let area = frame.area();
+        let banner = Rect::new(
+            area.x.saturating_add(1),
+            area.y + area.height.saturating_sub(4),
+            area.width.saturating_sub(2),
+            area.height.min(3),
+        );
+        frame.render_widget(Clear, banner);
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().fg(YELLOW).bg(PANEL_BG))
+                .wrap(Wrap { trim: false }),
+            banner,
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusPane {
     Sessions,
     Recent,
+    Limits,
 }
 
 impl FocusPane {
     fn next(self) -> Self {
         match self {
             Self::Sessions => Self::Recent,
-            Self::Recent => Self::Sessions,
+            Self::Recent => Self::Limits,
+            Self::Limits => Self::Sessions,
         }
     }
 }
@@ -334,6 +459,7 @@ struct MonitorApp {
     focus: FocusPane,
     selected: usize,
     recent_selected: usize,
+    limits_selected: usize,
     tick: usize,
     phase: MonitorPhase,
     shutdown: Option<oneshot::Sender<()>>,
@@ -411,6 +537,7 @@ impl MonitorApp {
 
     fn move_down(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
         match self.focus {
+            FocusPane::Limits => {}
             FocusPane::Sessions => {
                 if switch_panes && self.selected >= sessions.saturating_sub(1) && recent > 0 {
                     self.focus = FocusPane::Recent;
@@ -433,6 +560,7 @@ impl MonitorApp {
 
     fn move_up(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
         match self.focus {
+            FocusPane::Limits => {}
             FocusPane::Sessions => self.selected = self.selected.saturating_sub(1),
             FocusPane::Recent => {
                 if switch_panes && self.recent_selected == 0 && sessions > 0 {
@@ -477,14 +605,24 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
+    // Reserve a scrollable quota panel below Events without letting many profiles
+    // consume the entire dashboard. Two text lines per account keep resets visible.
+    let limits_height = (state
+        .account_limits
+        .len()
+        .saturating_mul(2)
+        .saturating_add(3))
+    .max(5)
+    .min(usize::from((area.height / 3).max(5))) as u16;
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Percentage(30),
-            Constraint::Percentage(20),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
+            Constraint::Ratio(30, 100),
+            Constraint::Ratio(20, 100),
+            Constraint::Ratio(25, 100),
+            Constraint::Ratio(25, 100),
+            Constraint::Length(limits_height),
             Constraint::Length(1),
         ])
         .split(area);
@@ -513,7 +651,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         app.focus == FocusPane::Recent,
     );
     render_events(frame, root[4], &state.recent);
-    render_footer(frame, root[5], app);
+    render_account_limits(
+        frame,
+        root[5],
+        state,
+        app.limits_selected,
+        app.focus == FocusPane::Limits,
+    );
+    render_footer(frame, root[6], app);
 
     if let Some(selected) = app.accounts_selected {
         render_accounts(frame, area, &state.accounts, selected);
@@ -560,7 +705,7 @@ fn render_accounts(
     selected: usize,
 ) {
     frame.render_widget(Clear, area);
-    let block = panel(" Accounts (read-only) · a / Esc close ", true);
+    let block = panel(" Accounts · Enter switch · a / Esc close", true);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let sections = Layout::vertical([
@@ -572,7 +717,7 @@ fn render_accounts(
     .split(inner);
     frame.render_widget(
         Paragraph::new(
-            "Local service metadata only; not live authentication or quota validation. Refresh ~5s.\nselected = pinned process profile; saved-default = default for future runs.",
+            "Local service metadata only; not live authentication or quota validation. Refresh ~5s.\nselected = active runtime profile; saved-default = default for future runs.",
         )
         .style(Style::default().fg(DIM_WHITE))
         .wrap(Wrap { trim: false }),
@@ -1485,6 +1630,117 @@ fn event_columns(tier: LayoutTier) -> Vec<ColumnSpec<EventColumn>> {
     }
 }
 
+fn quota_window_text(
+    window: Option<&crate::monitor::account_limits::LimitWindow>,
+    now_ms: u64,
+) -> String {
+    let Some(window) = window else {
+        return "unavailable\nreset unknown".into();
+    };
+    let reset = match window.reset_at_ms {
+        Some(reset) if reset > now_ms => {
+            let minutes = reset.saturating_sub(now_ms).div_ceil(60_000);
+            if minutes >= 1440 {
+                format!("reset in {}d {}h", minutes / 1440, minutes % 1440 / 60)
+            } else if minutes >= 60 {
+                format!("reset in {}h {}m", minutes / 60, minutes % 60)
+            } else {
+                format!("reset in {minutes}m")
+            }
+        }
+        Some(_) => "reset due; awaiting refresh".into(),
+        None => "reset unknown".into(),
+    };
+    format!("{:.1}% used\n{reset}", window.used_percent)
+}
+
+fn render_account_limits(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &MonitorSnapshot,
+    selected: usize,
+    focused: bool,
+) {
+    let count = state.account_limits.len();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { WHITE } else { SEPARATOR }))
+        .style(Style::default().fg(WHITE).bg(PANEL_BG))
+        .title(format!(
+            " Account limits · {} · Tab / ↑↓ scroll · * selected ",
+            count
+        ));
+    if count == 0 {
+        frame.render_widget(
+            Paragraph::new("No saved Codex logins / waiting for quotas. API keys: not applicable.")
+                .style(Style::default().fg(DIM_WHITE))
+                .block(block),
+            area,
+        );
+        return;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let rows = state
+        .account_limits
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let active = state.accounts.iter().any(|profile| {
+                profile.provider == account.provider
+                    && profile.name == account.name
+                    && profile.selected
+            });
+            let age = account
+                .updated_at_ms
+                .map(|updated| {
+                    let seconds = now_ms.saturating_sub(updated) / 1000;
+                    if seconds < 60 {
+                        format!("{seconds}s ago")
+                    } else {
+                        format!("{}m ago", seconds / 60)
+                    }
+                })
+                .unwrap_or_else(|| "never updated".into());
+            let label = format!(
+                "{} {}/{} ({}/{count})\n{} · {age}",
+                if active { "*" } else { " " },
+                account.provider,
+                account.name,
+                index + 1,
+                account.status
+            );
+            Row::new(vec![
+                Cell::from(label),
+                Cell::from(quota_window_text(account.five_hour.as_ref(), now_ms)),
+                Cell::from(quota_window_text(account.seven_day.as_ref(), now_ms)),
+            ])
+            .height(2)
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ],
+    )
+    .header(
+        Row::new(["Account / status / last update", "5 hours", "7 days"])
+            .style(Style::default().fg(DIM_WHITE)),
+    )
+    .column_spacing(1)
+    .block(block)
+    .row_highlight_style(Style::default().bg(SELECTED_BG));
+    // Selection is retained even while another pane is focused so the full list
+    // remains reachable, including after snapshots refresh or terminal resizing.
+    let mut table_state = TableState::default().with_selected(Some(selected.min(count - 1)));
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
 fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedSnapshot]) {
     let events = recent
         .iter()
@@ -1825,7 +2081,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, attached: boo
         ),
         ("?", "toggle help"),
         ("b", "toggle setup"),
-        ("a", "toggle accounts (read-only)"),
+        ("a", "toggle accounts (Enter to switch)"),
         ("PgUp/PgDn", "page accounts; Home/End first/last"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
@@ -1983,6 +2239,52 @@ mod tests {
             .join("\n")
     }
 
+    #[test]
+    fn quota_panel_shows_usage_missing_windows_and_scrolls_to_last_account() {
+        use crate::monitor::account_limits::{AccountLimit, LimitWindow};
+        let mut snapshot: MonitorSnapshot = crate::monitor::mock_state().into();
+        snapshot.account_limits = (0..30)
+            .map(|index| AccountLimit {
+                provider: "codex".into(),
+                name: format!("login-{index:02}"),
+                status: "Available".into(),
+                five_hour: Some(LimitWindow {
+                    used_percent: 37.5,
+                    reset_at_ms: None,
+                }),
+                seven_day: None,
+                updated_at_ms: None,
+            })
+            .collect();
+        let text = buffer_text(&draw(120, 7, |frame| {
+            render_account_limits(frame, frame.area(), &snapshot, 29, true);
+        }));
+        assert!(text.contains("login-29"));
+        assert!(text.contains("37.5% used"));
+        assert!(text.contains("unavailable"));
+        assert!(text.contains("reset unknown"));
+        assert!(!text.contains("0.0%"));
+        for (width, height) in [(80, 24), (30, 8), (10, 4), (1, 1)] {
+            draw(width, height, |frame| {
+                render_account_limits(frame, frame.area(), &snapshot, 29, true);
+            });
+        }
+        assert_eq!(FocusPane::Sessions.next().next(), FocusPane::Limits);
+        assert_eq!(FocusPane::Limits.next(), FocusPane::Sessions);
+    }
+
+    #[test]
+    fn quota_reset_countdown_does_not_fabricate_fresh_data_after_reset() {
+        use crate::monitor::account_limits::LimitWindow;
+        assert_eq!(quota_window_text(None, 0), "unavailable\nreset unknown");
+        let window = LimitWindow {
+            used_percent: 100.0,
+            reset_at_ms: Some(60_001),
+        };
+        assert!(quota_window_text(Some(&window), 0).contains("reset in 2m"));
+        assert!(quota_window_text(Some(&window), 60_001).contains("awaiting refresh"));
+    }
+
     fn account_profiles(count: usize) -> Vec<crate::account_profiles::ProfileStatus> {
         (0..count)
             .map(|index| crate::account_profiles::ProfileStatus {
@@ -2011,7 +2313,7 @@ mod tests {
         assert!(text.contains("profile-100 [selected]"));
         assert!(text.contains("Authenticated (local)"));
         assert!(text.contains("not live authentication or quota validation"));
-        assert!(text.contains("selected = pinned process profile"));
+        assert!(text.contains("selected = active runtime profile"));
         assert!(text.contains("saved-default = default for future runs"));
         assert!(text.contains("Expires: 2027-"));
         assert!(text.contains("101/101"));
@@ -2046,6 +2348,29 @@ mod tests {
     }
 
     #[test]
+    fn account_switch_requires_confirmation_and_captures_target() {
+        let profiles = account_profiles(3);
+        let mut switch = AccountSwitchUi::default();
+        switch.select(&profiles[0]);
+        assert_eq!(switch.confirm.as_ref().unwrap().name, "profile-000");
+        assert!(!switch.control.is_pending());
+        let buffer = draw(100, 20, |frame| switch.render(frame));
+        let text = buffer_text(&buffer);
+        assert!(text.contains("Switch ALL sessions for codex to profile-000?"));
+        assert!(text.contains("y = confirm"));
+        // Navigation does not mutate the captured target, and cancellation
+        // never submits a network request.
+        switch.confirm = None;
+        assert!(!switch.control.is_pending());
+        switch.select(&profiles[2]);
+        assert!(switch.confirm.is_none());
+        assert!(switch.notice.as_ref().unwrap().contains("already selected"));
+        for (width, height) in [(10, 4), (1, 1)] {
+            draw(width, height, |frame| switch.render(frame));
+        }
+    }
+
+    #[test]
     fn account_selection_pages_clamps_and_never_changes_profiles() {
         let mut app = MonitorApp {
             listen_url: "http://remote".into(),
@@ -2057,6 +2382,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,
@@ -2737,6 +3063,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,
@@ -2875,6 +3202,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: Some(shutdown_tx),
@@ -2922,6 +3250,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: Some(shutdown_tx),
@@ -2953,6 +3282,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,
@@ -2982,6 +3312,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 0,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,
@@ -3008,6 +3339,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 10,
             recent_selected: 10,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,
@@ -3035,6 +3367,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 1,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,
@@ -3062,6 +3395,7 @@ mod tests {
             focus: FocusPane::Sessions,
             selected: 1,
             recent_selected: 0,
+            limits_selected: 0,
             tick: 0,
             phase: MonitorPhase::Running,
             shutdown: None,

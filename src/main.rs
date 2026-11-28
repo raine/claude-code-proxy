@@ -45,7 +45,7 @@ enum Commands {
         #[arg(long)]
         anthropic_profile: Option<String>,
     },
-    /// Attach a read-only dashboard to a running proxy
+    /// Attach a dashboard with status and confirmed account switching
     Monitor {
         #[arg(long)]
         url: Option<reqwest::Url>,

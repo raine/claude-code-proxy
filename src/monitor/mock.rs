@@ -373,6 +373,29 @@ fn mock_state_for_tick(
         started_at,
         uptime: now.duration_since(started_at).unwrap_or_default(),
         accounts: Vec::new(),
+        account_limits: {
+            let now_ms = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            [("work", 32.0, 58.5), ("personal", 87.5, 12.0)]
+                .into_iter()
+                .map(|(name, five, seven)| super::account_limits::AccountLimit {
+                    provider: "codex".into(),
+                    name: name.into(),
+                    status: "Available (demo)".into(),
+                    five_hour: Some(super::account_limits::LimitWindow {
+                        used_percent: five,
+                        reset_at_ms: Some(now_ms + 7_200_000),
+                    }),
+                    seven_day: Some(super::account_limits::LimitWindow {
+                        used_percent: seven,
+                        reset_at_ms: Some(now_ms + 259_200_000),
+                    }),
+                    updated_at_ms: Some(now_ms),
+                })
+                .collect()
+        },
         sessions,
         active,
         recent: recent.into_iter().collect(),

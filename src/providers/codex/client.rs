@@ -1314,7 +1314,9 @@ impl CodexHttpClient {
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
                 let receiver = websocket.replace_receiver(rx);
+                let runtime_work = crate::server::runtime_work_guard();
                 tokio::spawn(async move {
+                    let _runtime_work = runtime_work;
                     if tx.send(item).await.is_ok() {
                         forward_codex_events(receiver, tx).await;
                     }
@@ -1353,7 +1355,10 @@ impl CodexHttpClient {
         let traffic = ctx.traffic.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
+        let runtime_work = crate::server::runtime_work_guard();
+
         tokio::spawn(async move {
+            let _runtime_work = runtime_work;
             let log = create_logger("codex");
             let mut semantic_output_forwarded = false;
 
@@ -2066,7 +2071,9 @@ impl CodexHttpClient {
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
+        let runtime_work = crate::server::runtime_work_guard();
         tokio::spawn(async move {
+            let _runtime_work = runtime_work;
             client
                 .coordinate_live_websocket_events(
                     body,

@@ -138,9 +138,11 @@ claude-code-proxy codex profile use work
 claude-code-proxy serve --codex-profile work --anthropic-profile personal
 ```
 
-Each process keeps one selected account per provider; there is no automatic rotation.
+Each process uses one selected account per provider; there is no automatic rotation.
 Press `a` in the monitor to list all profiles, local statuses, selected/default markers,
-and Codex token expiry without exposing keys or tokens.
+and Codex token expiry without exposing keys or tokens. Select a profile, press `Enter`,
+then `y` to switch at runtime without restarting. Wait for active requests/streams to
+finish first; switching affects all sessions for that provider, not the saved default.
 See [Account profiles](https://claude-code-proxy.raine.dev/using/account-profiles/)
 for selection precedence, credential storage, and removal.
 

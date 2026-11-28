@@ -34,11 +34,17 @@ In an attached dashboard, `q` and `Ctrl-C` detach immediately and leave the serv
 
 ## Account profile status
 
-The read-only Accounts view (`a`) lists all named Codex and Anthropic profiles plus the implicit `default` profile. It distinguishes `[selected]`, the account pinned to the running process, from `[saved-default]`, the default used by future processes. Missing selected/default credential files remain visible as unauthenticated profiles. Scroll with `↑`/`↓` or `j`/`k`, `PgUp`/`PgDn`, and `Home`/`End`; close with `a` or `Esc`.
+The Accounts view (`a`) lists all named Codex and Anthropic profiles plus the implicit `default` profile. It distinguishes `[selected]`, the active runtime account, from `[saved-default]`, the default used by future processes. Missing selected/default credential files remain visible as unauthenticated profiles. Scroll with `↑`/`↓` or `j`/`k`, `PgUp`/`PgDn`, and `Home`/`End`; press `Enter` then `y` to switch the highlighted profile, or `n`/`Esc` to cancel. The switch affects all sessions for that provider but does not change the saved default. Active inference requests and streams must finish first. Close Accounts with `a` or `Esc`.
 
-Statuses are local observations, not a live login, quota, or billing check. Anthropic keys are labeled unverified; expired Codex access tokens may still have refresh credentials. The UI does not refresh tokens, validate keys, or make provider requests. Profile metadata is cached and refreshed in the background, including for remotely attached monitors. API keys, access/refresh tokens, upstream account identifiers, and credential file paths are never included in account-status snapshots.
+Statuses in Accounts are local observations, not a live login, quota, or billing check. Anthropic keys are labeled unverified; expired Codex access tokens may still have refresh credentials. Profile metadata is cached and refreshed in the background, including for remotely attached monitors. API keys, access/refresh tokens, upstream account identifiers, and credential file paths are never included in account-status snapshots.
 
-Manage accounts through the [Account profiles](/using/account-profiles/) CLI commands; restarting the proxy is required to change its selected account.
+### Account limits below Events
+
+The main dashboard lists every saved Codex login in **Account limits**, directly below Events. Each row shows the **5-hour** and **7-day** used percentages, reset countdowns, retrieval status, and last successful update. `*` marks the currently selected account. Press `Tab` until this pane is focused, then use `↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, or `Home`/`End` to reach every account.
+
+The service polls ChatGPT's read-only usage endpoint roughly once per minute, with bounded concurrency and timeouts. This does not generate tokens, refresh OAuth credentials, or switch accounts. Failed reads retain explicitly stale values; absent windows show unavailable, never a fabricated zero. Expired credentials show an expiry status. Anthropic API keys do not have these subscription windows and are not included. Attached monitors receive safe quota metadata from the service, never credentials from their own machine.
+
+Add and remove accounts through the [Account profiles](/using/account-profiles/) CLI commands. Both integrated and attached monitors support confirmed runtime switching through a loopback-only control endpoint; no restart is required.
 
 ## Keyboard controls
 
@@ -46,7 +52,7 @@ Manage accounts through the [Account profiles](/using/account-profiles/) CLI com
 | --- | --- |
 | `Tab`, `←`, `→` | Change focused pane |
 | `j`, `k`, `↓`, `↑` | Move selection |
-| `Enter` | Open session or request details |
+| `Enter` | Open session/request details; in Accounts, request a profile switch |
 | `Esc` | Close details or an overlay |
 | `?` | Toggle shortcut help |
 | `b` | Toggle the setup overlay |

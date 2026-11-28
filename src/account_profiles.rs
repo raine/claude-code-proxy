@@ -1,14 +1,85 @@
-//! Named credential profiles. Selection is pinned once per process, not per request.
+//! Named credential profiles. Runtime selection changes only after inference drains.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 pub const DEFAULT_PROFILE: &str = "default";
 const PROVIDERS: [&str; 2] = ["codex", "anthropic"];
-static ACTIVE: OnceLock<Result<BTreeMap<String, String>, String>> = OnceLock::new();
+static ACTIVE: OnceLock<RwLock<Result<BTreeMap<String, String>, String>>> = OnceLock::new();
+thread_local! {
+    // Constructors are synchronous. Pin each new auth store to the candidate
+    // without publishing it to monitor readers before the backend swap commits.
+    static CONSTRUCTING: RefCell<Option<BTreeMap<String, String>>> = const { RefCell::new(None) };
+}
+
+fn selection() -> &'static RwLock<Result<BTreeMap<String, String>, String>> {
+    ACTIVE.get_or_init(|| {
+        let env = std::env::vars().collect();
+        RwLock::new(
+            resolve_selection(&ProfileStore::configured(), &BTreeMap::new(), &env)
+                .map_err(|error| error.to_string()),
+        )
+    })
+}
+
+pub(crate) fn candidate(provider: &str, name: &str) -> Result<BTreeMap<String, String>> {
+    validate_provider(provider)?;
+    validate_name(name)?;
+    let store = ProfileStore::configured();
+    let valid = if provider == "anthropic" {
+        let key = if name == DEFAULT_PROFILE {
+            crate::config::default_anthropic_api_key()
+        } else {
+            load_anthropic_key(&store, name).ok()
+        };
+        key.is_some_and(|key| !key.trim().is_empty() && http::HeaderValue::from_str(&key).is_ok())
+    } else {
+        crate::providers::codex::auth::token_store::auth_for_profile(&store, name)
+            .ok()
+            .flatten()
+            .is_some_and(|auth| {
+                !auth.access.trim().is_empty()
+                    && !auth.refresh.trim().is_empty()
+                    && http::HeaderValue::from_str(&format!("Bearer {}", auth.access)).is_ok()
+                    && auth
+                        .account_id
+                        .as_ref()
+                        .is_none_or(|id| http::HeaderValue::from_str(id).is_ok())
+            })
+    };
+    ensure!(valid, "Profile credentials are missing or invalid");
+    let mut selected = selection()
+        .read()
+        .unwrap()
+        .as_ref()
+        .map_err(|_| anyhow::anyhow!("Invalid account selection"))?
+        .clone();
+    selected.insert(provider.to_owned(), name.to_owned());
+    Ok(selected)
+}
+
+pub(crate) fn construct_with<T>(
+    selected: &BTreeMap<String, String>,
+    build: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<BTreeMap<String, String>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CONSTRUCTING.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = CONSTRUCTING.with(|slot| slot.replace(Some(selected.clone())));
+    let _reset = Reset(previous);
+    build()
+}
+
+pub(crate) fn commit(selected: BTreeMap<String, String>) {
+    *selection().write().unwrap() = Ok(selected);
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,18 +262,21 @@ pub fn initialize(overrides: BTreeMap<String, String>) -> Result<()> {
     let env = std::env::vars().collect();
     let selected = resolve_selection(&ProfileStore::configured(), &overrides, &env)?;
     ACTIVE
-        .set(Ok(selected))
+        .set(RwLock::new(Ok(selected)))
         .map_err(|_| anyhow::anyhow!("Account profiles are already initialized"))
 }
 
 pub fn active_profile(provider: &str) -> Result<String> {
     validate_provider(provider)?;
-    let selected = ACTIVE.get_or_init(|| {
-        let env = std::env::vars().collect();
-        resolve_selection(&ProfileStore::configured(), &BTreeMap::new(), &env)
-            .map_err(|error| error.to_string())
-    });
-    match selected {
+    if let Some(name) = CONSTRUCTING.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|map| map.get(provider).cloned())
+    }) {
+        return Ok(name);
+    }
+    let selected = selection().read().unwrap();
+    match &*selected {
         Ok(selected) => Ok(selected.get(provider).expect("known provider").clone()),
         Err(error) => bail!("{error}"),
     }

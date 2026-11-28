@@ -75,6 +75,8 @@ pub struct MonitorSnapshot {
     pub uptime: Duration,
     #[serde(default)]
     pub accounts: Vec<crate::account_profiles::ProfileStatus>,
+    #[serde(default)]
+    pub account_limits: Vec<super::account_limits::AccountLimit>,
     pub sessions: Vec<SessionSnapshot>,
     pub active: Vec<ActiveSnapshot>,
     pub recent: Vec<CompletedSnapshot>,
@@ -87,6 +89,7 @@ impl From<MonitorState> for MonitorSnapshot {
             snapshot_at: SystemTime::now(),
             uptime: state.uptime,
             accounts: state.accounts,
+            account_limits: state.account_limits,
             sessions: state.sessions.into_iter().map(Into::into).collect(),
             active: state.active.into_iter().map(Into::into).collect(),
             recent: state.recent.into_iter().map(Into::into).collect(),
@@ -345,12 +348,45 @@ mod tests {
     }
 
     #[test]
+    fn quota_snapshot_exposes_only_safe_fields_and_round_trips() {
+        let response = MonitorResponse::from(crate::monitor::mock_state());
+        let encoded = serde_json::to_value(&response).unwrap();
+        let quota = encoded["snapshot"]["account_limits"][0]
+            .as_object()
+            .unwrap();
+        let mut fields = quota.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "five_hour",
+                "name",
+                "provider",
+                "seven_day",
+                "status",
+                "updated_at_ms"
+            ]
+        );
+        let window = quota["five_hour"].as_object().unwrap();
+        assert_eq!(window.len(), 2);
+        assert!(window.contains_key("used_percent"));
+        assert!(window.contains_key("reset_at_ms"));
+        let decoded: MonitorResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.snapshot.account_limits,
+            response.snapshot.account_limits
+        );
+    }
+
+    #[test]
     fn snapshot_deserialization_accepts_legacy_and_newer_fields() {
         let snapshot: MonitorSnapshot = MonitorHandle::default().snapshot().into();
         let mut legacy = serde_json::to_value(&snapshot).unwrap();
         legacy.as_object_mut().unwrap().remove("snapshot_at");
         legacy.as_object_mut().unwrap().remove("accounts");
+        legacy.as_object_mut().unwrap().remove("account_limits");
         let decoded: MonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.account_limits.is_empty());
         assert!(decoded.accounts.is_empty());
         assert!(decoded.snapshot_at >= snapshot.started_at);
 
