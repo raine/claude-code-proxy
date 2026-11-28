@@ -351,8 +351,14 @@ pub async fn pump_live_bridge(
                     }
                     if let Some(text) = update.text_delta.as_ref()
                         && !text.text.is_empty()
-                        && pump_text(&text.text, &mut xml, &mut framer)
+                        && let Some(trailing) = pump_text(&text.text, &mut xml, &mut framer)
                     {
+                        // Claude Code only sees the first call. Anything the
+                        // agent wrote after it stays in Cursor's turn, so that
+                        // conversation no longer matches the transcript.
+                        if trailing {
+                            bridge.segment = None;
+                        }
                         sink(&framer.take_output());
                         return PumpOutcome::Replay;
                     }
@@ -390,18 +396,24 @@ pub async fn pump_live_bridge(
 /// it and sends its final checkpoint.
 ///
 /// Returns `false` when the turn cannot end without Claude Code (the agent
-/// asked for a tool), fails, or outlasts `limit`.
+/// asked for a tool), writes text Claude Code never receives, fails, or
+/// outlasts `limit`.
 pub async fn drain_to_turn_end(bridge: &mut LiveBridge, limit: Duration) -> bool {
     let drain = async {
         while let Some(event) = bridge.run.events.recv().await {
             match event {
                 LiveEvent::Message(message) => {
-                    if let Some(usage) = message
-                        .interaction_update
-                        .as_ref()
-                        .and_then(|update| update.turn_ended.as_ref())
-                    {
-                        log_turn_usage(usage, bridge.continued);
+                    if let Some(update) = message.interaction_update.as_ref() {
+                        if update
+                            .text_delta
+                            .as_ref()
+                            .is_some_and(|text| !text.text.trim().is_empty())
+                        {
+                            return false;
+                        }
+                        if let Some(usage) = update.turn_ended.as_ref() {
+                            log_turn_usage(usage, bridge.continued);
+                        }
                     }
                     let Some(exec) = message.exec_server_message.as_ref() else {
                         continue;
@@ -439,25 +451,31 @@ fn log_turn_usage(usage: &proto::TurnEnded, continued: bool) {
 
 /// Feed one text delta through the XML recovery parser.
 ///
-/// Returns `true` when a `<tool_use>` was recovered: the text channel cannot
-/// answer it, so the pump stops there.
+/// Returns `Some` when a `<tool_use>` was recovered: the text channel cannot
+/// answer it, so the pump stops there. The flag tells whether the delta held
+/// more than whitespace after the call, which the client never receives.
 fn pump_text(
     text: &str,
     xml: &mut CursorToolUseXmlParser,
     framer: &mut CursorSseFramer<'_>,
-) -> bool {
-    for event in xml.push(text) {
+) -> Option<bool> {
+    let mut events = xml.push(text).into_iter();
+    while let Some(event) = events.next() {
         match event {
             RecoveredCursorEvent::Text(text) => framer.emit_text_delta(&text),
             RecoveredCursorEvent::ToolUse(tool_use) => {
                 let input_json =
                     serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
                 framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
-                return true;
+                let trailing = events.chain(xml.flush()).any(|event| match event {
+                    RecoveredCursorEvent::Text(text) => !text.trim().is_empty(),
+                    RecoveredCursorEvent::ToolUse(_) => true,
+                });
+                return Some(trailing);
             }
         }
     }
-    false
+    None
 }
 
 fn flush_xml(

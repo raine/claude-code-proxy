@@ -1491,6 +1491,104 @@ async fn changed_history_starts_a_new_conversation() {
     clear_mock_env();
 }
 
+/// Text after a tool call recovered from the text channel never reaches Claude
+/// Code, so the request carrying the tool result starts a new conversation
+/// instead of continuing one that holds that text.
+#[tokio::test]
+async fn text_after_a_text_tool_call_starts_a_new_conversation() {
+    let _guard = ENV_LOCK.lock().await;
+    let (addr, records) = spawn_conversation_mock(
+        r#"<tool_use name="Glob">{"pattern":"*.rs"}</tool_use> It found main.rs."#,
+    )
+    .await;
+    set_mock_env(addr);
+
+    let provider = claude_code_proxy::providers::cursor::CursorProvider::new();
+    let first = collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "list the rust files"}
+        ])),
+        "continue-trailing-text",
+    )
+    .await;
+    assert!(!first.contains("It found"), "{first}");
+    collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "list the rust files"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Glob",
+                 "input": {"pattern": "*.rs"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "main.rs"}
+            ]}
+        ])),
+        "continue-trailing-text",
+    )
+    .await;
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert!(records[1].conversation_state.is_empty());
+    assert_ne!(records[1].conversation_id, records[0].conversation_id);
+    assert!(records[1].prompt.contains("list the rust files"));
+    clear_mock_env();
+}
+
+/// A client that leaves mid-turn kept only part of the reply, so its next
+/// request starts a new conversation.
+#[tokio::test]
+async fn interrupted_turn_starts_a_new_conversation() {
+    use claude_code_proxy::provider::{Provider, RequestContext};
+
+    let _guard = ENV_LOCK.lock().await;
+    let (addr, records) =
+        spawn_delayed_conversation_mock("first answer", std::time::Duration::from_millis(200))
+            .await;
+    set_mock_env(addr);
+
+    let provider = claude_code_proxy::providers::cursor::CursorProvider::new();
+    let request: claude_code_proxy::MessagesRequest =
+        serde_json::from_value(conversation_request(serde_json::json!([
+            {"role": "user", "content": "first question"}
+        ])))
+        .unwrap();
+    let response = provider
+        .handle_messages(
+            request,
+            RequestContext {
+                req_id: "test-continue-interrupted".to_string(),
+                session_id: Some("continue-interrupted".to_string()),
+                session_seq: None,
+                provider: "cursor".to_string(),
+                traffic: None,
+                monitor: None,
+            },
+        )
+        .await;
+    drop(response);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    collect_sse(
+        &provider,
+        conversation_request(serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "second question"}
+        ])),
+        "continue-interrupted",
+    )
+    .await;
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert!(records[1].conversation_state.is_empty());
+    assert!(records[1].prompt.contains("first question"));
+    clear_mock_env();
+}
+
 /// What one mock `Run` received.
 #[derive(Default, Clone, Debug)]
 struct RunRecord {
@@ -1534,6 +1632,14 @@ fn clear_mock_env() {
 /// before it answers "second answer".
 async fn spawn_conversation_mock(
     first_reply: &'static str,
+) -> (std::net::SocketAddr, Arc<Mutex<Vec<RunRecord>>>) {
+    spawn_delayed_conversation_mock(first_reply, std::time::Duration::ZERO).await
+}
+
+/// [`spawn_conversation_mock`] whose first run waits `delay` before it answers.
+async fn spawn_delayed_conversation_mock(
+    first_reply: &'static str,
+    delay: std::time::Duration,
 ) -> (std::net::SocketAddr, Arc<Mutex<Vec<RunRecord>>>) {
     use axum::Router;
     use axum::body::Body;
@@ -1586,6 +1692,7 @@ async fn spawn_conversation_mock(
                                     records[run].prompt = String::from_utf8(prompt).unwrap();
                                 }
                                 if run == 0 {
+                                    tokio::time::sleep(delay).await;
                                     let _ = tx.send(Ok(kv_frame(
                                         1,
                                         kv_server_message::Message::SetBlobArgs(SetBlobArgs {

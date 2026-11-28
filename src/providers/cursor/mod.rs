@@ -426,6 +426,7 @@ fn live_sse_response(
 
     tokio::spawn(async move {
         let mut sse = Vec::new();
+        let mut client_gone = false;
         let mut send_failed = false;
         for message in preamble {
             if bridge.run.send(&message).await.is_err() {
@@ -439,12 +440,17 @@ fn live_sse_response(
             false => {
                 pump_live_bridge(&mut bridge, &message_id, &model, &mut |chunk| {
                     sse.extend_from_slice(chunk);
-                    let _ = tx.send(Bytes::copy_from_slice(chunk));
+                    client_gone |= tx.send(Bytes::copy_from_slice(chunk)).is_err();
                 })
                 .await
             }
         };
 
+        // A client that left mid-turn (an interrupted request) kept only part
+        // of the reply; the rest must not carry into the next turn.
+        if client_gone {
+            bridge.segment = None;
+        }
         settle_run(bridge, outcome);
 
         if let Some(monitor) = monitor {
