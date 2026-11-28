@@ -2,7 +2,11 @@ mod client;
 mod stream;
 
 use async_trait::async_trait;
-use axum::{Json, http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 
 use crate::anthropic::{json_error, schema::MessagesRequest};
 use crate::provider::{
@@ -19,7 +23,10 @@ const MODELS: &[&str] = &[
 ];
 
 pub fn advertised_models() -> Vec<String> {
-    MODELS.iter().map(|model| format!("anthropic/{model}")).collect()
+    MODELS
+        .iter()
+        .map(|model| format!("anthropic/{model}"))
+        .collect()
 }
 
 pub struct AnthropicProvider {
@@ -38,22 +45,28 @@ impl AnthropicProvider {
             client: AnthropicClient::new(
                 crate::config::anthropic_base_url(),
                 crate::config::anthropic_api_key(),
-            ).ok(),
+            )
+            .ok(),
         }
     }
 
     fn with_request_headers(&self, headers: &http::HeaderMap) -> Self {
         Self {
-            client: self.client.as_ref().map(|client| client.with_request_headers(headers)),
+            client: self
+                .client
+                .as_ref()
+                .map(|client| client.with_request_headers(headers)),
         }
     }
 
     fn client(&self) -> Result<&AnthropicClient, ProviderError> {
-        self.client.as_ref().ok_or_else(|| ProviderError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ProviderErrorKind::Api,
-            "Invalid Anthropic provider configuration",
-        ))
+        self.client.as_ref().ok_or_else(|| {
+            ProviderError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ProviderErrorKind::Api,
+                "Invalid Anthropic provider configuration",
+            )
+        })
     }
 
     async fn buffered(
@@ -69,11 +82,19 @@ impl AnthropicProvider {
         let response = self.client()?.post(&value, count_tokens, &ctx).await?;
         let value = client::read_json(response).await?;
         if let Some(monitor) = &ctx.monitor {
-            let usage = if count_tokens { &value } else { &value["usage"] };
+            let usage = if count_tokens {
+                &value
+            } else {
+                &value["usage"]
+            };
             monitor.usage_updated(
                 &ctx.req_id,
-                usage.get("input_tokens").and_then(serde_json::Value::as_u64),
-                usage.get("output_tokens").and_then(serde_json::Value::as_u64),
+                usage
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64),
             );
         }
         if let Some(traffic) = &ctx.traffic {
@@ -92,11 +113,13 @@ fn resolve_model(raw: &str) -> Result<String, ProviderError> {
         "haiku" => "claude-haiku-5-5",
         "fable" => "claude-fable-5-1",
         model if model.starts_with("claude-") && model.len() > "claude-".len() => model,
-        _ => return Err(ProviderError::new(
-            StatusCode::BAD_REQUEST,
-            ProviderErrorKind::InvalidRequest,
-            "Anthropic requires a Claude model ID or opus/sonnet/haiku/fable alias",
-        )),
+        _ => {
+            return Err(ProviderError::new(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorKind::InvalidRequest,
+                "Anthropic requires a Claude model ID or opus/sonnet/haiku/fable alias",
+            ));
+        }
     };
     Ok(model.to_owned())
 }
@@ -106,16 +129,25 @@ fn prepare_request(
     count_tokens: bool,
 ) -> Result<(serde_json::Value, String), ProviderError> {
     let model = resolve_model(body.model.as_deref().unwrap_or("opus"))?;
-    let mut value = serde_json::to_value(body).map_err(|_| ProviderError::new(
-        StatusCode::BAD_REQUEST, ProviderErrorKind::InvalidRequest, "Invalid Anthropic request",
-    ))?;
+    let mut value = serde_json::to_value(body).map_err(|_| {
+        ProviderError::new(
+            StatusCode::BAD_REQUEST,
+            ProviderErrorKind::InvalidRequest,
+            "Invalid Anthropic request",
+        )
+    })?;
     value["model"] = serde_json::Value::String(model.clone());
     if count_tokens {
         // The token-count endpoint does not accept generation-only parameters.
-        let object = value.as_object_mut().expect("serialized MessagesRequest object");
-        object.retain(|key, _| matches!(
-            key.as_str(), "model" | "messages" | "system" | "tools" | "tool_choice" | "thinking"
-        ));
+        let object = value
+            .as_object_mut()
+            .expect("serialized MessagesRequest object");
+        object.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "model" | "messages" | "system" | "tools" | "tool_choice" | "thinking"
+            )
+        });
     } else if body.max_tokens.is_none() {
         value["max_tokens"] = serde_json::json!(64_000);
     }
@@ -126,11 +158,17 @@ fn prepare_request(
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn name(&self) -> &'static str { "anthropic" }
+    fn name(&self) -> &'static str {
+        "anthropic"
+    }
 
-    fn supported_models(&self) -> Vec<String> { advertised_models() }
+    fn supported_models(&self) -> Vec<String> {
+        advertised_models()
+    }
 
-    fn cli(&self) -> &'static dyn CliHandlers { &ANTHROPIC_CLI }
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &ANTHROPIC_CLI
+    }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         if body.stream {
@@ -141,9 +179,13 @@ impl Provider for AnthropicProvider {
                         GenerationBody::BufferedSse(bytes) => axum::body::Body::from(bytes),
                     };
                     (
-                        [("content-type", "text/event-stream"), ("cache-control", "no-cache")],
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("cache-control", "no-cache"),
+                        ],
                         body,
-                    ).into_response()
+                    )
+                        .into_response()
                 }
                 Err(error) => error_response(error),
             };
@@ -161,7 +203,9 @@ impl Provider for AnthropicProvider {
         _conversation_identity: Option<crate::request_identity::ConversationIdentity>,
         headers: http::HeaderMap,
     ) -> Response {
-        self.with_request_headers(&headers).handle_messages(body, ctx).await
+        self.with_request_headers(&headers)
+            .handle_messages(body, ctx)
+            .await
     }
 
     async fn handle_count_tokens_with_request_headers(
@@ -170,7 +214,9 @@ impl Provider for AnthropicProvider {
         ctx: RequestContext,
         headers: http::HeaderMap,
     ) -> Response {
-        self.with_request_headers(&headers).handle_count_tokens(body, ctx).await
+        self.with_request_headers(&headers)
+            .handle_count_tokens(body, ctx)
+            .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -201,7 +247,9 @@ impl Provider for AnthropicProvider {
 fn error_response(error: ProviderError) -> Response {
     let mut response = json_error(error.status, error.error_type(), error.message);
     if let Some(retry_after) = error.retry_after.and_then(|value| value.parse().ok()) {
-        response.headers_mut().insert(http::header::RETRY_AFTER, retry_after);
+        response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, retry_after);
     }
     response
 }
@@ -213,31 +261,47 @@ impl CliHandlers for AnthropicCli {
     fn login(&self) -> anyhow::Result<()> {
         use std::io::{IsTerminal, Read};
         let profile = crate::account_profiles::active_profile("anthropic")?;
-        anyhow::ensure!(profile != crate::account_profiles::DEFAULT_PROFILE,
-            "Anthropic uses an API key; configure CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, or anthropic.apiKey for default, or use auth login --profile NAME to save a named key. API billing is separate from Pro/Max.");
-        let key = ["CCP_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"].into_iter()
-            .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()));
+        anyhow::ensure!(
+            profile != crate::account_profiles::DEFAULT_PROFILE,
+            "Anthropic uses an API key; configure CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, or anthropic.apiKey for default, or use auth login --profile NAME to save a named key. API billing is separate from Pro/Max."
+        );
+        let key = ["CCP_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]
+            .into_iter()
+            .find_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
         let key = match key {
             Some(key) => key,
             None => {
-                anyhow::ensure!(!std::io::stdin().is_terminal(),
-                    "Set CCP_ANTHROPIC_API_KEY/ANTHROPIC_API_KEY or pipe a key on stdin; keys are never accepted as command-line arguments");
+                anyhow::ensure!(
+                    !std::io::stdin().is_terminal(),
+                    "Set CCP_ANTHROPIC_API_KEY/ANTHROPIC_API_KEY or pipe a key on stdin; keys are never accepted as command-line arguments"
+                );
                 let mut key = String::new();
                 std::io::stdin().take(16_385).read_to_string(&mut key)?;
                 anyhow::ensure!(key.len() <= 16_384, "API key input is too large");
                 key
             }
         };
-        anyhow::ensure!(!key.trim().chars().any(char::is_whitespace), "API key must not contain whitespace");
+        anyhow::ensure!(
+            !key.trim().chars().any(char::is_whitespace),
+            "API key must not contain whitespace"
+        );
         crate::account_profiles::save_anthropic_key(
-            &crate::account_profiles::ProfileStore::configured(), &profile, &key,
+            &crate::account_profiles::ProfileStore::configured(),
+            &profile,
+            &key,
         )?;
         println!("Saved Anthropic profile: {profile} (key not validated)");
         Ok(())
     }
 
     fn device(&self) -> anyhow::Result<()> {
-        anyhow::bail!("Anthropic API-key profiles do not use device login; use auth login --profile NAME")
+        anyhow::bail!(
+            "Anthropic API-key profiles do not use device login; use auth login --profile NAME"
+        )
     }
 
     fn status(&self) -> anyhow::Result<()> {
@@ -252,9 +316,13 @@ impl CliHandlers for AnthropicCli {
     fn logout(&self) -> anyhow::Result<()> {
         let profile = crate::account_profiles::active_profile("anthropic")?;
         if profile != crate::account_profiles::DEFAULT_PROFILE {
-            println!("To delete this key, select another default if needed, then run: claude-code-proxy anthropic profile remove {profile} --yes");
+            println!(
+                "To delete this key, select another default if needed, then run: claude-code-proxy anthropic profile remove {profile} --yes"
+            );
         } else {
-            println!("Remove CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, and anthropic.apiKey from your configuration to disconnect Anthropic.");
+            println!(
+                "Remove CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, and anthropic.apiKey from your configuration to disconnect Anthropic."
+            );
         }
         Ok(())
     }

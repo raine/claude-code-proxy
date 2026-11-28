@@ -330,7 +330,14 @@ mod tests {
         fields.sort_unstable();
         assert_eq!(
             fields,
-            ["expires_at_ms", "is_default", "name", "provider", "selected", "status"]
+            [
+                "expires_at_ms",
+                "is_default",
+                "name",
+                "provider",
+                "selected",
+                "status"
+            ]
         );
         let decoded: MonitorResponse = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.snapshot.accounts, response.snapshot.accounts);

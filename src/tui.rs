@@ -589,11 +589,20 @@ fn render_accounts(
         let rows = accounts.iter().map(|profile| {
             Row::new([Cell::from(vec![
                 Line::from(Span::styled(
-                    format!("{} / {} {}", profile.provider, profile.name, profile_markers(profile)),
+                    format!(
+                        "{} / {} {}",
+                        profile.provider,
+                        profile.name,
+                        profile_markers(profile)
+                    ),
                     Style::default().fg(WHITE),
                 )),
                 Line::from(Span::styled(
-                    format!("{} · Expires: {}", profile.status, profile_expiry(profile.expires_at_ms)),
+                    format!(
+                        "{} · Expires: {}",
+                        profile.status,
+                        profile_expiry(profile.expires_at_ms)
+                    ),
                     Style::default().fg(DIM_WHITE),
                 )),
             ])])
@@ -623,7 +632,11 @@ fn render_accounts(
     frame.render_widget(
         Paragraph::new(format!(
             "↑/↓ j/k scroll · PgUp/PgDn · Home/End · {}/{}",
-            if accounts.is_empty() { 0 } else { selected.min(accounts.len() - 1) + 1 },
+            if accounts.is_empty() {
+                0
+            } else {
+                selected.min(accounts.len() - 1) + 1
+            },
             accounts.len(),
         ))
         .style(Style::default().fg(TEAL)),
@@ -1981,7 +1994,8 @@ mod tests {
                     "Authenticated (local)"
                 } else {
                     "Configured (unverified)"
-                }.into(),
+                }
+                .into(),
                 expires_at_ms: Some(1_800_000_000_000),
             })
             .collect()

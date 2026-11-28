@@ -138,17 +138,28 @@ mod tests {
     fn anthropic_requests_update_affinity_except_aliases_and_auxiliary_requests() {
         let session_id = "session-anthropic-affinity-test";
         assert!(is_alias_routable_provider("anthropic"));
-        let initial = record_session_request(
-            Some(session_id), None, "anthropic", "custom-model", 1,
-        ).expect("initial session");
+        let initial =
+            record_session_request(Some(session_id), None, "anthropic", "custom-model", 1)
+                .expect("initial session");
         assert_eq!(initial.affinity_provider, Some(AliasProvider::Anthropic));
         let alias = record_session_request(
-            Some(session_id), Some(&initial), "codex", "claude-sonnet-4-6", 2,
-        ).expect("alias session");
+            Some(session_id),
+            Some(&initial),
+            "codex",
+            "claude-sonnet-4-6",
+            2,
+        )
+        .expect("alias session");
         assert_eq!(alias.affinity_provider, Some(AliasProvider::Anthropic));
         let auxiliary = record_session_request_with_affinity_update(
-            Some(session_id), Some(&alias), "kimi", "kimi-for-coding", false, 3,
-        ).expect("auxiliary session");
+            Some(session_id),
+            Some(&alias),
+            "kimi",
+            "kimi-for-coding",
+            false,
+            3,
+        )
+        .expect("auxiliary session");
         assert_eq!(auxiliary.affinity_provider, Some(AliasProvider::Anthropic));
     }
 

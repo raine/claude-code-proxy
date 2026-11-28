@@ -313,12 +313,21 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_GROK_CLIENT_VERSION") {
         out.push("grok.clientVersion (env)".to_string());
     }
-    if env.get("CCP_ANTHROPIC_API_KEY").is_some_and(|raw| !raw.trim().is_empty()) {
+    if env
+        .get("CCP_ANTHROPIC_API_KEY")
+        .is_some_and(|raw| !raw.trim().is_empty())
+    {
         out.push("anthropic.apiKey (env)".to_string());
-    } else if env.get("ANTHROPIC_API_KEY").is_some_and(|raw| !raw.trim().is_empty()) {
+    } else if env
+        .get("ANTHROPIC_API_KEY")
+        .is_some_and(|raw| !raw.trim().is_empty())
+    {
         out.push("anthropic.apiKey (Anthropic env)".to_string());
     }
-    if env.get("CCP_ANTHROPIC_BASE_URL").is_some_and(|raw| !raw.trim().is_empty()) {
+    if env
+        .get("CCP_ANTHROPIC_BASE_URL")
+        .is_some_and(|raw| !raw.trim().is_empty())
+    {
         out.push("anthropic.baseUrl (env)".to_string());
     }
     if env.contains_key("CCP_OPENCODE_API_KEY") {
@@ -598,7 +607,11 @@ fn resolve_anthropic_config(
     };
     let (api_key, api_key_source) = ["CCP_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]
         .into_iter()
-        .find_map(|name| env.get(name).and_then(nonempty).map(|key| (Some(key), Some(name))))
+        .find_map(|name| {
+            env.get(name)
+                .and_then(nonempty)
+                .map(|key| (Some(key), Some(name)))
+        })
         .or_else(|| {
             file.as_ref()
                 .and_then(|config| config.api_key.as_ref())
@@ -629,8 +642,10 @@ pub fn anthropic_api_key() -> Option<String> {
     if name != crate::account_profiles::DEFAULT_PROFILE {
         // Explicit account selection never falls back to unrelated environment keys.
         return crate::account_profiles::load_anthropic_key(
-            &crate::account_profiles::ProfileStore::configured(), &name,
-        ).ok();
+            &crate::account_profiles::ProfileStore::configured(),
+            &name,
+        )
+        .ok();
     }
     default_anthropic_api_key()
 }
@@ -650,9 +665,18 @@ pub fn anthropic_config_summary() -> String {
     match crate::account_profiles::active_profile("anthropic") {
         Ok(name) if name != crate::account_profiles::DEFAULT_PROFILE => {
             let configured = crate::account_profiles::load_anthropic_key(
-                &crate::account_profiles::ProfileStore::configured(), &name,
-            ).is_ok();
-            return format!("profile {name}: API key {}", if configured { "configured" } else { "not configured" });
+                &crate::account_profiles::ProfileStore::configured(),
+                &name,
+            )
+            .is_ok();
+            return format!(
+                "profile {name}: API key {}",
+                if configured {
+                    "configured"
+                } else {
+                    "not configured"
+                }
+            );
         }
         Err(_) => return "Invalid Anthropic account profile".to_owned(),
         _ => {}
@@ -1291,7 +1315,10 @@ mod tests {
         assert_eq!(resolved.base_url, "https://user:url-secret@example.com");
 
         env.insert("CCP_ANTHROPIC_API_KEY".into(), " ccp-secret ".into());
-        env.insert("CCP_ANTHROPIC_BASE_URL".into(), " https://upstream.example ".into());
+        env.insert(
+            "CCP_ANTHROPIC_BASE_URL".into(),
+            " https://upstream.example ".into(),
+        );
         let resolved = resolve_anthropic_config(&env, config.path());
         assert_eq!(resolved.api_key.as_deref(), Some("ccp-secret"));
         assert_eq!(resolved.api_key_source, Some("CCP_ANTHROPIC_API_KEY"));
@@ -1299,7 +1326,12 @@ mod tests {
         assert!(!resolved.summary().contains("ccp-secret"));
 
         env.insert("CCP_ANTHROPIC_API_KEY".into(), " \t ".into());
-        assert_eq!(resolve_anthropic_config(&env, config.path()).api_key.as_deref(), Some("standard-secret"));
+        assert_eq!(
+            resolve_anthropic_config(&env, config.path())
+                .api_key
+                .as_deref(),
+            Some("standard-secret")
+        );
         env.insert("ANTHROPIC_API_KEY".into(), "".into());
         env.insert("CCP_ANTHROPIC_BASE_URL".into(), " ".into());
         let resolved = resolve_anthropic_config(&env, config.path());
@@ -1320,7 +1352,11 @@ mod tests {
         let cfg = load_config_for_env(&config_env(&config));
         let lines = config_override_summary_lines(&cfg);
         assert!(lines.iter().any(|line| line == "anthropic.apiKey (config)"));
-        assert!(lines.iter().any(|line| line == "anthropic.baseUrl (config)"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "anthropic.baseUrl (config)")
+        );
         assert!(!lines.join("\n").contains("file-secret"));
         assert!(!lines.join("\n").contains("url-secret"));
     }
@@ -1349,13 +1385,29 @@ mod tests {
         assert_eq!(parse_alias("anthropic"), Some(AliasProvider::Anthropic));
         assert_eq!(AliasProvider::Anthropic.as_str(), "anthropic");
         let config = tempfile::TempDir::new().unwrap();
-        std::fs::write(config.path().join("config.json"), r#"{"aliasProvider":"anthropic"}"#).unwrap();
-        let mut env = HashMap::from([("CCP_CONFIG_DIR".into(), config.path().to_string_lossy().into_owned())]);
-        assert_eq!(load_config_for_env(&env).alias_provider, AliasProvider::Anthropic);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"aliasProvider":"anthropic"}"#,
+        )
+        .unwrap();
+        let mut env = HashMap::from([(
+            "CCP_CONFIG_DIR".into(),
+            config.path().to_string_lossy().into_owned(),
+        )]);
+        assert_eq!(
+            load_config_for_env(&env).alias_provider,
+            AliasProvider::Anthropic
+        );
         env.insert("CCP_ALIAS_PROVIDER".into(), "codex".into());
-        assert_eq!(load_config_for_env(&env).alias_provider, AliasProvider::Codex);
+        assert_eq!(
+            load_config_for_env(&env).alias_provider,
+            AliasProvider::Codex
+        );
         env.insert("CCP_ALIAS_PROVIDER".into(), "anthropic".into());
-        assert_eq!(load_config_for_env(&env).alias_provider, AliasProvider::Anthropic);
+        assert_eq!(
+            load_config_for_env(&env).alias_provider,
+            AliasProvider::Anthropic
+        );
     }
 
     #[test]

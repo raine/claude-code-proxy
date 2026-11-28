@@ -20,9 +20,15 @@ pub fn stream_body(response: reqwest::Response, ctx: RequestContext) -> Body {
         bytes: 0,
         chunks: 0,
     };
-    Body::from_stream(futures_util::stream::unfold(state, |mut state| async move {
-        state.next().await.map(|bytes| (Ok::<Bytes, Infallible>(bytes), state))
-    }))
+    Body::from_stream(futures_util::stream::unfold(
+        state,
+        |mut state| async move {
+            state
+                .next()
+                .await
+                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), state))
+        },
+    ))
 }
 
 struct StreamState {
@@ -45,7 +51,9 @@ impl StreamState {
             Some(Err(_)) => return Some(self.fail("Anthropic upstream stream failed")),
             None => return Some(self.fail("Anthropic upstream stream ended before message_stop")),
         };
-        if self.bytes == 0 && let Some(monitor) = &self.ctx.monitor {
+        if self.bytes == 0
+            && let Some(monitor) = &self.ctx.monitor
+        {
             monitor.generation_started(&self.ctx.req_id);
         }
         self.bytes = self.bytes.saturating_add(chunk.len() as u64);
@@ -64,26 +72,44 @@ impl StreamState {
             };
             if let Some(capture) = &mut self.capture {
                 capture.upstream_event(event.event.as_deref(), &value);
-                capture.downstream_event(event.event.as_deref().unwrap_or("message"), value.clone());
+                capture
+                    .downstream_event(event.event.as_deref().unwrap_or("message"), value.clone());
             }
-            input_tokens = value.pointer("/message/usage/input_tokens")
+            input_tokens = value
+                .pointer("/message/usage/input_tokens")
                 .or_else(|| value.pointer("/usage/input_tokens"))
-                .and_then(serde_json::Value::as_u64).or(input_tokens);
-            output_tokens = value.pointer("/message/usage/output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .or(input_tokens);
+            output_tokens = value
+                .pointer("/message/usage/output_tokens")
                 .or_else(|| value.pointer("/usage/output_tokens"))
-                .and_then(serde_json::Value::as_u64).or(output_tokens);
+                .and_then(serde_json::Value::as_u64)
+                .or(output_tokens);
             match value.get("type").and_then(serde_json::Value::as_str) {
-                Some("message_stop") => { self.done = true; completed = true; }
+                Some("message_stop") => {
+                    self.done = true;
+                    completed = true;
+                }
                 // Forward native error events unchanged, including their error type.
                 Some("error") => self.done = true,
                 _ => {}
             }
         }
         if let Some(monitor) = &self.ctx.monitor {
-            monitor.stream_progress(&self.ctx.req_id, chunk.len() as u64, 1, input_tokens, output_tokens);
+            monitor.stream_progress(
+                &self.ctx.req_id,
+                chunk.len() as u64,
+                1,
+                input_tokens,
+                output_tokens,
+            );
         }
         if self.done {
-            self.finish(if completed { "stream_completion" } else { "stream_error" });
+            self.finish(if completed {
+                "stream_completion"
+            } else {
+                "stream_error"
+            });
         }
         // Observe SSE for accounting, but forward original bytes/signatures unchanged.
         Some(chunk)
@@ -101,9 +127,13 @@ impl StreamState {
 
     fn finish(&mut self, kind: &str) {
         if let (Some(capture), Some(traffic)) = (self.capture.take(), self.ctx.traffic.as_ref()) {
-            capture.finish_named(traffic, serde_json::json!({
-                "kind": kind, "bytes": self.bytes, "chunks": self.chunks
-            }), "061-anthropic-stream-summary");
+            capture.finish_named(
+                traffic,
+                serde_json::json!({
+                    "kind": kind, "bytes": self.bytes, "chunks": self.chunks
+                }),
+                "061-anthropic-stream-summary",
+            );
         }
     }
 }

@@ -138,7 +138,12 @@ fn main() -> Result<()> {
             println!("claude-code-proxy {}", VERSION);
             Ok(())
         }
-        Commands::Serve { port, no_monitor, codex_profile, anthropic_profile } => {
+        Commands::Serve {
+            port,
+            no_monitor,
+            codex_profile,
+            anthropic_profile,
+        } => {
             let mut overrides = std::collections::BTreeMap::new();
             if let Some(profile) = codex_profile {
                 overrides.insert("codex".to_owned(), profile);
@@ -341,7 +346,10 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     };
     let mut overrides = std::collections::BTreeMap::new();
     if let Some(profile) = profile {
-        anyhow::ensure!(matches!(name, "codex" | "anthropic"), "Profiles are supported only for codex and anthropic");
+        anyhow::ensure!(
+            matches!(name, "codex" | "anthropic"),
+            "Profiles are supported only for codex and anthropic"
+        );
         overrides.insert(name.to_owned(), profile);
     }
     account_profiles::initialize(overrides)?;
@@ -383,16 +391,25 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 }
 
 fn run_profile_cli(provider: &str, command: ProfileCommand) -> Result<()> {
-    anyhow::ensure!(matches!(provider, "codex" | "anthropic"), "Profiles are supported only for codex and anthropic");
+    anyhow::ensure!(
+        matches!(provider, "codex" | "anthropic"),
+        "Profiles are supported only for codex and anthropic"
+    );
     let store = ProfileStore::configured();
     match command {
         ProfileCommand::Add { name } => {
             let path = store.credential_path(provider, &name)?;
-            anyhow::ensure!(!path.exists(), "Profile '{name}' already exists; use auth login --profile {name} to reauthenticate");
-            run_provider_cli(provider, ProviderGroup::Auth {
-                profile: Some(name),
-                command: claude_code_proxy::provider::AuthCommand::Login,
-            })
+            anyhow::ensure!(
+                !path.exists(),
+                "Profile '{name}' already exists; use auth login --profile {name} to reauthenticate"
+            );
+            run_provider_cli(
+                provider,
+                ProviderGroup::Auth {
+                    profile: Some(name),
+                    command: claude_code_proxy::provider::AuthCommand::Login,
+                },
+            )
         }
         ProfileCommand::List => {
             let default = store.default_profile(provider)?;
@@ -401,18 +418,25 @@ fn run_profile_cli(provider: &str, command: ProfileCommand) -> Result<()> {
                 let marker = if name == default { " (default)" } else { "" };
                 println!("{name}{marker}");
             }
-            println!("Selection: --profile/serve flags > CCP_{}_PROFILE > saved default", provider.to_ascii_uppercase());
+            println!(
+                "Selection: --profile/serve flags > CCP_{}_PROFILE > saved default",
+                provider.to_ascii_uppercase()
+            );
             Ok(())
         }
         ProfileCommand::Use { name } => {
             store.use_profile(provider, &name)?;
-            println!("Default {provider} profile: {name}. Restart the proxy to apply; explicit flags/environment take precedence.");
+            println!(
+                "Default {provider} profile: {name}. Restart the proxy to apply; explicit flags/environment take precedence."
+            );
             Ok(())
         }
         ProfileCommand::Remove { name, yes } => {
             anyhow::ensure!(yes, "Credential deletion requires --yes");
             store.remove(provider, &name)?;
-            println!("Removed {provider} profile: {name}. Credentials cached by running proxies are not revoked; restart them and revoke access upstream if needed.");
+            println!(
+                "Removed {provider} profile: {name}. Credentials cached by running proxies are not revoked; restart them and revoke access upstream if needed."
+            );
             Ok(())
         }
     }

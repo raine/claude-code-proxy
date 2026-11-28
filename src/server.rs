@@ -1834,7 +1834,9 @@ async fn dispatch_request(
     };
 
     let response = if count_tokens {
-        provider.handle_count_tokens_with_request_headers(body, context, headers.clone()).await
+        provider
+            .handle_count_tokens_with_request_headers(body, context, headers.clone())
+            .await
     } else {
         provider
             .handle_messages_with_request_headers(

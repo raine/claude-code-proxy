@@ -52,25 +52,39 @@ pub struct DefaultCodexAuthStore {
 
 impl AuthStorage<StoredAuth> for DefaultCodexAuthStore {
     fn load(&self) -> anyhow::Result<Option<StoredAuth>> {
-        self.inner.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?.load()
+        self.inner
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .load()
     }
 
     fn save(&self, value: StoredAuth) -> anyhow::Result<()> {
-        self.inner.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?.save(value)
+        self.inner
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .save(value)
     }
 
     fn clear(&self) -> anyhow::Result<()> {
-        self.inner.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?.clear()
+        self.inner
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .clear()
     }
 
     fn path(&self) -> String {
-        self.inner.as_ref().map(|store| store.path()).unwrap_or_else(|_| "Invalid Codex profile".into())
+        self.inner
+            .as_ref()
+            .map(|store| store.path())
+            .unwrap_or_else(|_| "Invalid Codex profile".into())
     }
 }
 
 pub fn file_store() -> CodexTokenStore<DefaultCodexAuthStore> {
     let inner = crate::account_profiles::active_profile("codex")
-        .and_then(|name| profile_storage(&crate::account_profiles::ProfileStore::configured(), &name))
+        .and_then(|name| {
+            profile_storage(&crate::account_profiles::ProfileStore::configured(), &name)
+        })
         .map_err(|error| error.to_string());
     CodexTokenStore::new(DefaultCodexAuthStore { inner })
 }
@@ -81,10 +95,18 @@ fn profile_storage(
 ) -> anyhow::Result<KeychainFileAuthStore<StoredAuth, SystemKeychain>> {
     crate::account_profiles::validate_name(name)?;
     if name != crate::account_profiles::DEFAULT_PROFILE {
-        let path = profiles.credential_path("codex", name)?.to_string_lossy().into_owned();
+        let path = profiles
+            .credential_path("codex", name)?
+            .to_string_lossy()
+            .into_owned();
         // A named profile must never read, refresh, or clear default/legacy credentials.
         return Ok(KeychainFileAuthStore::new(
-            path.clone(), path, KEYCHAIN_SERVICE, format!("profile:{name}"), false, SystemKeychain,
+            path.clone(),
+            path,
+            KEYCHAIN_SERVICE,
+            format!("profile:{name}"),
+            false,
+            SystemKeychain,
         ));
     }
     let primary = paths::provider_auth_file("codex");
@@ -124,17 +146,25 @@ mod tests {
         let work = profile_storage(&profiles, "work").unwrap();
         let personal = profile_storage(&profiles, "personal").unwrap();
         let auth = StoredAuth {
-            access: "work-access".into(), refresh: "work-refresh".into(),
-            expires: 4102444800000, account_id: Some("work-account".into()),
+            access: "work-access".into(),
+            refresh: "work-refresh".into(),
+            expires: 4102444800000,
+            account_id: Some("work-account".into()),
         };
         work.save(auth.clone()).unwrap();
         assert!(personal.load().unwrap().is_none());
         let personal_auth = StoredAuth {
-            access: "personal-access".into(), refresh: "personal-refresh".into(),
-            account_id: Some("personal-account".into()), ..auth.clone()
+            access: "personal-access".into(),
+            refresh: "personal-refresh".into(),
+            account_id: Some("personal-account".into()),
+            ..auth.clone()
         };
         personal.save(personal_auth.clone()).unwrap();
-        let rotated = StoredAuth { access: "rotated".into(), refresh: "rotated-refresh".into(), ..auth };
+        let rotated = StoredAuth {
+            access: "rotated".into(),
+            refresh: "rotated-refresh".into(),
+            ..auth
+        };
         work.save(rotated.clone()).unwrap();
         assert_eq!(work.load().unwrap(), Some(rotated));
         assert_eq!(personal.load().unwrap(), Some(personal_auth.clone()));

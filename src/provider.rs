@@ -49,7 +49,8 @@ pub trait Provider: Send + Sync {
         conversation_identity: Option<ConversationIdentity>,
         _headers: http::HeaderMap,
     ) -> Response {
-        self.handle_messages_with_conversation_identity(body, ctx, conversation_identity).await
+        self.handle_messages_with_conversation_identity(body, ctx, conversation_identity)
+            .await
     }
 
     async fn handle_count_tokens_with_request_headers(

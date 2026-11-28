@@ -37,7 +37,8 @@ impl ProfileStore {
     fn read_defaults(&self) -> Result<Defaults> {
         match fs::read(self.defaults_path()) {
             Ok(raw) => {
-                let defaults: Defaults = serde_json::from_slice(&raw).context("Invalid account-profiles.json")?;
+                let defaults: Defaults =
+                    serde_json::from_slice(&raw).context("Invalid account-profiles.json")?;
                 for (provider, name) in &defaults.defaults {
                     validate_provider(provider)?;
                     validate_name(name)?;
@@ -52,7 +53,11 @@ impl ProfileStore {
     pub fn default_profile(&self, provider: &str) -> Result<String> {
         validate_provider(provider)?;
         let defaults = self.read_defaults()?;
-        let name = defaults.defaults.get(provider).map(String::as_str).unwrap_or(DEFAULT_PROFILE);
+        let name = defaults
+            .defaults
+            .get(provider)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_PROFILE);
         validate_name(name)?;
         Ok(name.to_owned())
     }
@@ -61,8 +66,15 @@ impl ProfileStore {
     pub fn credential_path(&self, provider: &str, name: &str) -> Result<PathBuf> {
         validate_provider(provider)?;
         validate_name(name)?;
-        ensure!(name != DEFAULT_PROFILE, "The default profile uses existing provider configuration");
-        Ok(self.root.join("accounts").join(provider).join(format!("{name}.json")))
+        ensure!(
+            name != DEFAULT_PROFILE,
+            "The default profile uses existing provider configuration"
+        );
+        Ok(self
+            .root
+            .join("accounts")
+            .join(provider)
+            .join(format!("{name}.json")))
     }
 
     pub fn list(&self, provider: &str) -> Result<Vec<String>> {
@@ -99,17 +111,24 @@ impl ProfileStore {
         validate_provider(provider)?;
         validate_name(name)?;
         if name != DEFAULT_PROFILE {
-            ensure!(self.credential_path(provider, name)?.is_file(), "Profile '{name}' does not exist; authenticate it first");
+            ensure!(
+                self.credential_path(provider, name)?.is_file(),
+                "Profile '{name}' does not exist; authenticate it first"
+            );
         }
         let mut defaults = self.read_defaults()?;
-        defaults.defaults.insert(provider.to_owned(), name.to_owned());
+        defaults
+            .defaults
+            .insert(provider.to_owned(), name.to_owned());
         crate::auth::write_atomically(&self.defaults_path().to_string_lossy(), &defaults)
     }
 
     pub fn remove(&self, provider: &str, name: &str) -> Result<()> {
         let path = self.credential_path(provider, name)?;
-        ensure!(self.default_profile(provider)? != name,
-            "Cannot remove the default profile; select another profile first");
+        ensure!(
+            self.default_profile(provider)? != name,
+            "Cannot remove the default profile; select another profile first"
+        );
         // Removal is explicit and targets only the named file; never delete legacy auth.
         fs::remove_file(path).context("Cannot remove account profile")
     }
@@ -117,8 +136,11 @@ impl ProfileStore {
 
 pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
-        !name.is_empty() && name.len() <= 64
-            && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')),
+        !name.is_empty()
+            && name.len() <= 64
+            && name.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_')),
         "Profile names must contain 1-64 lowercase ASCII letters, digits, '-' or '_'"
     );
     let reserved = matches!(name, "con" | "prn" | "aux" | "nul")
@@ -132,7 +154,10 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 fn validate_provider(provider: &str) -> Result<()> {
-    ensure!(PROVIDERS.contains(&provider), "Profiles are supported only for codex and anthropic");
+    ensure!(
+        PROVIDERS.contains(&provider),
+        "Profiles are supported only for codex and anthropic"
+    );
     Ok(())
 }
 
@@ -144,9 +169,16 @@ fn resolve_selection(
     let mut selected = BTreeMap::new();
     for provider in PROVIDERS {
         let env_name = format!("CCP_{}_PROFILE", provider.to_ascii_uppercase());
-        let name = overrides.get(provider).cloned()
-            .or_else(|| env.get(&env_name).filter(|value| !value.is_empty()).cloned())
-            .map(Ok).unwrap_or_else(|| store.default_profile(provider))?;
+        let name = overrides
+            .get(provider)
+            .cloned()
+            .or_else(|| {
+                env.get(&env_name)
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            })
+            .map(Ok)
+            .unwrap_or_else(|| store.default_profile(provider))?;
         validate_name(&name)?;
         selected.insert(provider.to_owned(), name);
     }
@@ -158,7 +190,9 @@ fn resolve_selection(
 pub fn initialize(overrides: BTreeMap<String, String>) -> Result<()> {
     let env = std::env::vars().collect();
     let selected = resolve_selection(&ProfileStore::configured(), &overrides, &env)?;
-    ACTIVE.set(Ok(selected)).map_err(|_| anyhow::anyhow!("Account profiles are already initialized"))
+    ACTIVE
+        .set(Ok(selected))
+        .map_err(|_| anyhow::anyhow!("Account profiles are already initialized"))
 }
 
 pub fn active_profile(provider: &str) -> Result<String> {
@@ -182,8 +216,13 @@ struct ApiKeyProfile {
 
 pub fn save_anthropic_key(store: &ProfileStore, name: &str, key: &str) -> Result<()> {
     let path = store.credential_path("anthropic", name)?;
-    ensure!(!key.trim().is_empty(), "Anthropic API key must not be empty");
-    let profile = ApiKeyProfile { api_key: key.trim().to_owned() };
+    ensure!(
+        !key.trim().is_empty(),
+        "Anthropic API key must not be empty"
+    );
+    let profile = ApiKeyProfile {
+        api_key: key.trim().to_owned(),
+    };
     crate::auth::write_atomically(&path.to_string_lossy(), &profile)
 }
 
@@ -197,7 +236,10 @@ fn load_key(path: &Path) -> Result<String> {
     // Do not include serde's error: malformed input can contain secret values.
     let profile: ApiKeyProfile = serde_json::from_slice(&raw)
         .map_err(|_| anyhow::anyhow!("Invalid Anthropic profile credentials"))?;
-    ensure!(!profile.api_key.trim().is_empty(), "Anthropic profile API key is empty");
+    ensure!(
+        !profile.api_key.trim().is_empty(),
+        "Anthropic profile API key is empty"
+    );
     Ok(profile.api_key.trim().to_owned())
 }
 
@@ -215,8 +257,10 @@ pub struct ProfileStatus {
 
 pub fn profile_statuses() -> Vec<ProfileStatus> {
     let store = ProfileStore::configured();
-    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-        .max(0).saturating_div(1_000_000) as u64;
+    let now = time::OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .max(0)
+        .saturating_div(1_000_000) as u64;
     collect_statuses(&store, now, |provider| active_profile(provider).ok())
 }
 
@@ -232,7 +276,10 @@ fn collect_statuses(
         let names = match store.list(provider) {
             Ok(mut names) => {
                 // Include selected/default profiles even if their credential file disappeared.
-                for name in [default.as_ref().ok(), selected.as_ref()].into_iter().flatten() {
+                for name in [default.as_ref().ok(), selected.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
                     if !names.contains(name) {
                         names.push(name.clone());
                     }
@@ -242,9 +289,12 @@ fn collect_statuses(
             }
             Err(_) => {
                 result.push(ProfileStatus {
-                    provider: provider.to_owned(), name: "(profiles)".to_owned(),
-                    selected: false, is_default: false,
-                    status: "Cannot read profile directory".to_owned(), expires_at_ms: None,
+                    provider: provider.to_owned(),
+                    name: "(profiles)".to_owned(),
+                    selected: false,
+                    is_default: false,
+                    status: "Cannot read profile directory".to_owned(),
+                    expires_at_ms: None,
                 });
                 continue;
             }
@@ -262,7 +312,9 @@ fn collect_statuses(
                 provider: provider.to_owned(),
                 selected: selected.as_ref() == Some(&name),
                 is_default: default.as_ref().ok() == Some(&name),
-                name, status, expires_at_ms,
+                name,
+                status,
+                expires_at_ms,
             });
         }
     }
@@ -276,12 +328,30 @@ fn anthropic_status(store: &ProfileStore, name: &str) -> (String, Option<u64>) {
         match load_anthropic_key(store, name) {
             Ok(_) => true,
             Err(_) => {
-                let exists = store.credential_path("anthropic", name).is_ok_and(|path| path.exists());
-                return (if exists { "Invalid/unreadable credentials" } else { "Not configured" }.to_owned(), None);
+                let exists = store
+                    .credential_path("anthropic", name)
+                    .is_ok_and(|path| path.exists());
+                return (
+                    if exists {
+                        "Invalid/unreadable credentials"
+                    } else {
+                        "Not configured"
+                    }
+                    .to_owned(),
+                    None,
+                );
             }
         }
     };
-    (if configured { "Configured (unverified)" } else { "Not configured" }.to_owned(), None)
+    (
+        if configured {
+            "Configured (unverified)"
+        } else {
+            "Not configured"
+        }
+        .to_owned(),
+        None,
+    )
 }
 
 fn codex_status(store: &ProfileStore, name: &str, now: u64) -> (String, Option<u64>) {
@@ -299,8 +369,19 @@ fn codex_status(store: &ProfileStore, name: &str, now: u64) -> (String, Option<u
             (status.to_owned(), Some(auth.expires))
         }
         Ok(None) => {
-            let exists = name != DEFAULT_PROFILE && store.credential_path("codex", name).is_ok_and(|path| path.exists());
-            (if exists { "Invalid/unreadable credentials" } else { "Not authenticated" }.to_owned(), None)
+            let exists = name != DEFAULT_PROFILE
+                && store
+                    .credential_path("codex", name)
+                    .is_ok_and(|path| path.exists());
+            (
+                if exists {
+                    "Invalid/unreadable credentials"
+                } else {
+                    "Not authenticated"
+                }
+                .to_owned(),
+                None,
+            )
         }
         Err(_) => ("Cannot read credentials".to_owned(), None),
     }
@@ -312,7 +393,22 @@ mod tests {
 
     #[test]
     fn profile_names_cannot_escape_or_collide_on_windows() {
-        for name in ["", "../work", "a/b", "a\\b", ".", "..", "Work", "work.json", "x:y", "é", "con", "nul", "com1", "lpt9"] {
+        for name in [
+            "",
+            "../work",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "Work",
+            "work.json",
+            "x:y",
+            "é",
+            "con",
+            "nul",
+            "com1",
+            "lpt9",
+        ] {
             assert!(validate_name(name).is_err(), "{name}");
         }
         assert!(validate_name(&"x".repeat(65)).is_err());
@@ -329,7 +425,10 @@ mod tests {
         save_anthropic_key(&store, "work", " work-secret ").unwrap();
         save_anthropic_key(&store, "personal", "personal-secret").unwrap();
         assert_eq!(load_anthropic_key(&store, "work").unwrap(), "work-secret");
-        assert_eq!(load_anthropic_key(&store, "personal").unwrap(), "personal-secret");
+        assert_eq!(
+            load_anthropic_key(&store, "personal").unwrap(),
+            "personal-secret"
+        );
         assert!(store.use_profile("anthropic", "missing").is_err());
         store.use_profile("anthropic", "work").unwrap();
         assert!(store.remove("anthropic", "work").is_err());
@@ -350,9 +449,18 @@ mod tests {
         store.use_profile("anthropic", "work").unwrap();
         let env = BTreeMap::from([("CCP_ANTHROPIC_PROFILE".into(), "personal".into())]);
         let overrides = BTreeMap::from([("anthropic".into(), "explicit".into())]);
-        assert_eq!(resolve_selection(&store, &BTreeMap::new(), &BTreeMap::new()).unwrap()["anthropic"], "work");
-        assert_eq!(resolve_selection(&store, &BTreeMap::new(), &env).unwrap()["anthropic"], "personal");
-        assert_eq!(resolve_selection(&store, &overrides, &env).unwrap()["anthropic"], "explicit");
+        assert_eq!(
+            resolve_selection(&store, &BTreeMap::new(), &BTreeMap::new()).unwrap()["anthropic"],
+            "work"
+        );
+        assert_eq!(
+            resolve_selection(&store, &BTreeMap::new(), &env).unwrap()["anthropic"],
+            "personal"
+        );
+        assert_eq!(
+            resolve_selection(&store, &overrides, &env).unwrap()["anthropic"],
+            "explicit"
+        );
         let bad = BTreeMap::from([("CCP_CODEX_PROFILE".into(), "../bad".into())]);
         assert!(resolve_selection(&store, &BTreeMap::new(), &bad).is_err());
     }
@@ -362,19 +470,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(dir.path().to_owned());
         save_anthropic_key(&store, "work", "never-show-api-key").unwrap();
-        assert_eq!(anthropic_status(&store, "work").0, "Configured (unverified)");
+        assert_eq!(
+            anthropic_status(&store, "work").0,
+            "Configured (unverified)"
+        );
         assert_eq!(anthropic_status(&store, "missing").0, "Not configured");
         let path = store.credential_path("codex", "work").unwrap();
-        crate::auth::write_atomically(&path.to_string_lossy(), &serde_json::json!({
-            "access": "never-show-access", "refresh": "never-show-refresh",
-            "expires": 1000, "accountId": "never-show-account-id"
-        })).unwrap();
+        crate::auth::write_atomically(
+            &path.to_string_lossy(),
+            &serde_json::json!({
+                "access": "never-show-access", "refresh": "never-show-refresh",
+                "expires": 1000, "accountId": "never-show-account-id"
+            }),
+        )
+        .unwrap();
         let (status, expires_at_ms) = codex_status(&store, "work", 2000);
         assert_eq!(status, "Expired (refresh available)");
         assert_eq!(expires_at_ms, Some(1000));
         let row = ProfileStatus {
-            provider: "codex".into(), name: "work".into(), selected: true,
-            is_default: false, status, expires_at_ms,
+            provider: "codex".into(),
+            name: "work".into(),
+            selected: true,
+            is_default: false,
+            status,
+            expires_at_ms,
         };
         let serialized = serde_json::to_string(&row).unwrap();
         assert!(!serialized.contains("never-show"));
@@ -388,7 +507,12 @@ mod tests {
     fn malformed_default_selection_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(dir.path().to_owned());
-        for raw in ["not json", r#"{"defauts":{"codex":"work"}}"#, r#"{"defaults":{"codxe":"work"}}"#, r#"{"defaults":{"codex":"../work"}}"#] {
+        for raw in [
+            "not json",
+            r#"{"defauts":{"codex":"work"}}"#,
+            r#"{"defaults":{"codxe":"work"}}"#,
+            r#"{"defaults":{"codex":"../work"}}"#,
+        ] {
             fs::write(store.defaults_path(), raw).unwrap();
             assert!(store.default_profile("codex").is_err());
         }

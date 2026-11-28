@@ -69,10 +69,12 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn anthropic_status_checks_configuration_without_showing_key() -> Result<(), Box<dyn std::error::Error>> {
+fn anthropic_status_checks_configuration_without_showing_key()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    let output = cmd.args(["anthropic", "auth", "status"])
+    let output = cmd
+        .args(["anthropic", "auth", "status"])
         .env("CCP_CONFIG_DIR", temp.path())
         .env("CCP_ANTHROPIC_API_KEY", "test-secret-key")
         .env_remove("ANTHROPIC_API_KEY")
@@ -86,7 +88,9 @@ fn anthropic_status_checks_configuration_without_showing_key() -> Result<(), Box
         .env("CCP_CONFIG_DIR", temp.path())
         .env_remove("CCP_ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")
-        .assert().code(1).stdout(contains("Not authenticated"));
+        .assert()
+        .code(1)
+        .stdout(contains("Not authenticated"));
     Ok(())
 }
 

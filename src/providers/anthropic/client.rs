@@ -47,7 +47,9 @@ impl AnthropicClient {
         for name in ["anthropic-version", "anthropic-beta"] {
             client.headers.remove(name);
             for value in headers.get_all(name).iter() {
-                client.headers.append(http::HeaderName::from_static(name), value.clone());
+                client
+                    .headers
+                    .append(http::HeaderName::from_static(name), value.clone());
             }
         }
         client
@@ -76,7 +78,11 @@ impl AnthropicClient {
             )
         })?;
         let stream = body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
-        let accept = if stream { "text/event-stream" } else { "application/json" };
+        let accept = if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         let url = self.endpoint_url(count_tokens);
         if let Some(traffic) = &ctx.traffic {
             traffic.write_json("020-upstream-request", body);
@@ -90,29 +96,44 @@ impl AnthropicClient {
         if let Some(monitor) = &ctx.monitor {
             monitor.upstream_started(&ctx.req_id);
         }
-        let response = self.client.post(url)
+        let response = self
+            .client
+            .post(url)
             .header("x-api-key", key)
             .header("anthropic-version", API_VERSION)
             .headers(self.headers.clone())
             .header("accept", accept)
             .json(body)
-            .send().await.map_err(|_| upstream_error("Anthropic upstream request failed"))?;
+            .send()
+            .await
+            .map_err(|_| upstream_error("Anthropic upstream request failed"))?;
         if let Some(traffic) = &ctx.traffic {
-            traffic.write_json("030-upstream-response-headers", &serde_json::json!({
-                "status": response.status().as_u16(),
-                "request_id": response.headers().get("request-id").and_then(|v| v.to_str().ok())
-            }));
+            traffic.write_json(
+                "030-upstream-response-headers",
+                &serde_json::json!({
+                    "status": response.status().as_u16(),
+                    "request_id": response.headers().get("request-id").and_then(|v| v.to_str().ok())
+                }),
+            );
         }
         if response.status().is_success() {
             return Ok(response);
         }
         let status = response.status();
-        let retry_after = response.headers().get("retry-after")
-            .and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         // Bound rejected bodies as well, and never include transport errors/URLs in errors.
         let bytes = read_bytes(response, 64 * 1024).await.unwrap_or_default();
-        let message = serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-            .and_then(|v| v.pointer("/error/message").and_then(|v| v.as_str()).map(str::to_owned))
+        let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| format!("Anthropic upstream returned HTTP {status}"));
         let kind = match status {
             StatusCode::UNAUTHORIZED => ProviderErrorKind::Authentication,
@@ -142,7 +163,9 @@ async fn read_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| upstream_error("Anthropic upstream body failed"))?;
         if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(upstream_error("Anthropic upstream response exceeds the size limit"));
+            return Err(upstream_error(
+                "Anthropic upstream response exceeds the size limit",
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -157,14 +180,24 @@ mod tests {
     fn endpoints_accept_root_or_v1_base() {
         for base in ["https://api.anthropic.com", "https://api.anthropic.com/v1/"] {
             let client = AnthropicClient::new(base.into(), None).unwrap();
-            assert_eq!(client.endpoint_url(false).as_str(), "https://api.anthropic.com/v1/messages");
-            assert_eq!(client.endpoint_url(true).as_str(), "https://api.anthropic.com/v1/messages/count_tokens");
+            assert_eq!(
+                client.endpoint_url(false).as_str(),
+                "https://api.anthropic.com/v1/messages"
+            );
+            assert_eq!(
+                client.endpoint_url(true).as_str(),
+                "https://api.anthropic.com/v1/messages/count_tokens"
+            );
         }
     }
 
     #[test]
     fn rejects_credentials_and_non_http_urls() {
-        for base in ["file:///tmp/api", "https://secret@example.com", "https://example.com?key=secret"] {
+        for base in [
+            "file:///tmp/api",
+            "https://secret@example.com",
+            "https://example.com?key=secret",
+        ] {
             assert!(AnthropicClient::new(base.into(), None).is_err());
         }
     }

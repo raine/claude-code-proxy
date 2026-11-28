@@ -380,16 +380,42 @@ mod tests {
             "anthropic/claude-future-model",
         ] {
             assert_eq!(
-                registry.provider_for_model(model, Some(&AliasProvider::Kimi)).unwrap().name(),
+                registry
+                    .provider_for_model(model, Some(&AliasProvider::Kimi))
+                    .unwrap()
+                    .name(),
                 "anthropic"
             );
         }
-        assert_eq!(registry.provider_for_model("claude-opus-5-5", None).unwrap().name(), "codex");
-        assert!(registry.provider_for_model("anthropic/gpt-6-sol", None).is_none());
+        assert_eq!(
+            registry
+                .provider_for_model("claude-opus-5-5", None)
+                .unwrap()
+                .name(),
+            "codex"
+        );
+        assert!(
+            registry
+                .provider_for_model("anthropic/gpt-6-sol", None)
+                .is_none()
+        );
         let registry = Registry::new(AliasProvider::Anthropic);
-        assert_eq!(registry.provider_for_model("opus", None).unwrap().name(), "anthropic");
-        assert_eq!(registry.provider_for_model("claude-opus-5-5", None).unwrap().name(), "anthropic");
-        assert!(registry.supported_models_for("anthropic").contains(&"anthropic/claude-opus-5-5".to_string()));
+        assert_eq!(
+            registry.provider_for_model("opus", None).unwrap().name(),
+            "anthropic"
+        );
+        assert_eq!(
+            registry
+                .provider_for_model("claude-opus-5-5", None)
+                .unwrap()
+                .name(),
+            "anthropic"
+        );
+        assert!(
+            registry
+                .supported_models_for("anthropic")
+                .contains(&"anthropic/claude-opus-5-5".to_string())
+        );
     }
 
     #[test]
