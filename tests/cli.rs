@@ -89,14 +89,16 @@ fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::erro
 
 #[test]
 fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["kimi", "auth", "logout"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
-    // Logout clears the legacy path as well as the primary credential path.
-    cmd.env("HOME", temp.path());
-    cmd.env("USERPROFILE", temp.path());
-    cmd.assert().success();
+    for provider in ["kimi", "cursor"] {
+        let temp = TempDir::new()?;
+        let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+        cmd.args([provider, "auth", "logout"]);
+        cmd.env("CCP_CONFIG_DIR", temp.path());
+        // Logout clears the legacy path as well as the primary credential path.
+        cmd.env("HOME", temp.path());
+        cmd.env("USERPROFILE", temp.path());
+        cmd.assert().success();
+    }
     Ok(())
 }
 

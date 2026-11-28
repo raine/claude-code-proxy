@@ -292,6 +292,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CURSOR_CLIENT_VERSION") {
         out.push("cursor.clientVersion (env)".to_string());
     }
+    if env.contains_key("CCP_CURSOR_CONTINUATION") {
+        out.push("cursor.continuation (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_USER_AGENT") {
         out.push("kimi.userAgent (env)".to_string());
     }
@@ -1069,6 +1072,19 @@ fn detect_cursor_agent_version() -> Option<String> {
     } else {
         format!("cli-{version}")
     })
+}
+
+/// Whether a Cursor run continues the stored conversation of its Claude Code
+/// session instead of resending the whole transcript. On unless
+/// `CCP_CURSOR_CONTINUATION` turns it off.
+pub fn cursor_continuation() -> bool {
+    match std::env::var("CCP_CURSOR_CONTINUATION") {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {

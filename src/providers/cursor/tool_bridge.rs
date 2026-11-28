@@ -17,6 +17,7 @@ use once_cell::sync::Lazy;
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::client::{LiveEvent, LiveRun};
+use crate::providers::cursor::continuation::Segment;
 use crate::providers::cursor::proto;
 use crate::providers::cursor::sse::{CursorSseFramer, format_sse_error};
 use crate::providers::cursor::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
@@ -83,6 +84,11 @@ pub struct LiveBridge {
     pub allowed: Option<BTreeSet<String>>,
     /// Estimated size of the request that opened or resumed the run.
     pub input_floor: u64,
+    /// The transcript the run has seen, when its conversation is kept for the
+    /// next request.
+    pub segment: Option<Segment>,
+    /// Whether the run continued a stored conversation.
+    pub continued: bool,
     last_activity: Instant,
 }
 
@@ -94,6 +100,8 @@ impl LiveBridge {
             pending: None,
             allowed,
             input_floor: 0,
+            segment: None,
+            continued: false,
             last_activity: Instant::now(),
         }
     }
@@ -343,12 +351,19 @@ pub async fn pump_live_bridge(
                     }
                     if let Some(text) = update.text_delta.as_ref()
                         && !text.text.is_empty()
-                        && pump_text(&text.text, &mut xml, &mut framer)
+                        && let Some(trailing) = pump_text(&text.text, &mut xml, &mut framer)
                     {
+                        // Claude Code only sees the first call. Anything the
+                        // agent wrote after it stays in Cursor's turn, so that
+                        // conversation no longer matches the transcript.
+                        if trailing {
+                            bridge.segment = None;
+                        }
                         sink(&framer.take_output());
                         return PumpOutcome::Replay;
                     }
                     if let Some(usage) = update.turn_ended.as_ref() {
+                        log_turn_usage(usage, bridge.continued);
                         framer.record_usage(
                             usage.input_tokens,
                             usage.output_tokens,
@@ -376,27 +391,91 @@ pub async fn pump_live_bridge(
     }
 }
 
+/// Read a run to the end of its turn after the pump stopped on a tool call
+/// recovered from the text channel, so the server records the reply that holds
+/// it and sends its final checkpoint.
+///
+/// Returns `false` when the turn cannot end without Claude Code (the agent
+/// asked for a tool), writes text Claude Code never receives, fails, or
+/// outlasts `limit`.
+pub async fn drain_to_turn_end(bridge: &mut LiveBridge, limit: Duration) -> bool {
+    let drain = async {
+        while let Some(event) = bridge.run.events.recv().await {
+            match event {
+                LiveEvent::Message(message) => {
+                    if let Some(update) = message.interaction_update.as_ref() {
+                        if update
+                            .text_delta
+                            .as_ref()
+                            .is_some_and(|text| !text.text.trim().is_empty())
+                        {
+                            return false;
+                        }
+                        if let Some(usage) = update.turn_ended.as_ref() {
+                            log_turn_usage(usage, bridge.continued);
+                        }
+                    }
+                    let Some(exec) = message.exec_server_message.as_ref() else {
+                        continue;
+                    };
+                    match exec_action(exec, bridge.allowed.as_ref()) {
+                        ExecAction::Call { .. } => return false,
+                        ExecAction::Answer(reply) => {
+                            if !answer(exec, reply, &bridge.run).await {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                LiveEvent::End => return true,
+                LiveEvent::Error(_) => return false,
+            }
+        }
+        // The reader only stops without an event when the run is gone.
+        false
+    };
+    tokio::time::timeout(limit, drain).await.unwrap_or(false)
+}
+
+/// One line per run: the upstream's own token counts, which Claude Code's
+/// counters do not show, next to whether the run continued a conversation.
+fn log_turn_usage(usage: &proto::TurnEnded, continued: bool) {
+    let mut fields = serde_json::Map::new();
+    fields.insert("continued".into(), continued.into());
+    fields.insert("inputTokens".into(), usage.input_tokens.into());
+    fields.insert("outputTokens".into(), usage.output_tokens.into());
+    fields.insert("cacheReadTokens".into(), usage.cache_read_tokens.into());
+    fields.insert("cacheWriteTokens".into(), usage.cache_write_tokens.into());
+    crate::logging::create_logger("cursor").info("cursor_turn_usage", Some(fields));
+}
+
 /// Feed one text delta through the XML recovery parser.
 ///
-/// Returns `true` when a `<tool_use>` was recovered: the text channel cannot
-/// answer it, so the pump stops there.
+/// Returns `Some` when a `<tool_use>` was recovered: the text channel cannot
+/// answer it, so the pump stops there. The flag tells whether the delta held
+/// more than whitespace after the call, which the client never receives.
 fn pump_text(
     text: &str,
     xml: &mut CursorToolUseXmlParser,
     framer: &mut CursorSseFramer<'_>,
-) -> bool {
-    for event in xml.push(text) {
+) -> Option<bool> {
+    let mut events = xml.push(text).into_iter();
+    while let Some(event) = events.next() {
         match event {
             RecoveredCursorEvent::Text(text) => framer.emit_text_delta(&text),
             RecoveredCursorEvent::ToolUse(tool_use) => {
                 let input_json =
                     serde_json::to_string(&tool_use.input).unwrap_or_else(|_| "{}".to_string());
                 framer.emit_tool_pause(&tool_use.id, &tool_use.name, &input_json);
-                return true;
+                let trailing = events.chain(xml.flush()).any(|event| match event {
+                    RecoveredCursorEvent::Text(text) => !text.trim().is_empty(),
+                    RecoveredCursorEvent::ToolUse(_) => true,
+                });
+                return Some(trailing);
             }
         }
     }
-    false
+    None
 }
 
 fn flush_xml(
