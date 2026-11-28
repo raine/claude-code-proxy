@@ -4246,7 +4246,9 @@ mod tests {
         assert!(error.message.contains("keepalive error"));
     }
 
-    #[tokio::test]
+    // The duplex transport needs no OS I/O, so virtual time makes the ping count
+    // independent of Windows timer granularity and CI scheduler delays.
+    #[tokio::test(start_paused = true)]
     async fn keepalive_pongs_do_not_extend_response_start_timeout() {
         let (client_io, server_io) = tokio::io::duplex(1024);
         let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
