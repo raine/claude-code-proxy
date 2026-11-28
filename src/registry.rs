@@ -16,9 +16,11 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "haiku",
     "claude-haiku-4-5",
     "claude-haiku-4-5-20251001",
+    "claude-haiku-5-5",
     "sonnet",
     "claude-sonnet-4-6",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "opus",
     "claude-opus-4-7",
     "claude-opus-4-8",
@@ -26,6 +28,7 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-opus-5-5",
     "fable",
     "claude-fable-5",
+    "claude-fable-5-1",
 ];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
@@ -57,6 +60,10 @@ impl Registry {
         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
         models.insert("codex".into(), expand_codex_models());
         models.insert(
+            "anthropic".into(),
+            crate::providers::anthropic::advertised_models(),
+        );
+        models.insert(
             "kimi".into(),
             KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
         );
@@ -76,6 +83,7 @@ impl Registry {
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
+                "anthropic" => Arc::new(crate::providers::anthropic::AnthropicProvider::new()),
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
@@ -168,6 +176,10 @@ impl Registry {
         session_affinity: Option<&AliasProvider>,
     ) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
+        // An explicit namespace must never follow session affinity or legacy aliases.
+        if normalized.starts_with("anthropic/claude-") {
+            return self.handlers.get("anthropic").cloned();
+        }
         if is_anthropic_alias(&normalized) {
             let target = session_affinity.unwrap_or(&self.alias_provider);
             return self.handlers.get(target.as_str()).cloned();
@@ -358,6 +370,27 @@ fn build_cursor_models() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_anthropic_routes_ignore_alias_provider_and_session_affinity() {
+        let registry = Registry::new(AliasProvider::Codex);
+        for model in [
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-opus-5-5[1m]",
+            "anthropic/claude-future-model",
+        ] {
+            assert_eq!(
+                registry.provider_for_model(model, Some(&AliasProvider::Kimi)).unwrap().name(),
+                "anthropic"
+            );
+        }
+        assert_eq!(registry.provider_for_model("claude-opus-5-5", None).unwrap().name(), "codex");
+        assert!(registry.provider_for_model("anthropic/gpt-6-sol", None).is_none());
+        let registry = Registry::new(AliasProvider::Anthropic);
+        assert_eq!(registry.provider_for_model("opus", None).unwrap().name(), "anthropic");
+        assert_eq!(registry.provider_for_model("claude-opus-5-5", None).unwrap().name(), "anthropic");
+        assert!(registry.supported_models_for("anthropic").contains(&"anthropic/claude-opus-5-5".to_string()));
+    }
 
     #[test]
     fn normalize_model_trims_hint() {

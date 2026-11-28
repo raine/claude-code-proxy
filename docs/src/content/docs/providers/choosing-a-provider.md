@@ -7,6 +7,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 
 | Provider | Account | Upstream protocol | Model selection | Notable capabilities |
 | --- | --- | --- | --- | --- |
+| [Anthropic Claude](/providers/anthropic/) | Anthropic API key (separate API billing) | Native Anthropic Messages | `anthropic/<claude-model-id>` | Native tool/thinking blocks, live SSE, upstream token counting |
 | [Codex](/providers/codex/) | ChatGPT Plus or Pro | OpenAI Responses over WebSocket or HTTP SSE | Named Codex catalog, `-fast` and `-ultrafast` variants | Function tools, image input, hosted web search, reasoning summaries, optional native Responses route |
 | [Kimi](/providers/kimi/) | kimi.com with Kimi Code access | OpenAI-style chat completions | `kimi-for-coding` and aliases | Function tools, reasoning, image and video input |
 | [Grok](/providers/grok/) | grok.com | Responses API | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6` | Function tools, reasoning, web search, X search, citations |
@@ -15,6 +16,7 @@ One `serve` process supports every provider. Choose based on the account you hav
 
 ## Practical guidance
 
+- Choose **Anthropic Claude** for direct Claude API access with an API key and separate API billing.
 - Start with **Codex** when you have a ChatGPT subscription and want the most developed Claude Code translation path.
 - Choose **Kimi** for the Kimi Code model and multimodal coding input.
 - Choose **Grok** for Grok models and hosted web or X search.

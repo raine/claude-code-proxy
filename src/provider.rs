@@ -42,6 +42,25 @@ pub trait Provider: Send + Sync {
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
+    async fn handle_messages_with_request_headers(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+        _headers: http::HeaderMap,
+    ) -> Response {
+        self.handle_messages_with_conversation_identity(body, ctx, conversation_identity).await
+    }
+
+    async fn handle_count_tokens_with_request_headers(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        _headers: http::HeaderMap,
+    ) -> Response {
+        self.handle_count_tokens(body, ctx).await
+    }
+
     async fn generate_anthropic_stream(
         &self,
         _body: MessagesRequest,

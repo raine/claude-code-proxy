@@ -1,6 +1,6 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode Go**,
+Claude Code, powered by **Anthropic Claude**, **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode Go**,
 or **Cursor Agent**.
 
 Docs: <https://claude-code-proxy.raine.dev>
@@ -96,11 +96,21 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
+| Anthropic    | Anthropic API key (separate API billing) | `anthropic/<claude-model-id>`          |
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models, `-fast`/`-ultrafast` |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |
 | OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
 | Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
+
+### Anthropic Claude
+
+Set `CCP_ANTHROPIC_API_KEY` (or `ANTHROPIC_API_KEY`) in the **proxy process**, then
+start `claude-code-proxy serve`. Select `anthropic/claude-opus-5-5` in the client.
+The explicit `anthropic/` namespace avoids existing Claude-to-Codex/Kimi aliases.
+Set `CCP_ALIAS_PROVIDER=anthropic` on the proxy if those aliases should use Claude too.
+Claude Pro/Max subscriptions do not include API billing. See
+[Anthropic setup](https://claude-code-proxy.raine.dev/providers/anthropic/).
 
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.

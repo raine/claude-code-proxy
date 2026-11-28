@@ -1824,10 +1824,10 @@ async fn dispatch_request(
     };
 
     let response = if count_tokens {
-        provider.handle_count_tokens(body, context).await
+        provider.handle_count_tokens_with_request_headers(body, context, headers.clone()).await
     } else {
         provider
-            .handle_messages_with_conversation_identity(
+            .handle_messages_with_request_headers(
                 body,
                 context,
                 if auto_review_route.is_some() {
@@ -1835,6 +1835,7 @@ async fn dispatch_request(
                 } else {
                     conversation_identity
                 },
+                headers.clone(),
             )
             .await
     };

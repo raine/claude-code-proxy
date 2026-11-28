@@ -31,6 +31,8 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
+    assert!(out.contains("anthropic:"));
+    assert!(out.contains("anthropic/claude-opus-5-5"));
     assert!(out.contains("codex:"));
     assert!(out.contains("kimi:"));
     assert!(out.contains("opencode:"));
@@ -63,6 +65,28 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
     }
     assert!(!stdout.contains("demo"));
     assert!(!stdout.contains("mock data and no proxy server"));
+    Ok(())
+}
+
+#[test]
+fn anthropic_status_checks_configuration_without_showing_key() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let output = cmd.args(["anthropic", "auth", "status"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_ANTHROPIC_API_KEY", "test-secret-key")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("configured"));
+    assert!(!stdout.contains("test-secret-key"));
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["anthropic", "auth", "status"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env_remove("CCP_ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .assert().code(1).stdout(contains("Not authenticated"));
     Ok(())
 }
 

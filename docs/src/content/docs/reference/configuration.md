@@ -67,7 +67,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_BIND_ADDRESS` | `bindAddress` | `127.0.0.1` | Listener IP address. |
 | `PORT` | `port` | `18765` | Listener port. |
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
-| `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |
+| `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex`, `kimi`, or `anthropic`. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
 | `CCP_AUTO_REVIEW_EFFORT` | `autoReviewEffort` | — | Sets the Auto Mode classifier's reasoning effort to `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
@@ -77,7 +77,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
-Auto-review routing resolves the classifier's requested model first, not the main conversation's model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`; Grok and other providers do not establish alias affinity. Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
+Auto-review routing resolves the classifier's requested model first, not the main conversation's model. Recognized Claude aliases follow Codex/Kimi/Anthropic session affinity or `aliasProvider`; Grok and other providers do not establish alias affinity. Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
 
 Classifier effort is independent of model selection. A valid `CCP_AUTO_REVIEW_EFFORT` takes precedence over `autoReviewEffort` in the config file. Either overrides the classifier's `output_config.effort` and, on Codex, the global `CCP_CODEX_EFFORT` or `codex.effort`. Empty or invalid values are ignored. If neither setting is valid, normal effort selection applies. Supported levels depend on the provider and model; Cursor, for example, selects effort through its model variant.
 
@@ -102,6 +102,15 @@ On case-sensitive platforms, uppercase names are checked before lowercase names 
 After setting both variables through the operating system, service manager, or shell, start `claude-code-proxy serve` in the same environment.
 
 Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`. HTTP proxy URLs can contain percent-encoded Basic credentials, for example `http://user:password@127.0.0.1:7890`; SOCKS5 and SOCKS5H URLs can contain username/password credentials for the SOCKS handshake. SOCKS4 and SOCKS4A are supported without URL credentials. Prefer a secret-management mechanism when available because environment variables may be visible to other local processes. WSS certificate verification uses both bundled public roots and the platform native root store, including locally installed enterprise proxy CAs. Malformed or unsupported proxy URLs fail provider startup rather than being ignored. Proxy failures do not silently retry with a direct connection; only `NO_PROXY` selects direct routing. OS proxy settings, PAC files, and WPAD are not read automatically.
+
+## Anthropic Claude
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY` | `anthropic.apiKey` | unset | API key; proxy-specific environment variable takes precedence, then standard environment variable, then config. Blank values are ignored. |
+| `CCP_ANTHROPIC_BASE_URL` | `anthropic.baseUrl` | `https://api.anthropic.com` | Trusted upstream API root (optionally ending in `/v1`). Never reads the downstream `ANTHROPIC_BASE_URL`. |
+
+Use `anthropic/claude-opus-5-5` for explicit first-party routing. Set `CCP_ALIAS_PROVIDER=anthropic` to route recognized Claude aliases too. API charges are separate from Pro/Max subscriptions. See [Anthropic Claude](/providers/anthropic/).
 
 ## Codex
 

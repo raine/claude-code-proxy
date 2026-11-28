@@ -51,6 +51,11 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Configure Anthropic API-key authentication
+    Anthropic {
+        #[command(subcommand)]
+        command: ProviderGroup,
+    },
     /// Manage Codex authentication
     Codex {
         #[command(subcommand)]
@@ -186,6 +191,7 @@ fn main() -> Result<()> {
             print_models(&Registry::with_default_alias(), full);
             Ok(())
         }
+        Commands::Anthropic { command } => run_provider_cli("anthropic", command),
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
@@ -328,7 +334,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["anthropic", "codex", "kimi", "grok", "opencode", "cursor"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };

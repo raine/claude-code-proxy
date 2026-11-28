@@ -9,6 +9,7 @@ use crate::paths;
 pub enum AliasProvider {
     Codex,
     Kimi,
+    Anthropic,
 }
 
 impl AliasProvider {
@@ -16,6 +17,7 @@ impl AliasProvider {
         match self {
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
+            AliasProvider::Anthropic => "anthropic",
         }
     }
 }
@@ -47,6 +49,7 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub anthropic: Option<AnthropicConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -122,6 +125,14 @@ struct OpenCodeConfig {
     pub base_url: Option<String>,
 }
 
+#[derive(Deserialize, Clone)]
+struct AnthropicConfig {
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct FileLog {
     pub verbose: Option<bool>,
@@ -132,6 +143,7 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
+        "anthropic" => Some(AliasProvider::Anthropic),
         _ => None,
     }
 }
@@ -301,6 +313,14 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_GROK_CLIENT_VERSION") {
         out.push("grok.clientVersion (env)".to_string());
     }
+    if env.get("CCP_ANTHROPIC_API_KEY").is_some_and(|raw| !raw.trim().is_empty()) {
+        out.push("anthropic.apiKey (env)".to_string());
+    } else if env.get("ANTHROPIC_API_KEY").is_some_and(|raw| !raw.trim().is_empty()) {
+        out.push("anthropic.apiKey (Anthropic env)".to_string());
+    }
+    if env.get("CCP_ANTHROPIC_BASE_URL").is_some_and(|raw| !raw.trim().is_empty()) {
+        out.push("anthropic.baseUrl (env)".to_string());
+    }
     if env.contains_key("CCP_OPENCODE_API_KEY") {
         out.push("opencode.apiKey (env)".to_string());
     } else if env.contains_key("OPENCODE_API_KEY") {
@@ -363,6 +383,14 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(v) = log.stderr {
                 out.push(format!("log.stderr: {v}"));
+            }
+        }
+        if let Some(anthropic) = file_cfg.anthropic {
+            if anthropic.api_key.is_some_and(|raw| !raw.trim().is_empty()) {
+                out.push("anthropic.apiKey (config)".to_string());
+            }
+            if anthropic.base_url.is_some_and(|raw| !raw.trim().is_empty()) {
+                out.push("anthropic.baseUrl (config)".to_string());
             }
         }
         if let Some(opencode) = file_cfg.opencode {
@@ -542,6 +570,74 @@ pub fn parse_grok_search_blocks(raw: Option<&str>) -> GrokSearchBlocks {
 
 pub fn grok_search_blocks() -> GrokSearchBlocks {
     parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
+}
+
+struct ResolvedAnthropicConfig {
+    api_key: Option<String>,
+    api_key_source: Option<&'static str>,
+    base_url: String,
+}
+
+impl ResolvedAnthropicConfig {
+    fn summary(&self) -> String {
+        match self.api_key_source {
+            Some(source) => format!("API key configured ({source})"),
+            None => "API key not configured".to_string(),
+        }
+    }
+}
+
+fn resolve_anthropic_config(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> ResolvedAnthropicConfig {
+    let file = read_file_config(config_dir).and_then(|file| file.anthropic);
+    let nonempty = |value: &String| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
+    let (api_key, api_key_source) = ["CCP_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"]
+        .into_iter()
+        .find_map(|name| env.get(name).and_then(nonempty).map(|key| (Some(key), Some(name))))
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|config| config.api_key.as_ref())
+                .and_then(nonempty)
+                .map(|key| (Some(key), Some("config.json")))
+        })
+        .unwrap_or((None, None));
+    // ANTHROPIC_BASE_URL belongs to the downstream client and may point at this proxy.
+    let base_url = env
+        .get("CCP_ANTHROPIC_BASE_URL")
+        .and_then(nonempty)
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|config| config.base_url.as_ref())
+                .and_then(nonempty)
+        })
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+
+    ResolvedAnthropicConfig {
+        api_key,
+        api_key_source,
+        base_url,
+    }
+}
+
+pub fn anthropic_api_key() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_anthropic_config(&env, &paths::config_dir()).api_key
+}
+
+pub fn anthropic_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_anthropic_config(&env, &paths::config_dir()).base_url
+}
+
+/// Describes credential availability without exposing the key or endpoint credentials.
+pub fn anthropic_config_summary() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_anthropic_config(&env, &paths::config_dir()).summary()
 }
 
 struct ResolvedOpenCodeConfig {
@@ -1147,6 +1243,98 @@ mod tests {
 
         let _version = EnvGuard::set("CCP_GROK_CLIENT_VERSION", "1.0.15");
         assert_eq!(grok_client_version(), "1.0.15");
+    }
+
+    #[test]
+    fn anthropic_config_precedence_trimming_and_redaction() {
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"anthropic":{"apiKey":" file-secret ","baseUrl":"https://user:url-secret@example.com"}}"#,
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        let resolved = resolve_anthropic_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("file-secret"));
+        assert_eq!(resolved.api_key_source, Some("config.json"));
+        assert_eq!(resolved.base_url, "https://user:url-secret@example.com");
+        assert_eq!(resolved.summary(), "API key configured (config.json)");
+        assert!(!resolved.summary().contains("file-secret"));
+        assert!(!resolved.summary().contains("url-secret"));
+
+        env.insert("ANTHROPIC_API_KEY".into(), " standard-secret ".into());
+        env.insert("ANTHROPIC_BASE_URL".into(), "http://proxy.invalid".into());
+        let resolved = resolve_anthropic_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("standard-secret"));
+        assert_eq!(resolved.api_key_source, Some("ANTHROPIC_API_KEY"));
+        assert_eq!(resolved.base_url, "https://user:url-secret@example.com");
+
+        env.insert("CCP_ANTHROPIC_API_KEY".into(), " ccp-secret ".into());
+        env.insert("CCP_ANTHROPIC_BASE_URL".into(), " https://upstream.example ".into());
+        let resolved = resolve_anthropic_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("ccp-secret"));
+        assert_eq!(resolved.api_key_source, Some("CCP_ANTHROPIC_API_KEY"));
+        assert_eq!(resolved.base_url, "https://upstream.example");
+        assert!(!resolved.summary().contains("ccp-secret"));
+
+        env.insert("CCP_ANTHROPIC_API_KEY".into(), " \t ".into());
+        assert_eq!(resolve_anthropic_config(&env, config.path()).api_key.as_deref(), Some("standard-secret"));
+        env.insert("ANTHROPIC_API_KEY".into(), "".into());
+        env.insert("CCP_ANTHROPIC_BASE_URL".into(), " ".into());
+        let resolved = resolve_anthropic_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("file-secret"));
+        assert_eq!(resolved.base_url, "https://user:url-secret@example.com");
+    }
+
+    #[test]
+    fn anthropic_override_summary_redacts_config_secrets() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"anthropic":{"apiKey":"file-secret","baseUrl":"https://user:url-secret@example.com"}}"#,
+        )
+        .unwrap();
+        let _env = isolated_env(&config);
+        let cfg = load_config_for_env(&config_env(&config));
+        let lines = config_override_summary_lines(&cfg);
+        assert!(lines.iter().any(|line| line == "anthropic.apiKey (config)"));
+        assert!(lines.iter().any(|line| line == "anthropic.baseUrl (config)"));
+        assert!(!lines.join("\n").contains("file-secret"));
+        assert!(!lines.join("\n").contains("url-secret"));
+    }
+
+    #[test]
+    fn anthropic_config_defaults_ignore_downstream_base_url() {
+        let config = tempfile::TempDir::new().unwrap();
+        let env = HashMap::from([("ANTHROPIC_BASE_URL".into(), "http://proxy.invalid".into())]);
+        let resolved = resolve_anthropic_config(&env, config.path());
+        assert!(resolved.api_key.is_none());
+        assert_eq!(resolved.base_url, "https://api.anthropic.com");
+        assert_eq!(resolved.summary(), "API key not configured");
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"anthropic":{"apiKey":" \t ","baseUrl":" "}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_anthropic_config(&env, config.path());
+        assert!(resolved.api_key.is_none());
+        assert_eq!(resolved.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn anthropic_alias_parses_from_config_and_env() {
+        assert_eq!(parse_alias("anthropic"), Some(AliasProvider::Anthropic));
+        assert_eq!(AliasProvider::Anthropic.as_str(), "anthropic");
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(config.path().join("config.json"), r#"{"aliasProvider":"anthropic"}"#).unwrap();
+        let mut env = HashMap::from([("CCP_CONFIG_DIR".into(), config.path().to_string_lossy().into_owned())]);
+        assert_eq!(load_config_for_env(&env).alias_provider, AliasProvider::Anthropic);
+        env.insert("CCP_ALIAS_PROVIDER".into(), "codex".into());
+        assert_eq!(load_config_for_env(&env).alias_provider, AliasProvider::Codex);
+        env.insert("CCP_ALIAS_PROVIDER".into(), "anthropic".into());
+        assert_eq!(load_config_for_env(&env).alias_provider, AliasProvider::Anthropic);
     }
 
     #[test]

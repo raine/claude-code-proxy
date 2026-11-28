@@ -9,6 +9,7 @@ The model ID in each request selects its provider. One proxy listener can serve 
 
 | Pattern | Provider |
 | --- | --- |
+| `anthropic/claude-<model-id>` | Anthropic Claude API |
 | Registered `gpt-*` IDs and their `-fast` and `-ultrafast` forms | Codex |
 | `kimi-for-coding`, `kimi-k2.6`, `k2.6` | Kimi |
 | `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6` | Grok |
@@ -85,4 +86,4 @@ ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
 
 ## Alias routing
 
-`CCP_ALIAS_PROVIDER=kimi` or `"aliasProvider": "kimi"` routes recognized Anthropic-style aliases to Kimi. Accepted values are `codex` and `kimi`. Explicit provider IDs always use their provider.
+`CCP_ALIAS_PROVIDER=kimi` or `"aliasProvider": "kimi"` routes recognized Anthropic-style aliases to Kimi. Accepted values are `codex`, `kimi`, and `anthropic`. Explicit provider IDs always use their provider. For first-party Claude, prefer `anthropic/claude-opus-5-5`: the namespace bypasses alias/session routing. Bare recognized `claude-*` IDs retain their existing alias behavior.
