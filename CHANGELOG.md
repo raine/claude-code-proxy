@@ -3,6 +3,23 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.50 (2026-11-28)
+
+- Cursor conversations now continue across Claude Code turns, so Cursor's
+  prompt cache reuses earlier turns instead of writing the whole context again
+  on every request. Set `CCP_CURSOR_CONTINUATION=off` to send the full
+  transcript each time.
+  ([#219](https://github.com/raine/claude-code-proxy/pull/219))
+- Claude Code background requests on Codex, such as prompt suggestions, `/btw`
+  side questions, away summaries and session renames, no longer take over the
+  main conversation, so the next turn keeps its continuation instead of
+  resending the full history or failing.
+  ([#216](https://github.com/raine/claude-code-proxy/pull/216))
+- Codex turns that end without output after a tool call no longer stall for
+  minutes and fail with a 503 when Claude Code adds token-usage reminders after
+  the tool result.
+  ([#218](https://github.com/raine/claude-code-proxy/pull/218))
+
 ## v0.1.49 (2026-11-21)
 
 - Codex users can select `gpt-6.2-astra` and `gpt-6.2-sol`, including their
