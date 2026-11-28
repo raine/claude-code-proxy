@@ -1,12 +1,16 @@
+#[path = "process_environment.rs"]
+mod process_environment;
+
 /// Rerun one test without ambient config, credentials, or process-global env
 /// mutation that could race other tests. The config override disables Keychain;
 /// HOME also isolates the file store's legacy credential fallback.
 pub fn rerun_without_credentials(test_name: &str) -> bool {
     if std::env::var("CCP_TEST_ISOLATED_CODEX").as_deref() != Ok(test_name) {
         let isolated = tempfile::TempDir::new().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        process_environment::clear_for_test(&mut command);
+        let mut child = command
             .args(["--exact", test_name, "--nocapture"])
-            .env_clear()
             .env("CCP_TEST_ISOLATED_CODEX", test_name)
             .env("CCP_CONFIG_DIR", isolated.path())
             .env("HOME", isolated.path())

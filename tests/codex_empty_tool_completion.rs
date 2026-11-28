@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[path = "support/process_environment.rs"]
+mod process_environment;
+
 #[derive(Default)]
 struct Script {
     attempts: usize,
@@ -115,14 +118,7 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
         let log_path = dir.path().join("proxy.log");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
-        command.env_clear();
-        // Isolate credentials/config without removing the Windows runtime's
-        // environment (notably SystemRoot, needed by system DLLs and services).
-        for name in ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP"] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
+        process_environment::clear_for_test(&mut command);
         command
             .env("HOME", dir.path())
             .env("USERPROFILE", dir.path())

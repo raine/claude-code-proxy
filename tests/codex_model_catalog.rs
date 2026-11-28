@@ -7,6 +7,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/process_environment.rs"]
+mod process_environment;
+
 struct Proxy(Child);
 impl Drop for Proxy {
     fn drop(&mut self) {
@@ -18,9 +21,8 @@ impl Drop for Proxy {
 fn command(dir: &TempDir) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
     // Avoid inherited credentials, routing overrides, proxy settings and logs.
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("USERPROFILE", dir.path())
+    process_environment::clear_for_test(&mut cmd);
+    cmd.env("USERPROFILE", dir.path())
         .env("HOME", dir.path())
         .env("CODEX_HOME", dir.path())
         .env("CCP_CONFIG_DIR", dir.path())
@@ -59,7 +61,12 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     let dir = TempDir::new().unwrap();
     write_catalog(&dir, "gpt-test-future");
     let output = command(&dir).args(["models", "--full"]).output().unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "models command failed: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let listing = String::from_utf8(output.stdout).unwrap();
     assert!(listing.contains("gpt-test-future-fast"));
     for absent in [
@@ -105,6 +112,8 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
+    let log_path = dir.path().join("proxy-startup.log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let mut proxy = Proxy(
         command(&dir)
             .args(["serve", "--no-monitor", "--port", &port.to_string()])
@@ -113,8 +122,8 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
                 format!("http://{upstream_addr}/responses"),
             )
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
             .spawn()
             .unwrap(),
     );
@@ -124,16 +133,32 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{port}");
-    let mut ready = false;
-    for _ in 0..150 {
-        assert!(proxy.0.try_wait().unwrap().is_none(), "proxy exited");
-        if client.get(format!("{url}/healthz")).send().await.is_ok() {
-            ready = true;
-            break;
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = proxy.0.try_wait().unwrap();
+            assert!(
+                status.is_none(),
+                "proxy exited during startup: {status:?}\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            if let Ok(response) = client
+                .get(format!("{url}/healthz"))
+                .timeout(Duration::from_millis(500))
+                .send()
+                .await
+                && response.status().is_success()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(ready, "proxy did not start");
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "proxy did not start within 15 seconds\n{}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
     let listing: Value = client
         .get(format!("{url}/v1/models"))
         .send()
