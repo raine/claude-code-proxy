@@ -49,6 +49,20 @@ curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/script
 Windows and other prebuilt artifacts are available from
 [GitHub Releases](https://github.com/raine/claude-code-proxy/releases).
 
+To build your own Windows x64 executable without installing Rust locally:
+
+1. Push your changes and `.github/workflows/build-windows.yml` to your GitHub
+   repository's default branch (GitHub needs the workflow there to show the manual trigger).
+2. Open **Actions → Build Windows → Run workflow**, select the branch to build,
+   and confirm **Run workflow**. If Actions is disabled on your fork, enable it first.
+3. After tests and the build succeed, download **claude-code-proxy-windows-x64**
+   from the run's **Artifacts** section and extract the ZIP.
+4. Stop the old proxy, replace its executable with `claude-code-proxy.exe`, and
+   restart it using the same configuration directory to retain existing credentials.
+
+The download includes a SHA-256 checksum and is retained for 14 days. This manual
+workflow does not publish a release or require repository secrets.
+
 Sign in with a **ChatGPT Plus or Pro account**, not an OpenAI API account:
 
 ```sh

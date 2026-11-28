@@ -1,0 +1,43 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 executable
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Test
+        run: cargo test --locked
+      - name: Build release executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $binary = "target/x86_64-pc-windows-msvc/release/claude-code-proxy.exe"
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw "Version smoke test failed" }
+          & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw "Help smoke test failed" }
+      - name: Prepare download
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/claude-code-proxy.exe" "dist/claude-code-proxy.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/claude-code-proxy.exe").Hash.ToLowerInvariant()
+          "$hash  claude-code-proxy.exe" | Out-File -FilePath "dist/claude-code-proxy.exe.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v5
+        with:
+          name: claude-code-proxy-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
