@@ -251,7 +251,6 @@ async fn real_process_stateful_auto_empty_tool_completion_with_tokens_reminder()
     let upstream = listener.local_addr().unwrap();
     let recorded = captured_requests.clone();
     let upstream_task = tokio::spawn(async move {
-        let mut seq = 0_usize;
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let recorded = recorded.clone();
@@ -311,8 +310,6 @@ async fn real_process_stateful_auto_empty_tool_completion_with_tokens_reminder()
                     }
                 }
             });
-            seq += 1;
-            let _ = seq;
         }
     });
 
