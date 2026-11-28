@@ -1,0 +1,3 @@
+SYNTHETIC_READ_FIXTURE_STAGE_A_20261018
+Only synthetic fixture content: Unicode 雪, é, é; numbers 1 and 1.0.
+No credentials, private source, or production configuration.
