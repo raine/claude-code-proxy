@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
+    account_profiles::{self, ProfileStore},
     config, logging,
     monitor::MonitorHandle,
     paths,
@@ -37,6 +38,12 @@ enum Commands {
         port: Option<u16>,
         #[arg(long = "no-monitor", action = ArgAction::SetTrue)]
         no_monitor: bool,
+        /// Use a named Codex account for this process
+        #[arg(long)]
+        codex_profile: Option<String>,
+        /// Use a named Anthropic API-key profile for this process
+        #[arg(long)]
+        anthropic_profile: Option<String>,
     },
     /// Attach a read-only dashboard to a running proxy
     Monitor {
@@ -81,8 +88,33 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum ProviderGroup {
     Auth {
+        /// Select a named account (Codex and Anthropic only)
+        #[arg(long, global = true)]
+        profile: Option<String>,
         #[command(subcommand)]
         command: claude_code_proxy::provider::AuthCommand,
+    },
+    /// Manage named accounts (Codex and Anthropic only)
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Authenticate a new named account
+    Add { name: String },
+    /// List profile names without exposing credentials
+    List,
+    /// Select the default account for future proxy processes
+    Use { name: String },
+    /// Delete a non-default named profile's local credentials
+    Remove {
+        name: String,
+        /// Confirm local credential deletion
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -97,6 +129,8 @@ fn main() -> Result<()> {
     let commands = cli.command.unwrap_or(Commands::Serve {
         port: None,
         no_monitor: false,
+        codex_profile: None,
+        anthropic_profile: None,
     });
 
     match commands {
@@ -104,7 +138,15 @@ fn main() -> Result<()> {
             println!("claude-code-proxy {}", VERSION);
             Ok(())
         }
-        Commands::Serve { port, no_monitor } => {
+        Commands::Serve { port, no_monitor, codex_profile, anthropic_profile } => {
+            let mut overrides = std::collections::BTreeMap::new();
+            if let Some(profile) = codex_profile {
+                overrides.insert("codex".to_owned(), profile);
+            }
+            if let Some(profile) = anthropic_profile {
+                overrides.insert("anthropic".to_owned(), profile);
+            }
+            account_profiles::initialize(overrides)?;
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();
@@ -293,42 +335,86 @@ fn select_serve_mode(stdout_is_tty: bool, no_monitor: bool) -> ServeMode {
 }
 
 fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
+    let (profile, command) = match command {
+        ProviderGroup::Profile { command } => return run_profile_cli(name, command),
+        ProviderGroup::Auth { profile, command } => (profile, command),
+    };
+    let mut overrides = std::collections::BTreeMap::new();
+    if let Some(profile) = profile {
+        anyhow::ensure!(matches!(name, "codex" | "anthropic"), "Profiles are supported only for codex and anthropic");
+        overrides.insert(name.to_owned(), profile);
+    }
+    account_profiles::initialize(overrides)?;
     let registry = Registry::with_default_alias();
     let provider = registry
         .provider(name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider: {name}"))?;
     let handlers = provider.cli();
     match command {
-        ProviderGroup::Auth { command } => match command {
-            claude_code_proxy::provider::AuthCommand::Login => {
-                if let Err(err) = handlers.login() {
-                    eprintln!("{err}");
-                    std::process::exit(2);
+        claude_code_proxy::provider::AuthCommand::Login => {
+            if let Err(err) = handlers.login() {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        claude_code_proxy::provider::AuthCommand::Device => {
+            if let Err(err) = handlers.device() {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        claude_code_proxy::provider::AuthCommand::Status => {
+            if let Err(err) = handlers.status() {
+                println!("{err}");
+                if err.to_string() == "Not authenticated" {
+                    std::process::exit(1);
                 }
-                Ok(())
+                std::process::exit(2);
             }
-            claude_code_proxy::provider::AuthCommand::Device => {
-                if let Err(err) = handlers.device() {
-                    eprintln!("{err}");
-                    std::process::exit(2);
-                }
-                Ok(())
+            Ok(())
+        }
+        claude_code_proxy::provider::AuthCommand::Logout => {
+            handlers.logout()?;
+            Ok(())
+        }
+    }
+}
+
+fn run_profile_cli(provider: &str, command: ProfileCommand) -> Result<()> {
+    anyhow::ensure!(matches!(provider, "codex" | "anthropic"), "Profiles are supported only for codex and anthropic");
+    let store = ProfileStore::configured();
+    match command {
+        ProfileCommand::Add { name } => {
+            let path = store.credential_path(provider, &name)?;
+            anyhow::ensure!(!path.exists(), "Profile '{name}' already exists; use auth login --profile {name} to reauthenticate");
+            run_provider_cli(provider, ProviderGroup::Auth {
+                profile: Some(name),
+                command: claude_code_proxy::provider::AuthCommand::Login,
+            })
+        }
+        ProfileCommand::List => {
+            let default = store.default_profile(provider)?;
+            println!("Saved default: {default}");
+            for name in store.list(provider)? {
+                let marker = if name == default { " (default)" } else { "" };
+                println!("{name}{marker}");
             }
-            claude_code_proxy::provider::AuthCommand::Status => {
-                if let Err(err) = handlers.status() {
-                    println!("{err}");
-                    if err.to_string() == "Not authenticated" {
-                        std::process::exit(1);
-                    }
-                    std::process::exit(2);
-                }
-                Ok(())
-            }
-            claude_code_proxy::provider::AuthCommand::Logout => {
-                handlers.logout()?;
-                Ok(())
-            }
-        },
+            println!("Selection: --profile/serve flags > CCP_{}_PROFILE > saved default", provider.to_ascii_uppercase());
+            Ok(())
+        }
+        ProfileCommand::Use { name } => {
+            store.use_profile(provider, &name)?;
+            println!("Default {provider} profile: {name}. Restart the proxy to apply; explicit flags/environment take precedence.");
+            Ok(())
+        }
+        ProfileCommand::Remove { name, yes } => {
+            anyhow::ensure!(yes, "Credential deletion requires --yes");
+            store.remove(provider, &name)?;
+            println!("Removed {provider} profile: {name}. Credentials cached by running proxies are not revoked; restart them and revoke access upstream if needed.");
+            Ok(())
+        }
     }
 }
 

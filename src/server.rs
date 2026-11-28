@@ -188,13 +188,23 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
-    axum::serve(
+    let refresh = async {
+        if let Some(monitor) = &monitor {
+            monitor.refresh_profiles().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor.clone());
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    .with_graceful_shutdown(shutdown);
+    tokio::select! {
+        result = async { server.await } => result?,
+        _ = refresh => {},
+    }
     Ok(())
 }
 

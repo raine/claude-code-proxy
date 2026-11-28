@@ -244,6 +244,7 @@ impl Throughput {
 pub struct MonitorState {
     pub started_at: SystemTime,
     pub uptime: Duration,
+    pub accounts: Vec<crate::account_profiles::ProfileStatus>,
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
@@ -295,6 +296,7 @@ struct MonitorStore {
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
+    accounts: Vec<crate::account_profiles::ProfileStatus>,
 }
 
 #[derive(Debug)]
@@ -337,7 +339,23 @@ impl MonitorHandle {
                 session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 recent_limit,
+                accounts: Vec::new(),
             })),
+        }
+    }
+
+    /// Refresh safe local metadata off the executor and outside the store lock.
+    /// The server drives this future, so both integrated and attached viewers use
+    /// the service's cache, never the attaching machine's credentials.
+    pub async fn refresh_profiles(&self) {
+        loop {
+            if let Ok(accounts) =
+                tokio::task::spawn_blocking(crate::account_profiles::profile_statuses).await
+                && let Ok(mut store) = self.store.lock()
+            {
+                store.accounts = accounts;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 
@@ -353,6 +371,7 @@ impl MonitorHandle {
             Err(_) => MonitorState {
                 started_at: SystemTime::now(),
                 uptime: Duration::ZERO,
+                accounts: Vec::new(),
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
@@ -929,6 +948,7 @@ impl MonitorStore {
         MonitorState {
             started_at: self.started_at,
             uptime: self.started_instant.elapsed(),
+            accounts: self.accounts.clone(),
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
@@ -1140,6 +1160,24 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_profiles_are_shared_by_integrated_and_remote_snapshots() {
+        let monitor = MonitorHandle::new(10);
+        let remote_handle = monitor.clone();
+        let accounts = vec![crate::account_profiles::ProfileStatus {
+            provider: "anthropic".into(),
+            name: "work".into(),
+            selected: true,
+            is_default: false,
+            status: "Configured (unverified)".into(),
+            expires_at_ms: None,
+        }];
+        monitor.store.lock().unwrap().accounts = accounts.clone();
+        assert_eq!(monitor.snapshot().accounts, accounts);
+        let remote = snapshot::MonitorResponse::from(remote_handle.snapshot());
+        assert_eq!(remote.snapshot.accounts, accounts);
+    }
 
     #[test]
     fn started_requests_appear_active() {

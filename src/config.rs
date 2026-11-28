@@ -625,6 +625,17 @@ fn resolve_anthropic_config(
 }
 
 pub fn anthropic_api_key() -> Option<String> {
+    let name = crate::account_profiles::active_profile("anthropic").ok()?;
+    if name != crate::account_profiles::DEFAULT_PROFILE {
+        // Explicit account selection never falls back to unrelated environment keys.
+        return crate::account_profiles::load_anthropic_key(
+            &crate::account_profiles::ProfileStore::configured(), &name,
+        ).ok();
+    }
+    default_anthropic_api_key()
+}
+
+pub(crate) fn default_anthropic_api_key() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     resolve_anthropic_config(&env, &paths::config_dir()).api_key
 }
@@ -636,6 +647,16 @@ pub fn anthropic_base_url() -> String {
 
 /// Describes credential availability without exposing the key or endpoint credentials.
 pub fn anthropic_config_summary() -> String {
+    match crate::account_profiles::active_profile("anthropic") {
+        Ok(name) if name != crate::account_profiles::DEFAULT_PROFILE => {
+            let configured = crate::account_profiles::load_anthropic_key(
+                &crate::account_profiles::ProfileStore::configured(), &name,
+            ).is_ok();
+            return format!("profile {name}: API key {}", if configured { "configured" } else { "not configured" });
+        }
+        Err(_) => return "Invalid Anthropic account profile".to_owned(),
+        _ => {}
+    }
     let env: HashMap<_, _> = std::env::vars().collect();
     resolve_anthropic_config(&env, &paths::config_dir()).summary()
 }

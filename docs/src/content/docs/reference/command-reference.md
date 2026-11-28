@@ -18,7 +18,7 @@ Each prints `claude-code-proxy <version>`.
 ## `serve`
 
 ```sh
-claude-code-proxy serve [--port <PORT>] [--no-monitor]
+claude-code-proxy serve [--port <PORT>] [--no-monitor] [--codex-profile <NAME>] [--anthropic-profile <NAME>]
 ```
 
 Starts the local HTTP proxy and blocks until shutdown.
@@ -27,6 +27,8 @@ Starts the local HTTP proxy and blocks until shutdown.
 | --- | --- |
 | `--port <PORT>` | Overrides `PORT`, `config.json`, and the default for this invocation. |
 | `--no-monitor` | Uses plain output even when stdout is a terminal. |
+| `--codex-profile <NAME>` | Pins the Codex account for this process; overrides profile environment and saved defaults. |
+| `--anthropic-profile <NAME>` | Pins the Anthropic API-key account for this process. |
 
 The bind address comes from `CCP_BIND_ADDRESS` or `bindAddress`. Interactive stdout opens the monitor unless `--no-monitor` is present. Non-terminal stdout uses plain mode.
 
@@ -66,7 +68,8 @@ claude-code-proxy <provider> auth <action>
 
 | Provider | `login` | `device` | `status` | `logout` |
 | --- | --- | --- | --- | --- |
-| `codex` | Browser PKCE | Device code | Account, expiry, storage | Delete proxy credential |
+| `anthropic` | Import API key into a named profile | Unsupported | Selected profile/key presence (not validated) | Print key removal instructions |
+| `codex` | Browser PKCE | Device code | Account, expiry, storage | Delete selected proxy credential |
 | `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
 | `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
 | `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
@@ -83,6 +86,22 @@ claude-code-proxy cursor auth logout
 A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
+
+## Account profiles
+
+Codex and Anthropic accept `--profile NAME` before or after the auth action:
+
+```sh
+claude-code-proxy codex auth login --profile work
+claude-code-proxy codex auth device --profile personal
+claude-code-proxy anthropic auth login --profile work
+claude-code-proxy codex profile add NAME
+claude-code-proxy codex profile list
+claude-code-proxy codex profile use NAME
+claude-code-proxy codex profile remove NAME --yes
+```
+
+The profile-management commands also accept `anthropic` instead of `codex`. Anthropic login reads a key from environment variables or piped stdin, never a command-line key argument. `profile use` affects new proxy processes only; current processes keep their account. See [Account profiles](/using/account-profiles/) for precedence, default compatibility, storage, removal, and refresh-token limitations.
 
 ## Development commands
 

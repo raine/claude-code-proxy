@@ -211,21 +211,51 @@ const ANTHROPIC_CLI: AnthropicCli = AnthropicCli;
 
 impl CliHandlers for AnthropicCli {
     fn login(&self) -> anyhow::Result<()> {
-        anyhow::bail!("Anthropic uses an API key; set CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, or anthropic.apiKey in config.json. Claude Pro/Max subscriptions do not include API usage.")
+        use std::io::{IsTerminal, Read};
+        let profile = crate::account_profiles::active_profile("anthropic")?;
+        anyhow::ensure!(profile != crate::account_profiles::DEFAULT_PROFILE,
+            "Anthropic uses an API key; configure CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, or anthropic.apiKey for default, or use auth login --profile NAME to save a named key. API billing is separate from Pro/Max.");
+        let key = ["CCP_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"].into_iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()));
+        let key = match key {
+            Some(key) => key,
+            None => {
+                anyhow::ensure!(!std::io::stdin().is_terminal(),
+                    "Set CCP_ANTHROPIC_API_KEY/ANTHROPIC_API_KEY or pipe a key on stdin; keys are never accepted as command-line arguments");
+                let mut key = String::new();
+                std::io::stdin().take(16_385).read_to_string(&mut key)?;
+                anyhow::ensure!(key.len() <= 16_384, "API key input is too large");
+                key
+            }
+        };
+        anyhow::ensure!(!key.trim().chars().any(char::is_whitespace), "API key must not contain whitespace");
+        crate::account_profiles::save_anthropic_key(
+            &crate::account_profiles::ProfileStore::configured(), &profile, &key,
+        )?;
+        println!("Saved Anthropic profile: {profile} (key not validated)");
+        Ok(())
     }
 
-    fn device(&self) -> anyhow::Result<()> { self.login() }
+    fn device(&self) -> anyhow::Result<()> {
+        anyhow::bail!("Anthropic API-key profiles do not use device login; use auth login --profile NAME")
+    }
 
     fn status(&self) -> anyhow::Result<()> {
+        let profile = crate::account_profiles::active_profile("anthropic")?;
         if crate::config::anthropic_api_key().is_none() {
             anyhow::bail!("Not authenticated");
         }
-        println!("Anthropic API key configured (not validated)");
+        println!("Anthropic profile {profile}: API key configured (not validated)");
         Ok(())
     }
 
     fn logout(&self) -> anyhow::Result<()> {
-        println!("Remove CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, and anthropic.apiKey from your configuration to disconnect Anthropic.");
+        let profile = crate::account_profiles::active_profile("anthropic")?;
+        if profile != crate::account_profiles::DEFAULT_PROFILE {
+            println!("To delete this key, select another default if needed, then run: claude-code-proxy anthropic profile remove {profile} --yes");
+        } else {
+            println!("Remove CCP_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, and anthropic.apiKey from your configuration to disconnect Anthropic.");
+        }
         Ok(())
     }
 }

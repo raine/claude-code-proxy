@@ -143,6 +143,7 @@ fn run_monitor_loop(
         setup_text: config.setup_text,
         show_setup: false,
         show_help: false,
+        accounts_selected: None,
         detail: None,
         focus: FocusPane::Sessions,
         selected: 0,
@@ -175,6 +176,9 @@ fn run_monitor_events(
         let update = snapshot();
         let state = update.snapshot();
         app.clamp_selection(state.sessions.len(), state.recent.len());
+        if let Some(selected) = &mut app.accounts_selected {
+            *selected = (*selected).min(state.accounts.len().saturating_sub(1));
+        }
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| {
             render(frame, app, state);
@@ -223,6 +227,33 @@ fn run_monitor_events(
                     KeyCode::Char('q') => app.request_shutdown_confirmation(),
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
+                    KeyCode::Char('a') => {
+                        app.accounts_selected = if app.accounts_selected.is_some() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown
+                        if app.accounts_selected.is_some() =>
+                    {
+                        let step = if key.code == KeyCode::PageDown { 10 } else { 1 };
+                        app.move_account_selection(state.accounts.len(), step, true);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp
+                        if app.accounts_selected.is_some() =>
+                    {
+                        let step = if key.code == KeyCode::PageUp { 10 } else { 1 };
+                        app.move_account_selection(state.accounts.len(), step, false);
+                    }
+                    KeyCode::Home if app.accounts_selected.is_some() => {
+                        app.accounts_selected = Some(0);
+                    }
+                    KeyCode::End if app.accounts_selected.is_some() => {
+                        app.accounts_selected = Some(state.accounts.len().saturating_sub(1));
+                    }
+                    KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Enter
+                        if app.accounts_selected.is_some() => {}
                     KeyCode::Tab => app.focus = app.focus.next(),
                     KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
                     KeyCode::Char('j') => {
@@ -250,6 +281,8 @@ fn run_monitor_events(
                             app.show_help = false;
                         } else if app.show_setup {
                             app.show_setup = false;
+                        } else if app.accounts_selected.is_some() {
+                            app.accounts_selected = None;
                         } else {
                             app.detail = None;
                         }
@@ -296,6 +329,7 @@ struct MonitorApp {
     setup_text: String,
     show_setup: bool,
     show_help: bool,
+    accounts_selected: Option<usize>,
     detail: Option<DetailView>,
     focus: FocusPane,
     selected: usize,
@@ -307,6 +341,17 @@ struct MonitorApp {
 }
 
 impl MonitorApp {
+    fn move_account_selection(&mut self, count: usize, step: usize, down: bool) {
+        if let Some(selected) = &mut self.accounts_selected {
+            *selected = if down {
+                selected.saturating_add(step)
+            } else {
+                selected.saturating_sub(step)
+            }
+            .min(count.saturating_sub(1));
+        }
+    }
+
     fn is_attached(&self) -> bool {
         self.shutdown.is_none() && self.shutdown_complete.is_none()
     }
@@ -470,6 +515,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     render_events(frame, root[4], &state.recent);
     render_footer(frame, root[5], app);
 
+    if let Some(selected) = app.accounts_selected {
+        render_accounts(frame, area, &state.accounts, selected);
+    }
     if app.show_setup {
         render_setup_overlay(frame, area, &app.setup_text);
     }
@@ -481,6 +529,106 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         MonitorPhase::ConfirmingShutdown => render_shutdown_confirmation(frame, area),
         MonitorPhase::ShuttingDown => render_shutdown_overlay(frame, area, app.tick),
     }
+}
+
+fn profile_expiry(expires_at_ms: Option<u64>) -> String {
+    expires_at_ms
+        .and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+        .and_then(|time| Timestamp::try_from(time).ok())
+        .map(|timestamp| {
+            Zoned::new(timestamp, TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "not available".to_string())
+}
+
+fn profile_markers(profile: &crate::account_profiles::ProfileStatus) -> String {
+    match (profile.selected, profile.is_default) {
+        (true, true) => "[selected] [saved-default]",
+        (true, false) => "[selected]",
+        (false, true) => "[saved-default]",
+        (false, false) => "",
+    }
+    .to_string()
+}
+
+fn render_accounts(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    accounts: &[crate::account_profiles::ProfileStatus],
+    selected: usize,
+) {
+    frame.render_widget(Clear, area);
+    let block = panel(" Accounts (read-only) · a / Esc close ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(0),
+        Constraint::Length(5),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(
+            "Local service metadata only; not live authentication or quota validation. Refresh ~5s.\nselected = pinned process profile; saved-default = default for future runs.",
+        )
+        .style(Style::default().fg(DIM_WHITE))
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    if accounts.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No account profiles reported yet (loading, empty, or older service).")
+                .style(Style::default().fg(DIM_WHITE))
+                .wrap(Wrap { trim: false }),
+            sections[1],
+        );
+    } else {
+        let rows = accounts.iter().map(|profile| {
+            Row::new([Cell::from(vec![
+                Line::from(Span::styled(
+                    format!("{} / {} {}", profile.provider, profile.name, profile_markers(profile)),
+                    Style::default().fg(WHITE),
+                )),
+                Line::from(Span::styled(
+                    format!("{} · Expires: {}", profile.status, profile_expiry(profile.expires_at_ms)),
+                    Style::default().fg(DIM_WHITE),
+                )),
+            ])])
+            .height(2)
+        });
+        let selected = selected.min(accounts.len().saturating_sub(1));
+        let table = Table::new(rows, [Constraint::Min(0)])
+            .row_highlight_style(Style::default().bg(SELECTED_BG))
+            .highlight_symbol("› ");
+        let mut table_state = TableState::default().with_selected(Some(selected));
+        frame.render_stateful_widget(table, sections[1], &mut table_state);
+        let profile = &accounts[selected];
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} / {} {}\nStatus: {}\nExpires: {}",
+                profile.provider,
+                profile.name,
+                profile_markers(profile),
+                profile.status,
+                profile_expiry(profile.expires_at_ms),
+            ))
+            .style(Style::default().fg(WHITE))
+            .wrap(Wrap { trim: false }),
+            sections[2],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(format!(
+            "↑/↓ j/k scroll · PgUp/PgDn · Home/End · {}/{}",
+            if accounts.is_empty() { 0 } else { selected.min(accounts.len() - 1) + 1 },
+            accounts.len(),
+        ))
+        .style(Style::default().fg(TEAL)),
+        sections[3],
+    );
 }
 
 fn render_header(
@@ -1547,6 +1695,8 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp) {
         Span::styled(" help  ", Style::default().fg(DIM)),
         Span::styled("b", Style::default().fg(TEAL)),
         Span::styled(" setup  ", Style::default().fg(DIM)),
+        Span::styled("a", Style::default().fg(TEAL)),
+        Span::styled(" accounts  ", Style::default().fg(DIM)),
         Span::styled("arrows/j/k", Style::default().fg(TEAL)),
         Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
@@ -1635,7 +1785,7 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
 
 fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, attached: bool) {
     let width = 48.min(area.width.saturating_sub(4)).max(24);
-    let height = 12.min(area.height.saturating_sub(2)).max(8);
+    let height = 14.min(area.height.saturating_sub(2)).max(8);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -1662,6 +1812,8 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, attached: boo
         ),
         ("?", "toggle help"),
         ("b", "toggle setup"),
+        ("a", "toggle accounts (read-only)"),
+        ("PgUp/PgDn", "page accounts; Home/End first/last"),
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
         ("Tab", "switch pane"),
@@ -1816,6 +1968,97 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn account_profiles(count: usize) -> Vec<crate::account_profiles::ProfileStatus> {
+        (0..count)
+            .map(|index| crate::account_profiles::ProfileStatus {
+                provider: if index % 2 == 0 { "codex" } else { "anthropic" }.into(),
+                name: format!("profile-{index:03}"),
+                selected: index == count.saturating_sub(1),
+                is_default: index == 0,
+                status: if index % 2 == 0 {
+                    "Authenticated (local)"
+                } else {
+                    "Configured (unverified)"
+                }.into(),
+                expires_at_ms: Some(1_800_000_000_000),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accounts_view_scrolls_to_last_profile_and_labels_local_status() {
+        let profiles = account_profiles(101);
+        let buffer = draw(100, 26, |frame| {
+            render_accounts(frame, frame.area(), &profiles, 100);
+        });
+        let text = buffer_text(&buffer);
+        assert!(text.contains("profile-100 [selected]"));
+        assert!(text.contains("Authenticated (local)"));
+        assert!(text.contains("not live authentication or quota validation"));
+        assert!(text.contains("selected = pinned process profile"));
+        assert!(text.contains("saved-default = default for future runs"));
+        assert!(text.contains("Expires: 2027-"));
+        assert!(text.contains("101/101"));
+        assert!(!text.contains("profile-000"));
+    }
+
+    #[test]
+    fn accounts_view_shows_saved_default_and_unverified_status_without_color() {
+        let profiles = account_profiles(4);
+        let buffer = draw(100, 26, |frame| {
+            render_accounts(frame, frame.area(), &profiles, 0);
+        });
+        let text = buffer_text(&buffer);
+        assert!(text.contains("profile-000 [saved-default]"));
+        assert!(text.contains("anthropic / profile-001"));
+        assert!(text.contains("Configured (unverified)"));
+    }
+
+    #[test]
+    fn accounts_view_handles_empty_legacy_snapshot_and_small_terminals() {
+        let buffer = draw(80, 24, |frame| {
+            render_accounts(frame, frame.area(), &[], 0);
+        });
+        assert!(buffer_text(&buffer).contains("No account profiles reported yet"));
+        assert!(buffer_text(&buffer).contains("0/0"));
+        let profiles = account_profiles(100);
+        for (width, height) in [(30, 12), (10, 4), (1, 1)] {
+            draw(width, height, |frame| {
+                render_accounts(frame, frame.area(), &profiles, 99);
+            });
+        }
+    }
+
+    #[test]
+    fn account_selection_pages_clamps_and_never_changes_profiles() {
+        let mut app = MonitorApp {
+            listen_url: "http://remote".into(),
+            setup_text: String::new(),
+            show_setup: false,
+            show_help: false,
+            accounts_selected: Some(0),
+            detail: None,
+            focus: FocusPane::Sessions,
+            selected: 0,
+            recent_selected: 0,
+            tick: 0,
+            phase: MonitorPhase::Running,
+            shutdown: None,
+            shutdown_complete: None,
+        };
+        app.move_account_selection(101, 10, true);
+        assert_eq!(app.accounts_selected, Some(10));
+        app.move_account_selection(101, usize::MAX, true);
+        assert_eq!(app.accounts_selected, Some(100));
+        app.move_account_selection(101, 10, false);
+        assert_eq!(app.accounts_selected, Some(90));
+        app.move_account_selection(0, 10, true);
+        assert_eq!(app.accounts_selected, Some(0));
+        app.move_account_selection(0, 10, false);
+        assert_eq!(app.accounts_selected, Some(0));
+        assert_eq!(profile_expiry(None), "not available");
     }
 
     fn placeholder_position(buffer: &Buffer, placeholder: &str) -> Option<(u16, u16)> {
@@ -2475,6 +2718,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 0,
@@ -2612,6 +2856,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 0,
@@ -2658,6 +2903,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 0,
@@ -2688,6 +2934,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 0,
@@ -2716,6 +2963,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 0,
@@ -2741,6 +2989,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 10,
@@ -2767,6 +3016,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 1,
@@ -2793,6 +3043,7 @@ mod tests {
             setup_text: String::new(),
             show_setup: false,
             show_help: false,
+            accounts_selected: None,
             detail: None,
             focus: FocusPane::Sessions,
             selected: 1,

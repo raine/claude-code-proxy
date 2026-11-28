@@ -372,6 +372,7 @@ fn mock_state_for_tick(
     MonitorState {
         started_at,
         uptime: now.duration_since(started_at).unwrap_or_default(),
+        accounts: Vec::new(),
         sessions,
         active,
         recent: recent.into_iter().collect(),

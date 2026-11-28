@@ -30,6 +30,15 @@ In an attached dashboard, `q` and `Ctrl-C` detach immediately and leave the serv
 - Output throughput based on matched upstream timing and cumulative usage samples
 - Paths to traffic captures when capture is enabled
 - Configuration overrides and a ready-to-copy Claude Code setup
+- Codex and Anthropic account profiles, selected/saved-default markers, local credential status, and Codex token expiry
+
+## Account profile status
+
+The read-only Accounts view (`a`) lists all named Codex and Anthropic profiles plus the implicit `default` profile. It distinguishes `[selected]`, the account pinned to the running process, from `[saved-default]`, the default used by future processes. Missing selected/default credential files remain visible as unauthenticated profiles. Scroll with `↑`/`↓` or `j`/`k`, `PgUp`/`PgDn`, and `Home`/`End`; close with `a` or `Esc`.
+
+Statuses are local observations, not a live login, quota, or billing check. Anthropic keys are labeled unverified; expired Codex access tokens may still have refresh credentials. The UI does not refresh tokens, validate keys, or make provider requests. Profile metadata is cached and refreshed in the background, including for remotely attached monitors. API keys, access/refresh tokens, upstream account identifiers, and credential file paths are never included in account-status snapshots.
+
+Manage accounts through the [Account profiles](/using/account-profiles/) CLI commands; restarting the proxy is required to change its selected account.
 
 ## Keyboard controls
 
@@ -41,6 +50,7 @@ In an attached dashboard, `q` and `Ctrl-C` detach immediately and leave the serv
 | `Esc` | Close details or an overlay |
 | `?` | Toggle shortcut help |
 | `b` | Toggle the setup overlay |
+| `a` | Toggle Accounts: all profiles, local status, selected/saved-default markers, and expiry |
 | `q` | Detach an attached dashboard; in the built-in dashboard, confirm proxy shutdown |
 | `Ctrl-C` | Detach an attached dashboard; in the built-in dashboard, start shutdown (press again to force exit) |
 

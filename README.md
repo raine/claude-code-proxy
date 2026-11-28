@@ -112,6 +112,24 @@ Set `CCP_ALIAS_PROVIDER=anthropic` on the proxy if those aliases should use Clau
 Claude Pro/Max subscriptions do not include API billing. See
 [Anthropic setup](https://claude-code-proxy.raine.dev/providers/anthropic/).
 
+### Multiple accounts
+
+Codex OAuth accounts and Anthropic API keys can be stored as named profiles:
+
+```sh
+claude-code-proxy codex auth login --profile work
+claude-code-proxy anthropic auth login --profile personal # key from env or piped stdin
+claude-code-proxy codex profile list
+claude-code-proxy codex profile use work
+claude-code-proxy serve --codex-profile work --anthropic-profile personal
+```
+
+Each process keeps one selected account per provider; there is no automatic rotation.
+Press `a` in the monitor to list all profiles, local statuses, selected/default markers,
+and Codex token expiry without exposing keys or tokens.
+See [Account profiles](https://claude-code-proxy.raine.dev/using/account-profiles/)
+for selection precedence, credential storage, and removal.
+
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
 

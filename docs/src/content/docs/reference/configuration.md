@@ -68,6 +68,8 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `PORT` | `port` | `18765` | Listener port. |
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
 | `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex`, `kimi`, or `anthropic`. |
+| `CCP_CODEX_PROFILE` | `account-profiles.json` saved default | `default` | Selects a Codex OAuth profile at process startup; `serve --codex-profile` / auth `--profile` takes precedence. |
+| `CCP_ANTHROPIC_PROFILE` | `account-profiles.json` saved default | `default` | Selects a saved Anthropic API-key profile; named profiles do not fall back to environment/config keys. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
 | `CCP_AUTO_REVIEW_EFFORT` | `autoReviewEffort` | — | Sets the Auto Mode classifier's reasoning effort to `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |

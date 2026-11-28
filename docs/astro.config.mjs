@@ -56,6 +56,7 @@ export default defineConfig({
           label: 'Using the proxy',
           items: [
             { label: 'Configure Claude Code', slug: 'using/configure-claude-code' },
+            { label: 'Account profiles', slug: 'using/account-profiles' },
             { label: 'Models and routing', slug: 'using/models-and-routing' },
             { label: 'Switching models and backends', slug: 'using/switching-models-and-backends' },
             { label: 'Monitor TUI', slug: 'using/monitor-tui' },

@@ -1,3 +1,4 @@
+pub mod account_profiles;
 pub mod anthropic;
 pub mod auth;
 pub mod config;
