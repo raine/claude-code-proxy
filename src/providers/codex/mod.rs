@@ -1104,12 +1104,157 @@ async fn live_stream_response_once(
     )
 }
 
+const MAX_PASSIVE_REMINDER_BLOCK_BYTES: usize = 4096;
+const MAX_PASSIVE_REMINDER_SEGMENT_BYTES: usize = 512;
+const MAX_PASSIVE_REMINDER_SEGMENTS: usize = 8;
+const MAX_TRAILING_PASSIVE_REMINDER_MESSAGES: usize = 8;
+
+fn is_ascii_uint(s: &str) -> bool {
+    (1..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_ascii_int(s: &str) -> bool {
+    is_ascii_uint(s.strip_prefix('-').unwrap_or(s))
+}
+
+fn is_js_number(s: &str) -> bool {
+    let (mantissa, exp) = match s.find(['e', 'E']) {
+        Some(idx) => (&s[..idx], Some(&s[idx + 1..])),
+        None => (s, None),
+    };
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((whole, frac)) => is_ascii_uint(whole) && is_ascii_uint(frac),
+        None => is_ascii_uint(mantissa),
+    };
+    let exp_ok = match exp {
+        Some(exp_part) => is_ascii_uint(exp_part.strip_prefix(['+', '-']).unwrap_or(exp_part)),
+        None => true,
+    };
+    mantissa_ok && exp_ok
+}
+
+fn is_signed_js_number(s: &str) -> bool {
+    is_js_number(s.strip_prefix('-').unwrap_or(s))
+}
+
+fn is_compact_tokens(s: &str) -> bool {
+    let core = s.strip_suffix(['k', 'm', 'b', 'q', 't']).unwrap_or(s);
+    match core.split_once('.') {
+        Some((whole, frac)) => is_ascii_uint(whole) && is_ascii_uint(frac),
+        None => is_ascii_uint(core),
+    }
+}
+
+/// Strictly matches passive numeric/telemetry `<system-reminder>` bodies emitted by
+/// Claude Code (`total_tokens_reminder`, `token_usage`, `budget_usd`, `output_token_usage`).
+/// Rejects hook outputs, queued user commands, and any multi-line or unknown text.
+/// Note: Anthropic `Message` carries only `role` and `content`, so this is a narrow
+/// lexical allowlist rather than authenticated provenance.
+fn is_passive_claude_code_telemetry_reminder(body: &str) -> bool {
+    if body.contains('\n') || body.contains('\r') {
+        return false;
+    }
+    if let Some(tokens) = body
+        .strip_prefix("<total_tokens>")
+        .and_then(|s| s.strip_suffix(" tokens left</total_tokens>"))
+    {
+        return tokens == "Infinite" || is_ascii_uint(tokens);
+    }
+    if let Some(rest) = body.strip_prefix("Token usage: ")
+        && let Some((counts, rem)) = rest.split_once("; ")
+        && let Some((used, total)) = counts.split_once('/')
+        && let Some(rem) = rem.strip_suffix(" remaining")
+    {
+        return is_ascii_uint(used) && is_ascii_uint(total) && is_ascii_int(rem);
+    }
+    if let Some(rest) = body.strip_prefix("USD budget: $")
+        && let Some((counts, rem)) = rest.split_once("; $")
+        && let Some((used, total)) = counts.split_once("/$")
+        && let Some(rem) = rem.strip_suffix(" remaining")
+    {
+        return is_js_number(used) && is_js_number(total) && is_signed_js_number(rem);
+    }
+    if let Some(rest) = body.strip_prefix("Output tokens \u{2014} turn: ")
+        && let Some((turn, session)) = rest.split_once(" \u{00b7} session: ")
+    {
+        let turn_ok = match turn.split_once(" / ") {
+            Some((used, budget)) => is_compact_tokens(used) && is_compact_tokens(budget),
+            None => is_compact_tokens(turn),
+        };
+        return turn_ok && is_compact_tokens(session);
+    }
+    false
+}
+
+fn is_ignorable_tool_tail_text(text: &str) -> bool {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return true;
+    }
+    if rest.len() > MAX_PASSIVE_REMINDER_BLOCK_BYTES {
+        return false;
+    }
+    let mut segments = 0_usize;
+    while !rest.is_empty() {
+        if segments >= MAX_PASSIVE_REMINDER_SEGMENTS {
+            return false;
+        }
+        let Some(after_open) = rest.strip_prefix("<system-reminder>") else {
+            return false;
+        };
+        let Some((inner, after_close)) = after_open.split_once("</system-reminder>") else {
+            return false;
+        };
+        if inner.len() > MAX_PASSIVE_REMINDER_SEGMENT_BYTES || inner.contains("<system-reminder") {
+            return false;
+        }
+        if !is_passive_claude_code_telemetry_reminder(inner.trim()) {
+            return false;
+        }
+        segments += 1;
+        rest = after_close.trim_start();
+    }
+    segments > 0
+}
+
+fn is_passive_reminder_only_user_message(message: &crate::anthropic::schema::Message) -> bool {
+    if message.role != "user" {
+        return false;
+    }
+    match &message.content {
+        serde_json::Value::String(text) => is_ignorable_tool_tail_text(text),
+        serde_json::Value::Array(blocks) => {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    block.get("type").and_then(|v| v.as_str()) == Some("text")
+                        && block
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(is_ignorable_tool_tail_text)
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Empty success is eligible only when the last exchange resolves every tool call.
-/// Text and system messages may contain new instructions, even when added by hooks.
+/// Text and system messages remain instructions (even when described as hook output),
+/// except for whitespace and passive Claude Code runtime telemetry `<system-reminder>` blocks.
 fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
     use std::collections::HashSet;
 
-    let [.., assistant, user] = body.messages.as_slice() else {
+    let mut messages = body.messages.as_slice();
+    let mut peeled = 0_usize;
+    while peeled < MAX_TRAILING_PASSIVE_REMINDER_MESSAGES
+        && messages
+            .last()
+            .is_some_and(is_passive_reminder_only_user_message)
+    {
+        messages = &messages[..messages.len() - 1];
+        peeled += 1;
+    }
+
+    let [.., assistant, user] = messages else {
         return false;
     };
     if assistant.role != "assistant" || user.role != "user" {
@@ -1143,7 +1288,7 @@ fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
                 if block
                     .get("text")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|text| text.trim().is_empty()) => {}
+                    .is_some_and(is_ignorable_tool_tail_text) => {}
             Some("tool_result") => {
                 if !matches!(
                     block.get("is_error"),
@@ -2156,6 +2301,55 @@ mod tests {
             .unwrap()
             .push(serde_json::json!({"type":"text","text":" \n\t"}));
         assert!(tail_is_successful_tool_result(&make(whitespace)));
+        for passive in [
+            "<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>",
+            "<system-reminder><total_tokens>Infinite tokens left</total_tokens></system-reminder>",
+            "<system-reminder>\nToken usage: 69174/200000; 130826 remaining\n</system-reminder>",
+            "<system-reminder>\nToken usage: 200042/200000; -42 remaining\n</system-reminder>",
+            "<system-reminder>\nUSD budget: $1.2345/$10; $-0.5 remaining\n</system-reminder>",
+            "<system-reminder>\nUSD budget: $1e-4/$10.00; $9.9999 remaining\n</system-reminder>",
+            "<system-reminder>\nOutput tokens \u{2014} turn: 120 / 4.1k \u{00b7} session: 15.2k\n</system-reminder>",
+            "<system-reminder>\nOutput tokens \u{2014} turn: 0 \u{00b7} session: 950\n</system-reminder>",
+            "<system-reminder>\n<total_tokens>100 tokens left</total_tokens>\n</system-reminder>\n\n<system-reminder>\nToken usage: 1/200000; 199999 remaining\n</system-reminder>",
+        ] {
+            let mut with_passive = results.clone();
+            with_passive
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"type":"text","text":passive}));
+            assert!(
+                tail_is_successful_tool_result(&make(with_passive)),
+                "expected passive telemetry reminder to stay eligible: {passive}"
+            );
+        }
+        // Multiple passive text blocks inside the tool_result user message
+        {
+            let mut multi_blocks = results.clone();
+            let arr = multi_blocks.as_array_mut().unwrap();
+            arr.push(serde_json::json!({"type":"text","text":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"}));
+            arr.push(serde_json::json!({"type":"text","text":"<system-reminder>\nOutput tokens \u{2014} turn: 120 \u{00b7} session: 950\n</system-reminder>"}));
+            assert!(tail_is_successful_tool_result(&make(multi_blocks)));
+        }
+        // Trailing role="user" messages containing exclusively passive telemetry reminders
+        for trailing_content in [
+            serde_json::json!(
+                "<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"
+            ),
+            serde_json::json!([
+                {"type":"text","text":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"},
+                {"type":"text","text":"   \n  "}
+            ]),
+        ] {
+            let mut body = make(results.clone());
+            let trailing =
+                request_with_tail(serde_json::json!([{"role":"user","content":trailing_content}]));
+            body.messages.extend(trailing.messages);
+            assert!(
+                tail_is_successful_tool_result(&body),
+                "expected trailing passive user message to stay eligible: {trailing_content}"
+            );
+        }
+
         let mut cases = vec![
             serde_json::json!([results[0]]),
             serde_json::json!([results[0], results[0]]),
@@ -2172,6 +2366,15 @@ mod tests {
         for text in [
             "continue working",
             "<system-reminder>PostToolUse hook: continue</system-reminder>",
+            "<system-reminder>\nSessionStart hook additional context: wrote 22 models\n</system-reminder>",
+            "<system-reminder>\nThe user sent a new message while you were working:\nstop\n</system-reminder>",
+            "<system-reminder><total_tokens>100 tokens left</total_tokens></system-reminder>\nplease continue",
+            "<system-reminder kind=\"meta\"><total_tokens>100 tokens left</total_tokens></system-reminder>",
+            "<system-reminder><system-reminder><total_tokens>100 tokens left</total_tokens></system-reminder></system-reminder>",
+            "<system-reminder><total_tokens>100 tokens left</total_tokens>",
+            "<system-reminder><total_tokens>100 tokens left</total_tokens> extra</system-reminder>",
+            "<system-reminder>Token usage: 10/20; 10 remaining\nextra line</system-reminder>",
+            "<system-reminder>USD budget: $1/$2; $1 remaining junk</system-reminder>",
         ] {
             let mut invalid = results.clone();
             invalid
@@ -2186,12 +2389,54 @@ mod tests {
                 "{case}"
             );
         }
+        // Unknown block type or non-string text after tool_result must be rejected
+        for bad_block in [
+            serde_json::json!({"type":"text","text":123}),
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}),
+        ] {
+            let mut invalid = results.clone();
+            invalid.as_array_mut().unwrap().push(bad_block);
+            assert!(!tail_is_successful_tool_result(&make(invalid)));
+        }
         for role in ["user", "system"] {
             let mut body = make(results.clone());
             let trailing = request_with_tail(
                 serde_json::json!([{"role":role,"content":"PostToolUse hook: continue"}]),
             );
             body.messages.extend(trailing.messages);
+            assert!(!tail_is_successful_tool_result(&body));
+        }
+        // Trailing role="system" even with <total_tokens> must NOT be peeled
+        {
+            let mut body = make(results.clone());
+            let trailing = request_with_tail(serde_json::json!([
+                {"role":"system","content":"<system-reminder>\n<total_tokens>100 tokens left</total_tokens>\n</system-reminder>"}
+            ]));
+            body.messages.extend(trailing.messages);
+            assert!(!tail_is_successful_tool_result(&body));
+        }
+        // Empty trailing user message must NOT be peeled
+        {
+            let mut body = make(results.clone());
+            let trailing = request_with_tail(serde_json::json!([{"role":"user","content":[]}]));
+            body.messages.extend(trailing.messages);
+            assert!(!tail_is_successful_tool_result(&body));
+        }
+        // Passive reminder after ordinary user prompt (no tool_result) must remain ineligible
+        {
+            let body = request_with_tail(serde_json::json!([
+                {"role":"user","content":"please continue"},
+                {"role":"user","content":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"}
+            ]));
+            assert!(!tail_is_successful_tool_result(&body));
+        }
+        // Passive reminder after assistant text without tool_use must remain ineligible
+        {
+            let body = request_with_tail(serde_json::json!([
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":[{"type":"text","text":"hello"}]},
+                {"role":"user","content":"<system-reminder>\n<total_tokens>14979160 tokens left</total_tokens>\n</system-reminder>"}
+            ]));
             assert!(!tail_is_successful_tool_result(&body));
         }
     }
