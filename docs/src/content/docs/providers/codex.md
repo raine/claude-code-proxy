@@ -109,6 +109,8 @@ and quota accounting depend on the upstream subscription; this setting is opt-in
 
 `auto` is the default transport: it uses WebSocket with HTTP SSE fallback only when setup fails before a request is sent. Set `CCP_CODEX_TRANSPORT=websocket` for WebSocket-only behavior, or `http` for HTTP SSE. A failure after a request is sent does not trigger HTTP replay.
 
+With `codex.requestCompression` on and `auto` selected explicitly, a request that must carry the full conversation and exceeds `codex.autoWebSocketMaxBytes` (4 MiB serialized by default) goes straight to gzip-compressed HTTP instead of an uncompressed WebSocket frame. Requests that continue from a `previous_response_id` stay on WebSocket regardless of conversation size.
+
 On the HTTP transport, the proxy waits five minutes for the response headers before failing the request. Codex withholds the response head until the model produces its first output, so a large request to a high-effort model can hold it for minutes. `CCP_CODEX_HEADER_TIMEOUT_MS` or `codex.headerTimeoutMs` changes that bound.
 
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
@@ -116,6 +118,8 @@ WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables append-only WebSocket continuation. A valid identity containing only a Claude Code session ID owns the Main continuation for that session. Each valid direct Agent ID owns an independent continuation and reusable WebSocket within the same session. Nested Agents are keyed by their direct child ID; the parent ID is validated but does not become part of the owner key. The proxy sends `previous_response_id` only when the translated request shape and transcript extension are safe, and only on the exact live WebSocket that produced that response.
 
 An absent, malformed, or ambiguous identity does not reject the HTTP request; that request proceeds without continuation or WebSocket reuse. If the originating socket is missing, dead, or has been replaced, the proxy retries once with the full translated input and without the stale response ID. Continuation and connection state is held only in memory and is lost when the proxy restarts.
+
+Claude Code background requests that share the Main session ID, such as prompt suggestions, away summaries, session renames, `/btw` side questions, and memory extraction, are recognized by their final user message and get their own continuation and WebSocket. They can read the session's native compaction history but never replace or invalidate it, so they do not break the Main conversation's continuation.
 
 Detected auto-review classifier subrequests are intentionally stateless even when valid session and Agent headers are present. They neither consume nor publish continuation or WebSocket ownership.
 

@@ -362,7 +362,7 @@ const CLAUDE_FORK_AWAY_SUMMARY_MARKER: &str =
 const CLAUDE_FORK_PROMPT_SUGGESTION_MARKER: &str =
     "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]";
 const CLAUDE_FORK_AGENT_SUMMARY_MARKER: &str =
-    "Describe your most recent action in 3-5 words using present tense (-ing).";
+    "most recent action in 3-5 words using present tense (-ing).";
 const CLAUDE_FORK_RENAME_MARKER: &str = "Generate a short kebab-case name (2-4 words) that captures the main topic of this conversation.";
 const CLAUDE_FORK_SIDE_QUESTION_MARKER: &str =
     "This is a one-off response - there will be no follow-up turns";
@@ -407,6 +407,11 @@ fn claude_ephemeral_fork_in_content(content: &Value) -> Option<&'static str> {
 /// `prompt_suggestion`, `agent_summary`, `rename`, `side_question` `/btw`,
 /// `extract_memories`, `auto_dream`) so they can be isolated from the main
 /// session's continuation and compaction state.
+///
+/// A fork carries its instruction in the final user message (trailing
+/// `system` hook messages are skipped, as for compaction detection). Earlier
+/// user messages are main-thread history, so a marker quoted there must not
+/// turn every later main turn into a fork.
 pub(crate) fn claude_ephemeral_fork_label(request: &MessagesRequest) -> Option<&'static str> {
     if is_compact_messages_request(request) {
         return None;
@@ -415,8 +420,9 @@ pub(crate) fn claude_ephemeral_fork_label(request: &MessagesRequest) -> Option<&
         .messages
         .iter()
         .rev()
+        .find(|message| message.role != "system")
         .filter(|message| message.role == "user")
-        .find_map(|message| claude_ephemeral_fork_in_content(&message.content))
+        .and_then(|message| claude_ephemeral_fork_in_content(&message.content))
 }
 
 /// Reasoning-effort cap applied to compaction requests, or None when the
@@ -2848,6 +2854,32 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(claude_ephemeral_fork_label(&assistant_only), None);
+
+        let marker_in_history: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6.1-sol",
+            "messages": [
+                {"role": "user", "content": "Why does the proxy match \"# Dream: Memory Consolidation\"?"},
+                {"role": "assistant", "content": "It marks a background fork."},
+                {"role": "user", "content": "ok, continue"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(claude_ephemeral_fork_label(&marker_in_history), None);
+
+        let hook_after_fork: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6.1-sol",
+            "messages": [
+                {"role": "user", "content": "main turn"},
+                {"role": "assistant", "content": "main reply"},
+                {"role": "user", "content": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"},
+                {"role": "system", "content": "UserPromptSubmit hook success"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            claude_ephemeral_fork_label(&hook_after_fork),
+            Some("fork:prompt_suggestion")
+        );
 
         let normal: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-6.1-sol",

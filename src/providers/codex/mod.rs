@@ -3384,14 +3384,9 @@ mod tests {
      {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        crate::retry::set_zero_retry_delay_for_tests(true);
-        struct ResetRetryDelay;
-        impl Drop for ResetRetryDelay {
-            fn drop(&mut self) {
-                crate::retry::set_zero_retry_delay_for_tests(false);
-            }
-        }
-        let _retry_guard = ResetRetryDelay;
+        // The single outer retry waits out the real first backoff step. The
+        // process-global zero-delay switch is not used here because unit tests
+        // share one process and other tests assert real delays.
 
         // Case 1: establish pooled Turn 1 -> Turn 2 delta -> previous_response_not_found -> internal full-context retry -> WS closes before terminal -> outer retry succeeds.
         {
