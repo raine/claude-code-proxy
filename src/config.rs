@@ -82,8 +82,6 @@ struct CodexConfig {
     pub transport: Option<String>,
     #[serde(rename = "headerTimeoutMs")]
     pub header_timeout_ms: Option<u64>,
-    #[serde(rename = "autoWebSocketMaxBytes")]
-    pub auto_websocket_max_bytes: Option<usize>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -322,12 +320,6 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         out.push("CCP_CODEX_REQUEST_COMPRESSION (env)".to_string());
     }
     if env
-        .get("CCP_CODEX_AUTO_WS_MAX_BYTES")
-        .is_some_and(|raw| !raw.trim().is_empty())
-    {
-        out.push("CCP_CODEX_AUTO_WS_MAX_BYTES (env)".to_string());
-    }
-    if env
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
     {
@@ -395,9 +387,6 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(ms) = codex.header_timeout_ms {
                 out.push(format!("codex.headerTimeoutMs: {ms}"));
-            }
-            if let Some(bytes) = codex.auto_websocket_max_bytes {
-                out.push(format!("codex.autoWebSocketMaxBytes: {bytes}"));
             }
         }
     }
@@ -995,28 +984,6 @@ pub fn codex_header_timeout_ms() -> u64 {
     CODEX_DEFAULT_HEADER_TIMEOUT_MS
 }
 
-/// Default serialized payload limit (4 MiB) for full-context requests sent over
-/// WebSocket in `Auto` transport when HTTP request compression is enabled.
-/// Setting `0` disables the limit (`usize::MAX`).
-pub const CODEX_DEFAULT_AUTO_WEBSOCKET_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-pub fn codex_auto_websocket_max_bytes() -> usize {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_AUTO_WS_MAX_BYTES")
-        && let Ok(bytes) = raw.trim().parse::<usize>()
-    {
-        return if bytes == 0 { usize::MAX } else { bytes };
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(bytes) = codex.auto_websocket_max_bytes
-    {
-        return if bytes == 0 { usize::MAX } else { bytes };
-    }
-    CODEX_DEFAULT_AUTO_WEBSOCKET_MAX_BYTES
-}
-
 // ---------------------------------------------------------------------------
 // Cursor config
 // ---------------------------------------------------------------------------
@@ -1116,7 +1083,6 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
-            EnvGuard::unset("CCP_CODEX_AUTO_WS_MAX_BYTES"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
             EnvGuard::unset("CCP_GROK_CLIENT_VERSION"),
         ];
@@ -1630,50 +1596,5 @@ mod tests {
         let _disabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "false");
         assert!(!codex_request_compression());
         assert_eq!(codex_transport(), CodexTransport::Auto);
-    }
-
-    #[test]
-    fn codex_auto_websocket_max_bytes_defaults_and_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let config = tempfile::TempDir::new().unwrap();
-        let _env = isolated_env(&config);
-
-        assert_eq!(
-            codex_auto_websocket_max_bytes(),
-            CODEX_DEFAULT_AUTO_WEBSOCKET_MAX_BYTES
-        );
-        {
-            let _env_override = EnvGuard::set("CCP_CODEX_AUTO_WS_MAX_BYTES", "1048576");
-            assert_eq!(codex_auto_websocket_max_bytes(), 1_048_576);
-            assert!(
-                config_override_summary_lines(&load_config())
-                    .iter()
-                    .any(|s| s == "CCP_CODEX_AUTO_WS_MAX_BYTES (env)")
-            );
-        }
-        {
-            let _env_zero = EnvGuard::set("CCP_CODEX_AUTO_WS_MAX_BYTES", "0");
-            assert_eq!(codex_auto_websocket_max_bytes(), usize::MAX);
-        }
-        std::fs::write(
-            config.path().join("config.json"),
-            r#"{"codex":{"autoWebSocketMaxBytes":2097152}}"#,
-        )
-        .unwrap();
-        assert_eq!(codex_auto_websocket_max_bytes(), 2_097_152);
-        assert!(
-            config_override_summary_lines(&load_config())
-                .iter()
-                .any(|s| s == "codex.autoWebSocketMaxBytes: 2097152")
-        );
-        std::fs::write(
-            config.path().join("config.json"),
-            r#"{"codex":{"autoWebSocketMaxBytes":0}}"#,
-        )
-        .unwrap();
-        assert_eq!(codex_auto_websocket_max_bytes(), usize::MAX);
-
-        let _env_bogus = EnvGuard::set("CCP_CODEX_AUTO_WS_MAX_BYTES", "not-a-number");
-        assert_eq!(codex_auto_websocket_max_bytes(), usize::MAX);
     }
 }

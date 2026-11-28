@@ -109,8 +109,6 @@ and quota accounting depend on the upstream subscription; this setting is opt-in
 
 `auto` is the default transport: it uses WebSocket with HTTP SSE fallback only when setup fails before a request is sent. Set `CCP_CODEX_TRANSPORT=websocket` for WebSocket-only behavior, or `http` for HTTP SSE. A failure after a request is sent does not trigger HTTP replay.
 
-With `codex.requestCompression` on and `auto` selected explicitly, a request that must carry the full conversation and exceeds `codex.autoWebSocketMaxBytes` (4 MiB serialized by default) goes straight to gzip-compressed HTTP instead of an uncompressed WebSocket frame. Requests that continue from a `previous_response_id` stay on WebSocket regardless of conversation size.
-
 On the HTTP transport, the proxy waits five minutes for the response headers before failing the request. Codex withholds the response head until the model produces its first output, so a large request to a high-effort model can hold it for minutes. `CCP_CODEX_HEADER_TIMEOUT_MS` or `codex.headerTimeoutMs` changes that bound.
 
 WebSocket setup honors `HTTP_PROXY` for `ws://`, `HTTPS_PROXY` for the default `wss://` endpoint, `ALL_PROXY` as a fallback, and `NO_PROXY` exclusions. A normal HTTP proxy can therefore carry the default WebSocket connection with CONNECT; TUN mode is not required. Set proxy variables before starting the process and restart after changing them. For example, setting `HTTPS_PROXY` to `http://127.0.0.1:7890` sends HTTPS/WSS destinations through the HTTP proxy at port 7890; it does not require an `https://` proxy URL.
